@@ -1,0 +1,6 @@
+[submodule "libs/PFNs4BO"]
+	path = libs/PFNs4BO
+	url = https://github.com/automl/PFNs4BO.git
+[submodule "libs/PFNs"]
+	path = libs/PFNs
+	url = https://github.com/automl/PFNs.git
