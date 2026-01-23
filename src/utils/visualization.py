@@ -13,21 +13,24 @@ def r2_comparison(gp_results, pfn_results):
 
     for res_gp, res_pfn in zip(gp_results, pfn_results):
 
-        data.append({
+        for score in res_gp['r2']:
+            data.append({
                 'EMG': f"EMG {res_gp['emg']}",
-                'R2': res_gp['r2'],
+                'R2': score,
                 'Model': 'GP'
             })
-        data.append({
+
+        for score in res_pfn['r2']:
+            data.append({
                 'EMG': f"EMG {res_pfn['emg']}",
-                'R2': res_pfn['r2'],
+                'R2': score,
                 'Model': 'PFN'
             })
-        
+  
     df = pd.DataFrame(data)
     plt.figure(figsize=(10, 6))
     plt.ylim(0, 1)
-    sns.barplot(data=df, x='EMG', y='R2', hue='Model')
+    sns.barplot(data=df, x='EMG', y='R2', hue='Model', errorbar=('ci', 95))
     plt.title("R2 Score Comparison: GP vs PFN")
     plt.show()
 
@@ -92,22 +95,69 @@ def show_emg_map(results, idx, model_type):
     
     plt.show()
 
-    plt.suptitle(f"Model Fit: {res['dataset']} | Subj {res['subject']} | EMG {res['emg']}", fontsize=14)
-    plt.show()
+    #plt.suptitle(f"Model Fit: {res['dataset']} | Subj {res['subject']} | EMG {res['emg']}", fontsize=14)
+    #plt.show()
 
-def regret_curve(gp_vals, pfn_vals, optimal_val):
-
-    best_so_far_gp = np.maximum.accumulate(gp_vals)
-    best_so_far_pfn = np.maximum.accumulate(pfn_vals)
-
-    regret_gp = optimal_val - best_so_far_gp
-    regret_pfn = optimal_val - best_so_far_pfn
+def regret_curve(gp_vals, pfn_vals, idx):
     
-    # 4. Plotting
-    plt.step(range(len(regret_pfn)), regret_gp, where='post', label='gp')
-    plt.step(range(len(regret_pfn)), regret_pfn, where='post', label='pfn')
+    # Get metadata
+    res_gp = gp_vals[idx]
+    res_pfn = pfn_vals[idx]
+    
+    # Determine Optimal Value (Global Max)
+    # Ideally this is the max of the ground truth test set
+    optimal_val = res_gp['y_test'].max()
+    
+    def get_regret_stats(values_list):
+        # 1. Convert to array: Shape (n_reps, n_steps)
+        raw_vals = np.array(values_list)
+        
+        # 2. Calculate Best-So-Far for EACH repetition individually
+        # We accumulate max along axis 1 (the time steps)
+        best_so_far = np.maximum.accumulate(raw_vals, axis=1)
+        
+        # 3. Calculate Regret for EACH repetition
+        # Regret = Optimal - Best_Observed_So_Far
+        regret_all = optimal_val - best_so_far
+        
+        # 4. Compute Mean and Standard Error across repetitions (axis 0)
+        mean_regret = np.mean(regret_all, axis=0)
+        std_regret = np.std(regret_all, axis=0)
+        n_reps = raw_vals.shape[0]
+        
+        # Standard Error for 95% CI
+        se_regret = std_regret / np.sqrt(n_reps)
+        
+        return mean_regret, se_regret
+
+    # Get Stats
+    gp_mean, gp_se = get_regret_stats(res_gp['values'])
+    pfn_mean, pfn_se = get_regret_stats(res_pfn['values'])
+    
+    x_axis = range(len(gp_mean))
+
+    # --- Plotting ---
+    plt.figure(figsize=(8, 6))
+    
+    # 1. GP Plot
+    plt.plot(x_axis, gp_mean, color='sandybrown', label='GP', linewidth=2)
+    plt.fill_between(x_axis, 
+                     gp_mean - 1.96 * gp_se, 
+                     gp_mean + 1.96 * gp_se, 
+                     color='sandybrown', alpha=0.2)
+
+    # 2. PFN Plot
+    plt.plot(x_axis, pfn_mean, color='royalblue', label='PFN', linewidth=2)
+    plt.fill_between(x_axis, 
+                     pfn_mean - 1.96 * pfn_se, 
+                     pfn_mean + 1.96 * pfn_se, 
+                     color='royalblue', alpha=0.2)
+
+    dataset, subject, emg = res_gp['dataset'], res_gp['subject'], res_gp['emg']
+
     plt.xlabel('Iteration')
     plt.ylabel('Simple Regret')
-    plt.title('Optimization Regret Curve')
+    plt.title(f'Regret | {dataset} Subj {subject} EMG {emg}')
     plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.show()

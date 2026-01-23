@@ -26,7 +26,7 @@ from utils.visualization import *
 #           Bayesian Optimization Loop
 # ============================================
 
-def run_bo_loop(X_pool, y_pool, model_type, pfn_model=None, n_init=8, budget=100, device='cpu'):
+def run_bo_loop(X_pool, y_pool, y_test, model_type, pfn_model=None, n_init=1, budget=100, device='cpu'):
     """
     Performs the Active Learning loop.
     Returns:
@@ -47,6 +47,7 @@ def run_bo_loop(X_pool, y_pool, model_type, pfn_model=None, n_init=8, budget=100
     pool_indices = np.arange(n_locs)
     observed_indices = np.random.choice(pool_indices, size=n_init, replace=False).tolist()
     observed_values = [sample_from_pool(idx) for idx in observed_indices]
+    real_values = y_test[observed_indices].tolist()
 
     times = []
 
@@ -56,7 +57,7 @@ def run_bo_loop(X_pool, y_pool, model_type, pfn_model=None, n_init=8, budget=100
     for idx in observed_indices:
         n_samples[idx] += 1
 
-    kernel = 1.0 * RBF(length_scale=0.1) + WhiteKernel(noise_level=0.1)
+    #kernel = 1.0 * RBF(length_scale=0.1) + WhiteKernel(noise_level=0.1)
 
     
     # --- LOOP ---
@@ -72,16 +73,28 @@ def run_bo_loop(X_pool, y_pool, model_type, pfn_model=None, n_init=8, budget=100
         # --- GP Logic ---
         if model_type == 'gp':
             step_start = time.time()
-            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
-            gp.fit(X_train, y_train)
+            
+            # Initialize Model & Likelihood
+            likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+            model = ExactGP(X_train, y_train, likelihood).to(device)
+            
+            # Training Loop (Optimize Hyperparameters)
+            model.train()
+            likelihood.train()
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+            
+            # 50 iterations is usually sufficient for simple regression
+            for _ in range(50):
+                optimizer.zero_grad()
+                output = model(X_train)
+                loss = -mll(output, y_train)
+                loss.backward()
+                optimizer.step()
                 
             # Select Next Point (EI)
             best_f = y_train.max()
-            acq_vals = expected_improvement2(gp, X_cand, best_f, device )#expected_improvement(model, likelihood, X_cand, best_f, device)      
-
-            # 🔑 Penalize EI for repeated sampling
-            #penalty = 1.0 / (1.0 + torch.tensor(n_samples, device=device, dtype=torch.float32))
-            #acq_vals = acq_vals * penalty      
+            acq_vals = expected_improvement(model, likelihood, X_cand, best_f, device) #expected_improvement(model, likelihood, X_cand, best_f, device)        
 
             # Get index relative to X_pool (0 to 95)
             next_idx = acq_vals.argmax().item()
@@ -101,241 +114,240 @@ def run_bo_loop(X_pool, y_pool, model_type, pfn_model=None, n_init=8, budget=100
             
             if isinstance(idx_rel, torch.Tensor): idx_rel = idx_rel.item()
 
-            #penalty = 1.0 / (1.0 + 0.5*torch.tensor(n_samples, device=device, dtype=torch.float32))
-            #acq_vals = acq_vals * penalty
             next_idx = acq_vals.argmax().item()
-
-            #?#next_idx = idx_rel
         
         observed_indices.append(next_idx)  
         new_val = sample_from_pool(next_idx)
         observed_values.append(new_val)  
+        real_values.append(y_test[next_idx])
 
         step_time = time.time() - step_start
         times.append(step_time)
 
-    return observed_indices, observed_values, times
+    return observed_indices, observed_values, real_values, times
 
 def evaluate_fit(dataset, subject_idx, emg_idx, model_type, 
-                   pfn_model_weights=None, device='cpu', budget=100):
+                   pfn_model_weights=None, device='cpu', budget=150, n_reps=30):
     
     data = load_data(dataset, subject_idx)
 
-    X_train, y_train, X_test, y_test, scaler_y = preprocess_neural_data(data, emg_idx, model_type)
+    X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(data, emg_idx, model_type)
 
-    #subsampling context
-    n_reps = y_train.shape[1]
-    y_train = y_train.flatten()
-    indices = np.random.choice(len(y_train), budget, replace=False)
-    X_train=np.repeat(X_train, n_reps, axis=0)[indices]
-    y_train=y_train[indices]
+    n_stims = y_train_full.shape[1]
+    y_train_full = y_train_full.flatten()
+    
+    r2_scores = []
+    y_preds_all = []
+    total_time = 0
+
+    for i in range(n_reps):
+
+        indices = np.random.choice(len(y_train_full), budget, replace=False)
+        X_train=np.repeat(X_train_full, n_stims, axis=0)[indices]
+        y_train=y_train_full[indices]
 
 
-    if model_type == 'gp':
-        
-        start = time.time()
-        kernel = 1.0 * RBF(length_scale=0.1) + WhiteKernel(noise_level=0.1)
-        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
-        gp.fit(X_train, y_train)
-        y_pred = gp.predict(X_test)        
+        if model_type == 'gp':
+            
+            '''
+            start = time.time()
+            kernel = 1.0 * RBF(length_scale=0.1) + WhiteKernel(noise_level=0.1)
+            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+            gp.fit(X_train, y_train)
+            y_pred = gp.predict(X_test)  
+            '''
+            start = time.time()
 
-    elif model_type == 'pfn':
+            # 1. Convert to Tensors
+            train_x = torch.tensor(X_train, dtype=torch.float32, device=device)
+            train_y = torch.tensor(y_train, dtype=torch.float32, device=device)
+            
+            # 2. Initialize Model & Likelihood
+            likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+            model = ExactGP(train_x, train_y, likelihood).to(device)
+            
+            # 3. Training Loop (Optimize Hyperparameters)
+            model.train()
+            likelihood.train()
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+            
+            # 50 iterations is usually sufficient for simple regression
+            for _ in range(50):
+                optimizer.zero_grad()
+                output = model(train_x)
+                loss = -mll(output, train_y)
+                loss.backward()
+                optimizer.step()
+            
+            # 4. Prediction
+            model.eval()
+            likelihood.eval()
+            test_x_tensor = torch.tensor(X_test, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                # Get the mean of the posterior
+                posterior = likelihood(model(test_x_tensor))
+                y_pred = posterior.mean.cpu().numpy()
 
-        pfn_bo = TransformerBOMethod(
-        pfn_model_weights,
-        device=device,
-        acq_function='mean' # This tells the PFN to output posterior mean
-        )
 
-        start = time.time()
 
-        _, y_pred = pfn_bo.observe_and_suggest(
-            X_obs=X_train,
-            y_obs=y_train,
-            X_pen=X_test,
-            return_actual_ei=True
-        )
+        elif model_type == 'pfn':
 
-        if isinstance(y_pred, torch.Tensor): y_pred = y_pred.numpy()
+            pfn_bo = TransformerBOMethod(
+            pfn_model_weights,
+            device=device,
+            acq_function='mean' # This tells the PFN to output posterior mean
+            )
 
-    times = time.time() - start
-    r2 = r2_score(y_test, y_pred)
+            start = time.time()
+
+            _, y_pred = pfn_bo.observe_and_suggest(
+                X_obs=X_train,
+                y_obs=y_train,
+                X_pen=X_test,
+                return_actual_ei=True
+            )
+
+            if isinstance(y_pred, torch.Tensor): y_pred = y_pred.numpy()
+
+        # repetition results
+        total_time += (time.time() - start)
+        og_shape = y_pred.shape
+        y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
+        r2 = r2_score(y_test, y_pred)
+        r2_scores.append(r2)
+        y_preds_all.append(y_pred)
+
+    y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
+    
 
     return {
         'model_type': model_type,
-        'r2': r2, 
-        'times': times, 
+        'r2': r2_scores, 
+        'times': total_time / n_reps, 
         'y_test': y_test, 
-        'y_pred': y_pred,
+        'y_pred': y_pred_mean,
         'dataset': dataset,
         'subject': subject_idx,
         'emg': emg_idx
     }
  
 def evaluate_optimization(dataset, subject_idx, emg_idx, model_type, 
-                   pfn_model_weights=None, device='cpu', budget=100):
+                   pfn_model_weights=None, device='cpu', budget=100, n_reps=30):
     
     data = load_data(dataset, subject_idx)
+
+    X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(data, emg_idx, model_type)
+    #y_train_full = y_train_full.flatten()
     
-     # 1. Preprocess based on model type
-    norm_strategy = 'pfn' if model_type == 'pfn' else 'neural'
-    X_train, y_train, X_test, y_test, scalar_y = preprocess_neural_data(
-        data, emg_idx, normalization=norm_strategy
-    )
+    mean_times = []
+    values_all = []
 
-    # 2. Run BO Loop
-    # We pass pfn_model_weights only if needed.
-    traj, values, times = run_bo_loop(
-        X_train, y_train, 
-        model_type=model_type, 
-        pfn_model=pfn_model_weights, 
-        n_init=5, 
-        budget=budget, 
-        device=device
-    )
+    for i in range(n_reps):
 
-    # 3. Final Prediction & Metric Calculation
-    y_pred_scaled = None
+        traj, observed_values, real_values, times = run_bo_loop(X_train_full, y_train_full, y_test, model_type, pfn_model_weights,
+                                          n_init=8, budget=budget, device=device)
+    
+        mean_times.append(times)
+        values_all.append(real_values)
 
-    if model_type == 'gp':
-        # Re-construct data from trajectory for final fit
-        X_final = torch.tensor(X_train[traj], dtype=torch.float32, device=device)
-        y_final = torch.tensor(values, dtype=torch.float32, device=device)
-        X_test_torch = torch.tensor(X_test, dtype=torch.float32, device=device)
-
-        lik = gpytorch.likelihoods.GaussianLikelihood().to(device)
-        model = ExactGP(X_final, y_final, lik).to(device) # Ensure ExactGP is imported
-        
-        # Train
-        model.train(); lik.train()
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(lik, model)
-        
-        for _ in range(50):
-            optimizer.zero_grad()
-            loss = -mll(model(X_final), y_final)
-            loss.backward()
-            optimizer.step()
-            
-        model.eval(); lik.eval()
-        with torch.no_grad():
-            y_pred_scaled = lik(model(X_test_torch)).mean.cpu().numpy()
-
-    elif model_type == 'pfn':
-        # Prepare data for manual forward pass
-        X_final = torch.tensor(X_train[traj], dtype=torch.float32, device=device)
-        y_final = torch.tensor(values, dtype=torch.float32, device=device)
-        X_test_torch = torch.tensor(X_test, dtype=torch.float32, device=device)
-        
-        # Reshape for PFN: (Seq, Batch=1, Dim)
-        X_ctx = X_final.unsqueeze(1)
-        y_ctx = y_final.unsqueeze(1)
-        X_qry = X_test_torch.unsqueeze(1)
-        
-        pfn_model_weights.eval()
-        with torch.no_grad():
-            logits = pfn_model_weights(X_ctx, y_ctx, X_qry)
-            probs = torch.softmax(logits, dim=-1)
-            borders = pfn_model_weights.borders.to(device)
-            bucket_centers = (borders[:-1] + borders[1:]) / 2
-            y_pred_scaled = (probs * bucket_centers).sum(dim=-1).squeeze(1).cpu().numpy()
-
-    # 4. Inverse Transform for Reporting
-    # We must flatten/reshape correctly for inverse_transform
-    y_test_raw = scalar_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
-    y_pred_raw = scalar_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
-    values_raw = scalar_y.inverse_transform(np.array(values).reshape(-1, 1)).flatten()
-
-    r2 = r2_score(y_test_raw, y_pred_raw)
+    mean_times = np.mean(np.array(mean_times), axis=0)
+    
 
     return {
         'model_type': model_type,
-        'r2': r2, 
-        'times': times, 
-        'traj': traj,
-        'values': values_raw, # Needed for regret curve
-        'y_test': y_test_raw, 
-        'y_pred': y_pred_raw,
+        'times': mean_times, 
+        'values': values_all, # Needed for regret curve
+        'y_test': y_test, 
         'dataset': dataset,
         'subject': subject_idx,
         'emg': emg_idx
     }
 
-def evaluate_models(dataset, subject_idx, emg_idx, 
-                   device='cpu', budget=100):
+# ============================================
+#           Other plotters
+# ============================================
 
-    data = load_data(dataset, subject_idx)
-
-    # --- 0. Load PFN Model Once ---
-    model_path = './libs/PFNs4BO/pfns4bo/final_models/model_hebo_morebudget_9_unused_features_3.pt.gz'
-    with gzip.open(model_path, 'rb') as f:
-        model_weights = torch.load(f, map_location=device, weights_only=False)
-
-    # --- 1. Run GPBO ---
-    X_train_gp, y_train_gp, X_test_gp, y_test_gp, scalar_y_gp = preprocess_neural_data(data, emg_idx, normalization='neural')
-    gp_traj, gp_values, gp_times = run_bo_loop(X_train_gp, y_train_gp, 'gp', n_init=5, budget=budget, device=device)
-
-    # --- Run PFN BO Loop ---
-    X_train_pfn, y_train_pfn, X_test_pfn, y_test_pfn, scalar_y_pfn = preprocess_neural_data(data, emg_idx, normalization='pfn')
-    pfn_traj, pfn_values, pfn_times = run_bo_loop(X_train_pfn, y_train_pfn, 'pfn', pfn_model=model_weights, n_init=5, budget=budget, device=device)
-
-    # --- Final Evaluation (R2) ---
-        # 1. GP Final Prediction
-    X_train_gp = torch.tensor(X_train_gp[gp_traj], dtype=torch.float32, device=device)   
-    y_train_gp = torch.tensor(gp_values, dtype=torch.float32, device=device)
-    X_test_gp = torch.tensor(X_test_gp, dtype=torch.float32, device=device)
-
+def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
+    """
+    Runs the fit evaluation for varying budget levels and plots the R2 curve.
     
-    lik_gp = gpytorch.likelihoods.GaussianLikelihood().to(device)
-    gp_model = ExactGP(X_train_gp, y_train_gp, lik_gp).to(device)
-    gp_model.train()
-    lik_gp.train()
-    # Fit one last time
-    optimizer = torch.optim.Adam(gp_model.parameters(), lr=0.01)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(lik_gp, gp_model)
-    for _ in range(50):
-        optimizer.zero_grad()
-        loss = -mll(gp_model(X_train_gp), y_train_gp)
-        loss.backward()
-        optimizer.step()
+    Args:
+        datasets: List of experiment tuples (dataset, subject, emg).
+        device: 'cpu' or 'cuda'.
+        budgets: List of integers representing the budgets to test.
+    """
+    # List to collect all raw data points for the dataframe
+    plot_data = []
+
+    print(f"Starting Budget Sweep: {budgets}")
+
+    for b in budgets:
+        print(f"  > Running budget: {b}...")
         
-    gp_model.eval()
-    lik_gp.eval()
+        # We pass budget=b and n_reps via kwargs to main -> evaluate_fit
+        # n_reps=20 ensures we have enough data for a good Confidence Interval
+        results_gp, results_pfn = main(
+            datasets, 
+            evaluation_type='fit', 
+            device=device, 
+            budget=b, 
+            n_reps=20
+        )
 
-    with torch.no_grad():
-        y_pred_gp = lik_gp(gp_model(X_test_gp)).mean.cpu().numpy()
+        # --- Process GP Results ---
+        for res in results_gp:
+            # res['r2'] is a list of scores (one per repetition)
+            for score in res['r2']:
+                plot_data.append({
+                    'Budget': b,
+                    'Model': 'GP',
+                    'R2': score,
+                    # Optional: Track specific EMG for debugging/hue variants
+                    'ID': f"{res['subject']}_{res['emg']}" 
+                })
 
+        # --- Process PFN Results ---
+        for res in results_pfn:
+            for score in res['r2']:
+                plot_data.append({
+                    'Budget': b,
+                    'Model': 'PFN',
+                    'R2': score,
+                    'ID': f"{res['subject']}_{res['emg']}"
+                })
 
-    # 2. PFN Final Prediction (using 'mean' acquisition)
-    X_train_pfn = torch.tensor(X_train_pfn[pfn_traj], dtype=torch.float32, device=device)
-    y_train_pfn = torch.tensor(pfn_values, dtype=torch.float32, device=device)
+    # --- Visualization ---
+    df = pd.DataFrame(plot_data)
+
+    plt.figure(figsize=(10, 6))
     
-    pfn_evaluator = TransformerBOMethod(model_weights, device=device, acq_function='mean')
-    _, y_pred_pfn = pfn_evaluator.observe_and_suggest(
-        X_obs=X_train_pfn, 
-        y_obs=y_train_pfn, 
-        X_pen=X_test_pfn, 
-        return_actual_ei=True
+    # lineplot automatically calculates the mean and the 95% CI (shaded area)
+    # when provided with multiple y-values for the same x.
+    sns.lineplot(
+        data=df, 
+        x='Budget', 
+        y='R2', 
+        hue='Model', 
+        marker='o', 
+        errorbar=('ci', 95), 
+        linewidth=2
     )
-    if isinstance(y_pred_pfn, torch.Tensor): y_pred_pfn = y_pred_pfn.cpu().numpy()    
 
-
-    r2_gp = r2_score(scalar_y_gp.inverse_transform(y_test_gp.reshape(-1,1)), scalar_y_gp.inverse_transform(y_pred_gp.reshape(-1,1)))
-    r2_pfn = r2_score(scalar_y_pfn.inverse_transform(y_test_pfn.reshape(-1,1)), scalar_y_pfn.inverse_transform(y_pred_pfn.reshape(-1,1)))
-
-    regret_curve(y_pred_gp, y_pred_pfn, max(y_train_gp), max(y_train_pfn))
-
-    return {
-        'r2_gp': r2_gp, 'gp_times': gp_times, 'gp_traj': gp_traj,
-        'r2_pfn': r2_pfn, 'pfn_times': pfn_times, 'pfn_traj': pfn_traj,
-        'y_test': y_test_pfn, 'y_pred_gp': y_pred_gp, 'y_pred_pfn': y_pred_pfn }
+    plt.title("Model Fit Quality vs. Training Budget")
+    plt.ylabel("R² Score (Test Set)")
+    plt.xlabel("Budget (Number of Training Points)")
+    plt.ylim(0, 1.05) # Keep R2 within logical bounds
+    plt.grid(True, alpha=0.3)
+    plt.legend(title='Model Type')
+    plt.show()
 
 
 # ============================================
 #          Main Runner
 # ============================================
 
-def main(datasets, evaluation_type='fit', device='cpu'):
+def main(datasets, evaluation_type='fit', device='cpu', **kwargs):
     
     results = []
 
@@ -354,8 +366,8 @@ def main(datasets, evaluation_type='fit', device='cpu'):
 
         if evaluation_type == 'fit':
 
-            res_gp = evaluate_fit(dataset_type, subject_idx, emg_idx, 'gp', device=device)
-            res_pfn = evaluate_fit(dataset_type, subject_idx, emg_idx, 'pfn', pfn_model_weights=pfn_weights, device=device)
+            res_gp = evaluate_fit(dataset_type, subject_idx, emg_idx, 'gp', device=device, **kwargs)
+            res_pfn = evaluate_fit(dataset_type, subject_idx, emg_idx, 'pfn', pfn_model_weights=pfn_weights, device=device, **kwargs)
 
         elif evaluation_type == 'optimization':
 
@@ -371,29 +383,20 @@ def main(datasets, evaluation_type='fit', device='cpu'):
 if __name__ == '__main__':
 
     datasets = [
-    ('nhp', 0, 0), #('nhp', 0, 1),  ('nhp', 0, 2), ('nhp', 0, 3)
+    ('nhp', 0, 0), #('nhp', 0, 1), # ('nhp', 0, 2), ('nhp', 0, 3)
             ]
     
     results_gp, results_pfn = main(datasets, 'fit', device='cpu')
 
+    # 1: Testing the Approximation
     r2_comparison(results_gp, results_pfn)
 
-    exit(0)
-
-    # 2. Detailed Plots per Experiment
     for i in range(len(results_gp)):
         
-        # A. Regret Curve (Run in main as requested)
-        # Note: You need the 'values' key from the result dict
-        # We define "Optimal" as the max of the test set (ground truth)
-        optimal_val = max(results_gp[i]['y_test'].max(), results_pfn[i]['y_test'].max())
-        
-        regret_curve(
-            results_gp[i]['values'], 
-            results_pfn[i]['values'], 
-            optimal_val
-        )
+        #EMG Maps
+        show_emg_map(results_gp, i, "Gaussian Process")
+        show_emg_map(results_pfn, i, "PFN")
 
-        # B. EMG Maps
-        show_emg_map(results_gp[i], "Gaussian Process")
-        show_emg_map(results_pfn[i], "PFN")
+    # 2: Testing optimization
+    results_gp, results_pfn = main(datasets, 'optimization', device='cpu')
+    [regret_curve(results_gp, results_pfn, idx) for idx in range(len(results_gp))]

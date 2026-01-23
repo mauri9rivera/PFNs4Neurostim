@@ -303,4 +303,4 @@ def preprocess_neural_data(subject_data, emg_idx=0, normalization='pfn'):
         Y_test = Y_test_scaled.flatten()
 
 
-    return X_train, Y_train, X_train, Y_test, scaler_y
+    return X_train, Y_train, X_train, resp_mean, scaler_y
