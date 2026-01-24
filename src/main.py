@@ -342,6 +342,99 @@ def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
     plt.legend(title='Model Type')
     plt.show()
 
+def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
+    """
+    Runs the optimization evaluation for varying budgets and plots the Regret.
+
+    Args:
+        datasets: List of experiment tuples.
+        regret_metric: 'abs' (Final Simple Regret) or 'cum' (Cumulative Regret/AUC).
+        device: 'cpu' or 'cuda'.
+        budgets: List of budgets to sweep.
+    """
+    plot_data = []
+    
+    # Label configuration based on metric
+    if regret_metric == 'abs':
+        y_label = "Final Simple Regret"
+        title = "Optimization Performance: Final Regret vs Budget"
+    elif regret_metric == 'cum':
+        y_label = "Cumulative Regret (AUC)"
+        title = "Optimization Cost: Cumulative Regret vs Budget"
+
+    print(f"Starting Optimization Sweep ({regret_metric}): {budgets}")
+
+    for b in budgets:
+        print(f"  > Running budget: {b}...")
+        
+        # Run experiments with sufficient repetitions for CI
+        results_gp, results_pfn = main(
+            datasets, 
+            evaluation_type='optimization', 
+            device=device, 
+            budget=b, 
+            n_reps=20
+        )
+
+        # Helper to process results list
+        def process_results(results_list, model_name):
+            for res in results_list:
+                # 1. Determine Global Optimum for this specific dataset
+                optimal_val = res['y_test'].max()
+                
+                # 2. Extract Values: Shape (n_reps, budget)
+                raw_values = np.array(res['values']) 
+                
+                # 3. Calculate 'Best So Far' for every step in every repetition
+                # Shape: (n_reps, budget)
+                best_so_far = np.maximum.accumulate(raw_values, axis=1)
+                
+                # 4. Calculate Simple Regret Curve for every repetition
+                # Shape: (n_reps, budget)
+                simple_regret_curve = optimal_val - best_so_far
+                
+                # 5. Calculate Metric per Repetition
+                if regret_metric == 'abs':
+                    # Take the LAST value (Final Simple Regret)
+                    scores = simple_regret_curve[:, -1]
+                elif regret_metric == 'cum':
+                    # Sum over time (Area Under Curve / Cumulative Regret)
+                    scores = np.sum(simple_regret_curve, axis=1)
+                
+                # 6. Append to plot data
+                for score in scores:
+                    plot_data.append({
+                        'Budget': b,
+                        'Model': model_name,
+                        'Regret': score,
+                        'ID': f"{res['subject']}_{res['emg']}"
+                    })
+
+        # Process both models
+        process_results(results_gp, 'GP')
+        process_results(results_pfn, 'PFN')
+
+    # --- Visualization ---
+    df = pd.DataFrame(plot_data)
+
+    plt.figure(figsize=(10, 6))
+    
+    sns.lineplot(
+        data=df, 
+        x='Budget', 
+        y='Regret', 
+        hue='Model', 
+        marker='o', 
+        errorbar=('ci', 95), 
+        linewidth=2
+    )
+
+    plt.title(title)
+    plt.ylabel(y_label)
+    plt.xlabel("Budget (Number of Queries)")
+    plt.grid(True, alpha=0.3)
+    plt.legend(title='Model Type')
+    plt.show()
 
 # ============================================
 #          Main Runner
@@ -385,6 +478,11 @@ if __name__ == '__main__':
     datasets = [
     ('nhp', 0, 0), #('nhp', 0, 1), # ('nhp', 0, 2), ('nhp', 0, 3)
             ]
+    
+    optimization_budget(datasets, regret_metric='abs', budgets=[10, 100])
+
+    exit(0)
+            
     
     results_gp, results_pfn = main(datasets, 'fit', device='cpu')
 
