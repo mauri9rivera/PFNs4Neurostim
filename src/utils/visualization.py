@@ -2,12 +2,13 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+import os
 
 # ============================================
 #           Visualization
 # ============================================
 
-def r2_comparison(gp_results, pfn_results):
+def r2_comparison(gp_results, pfn_results, save=False):
 
     data = []
 
@@ -15,26 +16,42 @@ def r2_comparison(gp_results, pfn_results):
 
         for score in res_gp['r2']:
             data.append({
-                'EMG': f"EMG {res_gp['emg']}",
+                'muscle': f"S{res_gp['subject']} EMG {res_gp['emg']}",
                 'R2': score,
                 'Model': 'GP'
             })
 
         for score in res_pfn['r2']:
             data.append({
-                'EMG': f"EMG {res_pfn['emg']}",
+                'muscle': f"S{res_pfn['subject']}EMG {res_pfn['emg']}",
                 'R2': score,
                 'Model': 'PFN'
             })
+
+    custom_palette = {
+    'GP': 'sandybrown',
+    'PFN': 'royalblue'
+    }
   
     df = pd.DataFrame(data)
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(1.4*len(gp_results), 6))
     plt.ylim(0, 1)
-    sns.barplot(data=df, x='EMG', y='R2', hue='Model', errorbar=('ci', 95))
+    plt.xticks(rotation=45, ha='right')
+    sns.barplot(data=df, x='muscle', y='R2', hue='Model', palette=custom_palette, errorbar=('ci', 95))
     plt.title("R2 Score Comparison: GP vs PFN")
+    output_dir = os.path.join('output', 'fitness', f'{gp_results[0]["dataset"]}')
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(
+        output_dir,
+        f'r2_comparison.svg'
+    )
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
     plt.show()
+    plt.close()
 
-def plot_runtime_trajectory(gp_results, pfn_results):
+def plot_runtime_trajectory(gp_results, pfn_results, save=False):
     """
     Plots the inference time at each BO step.
     Expects results to be a list, we will aggregate or plot just the first one as example.
@@ -57,21 +74,32 @@ def plot_runtime_trajectory(gp_results, pfn_results):
     avg_gp = np.mean(all_gp_times, axis=0)
     avg_pfn = np.mean(all_pfn_times, axis=0)
     
-    plt.plot(avg_gp, color='red', linewidth=2, label='GP (GPyTorch)')
-    plt.plot(avg_pfn, color='blue', linewidth=2, label='PFN')
+    plt.plot(avg_gp, color='sandybrown', linewidth=2, label='GP (GPyTorch)')
+    plt.plot(avg_pfn, color='royalblue', linewidth=2, label='PFN')
     
-    plt.title("Inference Time per BO")
+    plt.title("Inference Time for BO")
     plt.xlabel("Iteration")
     plt.ylabel("Time (seconds)")
     plt.legend()
     plt.grid(True, alpha=0.3)
+    output_dir = os.path.join('output', 'optimization')
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(
+        output_dir,
+        f'runtime_trajectory.svg'
+    )
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
     plt.show()
-
-def show_emg_map(results, idx, model_type):
+    plt.close()
+    
+def show_emg_map(results, idx, model_type, save=False):
     res = results[idx]
     
     y_true = res['y_test']
     y_pred = res['y_pred']
+    r2_score = np.mean(np.array(res['r2']))
     
     # Determine Grid Shape
     n_channels = len(y_true)
@@ -79,26 +107,50 @@ def show_emg_map(results, idx, model_type):
     elif n_channels == 32: grid_shape = (4, 8)
     else: grid_shape = (1, n_channels) # Fallback
 
+    # Calculate global scale for a unified cmap
+    v_min = min(y_true.min(), y_pred.min())
+    v_max = max(y_true.max(), y_pred.max())
+
     map_true = y_true.reshape(grid_shape)
     map_pred   = y_pred.reshape(grid_shape)
+
+    # Find coordinates of the max values
+    max_idx_true = np.unravel_index(np.argmax(map_true), grid_shape)
+    max_idx_pred = np.unravel_index(np.argmax(map_pred), grid_shape)
     
     # Setup Plot
     fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Common keyword arguments for consistency
+    heatmap_kwargs = {
+        'cmap': 'viridis',
+        'vmin': v_min,
+        'vmax': v_max,
+    }
     
     # Plot Ground Truth
-    sns.heatmap(y_true.reshape(8, 12), ax=ax[0], cmap='viridis')
+    sns.heatmap(y_true.reshape(8, 12), ax=ax[0], **heatmap_kwargs)
     ax[0].set_title(f"Ground Truth (EMG {res['emg']})")
+    ax[0].plot(max_idx_true[1] + 0.5, max_idx_true[0] + 0.5, 'ro', markersize=8)
     
     # Plot Prediction
-    sns.heatmap(y_pred.reshape(8, 12), ax=ax[1], cmap='viridis')
-    ax[1].set_title(f"{model_type} Prediction")
+    sns.heatmap(y_pred.reshape(8, 12), ax=ax[1], **heatmap_kwargs)
+    ax[1].set_title(f"{model_type} Prediction | R2:{r2_score:.2f}")
+    ax[1].plot(max_idx_pred[1] + 0.5, max_idx_pred[0] + 0.5, 'ro', markersize=8)
     
+    output_dir = os.path.join('output', 'fitness')
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(
+        output_dir,
+        f'emg_map{idx}_{model_type}.svg'
+    )
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
     plt.show()
+    plt.close()
 
-    #plt.suptitle(f"Model Fit: {res['dataset']} | Subj {res['subject']} | EMG {res['emg']}", fontsize=14)
-    #plt.show()
-
-def regret_curve(gp_vals, pfn_vals, idx):
+def regret_curve(gp_vals, pfn_vals, idx, save=False):
     
     # Get metadata
     res_gp = gp_vals[idx]
@@ -160,4 +212,14 @@ def regret_curve(gp_vals, pfn_vals, idx):
     plt.title(f'Regret | {dataset} Subj {subject} EMG {emg}')
     plt.legend()
     plt.grid(True, alpha=0.3)
+    output_dir = os.path.join('output', 'optimization')
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(
+        output_dir,
+        f'regret_curve{idx}.svg'
+    )
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
     plt.show()
+    plt.close()

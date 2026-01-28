@@ -94,7 +94,7 @@ def run_bo_loop(X_pool, y_pool, y_test, model_type, pfn_model=None, n_init=1, bu
                 
             # Select Next Point (EI)
             best_f = y_train.max()
-            acq_vals = expected_improvement(model, likelihood, X_cand, best_f, device) #expected_improvement(model, likelihood, X_cand, best_f, device)        
+            acq_vals = expected_improvement(model, likelihood, X_cand, best_f, device)      
 
             # Get index relative to X_pool (0 to 95)
             next_idx = acq_vals.argmax().item()
@@ -149,15 +149,6 @@ def evaluate_fit(dataset, subject_idx, emg_idx, model_type,
 
         if model_type == 'gp':
             
-            '''
-            start = time.time()
-            kernel = 1.0 * RBF(length_scale=0.1) + WhiteKernel(noise_level=0.1)
-            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
-            gp.fit(X_train, y_train)
-            y_pred = gp.predict(X_test)  
-            '''
-            start = time.time()
-
             # 1. Convert to Tensors
             train_x = torch.tensor(X_train, dtype=torch.float32, device=device)
             train_y = torch.tensor(y_train, dtype=torch.float32, device=device)
@@ -165,6 +156,8 @@ def evaluate_fit(dataset, subject_idx, emg_idx, model_type,
             # 2. Initialize Model & Likelihood
             likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
             model = ExactGP(train_x, train_y, likelihood).to(device)
+
+            start = time.time()
             
             # 3. Training Loop (Optimize Hyperparameters)
             model.train()
@@ -188,8 +181,6 @@ def evaluate_fit(dataset, subject_idx, emg_idx, model_type,
                 # Get the mean of the posterior
                 posterior = likelihood(model(test_x_tensor))
                 y_pred = posterior.mean.cpu().numpy()
-
-
 
         elif model_type == 'pfn':
 
@@ -215,7 +206,7 @@ def evaluate_fit(dataset, subject_idx, emg_idx, model_type,
         og_shape = y_pred.shape
         y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
         r2 = r2_score(y_test, y_pred)
-        r2_scores.append(r2)
+        r2_scores.append(np.clip(r2, 0.0, 1.0))
         y_preds_all.append(y_pred)
 
     y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
@@ -233,7 +224,7 @@ def evaluate_fit(dataset, subject_idx, emg_idx, model_type,
     }
  
 def evaluate_optimization(dataset, subject_idx, emg_idx, model_type, 
-                   pfn_model_weights=None, device='cpu', budget=100, n_reps=30):
+                   pfn_model_weights=None, device='cpu', budget=100, n_reps=20):
     
     data = load_data(dataset, subject_idx)
 
@@ -268,7 +259,7 @@ def evaluate_optimization(dataset, subject_idx, emg_idx, model_type,
 #           Other plotters
 # ============================================
 
-def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
+def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200]):
     """
     Runs the fit evaluation for varying budget levels and plots the R2 curve.
     
@@ -292,7 +283,7 @@ def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
             evaluation_type='fit', 
             device=device, 
             budget=b, 
-            n_reps=20
+            n_reps=15
         )
 
         # --- Process GP Results ---
@@ -302,8 +293,7 @@ def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
                 plot_data.append({
                     'Budget': b,
                     'Model': 'GP',
-                    'R2': score,
-                    # Optional: Track specific EMG for debugging/hue variants
+                    'R2': np.clip(score, 0.0, 1.0),                  
                     'ID': f"{res['subject']}_{res['emg']}" 
                 })
 
@@ -313,14 +303,19 @@ def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
                 plot_data.append({
                     'Budget': b,
                     'Model': 'PFN',
-                    'R2': score,
+                    'R2':  np.clip(score, 0.0, 1.0),
                     'ID': f"{res['subject']}_{res['emg']}"
                 })
 
     # --- Visualization ---
     df = pd.DataFrame(plot_data)
 
-    plt.figure(figsize=(10, 6))
+    fig = plt.figure(figsize=(10, 6))
+
+    custom_palette = {
+    'GP': 'sandybrown',
+    'PFN': 'royalblue'
+    }
     
     # lineplot automatically calculates the mean and the 95% CI (shaded area)
     # when provided with multiple y-values for the same x.
@@ -329,8 +324,10 @@ def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
         x='Budget', 
         y='R2', 
         hue='Model', 
+        palette=custom_palette,  
         marker='o', 
         errorbar=('ci', 95), 
+        err_kws={'alpha': 0.2},
         linewidth=2
     )
 
@@ -340,39 +337,47 @@ def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
     plt.ylim(0, 1.05) # Keep R2 within logical bounds
     plt.grid(True, alpha=0.3)
     plt.legend(title='Model Type')
+    output_dir = os.path.join('output', 'fitness')
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(
+        output_dir,
+        f'fit_budget.svg'
+    )
+    plt.savefig(plot_path, format="svg")
     plt.show()
+    print(f"Saved plot to {plot_path}")
 
-def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10, 50, 100, 150, 200, 300]):
+def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10, 50, 100, 150, 200]):
     """
     Runs the optimization evaluation for varying budgets and plots the Regret.
 
     Args:
         datasets: List of experiment tuples.
-        regret_metric: 'abs' (Final Simple Regret) or 'cum' (Cumulative Regret/AUC).
+        regret_metric: 'abs' (Final Simple Regret) or 'cum' (Mean Simple Regret).
         device: 'cpu' or 'cuda'.
         budgets: List of budgets to sweep.
     """
     plot_data = []
-    
+
     # Label configuration based on metric
     if regret_metric == 'abs':
         y_label = "Final Simple Regret"
         title = "Optimization Performance: Final Regret vs Budget"
     elif regret_metric == 'cum':
-        y_label = "Cumulative Regret (AUC)"
-        title = "Optimization Cost: Cumulative Regret vs Budget"
+        y_label = "Mean Simple Regret"
+        title = "Optimization Cost: Mean Regret vs Budget"
 
     print(f"Starting Optimization Sweep ({regret_metric}): {budgets}")
 
     for b in budgets:
         print(f"  > Running budget: {b}...")
-        
+
         # Run experiments with sufficient repetitions for CI
         results_gp, results_pfn = main(
-            datasets, 
-            evaluation_type='optimization', 
-            device=device, 
-            budget=b, 
+            datasets,
+            evaluation_type='optimization',
+            device=device,
+            budget=b,
             n_reps=20
         )
 
@@ -381,26 +386,26 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
             for res in results_list:
                 # 1. Determine Global Optimum for this specific dataset
                 optimal_val = res['y_test'].max()
-                
+
                 # 2. Extract Values: Shape (n_reps, budget)
-                raw_values = np.array(res['values']) 
-                
+                raw_values = np.array(res['values'])
+
                 # 3. Calculate 'Best So Far' for every step in every repetition
                 # Shape: (n_reps, budget)
                 best_so_far = np.maximum.accumulate(raw_values, axis=1)
-                
+
                 # 4. Calculate Simple Regret Curve for every repetition
                 # Shape: (n_reps, budget)
                 simple_regret_curve = optimal_val - best_so_far
-                
+
                 # 5. Calculate Metric per Repetition
                 if regret_metric == 'abs':
                     # Take the LAST value (Final Simple Regret)
                     scores = simple_regret_curve[:, -1]
                 elif regret_metric == 'cum':
-                    # Sum over time (Area Under Curve / Cumulative Regret)
-                    scores = np.sum(simple_regret_curve, axis=1)
-                
+                    # Mean simple regret: normalized by budget for fair comparison
+                    scores = np.mean(simple_regret_curve, axis=1)
+
                 # 6. Append to plot data
                 for score in scores:
                     plot_data.append({
@@ -417,6 +422,11 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
     # --- Visualization ---
     df = pd.DataFrame(plot_data)
 
+    custom_palette = {
+    'GP': 'sandybrown',
+    'PFN': 'royalblue'
+    }
+
     plt.figure(figsize=(10, 6))
     
     sns.lineplot(
@@ -424,8 +434,10 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
         x='Budget', 
         y='Regret', 
         hue='Model', 
+        palette=custom_palette, 
         marker='o', 
         errorbar=('ci', 95), 
+        err_kws={'alpha': 0.2},
         linewidth=2
     )
 
@@ -434,7 +446,15 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
     plt.xlabel("Budget (Number of Queries)")
     plt.grid(True, alpha=0.3)
     plt.legend(title='Model Type')
+    output_dir = os.path.join('output', 'optimization')
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(
+        output_dir,
+        f'optimization_budget.svg'
+    )
+    plt.savefig(plot_path, format="svg")
     plt.show()
+    print(f"Saved plot to {plot_path}")
 
 # ============================================
 #          Main Runner
@@ -464,8 +484,8 @@ def main(datasets, evaluation_type='fit', device='cpu', **kwargs):
 
         elif evaluation_type == 'optimization':
 
-            res_gp = evaluate_optimization(dataset_type, subject_idx, emg_idx, 'gp', device=device)
-            res_pfn = evaluate_optimization(dataset_type, subject_idx, emg_idx, 'pfn', pfn_model_weights=pfn_weights, device=device)
+            res_gp = evaluate_optimization(dataset_type, subject_idx, emg_idx, 'gp', device=device, **kwargs)
+            res_pfn = evaluate_optimization(dataset_type, subject_idx, emg_idx, 'pfn', pfn_model_weights=pfn_weights, device=device, **kwargs)
 
         results_gp.append(res_gp)
         results_pfn.append(res_pfn)
@@ -475,26 +495,30 @@ def main(datasets, evaluation_type='fit', device='cpu', **kwargs):
 
 if __name__ == '__main__':
 
-    datasets = [
-    ('nhp', 0, 0), #('nhp', 0, 1), # ('nhp', 0, 2), ('nhp', 0, 3)
-            ]
+    nhp_dataset = [
+    ('nhp', 0, 0), ('nhp', 0, 1),  ('nhp', 0, 2), ('nhp', 0, 3),  ('nhp', 0, 4),  ('nhp', 0, 5),  
+    ('nhp',1, 0), ('nhp', 1, 1),  ('nhp', 1, 2), ('nhp', 1, 3),  ('nhp', 1, 4),  ('nhp', 1, 5),  ('nhp',1, 6),  ('nhp', 1, 7),
+    ('nhp', 2, 0), ('nhp', 2, 1),  ('nhp', 2, 2), ('nhp', 2, 3),
+    ('nhp', 3, 0), ('nhp', 3, 1),  ('nhp', 3, 2), ('nhp', 3, 3)
+        ]
     
-    optimization_budget(datasets, regret_metric='abs', budgets=[10, 100])
-
-    exit(0)
-            
+    rat_dataset = [ 
+    ('rat', 0, 0), ('rat', 0, 1), ('rat', 0, 2), ('rat', 0, 3), ('rat', 0, 4), ('rat', 0, 5),
+    ('rat', 1, 0), ('rat', 1, 1), ('rat', 1, 2), ('rat', 1, 3), ('rat', 1, 4), ('rat', 1, 5), ('rat', 1, 6),
+    ('rat', 2, 0), ('rat', 2, 1), ('rat', 2, 2), ('rat', 2, 3), ('rat', 2, 4), ('rat', 2, 5), ('rat', 2, 6), ('rat', 2, 7),
+    ('rat', 3, 0), ('rat', 3, 1), ('rat', 3, 2), ('rat', 3, 3), ('rat', 3, 4), ('rat', 3, 5),
+    ('rat', 4, 0), ('rat', 4, 1), ('rat', 4, 2), ('rat', 4, 3), ('rat', 4, 4),
+    ('rat', 5, 0), ('rat', 5, 1), ('rat', 5, 2), ('rat', 5, 3), ('rat', 5, 4), ('rat', 5, 5), ('rat', 5, 6), ('rat', 5, 7)
+        ]
     
-    results_gp, results_pfn = main(datasets, 'fit', device='cpu')
+    # Uncomment this section and change field of dataset to test optimization
+    #optimization_budget(rat_dataset, regret_metric='abs', budgets=[10, 30, 50, 64, 100])
+    #results_gp, results_pfn = main(nhp_dataset[0], 'optimization', device='cpu', budget=100)
+    #plot_runtime_trajectory(results_gp, results_pfn, save=False)
+    #[regret_curve(results_gp, results_pfn, idx) for idx in range(len(results_gp))]
 
-    # 1: Testing the Approximation
-    r2_comparison(results_gp, results_pfn)
+    # Uncomment this section and change field of dataset to test fitness
+    #r2_comparison(results_gp, results_pfn, save=True)
+    #fit_budget(rat_dataset, 'cpu')
 
-    for i in range(len(results_gp)):
-        
-        #EMG Maps
-        show_emg_map(results_gp, i, "Gaussian Process")
-        show_emg_map(results_pfn, i, "PFN")
-
-    # 2: Testing optimization
-    results_gp, results_pfn = main(datasets, 'optimization', device='cpu')
-    [regret_curve(results_gp, results_pfn, idx) for idx in range(len(results_gp))]
+    print(f'Runner will be implemented soon.')
