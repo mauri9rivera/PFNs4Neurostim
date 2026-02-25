@@ -1,0 +1,997 @@
+"""
+Fine-tuning orchestration for TabPFN on neurostimulation data.
+
+Two-phase workflow:
+  1. Backprop finetuning: finetune_tabpfn() trains a FinetunedTabPFNRegressor,
+     adapting pretrained weights to neurostimulation data via gradient updates.
+  2. Extraction for evaluation: extract_inference_model() deep-copies the
+     internal TabPFNRegressor with finetuned weights. This standalone model
+     uses in-context learning (.fit() stores context, no gradients) and
+     supports the full predict API including output_type="quantiles".
+
+Usage:
+    python finetuning.py --dataset rat --device cuda --epochs 30
+    python finetuning.py --dataset nhp --device cuda --epochs 30
+    python finetuning.py --evaluate --dataset rat --device cpu
+"""
+import argparse
+import copy
+import os
+import time
+import numpy as np
+import torch
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import r2_score
+
+import gpytorch
+
+from tabpfn import TabPFNRegressor
+from tabpfn.finetuning.finetuned_regressor import FinetunedTabPFNRegressor
+from tabpfn.model_loading import load_fitted_tabpfn_model, save_fitted_tabpfn_model
+from pathlib import Path
+
+from models.gaussians import ExactGP
+from utils.data_utils import (
+    build_finetuning_dataset, load_data, preprocess_neural_data,
+    HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS
+)
+from utils.gpbo_utils import expected_improvement
+from utils.visualization import show_emg_map, r2_comparison, regret_curve, plot_runtime_trajectory
+import random
+
+
+def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
+                    n_augmentations=25):
+    """
+    Fine-tune a TabPFNRegressor on augmented neurostimulation data.
+
+    Args:
+        dataset_type: 'rat' or 'nhp'
+        device: 'cpu' or 'cuda'
+        epochs: number of fine-tuning epochs
+        lr: learning rate
+        n_augmentations: augmentations per subject-EMG pair
+        output_dir: directory to save the fine-tuned model
+
+    Returns:
+        model: The finetuned FinetunedTabPFNRegressor instance (in-memory)
+    """
+    print(f"Building augmented dataset for '{dataset_type}' ...")
+    X_train, y_train = build_finetuning_dataset(
+        dataset_type,
+        n_augmentations=n_augmentations,
+        seed=42
+    )
+    print(f"  Dataset size: {X_train.shape[0]} rows, {X_train.shape[1]} features")
+
+    print(f"Initializing FinetunedTabPFNRegressor for fine-tuning (epochs={epochs}, lr={lr}) ...")
+
+    model = FinetunedTabPFNRegressor(
+        device=device,
+        epochs=epochs,
+        learning_rate=lr,
+        n_estimators_finetune=8,
+        n_estimators_validation=8,
+        n_estimators_final_inference=8,
+    )
+
+    print("Fine-tuning ...")
+    model.fit(X_train, y_train)
+    print("Fine-tuning complete.")
+
+    return model
+
+
+def extract_inference_model(finetuned_regressor):
+    """Extract a TabPFNRegressor with finetuned weights for in-context learning.
+
+    After finetuning completes, the FinetunedTabPFNRegressor stores an internal
+    TabPFNRegressor with finetuned weights at `finetuned_inference_regressor_`.
+    This function deep-copies it to produce a standalone regressor where:
+      - .fit(X, y) stores context (no gradient updates)
+      - .predict() supports output_type="quantiles" and all other options
+    """
+    if not hasattr(finetuned_regressor, 'finetuned_inference_regressor_'):
+        raise AttributeError(
+            "FinetunedTabPFNRegressor has not been fit yet. "
+            "Call .fit() before extracting the inference model."
+        )
+    inference_model = copy.deepcopy(finetuned_regressor.finetuned_inference_regressor_)
+    print(f"  Extracted TabPFNRegressor with finetuned weights "
+          f"(fit_mode={inference_model.fit_mode!r})")
+    return inference_model
+
+
+# ============================================
+#       GP BO Loop (mirrors run_bo_loop, GP only)
+# ============================================
+
+def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
+                  n_init=5, budget=100, device='cpu'):
+    """
+    Performs the Active Learning loop using a GP model.
+    (This mirrors run_bo_loop from main.py but only for the GP case)
+
+    Args:
+        X_pool: Feature matrix for the candidate pool (n_locs, n_features).
+        y_pool: Response matrix (n_locs, n_reps) with noisy observations.
+        x_test: Test feature matrix for final prediction.
+        y_test: Test response vector (mean across repetitions).
+        n_init: Number of random initial observations.
+        budget: Total number of observations (including initial).
+        device: 'cpu' or 'cuda'.
+
+    Returns:
+        - observed_indices: Indices of points chosen
+        - observed_values: Observed y values (with noise)
+        - real_values: True y values at observed indices
+        - times: Time taken at each step
+        - y_pred: Final predictions on x_test
+    """
+    n_locs, n_reps = y_pool.shape
+
+    def sample_from_pool(idx):
+        col_idx = np.random.randint(0, n_reps)
+        return y_pool[idx, col_idx]
+
+    # 1. Initialization (Random)
+    pool_indices = np.arange(n_locs)
+    observed_indices = np.random.choice(pool_indices, size=n_init, replace=False).tolist()
+    observed_values = [sample_from_pool(idx) for idx in observed_indices]
+    real_values = y_test[observed_indices].tolist()
+
+    times = []
+
+    # --- LOOP ---
+    for t in range(budget - n_init):
+        step_start = time.time()
+
+        X_train = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
+        y_train = torch.tensor(observed_values, dtype=torch.float32, device=device)
+        X_cand = torch.tensor(X_pool, dtype=torch.float32, device=device)
+
+        # Initialize Model & Likelihood
+        likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+        model = ExactGP(X_train, y_train, likelihood).to(device)
+
+        # Training Loop (Optimize Hyperparameters)
+        model.train()
+        likelihood.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+        for _ in range(50):
+            optimizer.zero_grad()
+            output = model(X_train)
+            loss = -mll(output, y_train)
+            loss.backward()
+            optimizer.step()
+
+        # Select Next Point (EI)
+        best_f = y_train.max()
+        acq_vals = expected_improvement(model, likelihood, X_cand, best_f, device)
+        next_idx = acq_vals.argmax().item()
+
+        observed_indices.append(next_idx)
+        new_val = sample_from_pool(next_idx)
+        observed_values.append(new_val)
+        real_values.append(y_test[next_idx])
+
+        step_time = time.time() - step_start
+        times.append(step_time)
+
+    # Final model fit on all observed data to predict on x_test
+    X_train_final = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
+    y_train_final = torch.tensor(observed_values, dtype=torch.float32, device=device)
+
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    model = ExactGP(X_train_final, y_train_final, likelihood).to(device)
+    model.train()
+    likelihood.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+    for _ in range(50):
+        optimizer.zero_grad()
+        output = model(X_train_final)
+        loss = -mll(output, y_train_final)
+        loss.backward()
+        optimizer.step()
+    model.eval()
+    likelihood.eval()
+    with torch.no_grad():
+        posterior = likelihood(model(torch.tensor(x_test, dtype=torch.float32, device=device)))
+        y_pred = posterior.mean.cpu().numpy()
+
+    return observed_indices, observed_values, real_values, times, y_pred
+
+
+# ============================================
+#       GP Baseline (mirrors finetuned_fit / finetuned_optimization)
+# ============================================
+
+def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
+                device='cpu', budget=150, n_reps=30):
+    """
+    GP baseline that mirrors finetuned_fit / finetuned_optimization.
+
+    Takes the same inputs as finetuned_fit and finetuned_optimization
+    (minus finetuned_model) and builds a GP to perform the task instead.
+
+    Identical to the 'gp' options in evaluate_fit and evaluate_optimization
+    in main.py.
+
+    Args:
+        dataset: 'rat' or 'nhp'
+        subject_idx: subject index
+        emg_idx: EMG channel index
+        mode: 'fit' or 'optimization'
+        device: 'cpu' or 'cuda'
+        budget: number of training points (fit) or queries (optimization)
+        n_reps: number of repetitions
+
+    Returns:
+        dict with results matching the format of finetuned_fit (mode='fit')
+        or finetuned_optimization (mode='optimization').
+    """
+    data = load_data(dataset, subject_idx)
+
+    X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(
+        data, emg_idx, 'gp'
+    )
+
+    if mode == 'fit':
+        n_stims = y_train_full.shape[1]
+        y_train_full_flat = y_train_full.flatten()
+
+        r2_scores = []
+        y_preds_all = []
+        total_time = 0
+
+        for i in range(n_reps):
+
+            indices = np.random.choice(len(y_train_full_flat), budget, replace=False)
+            X_train = np.repeat(X_train_full, n_stims, axis=0)[indices]
+            y_train = y_train_full_flat[indices]
+
+            # Convert to Tensors
+            train_x = torch.tensor(X_train, dtype=torch.float32, device=device)
+            train_y = torch.tensor(y_train, dtype=torch.float32, device=device)
+
+            # Initialize Model & Likelihood
+            likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+            model = ExactGP(train_x, train_y, likelihood).to(device)
+
+            start = time.time()
+
+            # Training Loop (Optimize Hyperparameters)
+            model.train()
+            likelihood.train()
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+            for _ in range(50):
+                optimizer.zero_grad()
+                output = model(train_x)
+                loss = -mll(output, train_y)
+                loss.backward()
+                optimizer.step()
+
+            # Prediction
+            model.eval()
+            likelihood.eval()
+            test_x_tensor = torch.tensor(X_test, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                posterior = likelihood(model(test_x_tensor))
+                y_pred = posterior.mean.cpu().numpy()
+
+            total_time += (time.time() - start)
+
+            og_shape = y_pred.shape
+            y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
+            r2 = r2_score(y_test, y_pred)
+            r2_scores.append(np.clip(r2, 0.0, 1.0))
+            y_preds_all.append(y_pred)
+
+        y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
+
+        return {
+            'model_type': 'gp',
+            'r2': r2_scores,
+            'times': total_time / n_reps,
+            'y_test': y_test,
+            'y_pred': y_pred_mean,
+            'dataset': dataset,
+            'subject': subject_idx,
+            'emg': emg_idx
+        }
+
+    elif mode == 'optimization':
+        mean_times = []
+        values_all = []
+        r2_scores = []
+        y_preds_all = []
+
+        for i in range(n_reps):
+
+            traj, observed_values, real_values, times, y_pred = run_gpbo_loop(
+                X_train_full, y_train_full, X_test, y_test,
+                n_init=8, budget=budget, device=device
+            )
+
+            mean_times.append(times)
+            values_all.append(real_values)
+
+            # Compute R2 from the final model predictions
+            og_shape = y_pred.shape
+            y_pred_unscaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
+            r2 = r2_score(y_test, y_pred_unscaled)
+            r2_scores.append(np.clip(r2, 0.0, 1.0))
+            y_preds_all.append(y_pred_unscaled)
+
+        mean_times = np.mean(np.array(mean_times), axis=0)
+        y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
+
+        return {
+            'model_type': 'gp',
+            'times': mean_times,
+            'values': values_all,
+            'y_test': y_test,
+            'r2': r2_scores,
+            'y_pred': y_pred_mean,
+            'dataset': dataset,
+            'subject': subject_idx,
+            'emg': emg_idx
+        }
+
+
+# ============================================
+#       Finetuned BO Loop (mirrors run_bo_loop)
+# ============================================
+
+def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
+                          n_init=5, budget=100, device='cpu'):
+    """
+    Performs the Active Learning loop using a finetuned TabPFN model.
+
+    This mirrors run_bo_loop from main.py but takes a TabPFNRegressor
+    extracted via extract_inference_model(). The .fit() call stores
+    in-context learning examples (no gradient updates).
+
+    Args:
+        model: A TabPFNRegressor from extract_inference_model()
+
+    Returns:
+        - observed_indices: Indices of points chosen
+        - observed_values: Observed y values (with noise)
+        - real_values: True y values at observed indices
+        - times: Time taken at each step
+        - y_pred: Final predictions on x_test
+    """
+    n_locs, n_reps = y_pool.shape
+
+    def sample_from_pool(idx):
+        col_idx = np.random.randint(0, n_reps)
+        return y_pool[idx, col_idx]
+
+    # 1. Initialization (Random)
+    pool_indices = np.arange(n_locs)
+    observed_indices = np.random.choice(pool_indices, size=n_init, replace=False).tolist()
+    observed_values = [sample_from_pool(idx) for idx in observed_indices]
+    real_values = y_test[observed_indices].tolist()
+
+    times = []
+
+    # --- LOOP ---
+    for t in range(budget - n_init):
+        step_start = time.time()
+
+        X_obs_np = X_pool[observed_indices]
+        y_obs_np = np.array(observed_values)
+
+        # Fit provides in-context examples for the transformer
+        model.fit(X_obs_np, y_obs_np)
+
+        # Compute EI directly from the bar distribution (no Gaussian assumption)
+        full_output = model.predict(X_pool, output_type="full")
+        logits = full_output['logits']
+        criterion = full_output['criterion']
+
+        best_f = float(np.max(y_obs_np))
+        ei_vals = criterion.ei(logits, best_f, maximize=True)
+        next_idx = int(ei_vals.argmax().item())
+
+        observed_indices.append(next_idx)
+        new_val = sample_from_pool(next_idx)
+        observed_values.append(new_val)
+        real_values.append(y_test[next_idx])
+
+        step_time = time.time() - step_start
+        times.append(step_time)
+
+    # Final prediction with all observed data as context
+    X_obs_final = X_pool[observed_indices]
+    y_obs_final = np.array(observed_values)
+    model.fit(X_obs_final, y_obs_final)
+    y_pred = model.predict(x_test)
+
+    return observed_indices, observed_values, real_values, times, np.asarray(y_pred)
+
+
+# ============================================
+#       Finetuned Fit (mirrors evaluate_fit)
+# ============================================
+
+def finetuned_fit(dataset, subject_idx, emg_idx, model,
+                  device='cpu', budget=150, n_reps=30):
+    """
+    Evaluate fit quality using a finetuned TabPFN model.
+
+    The .fit() call stores in-context learning examples that the transformer
+    uses to make predictions (no gradient updates).
+
+    Args:
+        model: A TabPFNRegressor from extract_inference_model()
+    """
+    data = load_data(dataset, subject_idx)
+
+    # Use 'pfn' normalization (MinMax for X, Standard for y)
+    X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(
+        data, emg_idx, 'pfn'
+    )
+
+    n_stims = y_train_full.shape[1]
+    y_train_full = y_train_full.flatten()
+
+    r2_scores = []
+    y_preds_all = []
+    total_time = 0
+
+    for i in range(n_reps):
+
+        indices = np.random.choice(len(y_train_full), budget, replace=False)
+        X_train = np.repeat(X_train_full, n_stims, axis=0)[indices]
+        y_train = y_train_full[indices]
+
+        start = time.time()
+
+        # .fit() provides in-context examples for prediction
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        total_time += (time.time() - start)
+
+        y_pred = np.asarray(y_pred)
+        og_shape = y_pred.shape
+        y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
+        r2 = r2_score(y_test, y_pred)
+        r2_scores.append(np.clip(r2, 0.0, 1.0))
+        y_preds_all.append(y_pred)
+
+    y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
+
+    return {
+        'model_type': 'finetuned_tabpfn',
+        'r2': r2_scores,
+        'times': total_time / n_reps,
+        'y_test': y_test,
+        'y_pred': y_pred_mean,
+        'dataset': dataset,
+        'subject': subject_idx,
+        'emg': emg_idx
+    }
+
+# ============================================
+#   Finetuned Optimization (mirrors evaluate_optimization)
+# ============================================
+
+def finetuned_optimization(dataset, subject_idx, emg_idx, model,
+                            device='cpu', budget=100, n_reps=20):
+    """
+    Evaluate optimization performance using a finetuned TabPFN model.
+
+    Args:
+        model: A TabPFNRegressor from extract_inference_model()
+    """
+    data = load_data(dataset, subject_idx)
+
+    # Use 'pfn' normalization
+    X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(
+        data, emg_idx, 'pfn'
+    )
+
+    mean_times = []
+    values_all = []
+    r2_scores = []
+    y_preds_all = []
+
+    for i in range(n_reps):
+
+        traj, observed_values, real_values, times, y_pred = run_finetunedbo_loop(
+            X_train_full, y_train_full, X_test, y_test, model,
+            n_init=8, budget=budget, device=device
+        )
+
+        mean_times.append(times)
+        values_all.append(real_values)
+
+        # Compute R2 from the final model predictions
+        og_shape = y_pred.shape
+        y_pred_unscaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
+        r2 = r2_score(y_test, y_pred_unscaled)
+        r2_scores.append(np.clip(r2, 0.0, 1.0))
+        y_preds_all.append(y_pred_unscaled)
+
+    mean_times = np.mean(np.array(mean_times), axis=0)
+    y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
+
+    return {
+        'model_type': 'finetuned_tabpfn',
+        'times': mean_times,
+        'values': values_all,
+        'y_test': y_test,
+        'r2': r2_scores,
+        'y_pred': y_pred_mean,
+        'dataset': dataset,
+        'subject': subject_idx,
+        'emg': emg_idx
+    }
+
+
+# ============================================
+#       Budget Sweep Functions
+# ============================================
+
+def finetuned_fit_budget(dataset_type, model, device='cpu',
+                          budgets=[10, 50, 100, 150, 200],
+                          test_subjects=None, test_emg_indices=None,
+                          split_type='', visualize=True):
+    """
+    Run fit evaluation for varying budget levels on held-out subjects.
+
+    Args:
+        dataset_type: 'rat' or 'nhp'
+        model: A TabPFNRegressor from extract_inference_model()
+        device: 'cpu' or 'cuda'
+        budgets: List of training budgets to test
+        test_subjects: list of subject indices to test on. If None, uses
+            HELD_OUT_SUBJECTS[dataset_type] (inter-subject, existing behavior).
+        test_emg_indices: list of EMG indices to test on per subject. If None,
+            iterates over all EMGs for each subject (existing behavior).
+        visualize: if True, produce and save the budget-sweep line plot.
+    """
+    if test_subjects is None:
+        test_subjects = HELD_OUT_SUBJECTS[dataset_type]
+    plot_data = []
+
+    print(f"Starting Finetuned TabPFN Budget Sweep: {budgets}")
+
+    for b in budgets:
+        print(f"  > Running budget: {b}...")
+
+        for subj_idx in test_subjects:
+            data = load_data(dataset_type, subj_idx)
+            n_emgs = data['sorted_respMean'].shape[1]
+
+            emg_range = test_emg_indices if test_emg_indices is not None else range(n_emgs)
+            for emg_idx in emg_range:
+                if emg_idx >= n_emgs:
+                    continue
+                res = finetuned_fit(
+                    dataset_type, subj_idx, emg_idx,
+                    model,
+                    device=device,
+                    budget=b,
+                    n_reps=15
+                )
+
+                for score in res['r2']:
+                    plot_data.append({
+                        'Budget': b,
+                        'Model': 'Finetuned TabPFN',
+                        'R2': np.clip(score, 0.0, 1.0),
+                        'ID': f"{res['subject']}_{res['emg']}"
+                    })
+
+    # --- Visualization ---
+    df = pd.DataFrame(plot_data)
+
+    plt.figure(figsize=(10, 6))
+
+    sns.lineplot(
+        data=df,
+        x='Budget',
+        y='R2',
+        hue='Model',
+        palette={'Finetuned TabPFN': 'seagreen'},
+        marker='o',
+        errorbar=('ci', 95),
+        err_kws={'alpha': 0.2},
+        linewidth=2
+    )
+
+    plt.title("Finetuned TabPFN Fit Quality vs. Training Budget")
+    plt.ylabel("R² Score (Test Set)")
+    plt.xlabel("Budget (Number of Training Points)")
+    plt.ylim(0, 1.05)
+    plt.grid(True, alpha=0.3)
+    plt.legend(title='Model Type')
+
+    output_dir = os.path.join('output', 'fitness')
+    os.makedirs(output_dir, exist_ok=True)
+    suffix = f'_{dataset_type}_{split_type}' if split_type else f'_{dataset_type}'
+    plot_path = os.path.join(output_dir, f'finetuned_fit_budget{suffix}.svg')
+    plt.savefig(plot_path, format="svg")
+
+    print(f"Saved plot to {plot_path}")
+
+    return df
+
+
+def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
+                                   device='cpu', budgets=[10, 50, 100, 150, 200],
+                                   test_subjects=None, test_emg_indices=None,
+                                   split_type=''):
+    """
+    Run optimization evaluation for varying budgets on held-out subjects.
+
+    Args:
+        dataset_type: 'rat' or 'nhp'
+        model: A TabPFNRegressor from extract_inference_model()
+        regret_metric: 'abs' (Final Simple Regret) or 'cum' (Mean Simple Regret)
+        device: 'cpu' or 'cuda'
+        budgets: List of budgets to sweep
+        test_subjects: list of subject indices to test on. If None, uses
+            HELD_OUT_SUBJECTS[dataset_type] (inter-subject, existing behavior).
+        test_emg_indices: list of EMG indices to test on per subject. If None,
+            iterates over all EMGs for each subject (existing behavior).
+    """
+    if test_subjects is None:
+        test_subjects = HELD_OUT_SUBJECTS[dataset_type]
+    plot_data = []
+
+    if regret_metric == 'abs':
+        y_label = "Final Simple Regret"
+        title = "Finetuned TabPFN Optimization: Final Regret vs Budget"
+    else:
+        y_label = "Mean Simple Regret"
+        title = "Finetuned TabPFN Optimization: Mean Regret vs Budget"
+
+    print(f"Starting Finetuned TabPFN Optimization Sweep ({regret_metric}): {budgets}")
+
+    for b in budgets:
+        print(f"  > Running budget: {b}...")
+
+        for subj_idx in test_subjects:
+            data = load_data(dataset_type, subj_idx)
+            n_emgs = data['sorted_respMean'].shape[1]
+
+            emg_range = test_emg_indices if test_emg_indices is not None else range(n_emgs)
+            for emg_idx in emg_range:
+                if emg_idx >= n_emgs:
+                    continue
+                res = finetuned_optimization(
+                    dataset_type, subj_idx, emg_idx,
+                    model,
+                    device=device,
+                    budget=b,
+                    n_reps=20
+                )
+
+                optimal_val = res['y_test'].max()
+                raw_values = np.array(res['values'])
+                best_so_far = np.maximum.accumulate(raw_values, axis=1)
+                simple_regret_curve = optimal_val - best_so_far
+
+                if regret_metric == 'abs':
+                    scores = simple_regret_curve[:, -1]
+                else:
+                    scores = np.mean(simple_regret_curve, axis=1)
+
+                for score in scores:
+                    plot_data.append({
+                        'Budget': b,
+                        'Model': 'Finetuned TabPFN',
+                        'Regret': score,
+                        'ID': f"{res['subject']}_{res['emg']}"
+                    })
+
+    # --- Visualization ---
+    df = pd.DataFrame(plot_data)
+
+    plt.figure(figsize=(10, 6))
+
+    sns.lineplot(
+        data=df,
+        x='Budget',
+        y='Regret',
+        hue='Model',
+        palette={'Finetuned TabPFN': 'seagreen'},
+        marker='o',
+        errorbar=('ci', 95),
+        err_kws={'alpha': 0.2},
+        linewidth=2
+    )
+
+    plt.title(title)
+    plt.ylabel(y_label)
+    plt.xlabel("Budget (Number of Queries)")
+    plt.grid(True, alpha=0.3)
+    plt.legend(title='Model Type')
+
+    output_dir = os.path.join('output', 'optimization')
+    os.makedirs(output_dir, exist_ok=True)
+    suffix = f'_{dataset_type}_{split_type}' if split_type else f'_{dataset_type}'
+    plot_path = os.path.join(output_dir, f'finetuned_optimization_budget{suffix}.svg')
+    plt.savefig(plot_path, format="svg")
+
+    print(f"Saved plot to {plot_path}")
+
+    return df
+
+
+# ============================================
+#       High-Level Experiment Runner
+# ============================================
+
+_VALID_MODES = {'fit', 'optimization', 'fit_budget', 'optimization_budget'}
+
+
+def run_experiment(
+    dataset_type,
+    split_type='inter_subject',
+    mode=None,
+    device='cuda',
+    budget=100,
+    n_reps=30,
+    epochs=20,
+    lr=1e-6,
+    n_augmentations=25,
+    held_out_emg_idx=None,
+    budgets=None,
+):
+    """
+    Unified entry point for transfer learning evaluation.
+
+    Args:
+        dataset_type: 'rat' or 'nhp'
+        split_type: 'inter_subject' — train on TRAIN_SUBJECTS, test on HELD_OUT_SUBJECTS;
+                    'intra_emg'     — train on ALL_SUBJECTS (excluding held_out_emg_idx),
+                                      test on that EMG across ALL_SUBJECTS.
+        mode: str or list of str — any combination of 'fit', 'optimization',
+              'fit_budget', 'optimization_budget'. The model is finetuned once
+              and all requested modes are evaluated sequentially.
+        device: 'cpu' or 'cuda'
+        budget: number of training points (fit) or BO queries (optimization)
+        n_reps: number of repetitions per experiment
+        epochs: fine-tuning epochs
+        lr: fine-tuning learning rate
+        n_augmentations: augmentations per subject-EMG pair
+        held_out_emg_idx: required when split_type='intra_emg'; the EMG index
+            held out from training and used as the test set.
+        budgets: list of budgets for 'fit_budget' / 'optimization_budget' modes.
+            Defaults to [10, 50, 100, 150, 200].
+
+    Returns:
+        dict keyed by mode name, each value being the result of that mode
+        ('fit'/'optimization' → {'TabPFN': [...], 'GP': [...]},
+         budget modes → DataFrame).
+    """
+    if mode is None:
+        mode = ['fit']
+    if isinstance(mode, str):
+        mode = [mode]
+    invalid = set(mode) - _VALID_MODES
+    if invalid:
+        raise ValueError(f"Unknown mode(s): {invalid}. Valid: {_VALID_MODES}")
+
+    if budgets is None:
+        budgets = [10, 50, 100, 150, 200]
+
+    # --- Resolve train / test sets ---
+    if split_type == 'inter_subject':
+        train_subject_indices = TRAIN_SUBJECTS[dataset_type]
+        test_subjects = HELD_OUT_SUBJECTS[dataset_type]
+        test_emg_indices = None          # all EMGs per subject
+        ft_held_out_emg = None
+    elif split_type == 'intra_emg':
+        if held_out_emg_idx is None:
+            raise ValueError("held_out_emg_idx must be set when split_type='intra_emg'")
+        train_subject_indices = ALL_SUBJECTS[dataset_type]
+        test_subjects = ALL_SUBJECTS[dataset_type]
+        test_emg_indices = [held_out_emg_idx]
+        ft_held_out_emg = held_out_emg_idx
+    else:
+        raise ValueError(f"Unknown split_type={split_type!r}. Use 'inter_subject' or 'intra_emg'.")
+
+    # --- Fine-tune on the correct split (once, shared across all modes) ---
+    print("=" * 60)
+    print(f"Fine-tuning TabPFN  [{dataset_type} | {split_type} | modes={mode}]")
+    print("=" * 60)
+    print(f"Building augmented dataset ({split_type}) ...")
+    X_ft, y_ft = build_finetuning_dataset(
+        dataset_type,
+        subject_indices=train_subject_indices,
+        held_out_emg_idx=ft_held_out_emg,
+        n_augmentations=n_augmentations,
+        seed=42,
+    )
+    print(f"  Dataset size: {X_ft.shape[0]} rows")
+    ft_model_raw = FinetunedTabPFNRegressor(
+        device=device,
+        epochs=epochs,
+        learning_rate=lr,
+        n_estimators_finetune=8,
+        n_estimators_validation=8,
+        n_estimators_final_inference=8,
+    )
+    print(f"Fine-tuning (epochs={epochs}, lr={lr}) ...")
+    ft_model_raw.fit(X_ft, y_ft)
+    ft_model = extract_inference_model(ft_model_raw)
+
+    # --- Build test experiment list (needed for fit / optimization modes) ---
+    experiments = []
+    for subj_idx in test_subjects:
+        data = load_data(dataset_type, subj_idx)
+        n_emgs = data['sorted_respMean'].shape[1]
+        emgs = test_emg_indices if test_emg_indices is not None else range(n_emgs)
+        for emg_idx in emgs:
+            if emg_idx < n_emgs:
+                experiments.append((subj_idx, emg_idx))
+
+    # --- Run each requested mode ---
+    all_results = {}
+
+    for m in mode:
+        print(f"\n{'=' * 60}")
+        print(f"Running mode: {m}")
+        print('=' * 60)
+
+        if m == 'fit':
+            results_ft, results_gp = [], []
+            for subj_idx, emg_idx in experiments:
+                print(f"  Fit: subject={subj_idx}, emg={emg_idx}")
+                res_ft = finetuned_fit(dataset_type, subj_idx, emg_idx, ft_model,
+                                       device=device, budget=budget, n_reps=n_reps)
+                res_gp = gp_baseline(dataset_type, subj_idx, emg_idx, mode='fit',
+                                      device=device, budget=budget, n_reps=n_reps)
+                results_ft.append(res_ft)
+                results_gp.append(res_gp)
+                print(f"    TabPFN R2={np.mean(res_ft['r2']):.3f}  |  GP R2={np.mean(res_gp['r2']):.3f}")
+
+            results_dict = {'GP': results_gp, 'TabPFN': results_ft}
+            tag = f'_{split_type}_finetuned_vs_gp'
+            r2_comparison(results_dict, mode=tag, save=True)
+            n_maps = min(6, len(experiments))
+            for idx in random.sample(range(len(experiments)), n_maps):
+                show_emg_map(results_ft, idx, 'TabPFN', mode=f'_{split_type}_finetuned', save=True)
+                show_emg_map(results_gp, idx, 'GP', mode=f'_{split_type}_baseline', save=True)
+
+            all_r2 = [np.mean(r['r2']) for r in results_ft]
+            print(f"\nDone. {len(results_ft)} experiments.")
+            print(f"Finetuned TabPFN mean R²: {np.mean(all_r2):.3f} ± {np.std(all_r2):.3f}")
+            all_results['fit'] = results_dict
+
+        elif m == 'optimization':
+            results_ft, results_gp = [], []
+            for subj_idx, emg_idx in experiments:
+                print(f"  Optimization: subject={subj_idx}, emg={emg_idx}")
+                res_ft = finetuned_optimization(dataset_type, subj_idx, emg_idx, ft_model,
+                                                 device=device, budget=budget, n_reps=n_reps)
+                res_gp = gp_baseline(dataset_type, subj_idx, emg_idx, mode='optimization',
+                                      device=device, budget=budget, n_reps=n_reps)
+                results_ft.append(res_ft)
+                results_gp.append(res_gp)
+                print(f"    TabPFN R2={np.mean(res_ft['r2']):.3f}  |  GP R2={np.mean(res_gp['r2']):.3f}")
+
+            results_dict = {'GP': results_gp, 'TabPFN': results_ft}
+            tag = f'_{split_type}_opt_finetuned_vs_gp'
+            r2_comparison(results_dict, mode=tag, save=True)
+            plot_runtime_trajectory(results_dict, split_type=split_type, save=True)
+            regret_curve(results_dict, split_type=split_type, save=True)
+
+            all_r2 = [np.mean(r['r2']) for r in results_ft]
+            print(f"\nDone. {len(results_ft)} experiments.")
+            print(f"Finetuned TabPFN mean R²: {np.mean(all_r2):.3f} ± {np.std(all_r2):.3f}")
+            all_results['optimization'] = results_dict
+
+        elif m == 'fit_budget':
+            df = finetuned_fit_budget(
+                dataset_type, ft_model,
+                device=device,
+                budgets=budgets,
+                test_subjects=test_subjects,
+                test_emg_indices=test_emg_indices,
+                split_type=split_type,
+            )
+            all_results['fit_budget'] = df
+
+        elif m == 'optimization_budget':
+            df = finetuned_optimization_budget(
+                dataset_type, ft_model,
+                device=device,
+                budgets=budgets,
+                test_subjects=test_subjects,
+                test_emg_indices=test_emg_indices,
+                split_type=split_type,
+            )
+            all_results['optimization_budget'] = df
+
+    return all_results
+
+
+# ============================================
+#       CLI Entry Point
+# ============================================
+
+def run_finetuning():
+    parser = argparse.ArgumentParser(
+        description='Fine-tune TabPFN on neurostimulation data and run evaluation.',
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument('--dataset', type=str, default='nhp', choices=['rat', 'nhp'],
+                        help='Dataset type (default: nhp)')
+    parser.add_argument('--split', type=str, default='inter_subject',
+                        choices=['inter_subject', 'intra_emg'],
+                        help='Train/test split strategy:\n'
+                             '  inter_subject — train on TRAIN_SUBJECTS, test on HELD_OUT_SUBJECTS\n'
+                             '  intra_emg     — train on ALL_SUBJECTS excl. held_out_emg, test on that EMG\n'
+                             '(default: inter_subject)')
+    parser.add_argument('--mode', type=str, default='fit',
+                        choices=['fit', 'optimization', 'fit_budget', 'optimization_budget'],
+                        help='Evaluation mode (default: fit)')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Device for training: cpu or cuda (default: cuda)')
+    parser.add_argument('--epochs', type=int, default=20,
+                        help='Number of fine-tuning epochs (default: 20)')
+    parser.add_argument('--lr', type=float, default=1e-6,
+                        help='Learning rate (default: 1e-6)')
+    parser.add_argument('--n_augmentations', type=int, default=25,
+                        help='Augmentations per subject-EMG pair (default: 25)')
+    parser.add_argument('--budget', type=int, default=100,
+                        help='Training points (fit) or BO queries (optimization) (default: 100)')
+    parser.add_argument('--n_reps', type=int, default=30,
+                        help='Repetitions per experiment (default: 30)')
+    parser.add_argument('--held_out_emg', type=int, default=None,
+                        help='EMG index to hold out; required when --split intra_emg')
+    parser.add_argument('--budgets', type=int, nargs='+', default=[10, 50, 100, 150, 200],
+                        help='Budget sweep values for *_budget modes (default: 10 50 100 150 200)')
+
+    args = parser.parse_args()
+
+    run_experiment(
+        dataset_type=args.dataset,
+        split_type=args.split,
+        mode=args.mode,
+        device=args.device,
+        budget=args.budget,
+        n_reps=args.n_reps,
+        epochs=args.epochs,
+        lr=args.lr,
+        n_augmentations=args.n_augmentations,
+        held_out_emg_idx=args.held_out_emg,
+        budgets=args.budgets,
+    )
+
+
+if __name__ == '__main__':
+    # ---- Configure experiment here ----
+    DATASET     = 'nhp'
+    SPLIT       = 'inter_subject'   # 'inter_subject' or 'intra_emg'
+    MODE        = 'fit'             # 'fit', 'optimization', 'fit_budget', 'optimization_budget'
+    DEVICE      = 'cuda'
+    BUDGET      = 100
+    HELD_OUT_EMG = None             # set to int (e.g. 3) when SPLIT='intra_emg'
+    BUDGETS     = [10, 50, 100, 150, 200]  # for budget sweep modes
+
+    run_experiment(
+        dataset_type=DATASET,
+        split_type=SPLIT,
+        mode=MODE,
+        device=DEVICE,
+        budget=BUDGET,
+        held_out_emg_idx=HELD_OUT_EMG,
+        budgets=BUDGETS,
+    )
+

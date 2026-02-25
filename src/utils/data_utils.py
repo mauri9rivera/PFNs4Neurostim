@@ -2,6 +2,9 @@ import numpy as np
 import scipy.io
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import pickle
+import os
+from datetime import datetime
+import csv
 
 
 # ============================================
@@ -90,18 +93,22 @@ def load_data(dataset_type, m_i):
 
         # Create a masked array where invalid points are masked
         masked_resp = np.ma.masked_where(sorted_isvalid == 0, sorted_resp)
-        
-        # Compute the mean over the last axis, ignoring masked (invalid) values
+
+        # Compute the mean and std over the last axis, ignoring masked (invalid) values
         sorted_respMean = masked_resp.mean(axis=-1)
+        sorted_respSD = masked_resp.std(axis=-1)
+        sorted_respSD = np.ma.filled(sorted_respSD, fill_value=0.0)
+        sorted_respMean = np.ma.filled(sorted_respMean, fill_value=0.0)
 
         emgs = data[0][0]
 
         return {
         'emgs': emgs,
-        'nChan': nChan, 
+        'nChan': nChan,
         'sorted_isvalid': sorted_isvalid,
         'sorted_resp': sorted_resp,
         'sorted_respMean': sorted_respMean,
+        'sorted_respSD': sorted_respSD,
         'ch2xy': ch2xy,
         'DimSearchSpace': 96
         }
@@ -166,21 +173,25 @@ def load_data(dataset_type, m_i):
         sorted_resp = np.max(sorted_filtered[:,:,:n_rep,resp_region[0]:resp_region[1]], axis=-1)
         # Create a masked array where invalid points are masked
         masked_resp = np.ma.masked_where(sorted_isvalid == 0, sorted_resp)
-        
-        # Compute the mean over the last axis, ignoring masked (invalid) values
+
+        # Compute the mean and std over the last axis, ignoring masked (invalid) values
         sorted_respMean = masked_resp.mean(axis=-1)
+        sorted_respSD = masked_resp.std(axis=-1)
+        sorted_respSD = np.ma.filled(sorted_respSD, fill_value=0.0)
+        sorted_respMean = np.ma.filled(sorted_respMean, fill_value=0.0)
 
         emgs = data[0][0]
 
         return {
         'emgs': emgs,
-        'nChan': nChan, 
+        'nChan': nChan,
         'sorted_isvalid': sorted_isvalid,
         'sorted_resp': sorted_resp,
         'sorted_respMean': sorted_respMean,
+        'sorted_respSD': sorted_respSD,
         'ch2xy': ch2xy,
         'DimSearchSpace': 32
-        } 
+        }
     elif dataset_type =='spinal':
 
         subject_map = {
@@ -264,7 +275,102 @@ def load_data(dataset_type, m_i):
         return subject   
     else:
         raise ValueError('The dataset type should be 5d_rat, nhp, rat or spinal' )
- 
+
+
+# ============================================
+#      Held-Out / Train Subject Splits
+# ============================================
+
+HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [0]}
+TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [1, 2, 3]}
+ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 2, 3]}
+
+
+# ============================================
+#      Data Augmentation for Fine-Tuning
+# ============================================
+
+def augment_maps(subject_data, emg_idx, n_augmentations=25, seed=42):
+    """
+    Generate augmented (X, y) training pairs by adding per-channel Gaussian noise.
+
+    For each augmentation, sample noise ~ N(0, std_map[channel]) per channel
+    and add it to the mean map. Also perturb individual repetitions similarly.
+
+    Args:
+        subject_data: dict returned by load_data
+        emg_idx: int, which EMG channel to augment
+        n_augmentations: int, number of augmented maps to produce
+        seed: int, random seed for reproducibility
+
+    Returns:
+        List of (X, y) tuples where X = MinMax-scaled coords, y = perturbed response
+    """
+    rng = np.random.RandomState(seed)
+
+    coords = subject_data['ch2xy']
+    mean_map = subject_data['sorted_respMean'][:, emg_idx]  # (nChan,)
+    std_map = subject_data['sorted_respSD'][:, emg_idx]     # (nChan,)
+
+    scaler_x = MinMaxScaler()
+    X_scaled = scaler_x.fit_transform(coords)
+    n_channels = mean_map.shape
+
+    scaler_y = StandardScaler()
+    scaler_y.fit(mean_map.reshape(-1, 1))
+
+    augmented_pairs = []
+    for _ in range(n_augmentations):
+        noise = rng.randn(len(mean_map)) * std_map
+        y_aug = scaler_y.transform((mean_map + noise).reshape(-1, 1)).ravel()
+        augmented_pairs.append((X_scaled.copy(), y_aug))
+
+    return augmented_pairs
+
+
+def build_finetuning_dataset(dataset_type, subject_indices=None,
+                              held_out_emg_idx=None,
+                              n_augmentations=25, seed=42):
+    """
+    Build a large (X_all, y_all) dataset for fine-tuning TabPFN by augmenting
+    training subjects across all EMG channels.
+
+    Args:
+        dataset_type: 'rat' or 'nhp'
+        subject_indices: list of subject ints to use (defaults to TRAIN_SUBJECTS)
+        held_out_emg_idx: int or None. If set, this EMG index is skipped for all
+            subjects (intra-EMG holdout). Passing None preserves existing behavior.
+        n_augmentations: augmentations per subject-EMG pair
+        seed: random seed
+
+    Returns:
+        X_all: np.ndarray of shape (N, 2), MinMax-scaled coordinates
+        y_all: np.ndarray of shape (N,), response values
+    """
+    if subject_indices is None:
+        subject_indices = TRAIN_SUBJECTS[dataset_type]
+
+    X_parts, y_parts = [], []
+
+    for subj_idx in subject_indices:
+        data = load_data(dataset_type, subj_idx)
+        n_emgs = data['sorted_respMean'].shape[1]
+
+        for emg_idx in range(n_emgs):
+            if held_out_emg_idx is not None and emg_idx == held_out_emg_idx:
+                continue
+            pairs = augment_maps(data, emg_idx,
+                                 n_augmentations=n_augmentations,
+                                 seed=seed + subj_idx * 100 + emg_idx)
+            for X, y in pairs:
+                X_parts.append(X)
+                y_parts.append(y)
+
+    X_all = np.concatenate(X_parts, axis=0)
+    y_all = np.concatenate(y_parts, axis=0)
+
+    return X_all, y_all
+
 
 def preprocess_neural_data(subject_data, emg_idx=0, normalization='pfn'):
     """
@@ -304,3 +410,97 @@ def preprocess_neural_data(subject_data, emg_idx=0, normalization='pfn'):
 
 
     return X_train, Y_train, X_train, resp_mean, scaler_y
+
+
+# ============================================
+#           Results Persistence
+# ============================================
+
+
+def save_results(results_dict, evaluation_type, output_dir='./output/results', tag=''):
+    """
+    Persist experiment results as a full-fidelity pickle and a scalar summary CSV.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+                      (as returned by main() or the finetuning evaluation loops).
+        evaluation_type: 'fit' or 'optimization'
+        output_dir: directory to write into (created if absent).
+        tag: optional suffix for the filename (e.g. 'finetuned_vs_gp').
+
+    Returns:
+        (pickle_path, csv_path)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Infer dataset name from the first result dict
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', 'unknown') if first_results else 'unknown'
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    parts = [dataset, evaluation_type]
+    if tag:
+        parts.append(tag)
+    parts.append(timestamp)
+    base = '_'.join(parts)
+
+    pkl_path = os.path.join(output_dir, f'{base}.pkl')
+    csv_path = os.path.join(output_dir, f'{base}_summary.csv')
+
+    # --- Pickle (full fidelity) ---
+    with open(pkl_path, 'wb') as f:
+        pickle.dump(results_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # --- Summary CSV ---
+    rows = []
+    for model_name, result_list in results_dict.items():
+        for res in result_list:
+            r2_arr = np.asarray(res['r2'])
+            row = {
+                'model': model_name,
+                'dataset': res.get('dataset', ''),
+                'subject': res.get('subject', ''),
+                'emg': res.get('emg', ''),
+                'mean_r2': float(np.mean(r2_arr)),
+                'std_r2': float(np.std(r2_arr)),
+                'n_reps': len(r2_arr),
+                'mean_time_s': float(np.mean(res['times'])),
+            }
+
+            if evaluation_type == 'optimization' and 'values' in res:
+                values = np.asarray(res['values'])
+                best_so_far = np.maximum.accumulate(values, axis=1)
+                optimal = float(res['y_test'].max())
+                final_regret = optimal - best_so_far[:, -1]
+                row['mean_final_regret'] = float(np.mean(final_regret))
+                row['budget'] = values.shape[1]
+
+            rows.append(row)
+
+    if rows:
+        fieldnames = list(rows[0].keys())
+        # Ensure optimization-only columns appear even when mixed
+        for r in rows:
+            for k in r:
+                if k not in fieldnames:
+                    fieldnames.append(k)
+
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    print(f"Saved pickle  -> {pkl_path}")
+    print(f"Saved summary -> {csv_path}")
+    return pkl_path, csv_path
+
+
+def load_results(pickle_path):
+    """
+    Reload a results_dict from a pickle saved by save_results().
+
+    Returns the exact dict[str, list[dict]] for direct use with
+    r2_comparison, regret_curve, show_emg_map, plot_runtime_trajectory, etc.
+    """
+    with open(pickle_path, 'rb') as f:
+        return pickle.load(f)

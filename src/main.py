@@ -10,6 +10,7 @@ import time
 import scipy.io
 import seaborn as sns
 import pickle
+import joblib
 import pandas as pd
 import gpytorch
 import pfns4bo
@@ -26,9 +27,14 @@ from utils.visualization import *
 #           Bayesian Optimization Loop
 # ============================================
 
-def run_bo_loop(X_pool, y_pool, y_test, model_type, pfn_model=None, n_init=1, budget=100, device='cpu'):
+def run_bo_loop(X_pool, y_pool, x_test, y_test, model_type, pfn_model=None,
+                n_init=1, budget=100, device='cpu'):
     """
-    Performs the Active Learning loop.
+    Performs the Active Learning loop for GP and PFN models.
+
+    Args:
+        pfn_model: PFN torch weights (model_type='pfn'). Ignored for 'gp'.
+
     Returns:
         - trajectory: Indices of points chosen
         - times: Time taken at each step
@@ -41,9 +47,8 @@ def run_bo_loop(X_pool, y_pool, y_test, model_type, pfn_model=None, n_init=1, bu
     def sample_from_pool(idx):
         col_idx = np.random.randint(0, n_reps)
         return y_pool[idx, col_idx]
-    
+
     # 1. Initialization (Random)
-    # We maintain a mask of available points
     pool_indices = np.arange(n_locs)
     observed_indices = np.random.choice(pool_indices, size=n_init, replace=False).tolist()
     observed_values = [sample_from_pool(idx) for idx in observed_indices]
@@ -51,39 +56,37 @@ def run_bo_loop(X_pool, y_pool, y_test, model_type, pfn_model=None, n_init=1, bu
 
     times = []
 
-    pfn_wrapper = TransformerBOMethod(pfn_model, device=device, acq_function='ei')
+    if model_type == 'pfn':
+        pfn_wrapper = TransformerBOMethod(pfn_model, device=device, acq_function='ei')
 
     n_samples = np.zeros(n_locs, dtype=int)
     for idx in observed_indices:
         n_samples[idx] += 1
 
-    #kernel = 1.0 * RBF(length_scale=0.1) + WhiteKernel(noise_level=0.1)
 
-    
     # --- LOOP ---
     for t in range(budget - n_init):
-        
-        
+
         # Prepare Tensors
-        X_train = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)     
+        X_train = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
         y_train = torch.tensor(observed_values, dtype=torch.float32, device=device)
 
         X_cand = torch.tensor(X_pool, dtype=torch.float32, device=device)
-        
+
         # --- GP Logic ---
         if model_type == 'gp':
             step_start = time.time()
-            
+
             # Initialize Model & Likelihood
             likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
             model = ExactGP(X_train, y_train, likelihood).to(device)
-            
+
             # Training Loop (Optimize Hyperparameters)
             model.train()
             likelihood.train()
             optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
             mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-            
+
             # 50 iterations is usually sufficient for simple regression
             for _ in range(50):
                 optimizer.zero_grad()
@@ -91,51 +94,88 @@ def run_bo_loop(X_pool, y_pool, y_test, model_type, pfn_model=None, n_init=1, bu
                 loss = -mll(output, y_train)
                 loss.backward()
                 optimizer.step()
-                
+
             # Select Next Point (EI)
             best_f = y_train.max()
-            acq_vals = expected_improvement(model, likelihood, X_cand, best_f, device)      
+            acq_vals = expected_improvement(model, likelihood, X_cand, best_f, device)
 
             # Get index relative to X_pool (0 to 95)
             next_idx = acq_vals.argmax().item()
 
         # --- PFN Logic ---
         elif model_type == 'pfn':
-            
+
             step_start = time.time()
-            # observe_and_suggest returns (relative_index, value)
-            # It expects (N, D) inputs and handles the internal batching/unsqueezing
             idx_rel, acq_vals = pfn_wrapper.observe_and_suggest(
-                X_obs=X_train, 
-                y_obs=y_train, 
+                X_obs=X_train,
+                y_obs=y_train,
                 X_pen=X_cand,
                 return_actual_ei=True
             )
-            
+
             if isinstance(idx_rel, torch.Tensor): idx_rel = idx_rel.item()
 
             next_idx = acq_vals.argmax().item()
-        
-        observed_indices.append(next_idx)  
+
+        observed_indices.append(next_idx)
         new_val = sample_from_pool(next_idx)
-        observed_values.append(new_val)  
+        observed_values.append(new_val)
         real_values.append(y_test[next_idx])
 
         step_time = time.time() - step_start
         times.append(step_time)
 
-    return observed_indices, observed_values, real_values, times
+    # Final model fit on all observed data to predict on full pool
+    X_train_final = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
+    y_train_final = torch.tensor(observed_values, dtype=torch.float32, device=device)
 
-def evaluate_fit(dataset, subject_idx, emg_idx, model_type, 
+    if model_type == 'gp':
+        likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+        model = ExactGP(X_train_final, y_train_final, likelihood).to(device)
+        model.train()
+        likelihood.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+        for _ in range(50):
+            optimizer.zero_grad()
+            output = model(X_train_final)
+            loss = -mll(output, y_train_final)
+            loss.backward()
+            optimizer.step()
+        model.eval()
+        likelihood.eval()
+        with torch.no_grad():
+            posterior = likelihood(model(torch.tensor(x_test, dtype=torch.float32, device=device)))
+            y_pred = posterior.mean.cpu().numpy()
+
+    elif model_type == 'pfn':
+        pfn_pred = TransformerBOMethod(pfn_model, device=device, acq_function='mean')
+        _, y_pred = pfn_pred.observe_and_suggest(
+            X_obs=X_train_final,
+            y_obs=y_train_final,
+            X_pen=torch.tensor(x_test, dtype=torch.float32, device=device),
+            return_actual_ei=True
+        )
+        if isinstance(y_pred, torch.Tensor):
+            y_pred = y_pred.cpu().numpy()
+
+    return observed_indices, observed_values, real_values, times, y_pred
+
+def evaluate_fit(dataset, subject_idx, emg_idx, model_type,
                    pfn_model_weights=None, device='cpu', budget=150, n_reps=30):
-    
+    """
+    Evaluate fit quality for GP and PFN models.
+
+    Args:
+        pfn_model_weights: PFN torch weights (model_type='pfn'). Ignored for 'gp'.
+    """
     data = load_data(dataset, subject_idx)
 
     X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(data, emg_idx, model_type)
 
     n_stims = y_train_full.shape[1]
     y_train_full = y_train_full.flatten()
-    
+
     r2_scores = []
     y_preds_all = []
     total_time = 0
@@ -143,28 +183,28 @@ def evaluate_fit(dataset, subject_idx, emg_idx, model_type,
     for i in range(n_reps):
 
         indices = np.random.choice(len(y_train_full), budget, replace=False)
-        X_train=np.repeat(X_train_full, n_stims, axis=0)[indices]
-        y_train=y_train_full[indices]
+        X_train = np.repeat(X_train_full, n_stims, axis=0)[indices]
+        y_train = y_train_full[indices]
 
 
         if model_type == 'gp':
-            
+
             # 1. Convert to Tensors
             train_x = torch.tensor(X_train, dtype=torch.float32, device=device)
             train_y = torch.tensor(y_train, dtype=torch.float32, device=device)
-            
+
             # 2. Initialize Model & Likelihood
             likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
             model = ExactGP(train_x, train_y, likelihood).to(device)
 
             start = time.time()
-            
+
             # 3. Training Loop (Optimize Hyperparameters)
             model.train()
             likelihood.train()
             optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
             mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-            
+
             # 50 iterations is usually sufficient for simple regression
             for _ in range(50):
                 optimizer.zero_grad()
@@ -172,7 +212,7 @@ def evaluate_fit(dataset, subject_idx, emg_idx, model_type,
                 loss = -mll(output, train_y)
                 loss.backward()
                 optimizer.step()
-            
+
             # 4. Prediction
             model.eval()
             likelihood.eval()
@@ -210,46 +250,62 @@ def evaluate_fit(dataset, subject_idx, emg_idx, model_type,
         y_preds_all.append(y_pred)
 
     y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
-    
+
 
     return {
         'model_type': model_type,
-        'r2': r2_scores, 
-        'times': total_time / n_reps, 
-        'y_test': y_test, 
+        'r2': r2_scores,
+        'times': total_time / n_reps,
+        'y_test': y_test,
         'y_pred': y_pred_mean,
         'dataset': dataset,
         'subject': subject_idx,
         'emg': emg_idx
     }
- 
-def evaluate_optimization(dataset, subject_idx, emg_idx, model_type, 
+
+def evaluate_optimization(dataset, subject_idx, emg_idx, model_type,
                    pfn_model_weights=None, device='cpu', budget=100, n_reps=20):
-    
+    """
+    Evaluate optimization performance for GP and PFN models.
+
+    Args:
+        pfn_model_weights: PFN torch weights (model_type='pfn'). Ignored for 'gp'.
+    """
     data = load_data(dataset, subject_idx)
 
     X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(data, emg_idx, model_type)
-    #y_train_full = y_train_full.flatten()
-    
+
     mean_times = []
     values_all = []
+    r2_scores = []
+    y_preds_all = []
 
     for i in range(n_reps):
 
-        traj, observed_values, real_values, times = run_bo_loop(X_train_full, y_train_full, y_test, model_type, pfn_model_weights,
-                                          n_init=8, budget=budget, device=device)
-    
+        traj, observed_values, real_values, times, y_pred = run_bo_loop(
+            X_train_full, y_train_full, X_test, y_test, model_type, pfn_model_weights,
+            n_init=8, budget=budget, device=device)
+
         mean_times.append(times)
         values_all.append(real_values)
 
+        # Compute R2 from the final model predictions
+        og_shape = y_pred.shape
+        y_pred_unscaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
+        r2 = r2_score(y_test, y_pred_unscaled)
+        r2_scores.append(np.clip(r2, 0.0, 1.0))
+        y_preds_all.append(y_pred_unscaled)
+
     mean_times = np.mean(np.array(mean_times), axis=0)
-    
+    y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
 
     return {
         'model_type': model_type,
-        'times': mean_times, 
+        'times': mean_times,
         'values': values_all, # Needed for regret curve
-        'y_test': y_test, 
+        'y_test': y_test,
+        'r2': r2_scores,
+        'y_pred': y_pred_mean,
         'dataset': dataset,
         'subject': subject_idx,
         'emg': emg_idx
@@ -262,50 +318,39 @@ def evaluate_optimization(dataset, subject_idx, emg_idx, model_type,
 def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200]):
     """
     Runs the fit evaluation for varying budget levels and plots the R2 curve.
-    
+
     Args:
         datasets: List of experiment tuples (dataset, subject, emg).
         device: 'cpu' or 'cuda'.
         budgets: List of integers representing the budgets to test.
     """
-    # List to collect all raw data points for the dataframe
     plot_data = []
 
     print(f"Starting Budget Sweep: {budgets}")
 
     for b in budgets:
         print(f"  > Running budget: {b}...")
-        
-        # We pass budget=b and n_reps via kwargs to main -> evaluate_fit
-        # n_reps=20 ensures we have enough data for a good Confidence Interval
+
         results_gp, results_pfn = main(
-            datasets, 
-            evaluation_type='fit', 
-            device=device, 
-            budget=b, 
+            datasets,
+            evaluation_type='fit',
+            device=device,
+            budget=b,
             n_reps=15
         )
 
-        # --- Process GP Results ---
-        for res in results_gp:
-            # res['r2'] is a list of scores (one per repetition)
-            for score in res['r2']:
-                plot_data.append({
-                    'Budget': b,
-                    'Model': 'GP',
-                    'R2': np.clip(score, 0.0, 1.0),                  
-                    'ID': f"{res['subject']}_{res['emg']}" 
-                })
+        def _collect(results_list, model_name):
+            for res in results_list:
+                for score in res['r2']:
+                    plot_data.append({
+                        'Budget': b,
+                        'Model': model_name,
+                        'R2': np.clip(score, 0.0, 1.0),
+                        'ID': f"{res['subject']}_{res['emg']}"
+                    })
 
-        # --- Process PFN Results ---
-        for res in results_pfn:
-            for score in res['r2']:
-                plot_data.append({
-                    'Budget': b,
-                    'Model': 'PFN',
-                    'R2':  np.clip(score, 0.0, 1.0),
-                    'ID': f"{res['subject']}_{res['emg']}"
-                })
+        _collect(results_gp, 'GP')
+        _collect(results_pfn, 'PFN')
 
     # --- Visualization ---
     df = pd.DataFrame(plot_data)
@@ -313,20 +358,18 @@ def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200]):
     fig = plt.figure(figsize=(10, 6))
 
     custom_palette = {
-    'GP': 'sandybrown',
-    'PFN': 'royalblue'
+        'GP': 'sandybrown',
+        'PFN': 'royalblue'
     }
-    
-    # lineplot automatically calculates the mean and the 95% CI (shaded area)
-    # when provided with multiple y-values for the same x.
+
     sns.lineplot(
-        data=df, 
-        x='Budget', 
-        y='R2', 
-        hue='Model', 
-        palette=custom_palette,  
-        marker='o', 
-        errorbar=('ci', 95), 
+        data=df,
+        x='Budget',
+        y='R2',
+        hue='Model',
+        palette=custom_palette,
+        marker='o',
+        errorbar=('ci', 95),
         err_kws={'alpha': 0.2},
         linewidth=2
     )
@@ -334,7 +377,7 @@ def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200]):
     plt.title("Model Fit Quality vs. Training Budget")
     plt.ylabel("R² Score (Test Set)")
     plt.xlabel("Budget (Number of Training Points)")
-    plt.ylim(0, 1.05) # Keep R2 within logical bounds
+    plt.ylim(0, 1.05)
     plt.grid(True, alpha=0.3)
     plt.legend(title='Model Type')
     output_dir = os.path.join('output', 'fitness')
@@ -347,7 +390,8 @@ def fit_budget(datasets, device='cpu', budgets=[10, 50, 100, 150, 200]):
     plt.show()
     print(f"Saved plot to {plot_path}")
 
-def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10, 50, 100, 150, 200]):
+def optimization_budget(datasets, regret_metric='abs', device='cpu',
+                        budgets=[10, 50, 100, 150, 200]):
     """
     Runs the optimization evaluation for varying budgets and plots the Regret.
 
@@ -359,7 +403,6 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
     """
     plot_data = []
 
-    # Label configuration based on metric
     if regret_metric == 'abs':
         y_label = "Final Simple Regret"
         title = "Optimization Performance: Final Regret vs Budget"
@@ -372,7 +415,6 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
     for b in budgets:
         print(f"  > Running budget: {b}...")
 
-        # Run experiments with sufficient repetitions for CI
         results_gp, results_pfn = main(
             datasets,
             evaluation_type='optimization',
@@ -381,32 +423,18 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
             n_reps=20
         )
 
-        # Helper to process results list
         def process_results(results_list, model_name):
             for res in results_list:
-                # 1. Determine Global Optimum for this specific dataset
                 optimal_val = res['y_test'].max()
-
-                # 2. Extract Values: Shape (n_reps, budget)
                 raw_values = np.array(res['values'])
-
-                # 3. Calculate 'Best So Far' for every step in every repetition
-                # Shape: (n_reps, budget)
                 best_so_far = np.maximum.accumulate(raw_values, axis=1)
-
-                # 4. Calculate Simple Regret Curve for every repetition
-                # Shape: (n_reps, budget)
                 simple_regret_curve = optimal_val - best_so_far
 
-                # 5. Calculate Metric per Repetition
                 if regret_metric == 'abs':
-                    # Take the LAST value (Final Simple Regret)
                     scores = simple_regret_curve[:, -1]
                 elif regret_metric == 'cum':
-                    # Mean simple regret: normalized by budget for fair comparison
                     scores = np.mean(simple_regret_curve, axis=1)
 
-                # 6. Append to plot data
                 for score in scores:
                     plot_data.append({
                         'Budget': b,
@@ -415,7 +443,6 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
                         'ID': f"{res['subject']}_{res['emg']}"
                     })
 
-        # Process both models
         process_results(results_gp, 'GP')
         process_results(results_pfn, 'PFN')
 
@@ -423,20 +450,20 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
     df = pd.DataFrame(plot_data)
 
     custom_palette = {
-    'GP': 'sandybrown',
-    'PFN': 'royalblue'
+        'GP': 'sandybrown',
+        'PFN': 'royalblue'
     }
 
     plt.figure(figsize=(10, 6))
-    
+
     sns.lineplot(
-        data=df, 
-        x='Budget', 
-        y='Regret', 
-        hue='Model', 
-        palette=custom_palette, 
-        marker='o', 
-        errorbar=('ci', 95), 
+        data=df,
+        x='Budget',
+        y='Regret',
+        hue='Model',
+        palette=custom_palette,
+        marker='o',
+        errorbar=('ci', 95),
         err_kws={'alpha': 0.2},
         linewidth=2
     )
@@ -461,15 +488,24 @@ def optimization_budget(datasets, regret_metric='abs', device='cpu', budgets=[10
 # ============================================
 
 def main(datasets, evaluation_type='fit', device='cpu', **kwargs):
-    
-    results = []
+    """
+    Run GP and PFN evaluations across all datasets.
 
+    Args:
+        datasets: list of (dataset_type, subject_idx, emg_idx) tuples
+        evaluation_type: 'fit' or 'optimization'
+        device: 'cpu' or 'cuda'
+        **kwargs: forwarded to evaluate_fit / evaluate_optimization
+                  (budget, n_reps, etc.)
+
+    Returns:
+        (results_gp, results_pfn) — both lists of result dicts.
+    """
     # --- Load PFN Weights --- #
-    model_path = './libs/PFNs4BO/pfns4bo/final_models/model_hebo_morebudget_9_unused_features_3.pt.gz'
-    with gzip.open(model_path, 'rb') as f:
-        # Load weights_only=False as discussed previously
+    pfn_weights_path = './libs/PFNs4BO/pfns4bo/final_models/model_hebo_morebudget_9_unused_features_3.pt.gz'
+    with gzip.open(pfn_weights_path, 'rb') as f:
         pfn_weights = torch.load(f, map_location=device, weights_only=False)
-    
+
     results_gp = []
     results_pfn = []
 
@@ -479,13 +515,17 @@ def main(datasets, evaluation_type='fit', device='cpu', **kwargs):
 
         if evaluation_type == 'fit':
 
-            res_gp = evaluate_fit(dataset_type, subject_idx, emg_idx, 'gp', device=device, **kwargs)
-            res_pfn = evaluate_fit(dataset_type, subject_idx, emg_idx, 'pfn', pfn_model_weights=pfn_weights, device=device, **kwargs)
+            res_gp = evaluate_fit(dataset_type, subject_idx, emg_idx, 'gp',
+                                  device=device, **kwargs)
+            res_pfn = evaluate_fit(dataset_type, subject_idx, emg_idx, 'pfn',
+                                   pfn_model_weights=pfn_weights, device=device, **kwargs)
 
         elif evaluation_type == 'optimization':
 
-            res_gp = evaluate_optimization(dataset_type, subject_idx, emg_idx, 'gp', device=device, **kwargs)
-            res_pfn = evaluate_optimization(dataset_type, subject_idx, emg_idx, 'pfn', pfn_model_weights=pfn_weights, device=device, **kwargs)
+            res_gp = evaluate_optimization(dataset_type, subject_idx, emg_idx, 'gp',
+                                           device=device, **kwargs)
+            res_pfn = evaluate_optimization(dataset_type, subject_idx, emg_idx, 'pfn',
+                                            pfn_model_weights=pfn_weights, device=device, **kwargs)
 
         results_gp.append(res_gp)
         results_pfn.append(res_pfn)
@@ -496,13 +536,13 @@ def main(datasets, evaluation_type='fit', device='cpu', **kwargs):
 if __name__ == '__main__':
 
     nhp_dataset = [
-    ('nhp', 0, 0), ('nhp', 0, 1),  ('nhp', 0, 2), ('nhp', 0, 3),  ('nhp', 0, 4),  ('nhp', 0, 5),  
+    ('nhp', 0, 0), ('nhp', 0, 1),  ('nhp', 0, 2), ('nhp', 0, 3),  ('nhp', 0, 4),  ('nhp', 0, 5),
     ('nhp',1, 0), ('nhp', 1, 1),  ('nhp', 1, 2), ('nhp', 1, 3),  ('nhp', 1, 4),  ('nhp', 1, 5),  ('nhp',1, 6),  ('nhp', 1, 7),
     ('nhp', 2, 0), ('nhp', 2, 1),  ('nhp', 2, 2), ('nhp', 2, 3),
     ('nhp', 3, 0), ('nhp', 3, 1),  ('nhp', 3, 2), ('nhp', 3, 3)
         ]
-    
-    rat_dataset = [ 
+
+    rat_dataset = [
     ('rat', 0, 0), ('rat', 0, 1), ('rat', 0, 2), ('rat', 0, 3), ('rat', 0, 4), ('rat', 0, 5),
     ('rat', 1, 0), ('rat', 1, 1), ('rat', 1, 2), ('rat', 1, 3), ('rat', 1, 4), ('rat', 1, 5), ('rat', 1, 6),
     ('rat', 2, 0), ('rat', 2, 1), ('rat', 2, 2), ('rat', 2, 3), ('rat', 2, 4), ('rat', 2, 5), ('rat', 2, 6), ('rat', 2, 7),
@@ -510,15 +550,19 @@ if __name__ == '__main__':
     ('rat', 4, 0), ('rat', 4, 1), ('rat', 4, 2), ('rat', 4, 3), ('rat', 4, 4),
     ('rat', 5, 0), ('rat', 5, 1), ('rat', 5, 2), ('rat', 5, 3), ('rat', 5, 4), ('rat', 5, 5), ('rat', 5, 6), ('rat', 5, 7)
         ]
-    
+
     # Uncomment this section and change field of dataset to test optimization
     #optimization_budget(rat_dataset, regret_metric='abs', budgets=[10, 30, 50, 64, 100])
-    #results_gp, results_pfn = main(nhp_dataset[0], 'optimization', device='cpu', budget=100)
-    #plot_runtime_trajectory(results_gp, results_pfn, save=False)
-    #[regret_curve(results_gp, results_pfn, idx) for idx in range(len(results_gp))]
+    results_gp, results_pfn = main(rat_dataset, 'optimization', device='cpu', budget=32)
+
+    results_dict = {'GP': results_gp, 'PFN': results_pfn}
+
+    r2_comparison(results_dict, mode='_opt', save=True)
+    #plot_runtime_trajectory(results_dict, save=False)
+    #regret_curve(results_dict)
 
     # Uncomment this section and change field of dataset to test fitness
-    #r2_comparison(results_gp, results_pfn, save=True)
+    #r2_comparison(results_dict, save=True)
     #fit_budget(rat_dataset, 'cpu')
 
     print(f'Runner will be implemented soon.')
