@@ -252,3 +252,353 @@ def regret_curve(results_dict, split_type='', save=False):
         print(f"Saved plot to {plot_path}")
 
     plt.close()
+
+
+def r2_by_subject(results_dict, split_type='', save=False):
+    """
+    Box plot of R² values grouped by subject index, one bar per model.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    data = []
+    for model_name, results_list in results_dict.items():
+        for res in results_list:
+            for score in res['r2']:
+                data.append({
+                    'Subject': f"S{res['subject']}",
+                    'R2': score,
+                    'Model': model_name
+                })
+
+    df = pd.DataFrame(data)
+    n_subjects = df['Subject'].nunique()
+    plt.figure(figsize=(max(6, 1.8 * n_subjects), 5))
+    sns.boxplot(data=df, x='Subject', y='R2', hue='Model', palette=PALETTE)
+    plt.ylim(0, 1)
+    plt.title("R² by Subject")
+    plt.xlabel("Subject")
+    plt.ylabel("R²")
+    plt.legend(title='Model')
+    plt.grid(True, alpha=0.3, axis='y')
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    output_dir = os.path.join('output', 'fitness', dataset)
+    os.makedirs(output_dir, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(output_dir, f'r2_by_subject{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def r2_by_emg(results_dict, split_type='', save=False):
+    """
+    Box plot of R² values grouped by EMG index, one bar per model.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    data = []
+    for model_name, results_list in results_dict.items():
+        for res in results_list:
+            for score in res['r2']:
+                data.append({
+                    'EMG': f"EMG {res['emg']}",
+                    'R2': score,
+                    'Model': model_name
+                })
+
+    df = pd.DataFrame(data)
+    n_emgs = df['EMG'].nunique()
+    plt.figure(figsize=(max(6, 1.8 * n_emgs), 5))
+    sns.boxplot(data=df, x='EMG', y='R2', hue='Model', palette=PALETTE)
+    plt.ylim(0, 1)
+    plt.title("R² by EMG Channel")
+    plt.xlabel("EMG")
+    plt.ylabel("R²")
+    plt.legend(title='Model')
+    plt.grid(True, alpha=0.3, axis='y')
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    output_dir = os.path.join('output', 'fitness', dataset)
+    os.makedirs(output_dir, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(output_dir, f'r2_by_emg{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def regret_by_subject(results_dict, split_type='', save=False):
+    """
+    Box plot of final simple regret grouped by subject index.
+
+    Final simple regret = optimal_value - best_observed_at_last_step.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+                      (optimization mode; each result must have 'values' and 'y_test')
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    data = []
+    for model_name, results_list in results_dict.items():
+        for res in results_list:
+            if 'values' not in res:
+                continue
+            optimal = float(res['y_test'].max())
+            raw_vals = np.array(res['values'])
+            best_so_far = np.maximum.accumulate(raw_vals, axis=1)
+            final_regrets = optimal - best_so_far[:, -1]
+            for regret in final_regrets:
+                data.append({
+                    'Subject': f"S{res['subject']}",
+                    'Regret': float(regret),
+                    'Model': model_name
+                })
+
+    if not data:
+        return
+
+    df = pd.DataFrame(data)
+    n_subjects = df['Subject'].nunique()
+    plt.figure(figsize=(max(6, 1.8 * n_subjects), 5))
+    sns.boxplot(data=df, x='Subject', y='Regret', hue='Model', palette=PALETTE)
+    plt.title("Final Simple Regret by Subject")
+    plt.xlabel("Subject")
+    plt.ylabel("Final Simple Regret")
+    plt.legend(title='Model')
+    plt.grid(True, alpha=0.3, axis='y')
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    output_dir = os.path.join('output', 'optimization')
+    os.makedirs(output_dir, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(output_dir, f'regret_by_subject{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def regret_by_emg(results_dict, split_type='', save=False):
+    """
+    Box plot of final simple regret grouped by EMG index.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+                      (optimization mode; each result must have 'values' and 'y_test')
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    data = []
+    for model_name, results_list in results_dict.items():
+        for res in results_list:
+            if 'values' not in res:
+                continue
+            optimal = float(res['y_test'].max())
+            raw_vals = np.array(res['values'])
+            best_so_far = np.maximum.accumulate(raw_vals, axis=1)
+            final_regrets = optimal - best_so_far[:, -1]
+            for regret in final_regrets:
+                data.append({
+                    'EMG': f"EMG {res['emg']}",
+                    'Regret': float(regret),
+                    'Model': model_name
+                })
+
+    if not data:
+        return
+
+    df = pd.DataFrame(data)
+    n_emgs = df['EMG'].nunique()
+    plt.figure(figsize=(max(6, 1.8 * n_emgs), 5))
+    sns.boxplot(data=df, x='EMG', y='Regret', hue='Model', palette=PALETTE)
+    plt.title("Final Simple Regret by EMG Channel")
+    plt.xlabel("EMG")
+    plt.ylabel("Final Simple Regret")
+    plt.legend(title='Model')
+    plt.grid(True, alpha=0.3, axis='y')
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    output_dir = os.path.join('output', 'optimization')
+    os.makedirs(output_dir, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(output_dir, f'regret_by_emg{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def budget_sweep_plot(df, eval_type, dataset='', split_type='', save=False):
+    """
+    Line plot of R² (eval_type='fit') or Regret (eval_type='optimization')
+    vs Budget, with both GP and TabPFN shown with 95% CI bands.
+
+    Args:
+        df: DataFrame with columns Budget, Model, R2 or Regret, ID
+        eval_type: 'fit' (uses R2 column) or 'optimization' (uses Regret column)
+        dataset: dataset name used for output path and title
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+    """
+    y_col = 'R2' if eval_type == 'fit' else 'Regret'
+    y_label = 'R² Score (Test Set)' if eval_type == 'fit' else 'Final Simple Regret'
+    title = f'Fit Quality vs. Training Budget ({dataset})' if eval_type == 'fit' \
+        else f'Optimization: Final Regret vs Budget ({dataset})'
+
+    models_in_df = df['Model'].unique().tolist()
+    palette = {m: PALETTE.get(m, 'gray') for m in models_in_df}
+
+    plt.figure(figsize=(10, 6))
+    sns.lineplot(
+        data=df,
+        x='Budget',
+        y=y_col,
+        hue='Model',
+        palette=palette,
+        marker='o',
+        errorbar=('ci', 95),
+        err_kws={'alpha': 0.2},
+        linewidth=2
+    )
+    plt.title(title)
+    plt.ylabel(y_label)
+    plt.xlabel('Budget (Number of Training Points)' if eval_type == 'fit'
+               else 'Budget (Number of Queries)')
+    if eval_type == 'fit':
+        plt.ylim(0, 1.05)
+    plt.grid(True, alpha=0.3)
+    plt.legend(title='Model')
+
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    if eval_type == 'fit':
+        output_dir = os.path.join('output', 'fitness', dataset)
+        os.makedirs(output_dir, exist_ok=True)
+        plot_path = os.path.join(output_dir, f'budget_sweep_fit{suffix}.svg')
+    else:
+        output_dir = os.path.join('output', 'optimization')
+        os.makedirs(output_dir, exist_ok=True)
+        plot_path = os.path.join(output_dir, f'budget_sweep_optimization{suffix}.svg')
+
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def regret_with_timing(results_dict, split_type='', save=False):
+    """
+    2-row figure: top = regret curves (95% CI bands), bottom = per-step inference time.
+    One column per experiment (subject/EMG pair).
+
+    Replaces separate regret_curve + plot_runtime_trajectory calls when both
+    metrics are needed on one figure.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+                      (optimization mode; each result must have 'values', 'y_test', 'times')
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    first_results = next(iter(results_dict.values()))
+    n_experiments = len(first_results)
+
+    def get_regret_stats(values_list, optimal_val):
+        raw_vals = np.array(values_list)
+        best_so_far = np.maximum.accumulate(raw_vals, axis=1)
+        regret_all = optimal_val - best_so_far
+        mean_regret = np.mean(regret_all, axis=0)
+        se_regret = np.std(regret_all, axis=0) / np.sqrt(raw_vals.shape[0])
+        return mean_regret, se_regret
+
+    fig, axes = plt.subplots(2, n_experiments,
+                             figsize=(4 * n_experiments, 8),
+                             squeeze=False)
+
+    for idx in range(n_experiments):
+        ax_reg = axes[0, idx]
+        ax_time = axes[1, idx]
+
+        ref_res = first_results[idx]
+        optimal_val = ref_res['y_test'].max()
+
+        for model_name, results_list in results_dict.items():
+            res = results_list[idx]
+            color = PALETTE.get(model_name, 'gray')
+
+            # --- regret row ---
+            if 'values' in res:
+                mean_reg, se_reg = get_regret_stats(res['values'], optimal_val)
+                x_axis = range(len(mean_reg))
+                ax_reg.plot(x_axis, mean_reg, color=color, label=model_name, linewidth=2)
+                ax_reg.fill_between(x_axis,
+                                    mean_reg - 1.96 * se_reg,
+                                    mean_reg + 1.96 * se_reg,
+                                    color=color, alpha=0.2)
+
+            # --- timing row ---
+            times = res['times']
+            if np.ndim(times) == 0:
+                # scalar — skip per-step timing
+                ax_time.axhline(float(times), color=color, linewidth=2,
+                                label=model_name, linestyle='--')
+            else:
+                times_arr = np.array(times)
+                ax_time.plot(times_arr, color=color, linewidth=2, label=model_name)
+
+        ax_reg.set_title(f"S{ref_res['subject']} EMG {ref_res['emg']}", fontsize=9)
+        ax_reg.set_xlabel('Iteration')
+        ax_reg.grid(True, alpha=0.3)
+        ax_reg.set_ylim(bottom=0)
+
+        ax_time.set_xlabel('Iteration')
+        ax_time.set_ylabel('Time (s)')
+        ax_time.grid(True, alpha=0.3)
+
+    axes[0, 0].set_ylabel('Simple Regret')
+    axes[1, 0].set_ylabel('Inference Time (s)')
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper right', fontsize=9)
+
+    dataset = first_results[0].get('dataset', '')
+    fig.suptitle(f'Regret & Inference Time | {dataset}', fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    output_dir = os.path.join('output', 'optimization')
+    os.makedirs(output_dir, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(output_dir, f'regret_timing{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()

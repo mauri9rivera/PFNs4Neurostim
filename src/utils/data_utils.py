@@ -281,9 +281,32 @@ def load_data(dataset_type, m_i):
 #      Held-Out / Train Subject Splits
 # ============================================
 
-HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [0]}
-TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [1, 2, 3]}
+HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [1]}
+TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 2, 3]}
 ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 2, 3]}
+
+
+def generate_experiment_tag(dataset_type, split_type, epochs, lr, n_augmentations,
+                             held_out_subj_idx=None, held_out_emg_idx=None):
+    """
+    Build a deterministic, human-readable tag encoding all training hyper-params.
+
+    Tag format:
+        {dataset}_{split}[_subj{N}][_emg{N}]_ep{E}_lr{LR}_aug{A}
+
+    Examples:
+        nhp_inter_subject_ep20_lr1.00e-06_aug25
+        rat_intra_emg_emg3_ep20_lr1.00e-06_aug25
+        nhp_inter_subject_subj0_ep30_lr1.00e-05_aug50
+    """
+    lr_str = f"{lr:.2e}"
+    parts = [dataset_type, split_type]
+    if held_out_subj_idx is not None:
+        parts.append(f'subj{held_out_subj_idx}')
+    if held_out_emg_idx is not None:
+        parts.append(f'emg{held_out_emg_idx}')
+    parts += [f'ep{epochs}', f'lr{lr_str}', f'aug{n_augmentations}']
+    return '_'.join(parts)
 
 
 # ============================================

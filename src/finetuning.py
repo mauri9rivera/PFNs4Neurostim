@@ -35,10 +35,16 @@ from pathlib import Path
 from models.gaussians import ExactGP
 from utils.data_utils import (
     build_finetuning_dataset, load_data, preprocess_neural_data,
-    HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS
+    HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS,
+    generate_experiment_tag, save_results,
 )
 from utils.gpbo_utils import expected_improvement
-from utils.visualization import show_emg_map, r2_comparison, regret_curve, plot_runtime_trajectory
+from utils.visualization import (
+    show_emg_map, r2_comparison, regret_curve, plot_runtime_trajectory,
+    r2_by_subject, r2_by_emg,
+    regret_by_subject, regret_by_emg,
+    budget_sweep_plot, regret_with_timing,
+)
 import random
 
 
@@ -578,53 +584,35 @@ def finetuned_fit_budget(dataset_type, model, device='cpu',
             for emg_idx in emg_range:
                 if emg_idx >= n_emgs:
                     continue
-                res = finetuned_fit(
+                res_ft = finetuned_fit(
                     dataset_type, subj_idx, emg_idx,
                     model,
                     device=device,
                     budget=b,
                     n_reps=15
                 )
-
-                for score in res['r2']:
+                for score in res_ft['r2']:
                     plot_data.append({
                         'Budget': b,
-                        'Model': 'Finetuned TabPFN',
+                        'Model': 'TabPFN',
                         'R2': np.clip(score, 0.0, 1.0),
-                        'ID': f"{res['subject']}_{res['emg']}"
+                        'ID': f"{res_ft['subject']}_{res_ft['emg']}"
                     })
 
-    # --- Visualization ---
+                res_gp = gp_baseline(dataset_type, subj_idx, emg_idx, mode='fit',
+                                     device=device, budget=b, n_reps=15)
+                for score in res_gp['r2']:
+                    plot_data.append({
+                        'Budget': b,
+                        'Model': 'GP',
+                        'R2': np.clip(score, 0.0, 1.0),
+                        'ID': f"{res_gp['subject']}_{res_gp['emg']}"
+                    })
+
     df = pd.DataFrame(plot_data)
-
-    plt.figure(figsize=(10, 6))
-
-    sns.lineplot(
-        data=df,
-        x='Budget',
-        y='R2',
-        hue='Model',
-        palette={'Finetuned TabPFN': 'seagreen'},
-        marker='o',
-        errorbar=('ci', 95),
-        err_kws={'alpha': 0.2},
-        linewidth=2
-    )
-
-    plt.title("Finetuned TabPFN Fit Quality vs. Training Budget")
-    plt.ylabel("R² Score (Test Set)")
-    plt.xlabel("Budget (Number of Training Points)")
-    plt.ylim(0, 1.05)
-    plt.grid(True, alpha=0.3)
-    plt.legend(title='Model Type')
-
-    output_dir = os.path.join('output', 'fitness')
-    os.makedirs(output_dir, exist_ok=True)
-    suffix = f'_{dataset_type}_{split_type}' if split_type else f'_{dataset_type}'
-    plot_path = os.path.join(output_dir, f'finetuned_fit_budget{suffix}.svg')
-    plt.savefig(plot_path, format="svg")
-
-    print(f"Saved plot to {plot_path}")
+    if visualize:
+        budget_sweep_plot(df, eval_type='fit', dataset=dataset_type,
+                          split_type=split_type, save=True)
 
     return df
 
@@ -651,13 +639,6 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
         test_subjects = HELD_OUT_SUBJECTS[dataset_type]
     plot_data = []
 
-    if regret_metric == 'abs':
-        y_label = "Final Simple Regret"
-        title = "Finetuned TabPFN Optimization: Final Regret vs Budget"
-    else:
-        y_label = "Mean Simple Regret"
-        title = "Finetuned TabPFN Optimization: Mean Regret vs Budget"
-
     print(f"Starting Finetuned TabPFN Optimization Sweep ({regret_metric}): {budgets}")
 
     for b in budgets:
@@ -671,62 +652,48 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
             for emg_idx in emg_range:
                 if emg_idx >= n_emgs:
                     continue
-                res = finetuned_optimization(
+
+                res_ft = finetuned_optimization(
                     dataset_type, subj_idx, emg_idx,
                     model,
                     device=device,
                     budget=b,
                     n_reps=20
                 )
-
-                optimal_val = res['y_test'].max()
-                raw_values = np.array(res['values'])
-                best_so_far = np.maximum.accumulate(raw_values, axis=1)
-                simple_regret_curve = optimal_val - best_so_far
-
-                if regret_metric == 'abs':
-                    scores = simple_regret_curve[:, -1]
-                else:
-                    scores = np.mean(simple_regret_curve, axis=1)
-
-                for score in scores:
+                optimal_ft = res_ft['y_test'].max()
+                raw_ft = np.array(res_ft['values'])
+                best_ft = np.maximum.accumulate(raw_ft, axis=1)
+                regret_ft = optimal_ft - best_ft
+                scores_ft = regret_ft[:, -1] if regret_metric == 'abs' \
+                    else np.mean(regret_ft, axis=1)
+                for score in scores_ft:
                     plot_data.append({
                         'Budget': b,
-                        'Model': 'Finetuned TabPFN',
+                        'Model': 'TabPFN',
                         'Regret': score,
-                        'ID': f"{res['subject']}_{res['emg']}"
+                        'ID': f"{res_ft['subject']}_{res_ft['emg']}"
                     })
 
-    # --- Visualization ---
+                res_gp = gp_baseline(dataset_type, subj_idx, emg_idx,
+                                     mode='optimization',
+                                     device=device, budget=b, n_reps=20)
+                optimal_gp = res_gp['y_test'].max()
+                raw_gp = np.array(res_gp['values'])
+                best_gp = np.maximum.accumulate(raw_gp, axis=1)
+                regret_gp = optimal_gp - best_gp
+                scores_gp = regret_gp[:, -1] if regret_metric == 'abs' \
+                    else np.mean(regret_gp, axis=1)
+                for score in scores_gp:
+                    plot_data.append({
+                        'Budget': b,
+                        'Model': 'GP',
+                        'Regret': score,
+                        'ID': f"{res_gp['subject']}_{res_gp['emg']}"
+                    })
+
     df = pd.DataFrame(plot_data)
-
-    plt.figure(figsize=(10, 6))
-
-    sns.lineplot(
-        data=df,
-        x='Budget',
-        y='Regret',
-        hue='Model',
-        palette={'Finetuned TabPFN': 'seagreen'},
-        marker='o',
-        errorbar=('ci', 95),
-        err_kws={'alpha': 0.2},
-        linewidth=2
-    )
-
-    plt.title(title)
-    plt.ylabel(y_label)
-    plt.xlabel("Budget (Number of Queries)")
-    plt.grid(True, alpha=0.3)
-    plt.legend(title='Model Type')
-
-    output_dir = os.path.join('output', 'optimization')
-    os.makedirs(output_dir, exist_ok=True)
-    suffix = f'_{dataset_type}_{split_type}' if split_type else f'_{dataset_type}'
-    plot_path = os.path.join(output_dir, f'finetuned_optimization_budget{suffix}.svg')
-    plt.savefig(plot_path, format="svg")
-
-    print(f"Saved plot to {plot_path}")
+    budget_sweep_plot(df, eval_type='optimization', dataset=dataset_type,
+                      split_type=split_type, save=True)
 
     return df
 
@@ -749,7 +716,9 @@ def run_experiment(
     lr=1e-6,
     n_augmentations=25,
     held_out_emg_idx=None,
+    held_out_subj_idx=None,
     budgets=None,
+    save=False,
 ):
     """
     Unified entry point for transfer learning evaluation.
@@ -770,8 +739,12 @@ def run_experiment(
         n_augmentations: augmentations per subject-EMG pair
         held_out_emg_idx: required when split_type='intra_emg'; the EMG index
             held out from training and used as the test set.
+        held_out_subj_idx: optional int. When set, overrides the default subject
+            split: trains on all subjects except this one and tests on it alone.
+            Works for both split_type values.
         budgets: list of budgets for 'fit_budget' / 'optimization_budget' modes.
             Defaults to [10, 50, 100, 150, 200].
+        save: if True, persist results to output/results/ (pkl + CSV summary).
 
     Returns:
         dict keyed by mode name, each value being the result of that mode
@@ -791,19 +764,41 @@ def run_experiment(
 
     # --- Resolve train / test sets ---
     if split_type == 'inter_subject':
-        train_subject_indices = TRAIN_SUBJECTS[dataset_type]
-        test_subjects = HELD_OUT_SUBJECTS[dataset_type]
-        test_emg_indices = None          # all EMGs per subject
+        if held_out_subj_idx is not None:
+            train_subject_indices = [s for s in ALL_SUBJECTS[dataset_type] if s != held_out_subj_idx]
+            test_subjects = [held_out_subj_idx]
+        else:
+            train_subject_indices = TRAIN_SUBJECTS[dataset_type]
+            test_subjects = HELD_OUT_SUBJECTS[dataset_type]
+        test_emg_indices = None
         ft_held_out_emg = None
     elif split_type == 'intra_emg':
         if held_out_emg_idx is None:
             raise ValueError("held_out_emg_idx must be set when split_type='intra_emg'")
-        train_subject_indices = ALL_SUBJECTS[dataset_type]
-        test_subjects = ALL_SUBJECTS[dataset_type]
+        if held_out_subj_idx is not None:
+            train_subject_indices = [s for s in ALL_SUBJECTS[dataset_type] if s != held_out_subj_idx]
+            test_subjects = [held_out_subj_idx]
+        else:
+            train_subject_indices = ALL_SUBJECTS[dataset_type]
+            test_subjects = ALL_SUBJECTS[dataset_type]
         test_emg_indices = [held_out_emg_idx]
         ft_held_out_emg = held_out_emg_idx
     else:
         raise ValueError(f"Unknown split_type={split_type!r}. Use 'inter_subject' or 'intra_emg'.")
+
+    # --- Build experiment tag for unique filenames ---
+    tag_parts = [split_type]
+    if held_out_subj_idx is not None:
+        tag_parts.append(f'subj{held_out_subj_idx}')
+    if held_out_emg_idx is not None:
+        tag_parts.append(f'emg{held_out_emg_idx}')
+    exp_tag = '_'.join(tag_parts)
+
+    _save_tag = generate_experiment_tag(
+        dataset_type, split_type, epochs, lr, n_augmentations,
+        held_out_subj_idx=held_out_subj_idx,
+        held_out_emg_idx=held_out_emg_idx,
+    )
 
     # --- Fine-tune on the correct split (once, shared across all modes) ---
     print("=" * 60)
@@ -825,6 +820,7 @@ def run_experiment(
         n_estimators_finetune=8,
         n_estimators_validation=8,
         n_estimators_final_inference=8,
+        #TODO: try eval_metric='r2' or 'rmse'
     )
     print(f"Fine-tuning (epochs={epochs}, lr={lr}) ...")
     ft_model_raw.fit(X_ft, y_ft)
@@ -861,16 +857,21 @@ def run_experiment(
                 print(f"    TabPFN R2={np.mean(res_ft['r2']):.3f}  |  GP R2={np.mean(res_gp['r2']):.3f}")
 
             results_dict = {'GP': results_gp, 'TabPFN': results_ft}
-            tag = f'_{split_type}_finetuned_vs_gp'
+            tag = f'_{exp_tag}_finetuned_vs_gp'
             r2_comparison(results_dict, mode=tag, save=True)
+            r2_by_subject(results_dict, split_type=exp_tag, save=True)
+            r2_by_emg(results_dict, split_type=exp_tag, save=True)
             n_maps = min(6, len(experiments))
             for idx in random.sample(range(len(experiments)), n_maps):
-                show_emg_map(results_ft, idx, 'TabPFN', mode=f'_{split_type}_finetuned', save=True)
-                show_emg_map(results_gp, idx, 'GP', mode=f'_{split_type}_baseline', save=True)
+                show_emg_map(results_ft, idx, 'TabPFN', mode=f'_{exp_tag}_finetuned', save=True)
+                show_emg_map(results_gp, idx, 'GP', mode=f'_{exp_tag}_baseline', save=True)
 
             all_r2 = [np.mean(r['r2']) for r in results_ft]
             print(f"\nDone. {len(results_ft)} experiments.")
             print(f"Finetuned TabPFN mean R²: {np.mean(all_r2):.3f} ± {np.std(all_r2):.3f}")
+
+            if save:
+                save_results(results_dict, 'fit', tag=_save_tag)
             all_results['fit'] = results_dict
 
         elif m == 'optimization':
@@ -886,14 +887,20 @@ def run_experiment(
                 print(f"    TabPFN R2={np.mean(res_ft['r2']):.3f}  |  GP R2={np.mean(res_gp['r2']):.3f}")
 
             results_dict = {'GP': results_gp, 'TabPFN': results_ft}
-            tag = f'_{split_type}_opt_finetuned_vs_gp'
+            tag = f'_{exp_tag}_opt_finetuned_vs_gp'
             r2_comparison(results_dict, mode=tag, save=True)
-            plot_runtime_trajectory(results_dict, split_type=split_type, save=True)
-            regret_curve(results_dict, split_type=split_type, save=True)
+            regret_curve(results_dict, split_type=exp_tag, save=True)
+            plot_runtime_trajectory(results_dict, split_type=exp_tag, save=True)
+            regret_with_timing(results_dict, split_type=exp_tag, save=True)
+            regret_by_subject(results_dict, split_type=exp_tag, save=True)
+            regret_by_emg(results_dict, split_type=exp_tag, save=True)
 
             all_r2 = [np.mean(r['r2']) for r in results_ft]
             print(f"\nDone. {len(results_ft)} experiments.")
             print(f"Finetuned TabPFN mean R²: {np.mean(all_r2):.3f} ± {np.std(all_r2):.3f}")
+
+            if save:
+                save_results(results_dict, 'optimization', tag=_save_tag)
             all_results['optimization'] = results_dict
 
         elif m == 'fit_budget':
@@ -903,8 +910,13 @@ def run_experiment(
                 budgets=budgets,
                 test_subjects=test_subjects,
                 test_emg_indices=test_emg_indices,
-                split_type=split_type,
+                split_type=exp_tag,
             )
+            if save:
+                os.makedirs('./output/results', exist_ok=True)
+                pkl_path = f'./output/results/{_save_tag}_fit_budget.pkl'
+                df.to_pickle(pkl_path)
+                print(f"Saved budget DataFrame -> {pkl_path}")
             all_results['fit_budget'] = df
 
         elif m == 'optimization_budget':
@@ -914,8 +926,13 @@ def run_experiment(
                 budgets=budgets,
                 test_subjects=test_subjects,
                 test_emg_indices=test_emg_indices,
-                split_type=split_type,
+                split_type=exp_tag,
             )
+            if save:
+                os.makedirs('./output/results', exist_ok=True)
+                pkl_path = f'./output/results/{_save_tag}_optimization_budget.pkl'
+                df.to_pickle(pkl_path)
+                print(f"Saved budget DataFrame -> {pkl_path}")
             all_results['optimization_budget'] = df
 
     return all_results
@@ -938,9 +955,11 @@ def run_finetuning():
                              '  inter_subject — train on TRAIN_SUBJECTS, test on HELD_OUT_SUBJECTS\n'
                              '  intra_emg     — train on ALL_SUBJECTS excl. held_out_emg, test on that EMG\n'
                              '(default: inter_subject)')
-    parser.add_argument('--mode', type=str, default='fit',
-                        choices=['fit', 'optimization', 'fit_budget', 'optimization_budget'],
-                        help='Evaluation mode (default: fit)')
+    parser.add_argument('--mode', type=lambda s: s.split(','), default=['fit'],
+                        metavar='MODE[,MODE,...]',
+                        help='Comma-separated evaluation modes. Valid values: '
+                             'fit, optimization, fit_budget, optimization_budget. '
+                             '(default: fit, example: --mode fit,optimization)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device for training: cpu or cuda (default: cuda)')
     parser.add_argument('--epochs', type=int, default=20,
@@ -955,10 +974,20 @@ def run_finetuning():
                         help='Repetitions per experiment (default: 30)')
     parser.add_argument('--held_out_emg', type=int, default=None,
                         help='EMG index to hold out; required when --split intra_emg')
+    parser.add_argument('--held_out_subj', type=int, default=None,
+                        help='Subject index to hold out as the sole test subject; '
+                             'overrides the default HELD_OUT_SUBJECTS split when set')
     parser.add_argument('--budgets', type=int, nargs='+', default=[10, 50, 100, 150, 200],
                         help='Budget sweep values for *_budget modes (default: 10 50 100 150 200)')
+    parser.add_argument('--save', action='store_true', default=False,
+                        help='Persist results to output/results/ (pkl + CSV summary)')
 
     args = parser.parse_args()
+
+    invalid = set(args.mode) - _VALID_MODES
+    if invalid:
+        parser.error(f"Invalid mode(s): {', '.join(sorted(invalid))}. "
+                     f"Valid: {', '.join(sorted(_VALID_MODES))}")
 
     run_experiment(
         dataset_type=args.dataset,
@@ -971,7 +1000,9 @@ def run_finetuning():
         lr=args.lr,
         n_augmentations=args.n_augmentations,
         held_out_emg_idx=args.held_out_emg,
+        held_out_subj_idx=args.held_out_subj,
         budgets=args.budgets,
+        save=args.save,
     )
 
 
@@ -982,8 +1013,10 @@ if __name__ == '__main__':
     MODE        = 'fit'             # 'fit', 'optimization', 'fit_budget', 'optimization_budget'
     DEVICE      = 'cuda'
     BUDGET      = 100
-    HELD_OUT_EMG = None             # set to int (e.g. 3) when SPLIT='intra_emg'
-    BUDGETS     = [10, 50, 100, 150, 200]  # for budget sweep modes
+    HELD_OUT_EMG  = None            # set to int (e.g. 3) when SPLIT='intra_emg'
+    HELD_OUT_SUBJ = None            # set to int to override default subject split
+    BUDGETS       = [10, 50, 100, 150, 200]  # for budget sweep modes
+    SAVE          = True            # persist results to output/results/
 
     run_experiment(
         dataset_type=DATASET,
@@ -992,6 +1025,8 @@ if __name__ == '__main__':
         device=DEVICE,
         budget=BUDGET,
         held_out_emg_idx=HELD_OUT_EMG,
+        held_out_subj_idx=HELD_OUT_SUBJ,
         budgets=BUDGETS,
+        save=SAVE,
     )
 
