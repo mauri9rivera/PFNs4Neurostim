@@ -3,6 +3,7 @@ import scipy.io
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import pickle
 import os
+import json
 from datetime import datetime
 import csv
 
@@ -309,6 +310,24 @@ def generate_experiment_tag(dataset_type, split_type, epochs, lr, n_augmentation
     return '_'.join(parts)
 
 
+def create_run_dir(exp_tag: str, base_dir='./output/runs') -> str:
+    """Create output/runs/{exp_tag}_{timestamp}/ and return its path."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = os.path.join(base_dir, f'{exp_tag}_{timestamp}')
+    for sub in ('fitness', 'optimization', 'results'):
+        os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
+    return run_dir
+
+
+def write_run_config(run_dir: str, config: dict) -> str:
+    """Serialize config dict to {run_dir}/config.json. Returns the file path."""
+    path = os.path.join(run_dir, 'config.json')
+    with open(path, 'w') as f:
+        json.dump(config, f, indent=2, default=str)
+    print(f"Saved config  -> {path}")
+    return path
+
+
 # ============================================
 #      Data Augmentation for Fine-Tuning
 # ============================================
@@ -351,9 +370,94 @@ def augment_maps(subject_data, emg_idx, n_augmentations=25, seed=42):
     return augmented_pairs
 
 
+def plot_augmented_maps(subject_data, emg_idx, dataset_type, subj_idx,
+                        n_show=6, n_augmentations=25, seed=42):
+    """
+    Visualize the original EMG map alongside augmented versions (debug only).
+
+    Inverse-transforms augmented y values back to the original response scale
+    so all maps share the same colorbar for direct comparison.
+
+    Args:
+        subject_data: dict returned by load_data
+        emg_idx: int, which EMG channel to visualize
+        dataset_type: str, e.g. 'nhp' or 'rat' (used in title only)
+        subj_idx: int, subject index (used in title only)
+        n_show: number of augmented maps to display (default 6)
+        n_augmentations: total augmentations to generate before selecting n_show
+        seed: random seed passed to augment_maps
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import math
+
+    mean_map = subject_data['sorted_respMean'][:, emg_idx]  # (nChan,)
+    nChan = len(mean_map)
+    if nChan == 96:
+        grid_shape = (8, 12)
+    elif nChan == 32:
+        grid_shape = (4, 8)
+    else:
+        grid_shape = (1, nChan)
+
+    # Generate augmented pairs and inverse-transform y back to response scale
+    scaler_y = StandardScaler()
+    scaler_y.fit(mean_map.reshape(-1, 1))
+
+    pairs = augment_maps(subject_data, emg_idx,
+                         n_augmentations=n_augmentations, seed=seed)
+    n_show = min(n_show, len(pairs))
+    aug_maps = [
+        scaler_y.inverse_transform(y.reshape(-1, 1)).ravel()
+        for _, y in pairs[:n_show]
+    ]
+
+    # Shared color scale across original + all augmented maps
+    all_vals = np.concatenate([mean_map] + aug_maps)
+    vmin, vmax = all_vals.min(), all_vals.max()
+    heatmap_kw = dict(cmap='viridis', vmin=vmin, vmax=vmax,
+                      cbar=False, xticklabels=False, yticklabels=False)
+
+    n_total = 1 + n_show
+    n_cols = min(4, n_total)
+    n_rows = math.ceil(n_total / n_cols)
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(3.5 * n_cols, 3.5 * n_rows),
+                             squeeze=False)
+    axes_flat = axes.flatten()
+
+    # Original map
+    sns.heatmap(mean_map.reshape(grid_shape), ax=axes_flat[0], **heatmap_kw)
+    axes_flat[0].set_title(f'Original\n{dataset_type} S{subj_idx} EMG{emg_idx}',
+                           fontsize=9)
+
+    # Augmented maps
+    for i, y_map in enumerate(aug_maps):
+        sns.heatmap(y_map.reshape(grid_shape), ax=axes_flat[i + 1], **heatmap_kw)
+        axes_flat[i + 1].set_title(f'Aug {i + 1}\n{dataset_type} S{subj_idx} EMG{emg_idx}',
+                                   fontsize=9)
+
+    # Hide unused axes
+    for j in range(n_total, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    # Shared colorbar on the right
+    fig.subplots_adjust(right=0.88)
+    cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.7])
+    sm = plt.cm.ScalarMappable(cmap='viridis',
+                               norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    fig.colorbar(sm, cax=cbar_ax)
+
+    fig.suptitle(f'Data Augmentation | {dataset_type} Subject {subj_idx} EMG {emg_idx}',
+                 fontsize=11)
+    fig.tight_layout(rect=[0, 0, 0.89, 0.95])
+    plt.show()
+
+
 def build_finetuning_dataset(dataset_type, subject_indices=None,
                               held_out_emg_idx=None,
-                              n_augmentations=25, seed=42):
+                              n_augmentations=10, seed=42):
     """
     Build a large (X_all, y_all) dataset for fine-tuning TabPFN by augmenting
     training subjects across all EMG channels.
@@ -409,7 +513,6 @@ def preprocess_neural_data(subject_data, emg_idx=0, normalization='pfn'):
 
     if normalization == 'pfn':
     
-
         scaler_x = MinMaxScaler()
         X_train = scaler_x.fit_transform(coords)
         
@@ -527,3 +630,14 @@ def load_results(pickle_path):
     """
     with open(pickle_path, 'rb') as f:
         return pickle.load(f)
+
+
+if __name__ == '__main__':
+    DATASET  = 'nhp'
+    SUBJ_IDX = 1
+    EMG_IDX  = 4
+    N_SHOW   = 12
+
+    data = load_data(DATASET, SUBJ_IDX)
+    plot_augmented_maps(data, EMG_IDX, DATASET, SUBJ_IDX, n_show=N_SHOW)
+

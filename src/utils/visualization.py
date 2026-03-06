@@ -39,7 +39,7 @@ def _normalize_results_dict(first_arg, second_arg=None):
     return results
 
 
-def r2_comparison(results_dict_or_gp, pfn_results=None, mode='', save=False):
+def r2_comparison(results_dict_or_gp, pfn_results=None, mode='', save=False, output_dir=None):
 
     results_dict = _normalize_results_dict(results_dict_or_gp, pfn_results)
 
@@ -68,9 +68,10 @@ def r2_comparison(results_dict_or_gp, pfn_results=None, mode='', save=False):
 
     # Determine dataset from first available result
     first_results = next(iter(results_dict.values()))
-    output_dir = os.path.join('output', 'fitness', f'{first_results[0]["dataset"]}')
-    os.makedirs(output_dir, exist_ok=True)
-    plot_path = os.path.join(output_dir, f'r2_comparison{mode}.svg')
+    base = os.path.join(output_dir, 'fitness') if output_dir else \
+           os.path.join('output', 'fitness', first_results[0]['dataset'])
+    os.makedirs(base, exist_ok=True)
+    plot_path = os.path.join(base, f'r2_comparison{mode}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
@@ -78,7 +79,7 @@ def r2_comparison(results_dict_or_gp, pfn_results=None, mode='', save=False):
     plt.close()
 
 
-def plot_runtime_trajectory(results_dict_or_gp, pfn_results=None, split_type='', save=False):
+def plot_runtime_trajectory(results_dict_or_gp, pfn_results=None, split_type='', save=False, output_dir=None):
     """
     Plots the inference time at each BO step for all models.
     """
@@ -107,9 +108,10 @@ def plot_runtime_trajectory(results_dict_or_gp, pfn_results=None, split_type='',
     first_results = next(iter(results_dict.values()))
     dataset = first_results[0].get('dataset', '')
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    output_dir = os.path.join('output', 'optimization')
-    os.makedirs(output_dir, exist_ok=True)
-    plot_path = os.path.join(output_dir, f'runtime_trajectory{suffix}.svg')
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
+    plot_path = os.path.join(base, f'runtime_trajectory{suffix}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
@@ -117,7 +119,7 @@ def plot_runtime_trajectory(results_dict_or_gp, pfn_results=None, split_type='',
     plt.close()
 
 
-def show_emg_map(results, idx, model_type, mode='', save=False):
+def show_emg_map(results, idx, model_type, mode='', save=False, output_dir=None):
     res = results[idx]
 
     y_true = res['y_test']
@@ -158,9 +160,10 @@ def show_emg_map(results, idx, model_type, mode='', save=False):
     ax[1].set_title(f"Prediction | R2:{r2_score:.2f}")
     ax[1].plot(max_idx_pred[1] + 0.5, max_idx_pred[0] + 0.5, 'ro', markersize=8)
 
-    output_dir = os.path.join('output', 'fitness', f'{dataset}')
-    os.makedirs(output_dir, exist_ok=True)
-    plot_path = os.path.join(output_dir, f'emg_map_{dataset}_s{subject}_emg{emg}_{model_type}{mode}.svg')
+    base = os.path.join(output_dir, 'fitness') if output_dir else \
+           os.path.join('output', 'fitness', dataset)
+    os.makedirs(base, exist_ok=True)
+    plot_path = os.path.join(base, f'emg_map_{dataset}_s{subject}_emg{emg}_{model_type}{mode}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
@@ -168,7 +171,7 @@ def show_emg_map(results, idx, model_type, mode='', save=False):
     plt.close()
 
 
-def regret_curve(results_dict, split_type='', save=False):
+def regret_curve(results_dict, split_type='', save=False, output_dir=None):
     """
     Plot regret curves for all models across all experiments in a 1×N grid.
 
@@ -243,10 +246,11 @@ def regret_curve(results_dict, split_type='', save=False):
     fig.suptitle(f'Regret Curves | {dataset}', fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.93])
 
-    output_dir = os.path.join('output', 'optimization')
-    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    plot_path = os.path.join(output_dir, f'regret_curves{suffix}.svg')
+    plot_path = os.path.join(base, f'regret_curves{suffix}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
@@ -254,7 +258,7 @@ def regret_curve(results_dict, split_type='', save=False):
     plt.close()
 
 
-def r2_by_subject(results_dict, split_type='', save=False):
+def r2_by_subject(results_dict, split_type='', save=False, output_dir=None):
     """
     Box plot of R² values grouped by subject index, one bar per model.
 
@@ -288,10 +292,11 @@ def r2_by_subject(results_dict, split_type='', save=False):
 
     first_results = next(iter(results_dict.values()))
     dataset = first_results[0].get('dataset', '')
-    output_dir = os.path.join('output', 'fitness', dataset)
-    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.join(output_dir, 'fitness') if output_dir else \
+           os.path.join('output', 'fitness', dataset)
+    os.makedirs(base, exist_ok=True)
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    plot_path = os.path.join(output_dir, f'r2_by_subject{suffix}.svg')
+    plot_path = os.path.join(base, f'r2_by_subject{suffix}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
@@ -299,7 +304,7 @@ def r2_by_subject(results_dict, split_type='', save=False):
     plt.close()
 
 
-def r2_by_emg(results_dict, split_type='', save=False):
+def r2_by_emg(results_dict, split_type='', save=False, output_dir=None):
     """
     Box plot of R² values grouped by EMG index, one bar per model.
 
@@ -333,10 +338,11 @@ def r2_by_emg(results_dict, split_type='', save=False):
 
     first_results = next(iter(results_dict.values()))
     dataset = first_results[0].get('dataset', '')
-    output_dir = os.path.join('output', 'fitness', dataset)
-    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.join(output_dir, 'fitness') if output_dir else \
+           os.path.join('output', 'fitness', dataset)
+    os.makedirs(base, exist_ok=True)
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    plot_path = os.path.join(output_dir, f'r2_by_emg{suffix}.svg')
+    plot_path = os.path.join(base, f'r2_by_emg{suffix}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
@@ -344,7 +350,7 @@ def r2_by_emg(results_dict, split_type='', save=False):
     plt.close()
 
 
-def regret_by_subject(results_dict, split_type='', save=False):
+def regret_by_subject(results_dict, split_type='', save=False, output_dir=None):
     """
     Box plot of final simple regret grouped by subject index.
 
@@ -389,10 +395,11 @@ def regret_by_subject(results_dict, split_type='', save=False):
 
     first_results = next(iter(results_dict.values()))
     dataset = first_results[0].get('dataset', '')
-    output_dir = os.path.join('output', 'optimization')
-    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    plot_path = os.path.join(output_dir, f'regret_by_subject{suffix}.svg')
+    plot_path = os.path.join(base, f'regret_by_subject{suffix}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
@@ -400,7 +407,7 @@ def regret_by_subject(results_dict, split_type='', save=False):
     plt.close()
 
 
-def regret_by_emg(results_dict, split_type='', save=False):
+def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
     """
     Box plot of final simple regret grouped by EMG index.
 
@@ -443,10 +450,11 @@ def regret_by_emg(results_dict, split_type='', save=False):
 
     first_results = next(iter(results_dict.values()))
     dataset = first_results[0].get('dataset', '')
-    output_dir = os.path.join('output', 'optimization')
-    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    plot_path = os.path.join(output_dir, f'regret_by_emg{suffix}.svg')
+    plot_path = os.path.join(base, f'regret_by_emg{suffix}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
@@ -454,7 +462,7 @@ def regret_by_emg(results_dict, split_type='', save=False):
     plt.close()
 
 
-def budget_sweep_plot(df, eval_type, dataset='', split_type='', save=False):
+def budget_sweep_plot(df, eval_type, dataset='', split_type='', save=False, output_dir=None):
     """
     Line plot of R² (eval_type='fit') or Regret (eval_type='optimization')
     vs Budget, with both GP and TabPFN shown with 95% CI bands.
@@ -497,13 +505,15 @@ def budget_sweep_plot(df, eval_type, dataset='', split_type='', save=False):
 
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
     if eval_type == 'fit':
-        output_dir = os.path.join('output', 'fitness', dataset)
-        os.makedirs(output_dir, exist_ok=True)
-        plot_path = os.path.join(output_dir, f'budget_sweep_fit{suffix}.svg')
+        base = os.path.join(output_dir, 'fitness') if output_dir else \
+               os.path.join('output', 'fitness', dataset)
+        os.makedirs(base, exist_ok=True)
+        plot_path = os.path.join(base, f'budget_sweep_fit{suffix}.svg')
     else:
-        output_dir = os.path.join('output', 'optimization')
-        os.makedirs(output_dir, exist_ok=True)
-        plot_path = os.path.join(output_dir, f'budget_sweep_optimization{suffix}.svg')
+        base = os.path.join(output_dir, 'optimization') if output_dir else \
+               os.path.join('output', 'optimization')
+        os.makedirs(base, exist_ok=True)
+        plot_path = os.path.join(base, f'budget_sweep_optimization{suffix}.svg')
 
     if save:
         plt.savefig(plot_path, format="svg")
@@ -512,7 +522,7 @@ def budget_sweep_plot(df, eval_type, dataset='', split_type='', save=False):
     plt.close()
 
 
-def regret_with_timing(results_dict, split_type='', save=False):
+def regret_with_timing(results_dict, split_type='', save=False, output_dir=None):
     """
     2-row figure: top = regret curves (95% CI bands), bottom = per-step inference time.
     One column per experiment (subject/EMG pair).
@@ -593,12 +603,86 @@ def regret_with_timing(results_dict, split_type='', save=False):
     fig.suptitle(f'Regret & Inference Time | {dataset}', fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
 
-    output_dir = os.path.join('output', 'optimization')
-    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    plot_path = os.path.join(output_dir, f'regret_timing{suffix}.svg')
+    plot_path = os.path.join(base, f'regret_timing{suffix}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def augmentation_sweep_plot(df, eval_type, dataset='', split_type='', save=False, output_dir=None):
+    """
+    Point plot of R² and (optionally) Final Regret vs number of augmentations.
+
+    n_aug=0 represents vanilla TabPFN (no finetuning); n_aug>0 represents
+    finetuned TabPFN with that many augmentations per subject-EMG pair.
+
+    Args:
+        df: DataFrame with columns n_aug, R2, (Regret), ID
+        eval_type: 'fit' (R² only) or 'optimization' (R² + Regret, 2 rows)
+        dataset: dataset name used for output path and title
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+    """
+    color = sns.color_palette("muted")[0]
+
+    # Build ordered x-axis labels: 0 → 'Vanilla', rest as strings
+    aug_values = sorted(df['n_aug'].unique())
+    x_labels = ['Vanilla' if v == 0 else str(v) for v in aug_values]
+
+    # Map numeric n_aug to display label for plotting
+    df = df.copy()
+    label_map = {v: ('Vanilla' if v == 0 else str(v)) for v in aug_values}
+    df['Aug'] = df['n_aug'].map(label_map)
+
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+
+    if eval_type == 'fit':
+        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+        sns.pointplot(data=df, x='Aug', y='R2', order=x_labels,
+                      color=color, capsize=0.15, errorbar=('ci', 95), ax=ax)
+        ax.set_xlabel('Number of Augmentations')
+        ax.set_ylabel('R² Score')
+        ax.set_ylim(0, 1)
+        ax.set_title(f'R² vs Augmentations ({dataset})')
+        ax.grid(True, alpha=0.3, axis='y')
+
+        base = os.path.join(output_dir, 'fitness') if output_dir else \
+               os.path.join('output', 'fitness', dataset)
+        os.makedirs(base, exist_ok=True)
+        plot_path = os.path.join(base, f'aug_sweep_fit{suffix}.svg')
+
+    else:  # optimization
+        fig, axes = plt.subplots(2, 1, figsize=(8, 9), sharex=True)
+
+        sns.pointplot(data=df, x='Aug', y='R2', order=x_labels,
+                      color=color, capsize=0.15, errorbar=('ci', 95), ax=axes[0])
+        axes[0].set_ylabel('R² Score')
+        axes[0].set_ylim(0, 1)
+        axes[0].set_title(f'R² vs Augmentations ({dataset})')
+        axes[0].grid(True, alpha=0.3, axis='y')
+
+        sns.pointplot(data=df, x='Aug', y='Regret', order=x_labels,
+                      color=color, capsize=0.15, errorbar=('ci', 95), ax=axes[1])
+        axes[1].set_ylabel('Final Simple Regret')
+        axes[1].set_xlabel('Number of Augmentations')
+        axes[1].set_title(f'Final Regret vs Augmentations ({dataset})')
+        axes[1].grid(True, alpha=0.3, axis='y')
+
+        fig.tight_layout()
+
+        base = os.path.join(output_dir, 'optimization') if output_dir else \
+               os.path.join('output', 'optimization')
+        os.makedirs(base, exist_ok=True)
+        plot_path = os.path.join(base, f'aug_sweep_optimization{suffix}.svg')
+
+    if save:
+        plt.savefig(plot_path, format='svg')
         print(f"Saved plot to {plot_path}")
 
     plt.close()
