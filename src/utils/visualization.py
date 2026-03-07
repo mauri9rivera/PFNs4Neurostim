@@ -39,7 +39,7 @@ def _normalize_results_dict(first_arg, second_arg=None):
     return results
 
 
-def r2_comparison(results_dict_or_gp, pfn_results=None, mode='', save=False, output_dir=None):
+def r2_comparison(results_dict_or_gp, pfn_results=None, mode='', save=False, output_dir=None, eval_type='fit'):
 
     results_dict = _normalize_results_dict(results_dict_or_gp, pfn_results)
 

@@ -1,8 +1,28 @@
+import math
 import torch
 from torch.distributions import Normal
 from sklearn.gaussian_process import GaussianProcessRegressor
 from scipy.stats import norm as sp_norm
 import numpy as np
+
+
+def compute_ucb_kappa(t, n_steps, kappa_0, kappa_min):
+    """
+    Cosine annealing of UCB exploration parameter kappa.
+
+    At t=0: returns kappa_0 (maximum exploration).
+    At t=n_steps: returns kappa_min (maximum exploitation).
+    At t=n_steps/2: returns (kappa_0 + kappa_min) / 2.
+
+    Args:
+        t: current step (0-indexed)
+        n_steps: total number of BO steps (budget - n_init)
+        kappa_0: initial (maximum) kappa
+        kappa_min: final (minimum) kappa
+    """
+    if n_steps <= 0:
+        return kappa_min
+    return kappa_min + 0.5 * (kappa_0 - kappa_min) * (1 + math.cos(math.pi * t / n_steps))
 
 
 def expected_improvement(model, likelihood, X_candidates, y_best, device):

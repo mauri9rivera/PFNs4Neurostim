@@ -16,6 +16,7 @@ Usage:
 """
 import argparse
 import copy
+import math
 import os
 import time
 from datetime import datetime
@@ -40,10 +41,10 @@ from utils.data_utils import (
     generate_experiment_tag, save_results,
     create_run_dir, write_run_config,
 )
-from utils.gpbo_utils import expected_improvement
+from utils.gpbo_utils import expected_improvement, compute_ucb_kappa
 from utils.visualization import (
     show_emg_map, r2_comparison, regret_curve, plot_runtime_trajectory,
-    r2_by_subject, r2_by_emg,
+    r2_by_subject,
     regret_by_subject, regret_by_emg,
     budget_sweep_plot, regret_with_timing,
     augmentation_sweep_plot,
@@ -142,8 +143,7 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
     n_locs, n_reps = y_pool.shape
 
     def sample_from_pool(idx):
-        col_idx = np.random.randint(0, n_reps)
-        return y_pool[idx, col_idx]
+        return float(y_pool[idx, :].mean())
 
     # 1. Initialization (Random)
     pool_indices = np.arange(n_locs)
@@ -152,9 +152,10 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
     real_values = y_test[observed_indices].tolist()
 
     times = []
+    n_steps = budget - n_init
 
     # --- LOOP ---
-    for t in range(budget - n_init):
+    for t in range(n_steps):
         step_start = time.time()
 
         X_train = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
@@ -178,9 +179,18 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
             loss.backward()
             optimizer.step()
 
-        # Select Next Point (EI)
-        best_f = y_train.max()
-        acq_vals = expected_improvement(model, likelihood, X_cand, best_f, device)
+        # Select Next Point (UCB with cosine-annealed kappa)
+        kappa = compute_ucb_kappa(t, n_steps, kappa_0=5.0, kappa_min=1.0)
+        model.eval()
+        likelihood.eval()
+        with torch.no_grad():
+            posterior = likelihood(model(X_cand))
+            mean = posterior.mean
+            sigma = posterior.stddev
+        acq_vals = mean + kappa * sigma
+        # Prevent revisiting already-observed locations
+        for obs_idx in observed_indices:
+            acq_vals[obs_idx] = -float('inf')
         next_idx = acq_vals.argmax().item()
 
         observed_indices.append(next_idx)
@@ -326,7 +336,7 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
 
             traj, observed_values, real_values, times, y_pred = run_gpbo_loop(
                 X_train_full, y_train_full, X_test, y_test,
-                n_init=8, budget=budget, device=device
+                n_init=max(1, int(0.05 * budget)), budget=budget, device=device
             )
 
             mean_times.append(times)
@@ -381,8 +391,7 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
     n_locs, n_reps = y_pool.shape
 
     def sample_from_pool(idx):
-        col_idx = np.random.randint(0, n_reps)
-        return y_pool[idx, col_idx]
+        return float(y_pool[idx, :].mean())
 
     # 1. Initialization (Random)
     pool_indices = np.arange(n_locs)
@@ -391,9 +400,10 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
     real_values = y_test[observed_indices].tolist()
 
     times = []
+    n_steps = budget - n_init
 
     # --- LOOP ---
-    for t in range(budget - n_init):
+    for t in range(n_steps):
         step_start = time.time()
 
         X_obs_np = X_pool[observed_indices]
@@ -402,14 +412,19 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
         # Fit provides in-context examples for the transformer
         model.fit(X_obs_np, y_obs_np)
 
-        # Compute EI directly from the bar distribution (no Gaussian assumption)
+        # Compute UCB directly from the bar distribution (no Gaussian assumption)
+        # kappa → rest_prob via: rest_prob = 0.5 * erfc(kappa / sqrt(2))
+        kappa = compute_ucb_kappa(t, n_steps, kappa_0=2.5, kappa_min=0.5)
+        rest_prob = 0.5 * math.erfc(kappa / math.sqrt(2))
         full_output = model.predict(X_pool, output_type="full")
         logits = full_output['logits']
         criterion = full_output['criterion']
-
-        best_f = float(np.max(y_obs_np))
-        ei_vals = criterion.ei(logits, best_f, maximize=True)
-        next_idx = int(ei_vals.argmax().item())
+        ucb_vals = criterion.ucb(logits, 0, rest_prob=rest_prob, maximize=True)
+        ucb_vals = ucb_vals.clone()
+        # Prevent revisiting already-observed locations
+        for obs_idx in observed_indices:
+            ucb_vals[obs_idx] = -float('inf')
+        next_idx = int(ucb_vals.argmax().item())
 
         observed_indices.append(next_idx)
         new_val = sample_from_pool(next_idx)
@@ -519,7 +534,7 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
 
         traj, observed_values, real_values, times, y_pred = run_finetunedbo_loop(
             X_train_full, y_train_full, X_test, y_test, model,
-            n_init=8, budget=budget, device=device
+            n_init=max(1, int(0.05 * budget)), budget=budget, device=device
         )
 
         mean_times.append(times)
@@ -1096,7 +1111,6 @@ def run_experiment(
             tag = f'_{exp_tag}_finetuned_vs_gp'
             r2_comparison(results_dict, mode=tag, save=True, output_dir=run_dir)
             r2_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
-            r2_by_emg(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             n_maps = min(6, len(experiments))
             for idx in random.sample(range(len(experiments)), n_maps):
                 show_emg_map(results_ft, idx, 'TabPFN', mode=f'_{exp_tag}_finetuned', save=True, output_dir=run_dir)
@@ -1126,7 +1140,7 @@ def run_experiment(
 
             results_dict = {'GP': results_gp, 'TabPFN': results_ft}
             tag = f'_{exp_tag}_opt_finetuned_vs_gp'
-            r2_comparison(results_dict, mode=tag, save=True, output_dir=run_dir)
+            r2_comparison(results_dict, mode=tag, save=True, output_dir=run_dir, eval_type='optimization')
             regret_curve(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             plot_runtime_trajectory(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_with_timing(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
