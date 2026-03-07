@@ -119,7 +119,7 @@ def plot_runtime_trajectory(results_dict_or_gp, pfn_results=None, split_type='',
     plt.close()
 
 
-def show_emg_map(results, idx, model_type, mode='', save=False, output_dir=None):
+def show_emg_map(results, idx, model_type, mode='', save=False, output_dir=None, eval_type='fit'):
     res = results[idx]
 
     y_true = res['y_test']
@@ -160,8 +160,12 @@ def show_emg_map(results, idx, model_type, mode='', save=False, output_dir=None)
     ax[1].set_title(f"Prediction | R2:{r2_score:.2f}")
     ax[1].plot(max_idx_pred[1] + 0.5, max_idx_pred[0] + 0.5, 'ro', markersize=8)
 
-    base = os.path.join(output_dir, 'fitness') if output_dir else \
-           os.path.join('output', 'fitness', dataset)
+    if eval_type == 'optimization':
+        base = os.path.join(output_dir, 'optimization') if output_dir else \
+               os.path.join('output', 'optimization')
+    else:
+        base = os.path.join(output_dir, 'fitness') if output_dir else \
+               os.path.join('output', 'fitness', dataset)
     os.makedirs(base, exist_ok=True)
     plot_path = os.path.join(base, f'emg_map_{dataset}_s{subject}_emg{emg}_{model_type}{mode}.svg')
     if save:

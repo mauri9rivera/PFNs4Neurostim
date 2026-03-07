@@ -530,10 +530,16 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
     r2_scores = []
     y_preds_all = []
 
+    # Use a single-estimator copy for the BO loop: ensemble averaging
+    # (n_estimators=8) means 8 forward passes per step, making each step
+    # ~8× slower than necessary. One pass suffices for acquisition.
+    bo_model = copy.deepcopy(model)
+    bo_model.n_estimators = 1
+
     for i in range(n_reps):
 
         traj, observed_values, real_values, times, y_pred = run_finetunedbo_loop(
-            X_train_full, y_train_full, X_test, y_test, model,
+            X_train_full, y_train_full, X_test, y_test, bo_model,
             n_init=max(1, int(0.05 * budget)), budget=budget, device=device
         )
 
@@ -1146,6 +1152,12 @@ def run_experiment(
             regret_with_timing(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_by_emg(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
+            n_maps = min(6, len(experiments))
+            for idx in random.sample(range(len(experiments)), n_maps):
+                show_emg_map(results_ft, idx, 'TabPFN', mode=f'_{exp_tag}_opt_finetuned',
+                             save=True, output_dir=run_dir, eval_type='optimization')
+                show_emg_map(results_gp, idx, 'GP', mode=f'_{exp_tag}_opt_baseline',
+                             save=True, output_dir=run_dir, eval_type='optimization')
 
             all_r2 = [np.mean(r['r2']) for r in results_ft]
             print(f"\nDone. {len(results_ft)} experiments.")

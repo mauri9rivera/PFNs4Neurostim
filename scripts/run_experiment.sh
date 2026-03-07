@@ -28,7 +28,7 @@
 #SBATCH --output=logs/slurm_%A_%a_%x.out
 #SBATCH --error=logs/slurm_%A_%a_%x.err
 #SBATCH --partition=main
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:rtx8000:1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=7G
 #SBATCH --time=3:00:00
