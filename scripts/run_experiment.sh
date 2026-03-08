@@ -37,8 +37,8 @@ set -euo pipefail
 
 # ── Shared defaults ──────────────────────────────────────────────────────────
 DATASET=${DATASET:-nhp}
-EPOCHS=${EPOCHS:-20}
-LR=${LR:-1e-6}
+EPOCHS=${EPOCHS:-50}
+LR=${LR:-1e-5}
 N_REPS=${N_REPS:-30}
 FAMILY=${FAMILY:-0}
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}

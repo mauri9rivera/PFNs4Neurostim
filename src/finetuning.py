@@ -46,8 +46,8 @@ from utils.visualization import (
     show_emg_map, r2_comparison, regret_curve, plot_runtime_trajectory,
     r2_by_subject,
     regret_by_subject, regret_by_emg,
-    budget_sweep_plot, regret_with_timing,
-    augmentation_sweep_plot,
+    budget_sweep_plot, budget_sweep_plot_v2, regret_with_timing,
+    augmentation_sweep_plot, n_augmentation_sweep_plot_v2,
 )
 import random
 
@@ -336,7 +336,7 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
 
             traj, observed_values, real_values, times, y_pred = run_gpbo_loop(
                 X_train_full, y_train_full, X_test, y_test,
-                n_init=max(1, int(0.05 * budget)), budget=budget, device=device
+                n_init=max(3, int(0.05 * budget)), budget=budget, device=device
             )
 
             mean_times.append(times)
@@ -540,7 +540,7 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
 
         traj, observed_values, real_values, times, y_pred = run_finetunedbo_loop(
             X_train_full, y_train_full, X_test, y_test, bo_model,
-            n_init=max(1, int(0.05 * budget)), budget=budget, device=device
+            n_init=max(3, int(0.05 * budget)), budget=budget, device=device
         )
 
         mean_times.append(times)
@@ -733,8 +733,8 @@ def finetuned_percentage(
     device='cpu',
     budget=100,
     n_reps=20,
-    epochs=20,
-    lr=1e-6,
+    epochs=50,
+    lr=1e-5,
     n_augmentations=None,
     held_out_emg_idx=None,
     held_out_subj_idx=None,
@@ -766,6 +766,15 @@ def finetuned_percentage(
     """
     if n_augmentations is None:
         n_augmentations = [1, 2, 5, 7, 10, 25]
+
+    for v in n_augmentations:
+        if v < 0:
+            raise ValueError(f"n_augmentations values must be >= 0, got {v}")
+        if v >= 1 and abs(v - round(v)) > 1e-9:
+            raise ValueError(
+                f"Values >= 1 must be whole numbers (got {v}). "
+                "Use a value in (0,1) for fractional dataset size."
+            )
 
     # --- Resolve train / test sets (mirrors run_experiment logic) ---
     if split_type == 'inter_subject':
@@ -882,18 +891,48 @@ def finetuned_percentage(
         _accumulate(res)
 
     # --- Phase 2: Finetuned TabPFN sweep ---
-    for n_aug in n_augmentations:
-        print("=" * 60)
-        print(f"[Aug Sweep] Finetuning with n_aug={n_aug} | {dataset_type} | {split_type}")
-        print("=" * 60)
-        X_ft, y_ft = build_finetuning_dataset(
+    fraction_values = [v for v in n_augmentations if 0 < v < 1]
+    if fraction_values:
+        print("[Aug Sweep] Building 1-aug reference dataset for fraction subsampling...")
+        X_ref, y_ref = build_finetuning_dataset(
             dataset_type,
             subject_indices=train_subject_indices,
             held_out_emg_idx=ft_held_out_emg,
-            n_augmentations=n_aug,
+            n_augmentations=1,
             seed=42,
         )
-        print(f"  Dataset size: {X_ft.shape[0]} rows")
+        n_ref = len(X_ref)
+        print(f"  Reference size: {n_ref} rows")
+    else:
+        X_ref = y_ref = n_ref = None
+
+    for n_aug in n_augmentations:
+        print("=" * 60)
+        print(f"[Aug Sweep] n_aug={n_aug} | {dataset_type} | {split_type}")
+        print("=" * 60)
+
+        if 0 < n_aug < 1:
+            # Fractional mode: subsample from reference dataset
+            n_sample = int(np.floor(n_aug * n_ref))
+            if n_sample == 0:
+                print(f"  WARNING: fraction {n_aug} × {n_ref} = 0 samples. Skipping.")
+                continue
+            rng = np.random.RandomState(42)
+            idx = rng.choice(n_ref, size=n_sample, replace=False)
+            X_ft, y_ft = X_ref[idx], y_ref[idx]
+            print(f"  Subsample: {n_sample}/{n_ref} rows ({int(round(n_aug * 100))}%)")
+        else:
+            # Integer mode: build full augmented dataset
+            n_aug_int = int(round(n_aug))
+            X_ft, y_ft = build_finetuning_dataset(
+                dataset_type,
+                subject_indices=train_subject_indices,
+                held_out_emg_idx=ft_held_out_emg,
+                n_augmentations=n_aug_int,
+                seed=42,
+            )
+            print(f"  Dataset size: {X_ft.shape[0]} rows")
+
         ft_model_raw = FinetunedTabPFNRegressor(
             device=device, epochs=epochs, learning_rate=lr,
             n_estimators_finetune=8, n_estimators_validation=8,
@@ -942,8 +981,8 @@ def run_experiment(
     device='cuda',
     budget=100,
     n_reps=30,
-    epochs=20,
-    lr=1e-6,
+    epochs=50,
+    lr=1e-5,
     n_augmentations=25,
     held_out_emg_idx=None,
     held_out_subj_idx=None,
@@ -1209,6 +1248,69 @@ def run_experiment(
 
 
 # ============================================
+#       Post-hoc Result Merging
+# ============================================
+
+def load_sweep_results(tags, result_type, runs_dir='output/runs'):
+    """
+    Load and merge pickle DataFrames from multiple experiment tags.
+
+    For each tag, searches for a matching run directory under runs_dir and
+    loads the corresponding pkl file. Useful for aggregating family-1/2/3
+    results across subjects before producing cross-subject plots.
+
+    Args:
+        tags: list of experiment tags, e.g.
+              ['nhp_inter_subject_subj0_ep50_lr1.00e-05_aug25',
+               'nhp_inter_subject_subj1_ep50_lr1.00e-05_aug25']
+        result_type: 'optimization_budget' → loads {tag}_optimization_budget.pkl
+                     'fit_budget'          → loads {tag}_fit_budget.pkl
+                     'aug_sweep'           → loads {tag}.pkl
+        runs_dir: root directory containing run subdirectories (default: 'output/runs')
+
+    Returns:
+        Merged pd.DataFrame from all matched pickle files.
+
+    Raises:
+        FileNotFoundError: if no pkl is found for a given tag.
+    """
+    import glob as _glob
+
+    frames = []
+    for tag in tags:
+        # Each run dir is named {tag}_{timestamp}; find any matching dir
+        pattern = os.path.join(runs_dir, f'{tag}_*', 'results')
+        candidates = _glob.glob(pattern)
+        if not candidates:
+            # Also try without timestamp suffix (manual saves)
+            candidates = _glob.glob(os.path.join(runs_dir, tag, 'results'))
+        if not candidates:
+            raise FileNotFoundError(
+                f"No run directory found for tag '{tag}' under '{runs_dir}'. "
+                f"Searched: {os.path.join(runs_dir, tag + '_*', 'results')}"
+            )
+        # Use the most recently modified results dir if multiple matches
+        results_dir = sorted(candidates, key=os.path.getmtime)[-1]
+
+        if result_type == 'aug_sweep':
+            pkl_name = f'{tag}.pkl'
+        else:
+            pkl_name = f'{tag}_{result_type}.pkl'
+
+        pkl_path = os.path.join(results_dir, pkl_name)
+        if not os.path.exists(pkl_path):
+            raise FileNotFoundError(f"Expected pkl not found: {pkl_path}")
+
+        df = pd.read_pickle(pkl_path)
+        frames.append(df)
+        print(f"Loaded: {pkl_path}  ({len(df)} rows)")
+
+    merged = pd.concat(frames, ignore_index=True)
+    print(f"Merged {len(tags)} files → {len(merged)} total rows")
+    return merged
+
+
+# ============================================
 #       CLI Entry Point
 # ============================================
 
@@ -1233,9 +1335,9 @@ def run_finetuning():
                              '(default: fit, example: --mode aug_sweep_optimization)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device for training: cpu or cuda (default: cuda)')
-    parser.add_argument('--epochs', type=int, default=20,
-                        help='Number of fine-tuning epochs (default: 20)')
-    parser.add_argument('--lr', type=float, default=1e-6,
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='Number of fine-tuning epochs (default: 50)')
+    parser.add_argument('--lr', type=float, default=1e-5,
                         help='Learning rate (default: 1e-6)')
     parser.add_argument('--n_augmentations', type=int, default=25,
                         help='Augmentations per subject-EMG pair (default: 25)')
@@ -1248,11 +1350,12 @@ def run_finetuning():
     parser.add_argument('--held_out_subj', type=int, default=None,
                         help='Subject index to hold out as the sole test subject; '
                              'overrides the default HELD_OUT_SUBJECTS split when set')
-    parser.add_argument('--budgets', type=int, nargs='+', default=[10, 50, 100, 150, 200],
-                        help='Budget sweep values for *_budget modes (default: 10 50 100 150 200)')
-    parser.add_argument('--aug_counts', type=int, nargs='+', default=None,
+    parser.add_argument('--budgets', type=int, nargs='+', default=[10, 30, 50, 100],
+                        help='Budget sweep values for *_budget modes (default: 10 30 50 100)')
+    parser.add_argument('--aug_counts', type=float, nargs='+', default=None,
                         help='Augmentation counts to sweep for aug_sweep_* modes '
-                             '(default: 1 2 5 7 10 25). Vanilla TabPFN (0 augs) is '
+                             '(default: 1 2 5 7 10 25). Values in (0,1) are fractions '
+                             'of the 1-aug reference dataset. Vanilla TabPFN (0 augs) is '
                              'always included as baseline.')
     parser.add_argument('--save', action='store_true', default=False,
                         help='Persist results to output/results/ (pkl + CSV summary)')

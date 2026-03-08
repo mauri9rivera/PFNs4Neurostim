@@ -22,6 +22,16 @@ _TRACE_COLORS = {
 }
 
 
+def _aug_label(v):
+    """Human-readable x-axis label for an n_aug value."""
+    if v == 0:
+        return 'Vanilla'
+    elif 0 < v < 1:
+        return f'{int(round(v * 100))}%'
+    else:
+        return str(int(round(v)))
+
+
 def _normalize_results_dict(first_arg, second_arg=None):
     """
     Backward-compatible helper: accept either a results_dict (dict mapping
@@ -635,13 +645,13 @@ def augmentation_sweep_plot(df, eval_type, dataset='', split_type='', save=False
     """
     color = sns.color_palette("muted")[0]
 
-    # Build ordered x-axis labels: 0 → 'Vanilla', rest as strings
+    # Build ordered x-axis labels: 0 → 'Vanilla', fractions → 'X%', integers as-is
     aug_values = sorted(df['n_aug'].unique())
-    x_labels = ['Vanilla' if v == 0 else str(v) for v in aug_values]
+    x_labels = [_aug_label(v) for v in aug_values]
 
     # Map numeric n_aug to display label for plotting
     df = df.copy()
-    label_map = {v: ('Vanilla' if v == 0 else str(v)) for v in aug_values}
+    label_map = {v: _aug_label(v) for v in aug_values}
     df['Aug'] = df['n_aug'].map(label_map)
 
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
@@ -685,6 +695,175 @@ def augmentation_sweep_plot(df, eval_type, dataset='', split_type='', save=False
         os.makedirs(base, exist_ok=True)
         plot_path = os.path.join(base, f'aug_sweep_optimization{suffix}.svg')
 
+    if save:
+        plt.savefig(plot_path, format='svg')
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def budget_sweep_plot_v2(df, eval_type, dataset='', split_type='', save=False, output_dir=None):
+    """
+    Budget sweep with per-subject light traces and bold cross-subject mean.
+
+    Light semi-transparent lines show each subject's mean score at each budget;
+    the bold line shows the mean across subjects ± SE. One trace per model.
+
+    Args:
+        df: DataFrame with columns Budget, Model, ID, and R2 and/or Regret.
+            ID format: '{subject}_{emg}'.
+        eval_type: 'fit' → R² panel; 'optimization' → Regret panel (+ R² if present).
+        dataset, split_type, save, output_dir: same as budget_sweep_plot.
+    """
+    df = df.copy()
+    df['Subject'] = df['ID'].str.split('_').str[0]
+
+    metrics = []
+    if eval_type == 'fit' and 'R2' in df.columns:
+        metrics = [('R2', 'R² Score', (0, 1.05), 'R² vs Budget')]
+    elif eval_type == 'optimization':
+        if 'R2' in df.columns:
+            metrics.append(('R2', 'R² Score', (0, 1.05), 'R² vs Budget'))
+        if 'Regret' in df.columns:
+            metrics.append(('Regret', 'Final Simple Regret', None, 'Regret vs Budget'))
+
+    if not metrics:
+        return
+
+    n_panels = len(metrics)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(10, 5 * n_panels), squeeze=False)
+
+    models = sorted(df['Model'].unique())
+    for ax, (y_col, y_label, ylim, panel_title) in zip(axes[:, 0], metrics):
+        for model in models:
+            color = PALETTE.get(model, 'gray')
+            mdf = df[df['Model'] == model]
+
+            subj_means = mdf.groupby(['Subject', 'Budget'])[y_col].mean().reset_index()
+            for _, sdf in subj_means.groupby('Subject'):
+                sdf = sdf.sort_values('Budget')
+                ax.plot(sdf['Budget'], sdf[y_col],
+                        color=color, alpha=0.25, linewidth=1, label='_nolegend_')
+
+            grand = subj_means.groupby('Budget')[y_col].agg(['mean', 'sem']).reset_index()
+            grand = grand.sort_values('Budget')
+            ax.plot(grand['Budget'], grand['mean'],
+                    color=color, linewidth=2.5, marker='o', markersize=5, label=model)
+            ax.fill_between(grand['Budget'],
+                            grand['mean'] - grand['sem'],
+                            grand['mean'] + grand['sem'],
+                            color=color, alpha=0.2)
+
+        ax.set_xlabel('Budget')
+        ax.set_ylabel(y_label)
+        ax.set_title(f'{panel_title} ({dataset})')
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.grid(True, alpha=0.3)
+        ax.legend(title='Model')
+
+    fig.tight_layout()
+
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    if eval_type == 'fit':
+        base = os.path.join(output_dir, 'fitness') if output_dir else \
+               os.path.join('output', 'fitness', dataset)
+        plot_path = os.path.join(base, f'budget_sweep_fit_v2{suffix}.svg')
+    else:
+        base = os.path.join(output_dir, 'optimization') if output_dir else \
+               os.path.join('output', 'optimization')
+        plot_path = os.path.join(base, f'budget_sweep_optimization_v2{suffix}.svg')
+
+    os.makedirs(base, exist_ok=True)
+    if save:
+        plt.savefig(plot_path, format='svg')
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def n_augmentation_sweep_plot_v2(df, eval_type, dataset='', split_type='', save=False, output_dir=None):
+    """
+    Augmentation sweep with per-subject light traces and bold cross-subject mean.
+
+    n_aug=0 is labeled 'Vanilla' (baseline TabPFN, no finetuning).
+    Each subject's mean per n_aug value is shown as a light trace; the bold
+    trace is the cross-subject mean ± SE.
+
+    Args:
+        df: DataFrame with columns n_aug, ID, and R2 and/or Regret.
+            ID format: '{subject}_{emg}'.
+        eval_type: 'fit' → R² panel; 'optimization' → R² + Regret panels.
+        dataset, split_type, save, output_dir: same as augmentation_sweep_plot.
+    """
+    df = df.copy()
+    df['Subject'] = df['ID'].str.split('_').str[0]
+
+    aug_values = sorted(df['n_aug'].unique())
+    pos_map = {v: i for i, v in enumerate(aug_values)}
+    x_labels = [_aug_label(v) for v in aug_values]
+    x_positions = list(range(len(aug_values)))
+
+    metrics = []
+    if eval_type == 'fit' and 'R2' in df.columns:
+        metrics = [('R2', 'R² Score', (0, 1.05))]
+    elif eval_type == 'optimization':
+        if 'R2' in df.columns:
+            metrics.append(('R2', 'R² Score', (0, 1.05)))
+        if 'Regret' in df.columns:
+            metrics.append(('Regret', 'Final Simple Regret', None))
+
+    if not metrics:
+        return
+
+    color = sns.color_palette("muted")[0]
+    n_panels = len(metrics)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(9, 5 * n_panels), squeeze=False)
+
+    for ax, (y_col, y_label, ylim) in zip(axes[:, 0], metrics):
+        subj_means = df.groupby(['Subject', 'n_aug'])[y_col].mean().reset_index()
+
+        for _, sdf in subj_means.groupby('Subject'):
+            sdf = sdf.sort_values('n_aug')
+            xs = [pos_map[v] for v in sdf['n_aug']]
+            ax.plot(xs, sdf[y_col],
+                    color=color, alpha=0.25, linewidth=1,
+                    marker='o', markersize=3, label='_nolegend_')
+
+        grand = subj_means.groupby('n_aug')[y_col].agg(['mean', 'sem']).reset_index()
+        grand = grand.sort_values('n_aug')
+        xs_grand = [pos_map[v] for v in grand['n_aug']]
+        ax.plot(xs_grand, grand['mean'],
+                color=color, linewidth=2.5, marker='o', markersize=5,
+                label='Finetuned TabPFN')
+        ax.fill_between(xs_grand,
+                        grand['mean'] - grand['sem'],
+                        grand['mean'] + grand['sem'],
+                        color=color, alpha=0.2)
+
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(x_labels)
+        ax.set_xlabel('Number of Augmentations')
+        ax.set_ylabel(y_label)
+        ax.set_title(f'{y_label} vs Augmentations ({dataset})')
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.grid(True, alpha=0.3, axis='y')
+        ax.legend()
+
+    fig.tight_layout()
+
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    if eval_type == 'fit':
+        base = os.path.join(output_dir, 'fitness') if output_dir else \
+               os.path.join('output', 'fitness', dataset)
+        plot_path = os.path.join(base, f'aug_sweep_fit_v2{suffix}.svg')
+    else:
+        base = os.path.join(output_dir, 'optimization') if output_dir else \
+               os.path.join('output', 'optimization')
+        plot_path = os.path.join(base, f'aug_sweep_optimization_v2{suffix}.svg')
+
+    os.makedirs(base, exist_ok=True)
     if save:
         plt.savefig(plot_path, format='svg')
         print(f"Saved plot to {plot_path}")

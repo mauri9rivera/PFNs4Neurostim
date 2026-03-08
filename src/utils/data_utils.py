@@ -283,7 +283,7 @@ def load_data(dataset_type, m_i):
 # ============================================
 
 HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [1]}
-TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 2, 3]}
+TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 3]}
 ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 3]}
 
 
