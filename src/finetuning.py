@@ -690,11 +690,12 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
                 regret_ft = optimal_ft - best_ft
                 scores_ft = regret_ft[:, -1] if regret_metric == 'abs' \
                     else np.mean(regret_ft, axis=1)
-                for score in scores_ft:
+                for score, r2 in zip(scores_ft, res_ft['r2']):
                     plot_data.append({
                         'Budget': b,
                         'Model': 'TabPFN',
                         'Regret': score,
+                        'R2': float(np.clip(r2, 0.0, 1.0)),
                         'ID': f"{res_ft['subject']}_{res_ft['emg']}"
                     })
 
@@ -707,17 +708,18 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
                 regret_gp = optimal_gp - best_gp
                 scores_gp = regret_gp[:, -1] if regret_metric == 'abs' \
                     else np.mean(regret_gp, axis=1)
-                for score in scores_gp:
+                for score, r2 in zip(scores_gp, res_gp['r2']):
                     plot_data.append({
                         'Budget': b,
                         'Model': 'GP',
                         'Regret': score,
+                        'R2': float(np.clip(r2, 0.0, 1.0)),
                         'ID': f"{res_gp['subject']}_{res_gp['emg']}"
                     })
 
     df = pd.DataFrame(plot_data)
-    budget_sweep_plot(df, eval_type='optimization', dataset=dataset_type,
-                      split_type=split_type, save=True, output_dir=output_dir)
+    budget_sweep_plot_v2(df, eval_type='optimization', dataset=dataset_type,
+                         split_type=split_type, save=True, output_dir=output_dir)
 
     return df
 
