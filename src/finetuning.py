@@ -48,12 +48,256 @@ from utils.visualization import (
     regret_by_subject, regret_by_emg,
     budget_sweep_plot, budget_sweep_plot_v2, regret_with_timing,
     augmentation_sweep_plot, n_augmentation_sweep_plot_v2,
+    plot_gradient_metrics, plot_weight_metrics, plot_cka_similarity,
+    visualize_representation,
 )
 import random
 
 
+def _snapshot_iters(budget, n_init):
+    """Compute log2-spaced iteration counts (total observations, 1-indexed) for snapshots."""
+    iters = set()
+    i = 1
+    while n_init + i <= budget:
+        iters.add(n_init + i)
+        i *= 2
+    iters.add(budget)  # always include final
+    return sorted(iters)
+
+
+# ============================================
+#       Gradient Monitoring
+# ============================================
+
+def linear_cka(X, Y):
+    """Linear CKA between activation matrices X, Y of shape [n, d]."""
+    X = X - X.mean(dim=0, keepdim=True)
+    Y = Y - Y.mean(dim=0, keepdim=True)
+    hsic_xy = (Y.T @ X).norm() ** 2
+    hsic_xx = (X.T @ X).norm()
+    hsic_yy = (Y.T @ Y).norm()
+    return (hsic_xy / (hsic_xx * hsic_yy + 1e-10)).item()
+
+
+class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
+    """
+    FinetunedTabPFNRegressor with comprehensive per-epoch finetuning diagnostics.
+
+    When verbose_gradients=True, collects three categories of metrics each epoch:
+      1. Gradient-based: gradient norm, gradient/weight ratio, update-to-parameter ratio
+      2. Weight-based: weight displacement (L2), cosine similarity vs pretrained
+      3. Representation-based: CKA similarity to pretrained activations (via forward hooks)
+
+    All metrics are stored in self._diagnostics_ (list of per-epoch dicts).
+    """
+
+    def __init__(self, *args, verbose_gradients=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.verbose_gradients = verbose_gradients
+        self._diagnostics_ = []
+        self._cka_ref_X_ = None
+        self._cka_ref_y_ = None
+        self._pretrained_acts_ = {}
+        self._cka_hook_names_ = []
+        self._cka_ref_inputs_ = None
+
+    def fit(self, X, y, **kwargs):
+        self._grad_log_ = []
+        self._pretrained_params_ = {}
+        self._diagnostics_ = []
+        self._pretrained_acts_ = {}
+
+        # Store reference batch for CKA (fixed seed for reproducibility)
+        n_ref = min(100, len(X))
+        rng = np.random.RandomState(0)
+        ref_idx = rng.choice(len(X), n_ref, replace=False)
+        self._cka_ref_X_ = X[ref_idx]
+        self._cka_ref_y_ = y[ref_idx]
+
+        result = super().fit(X, y, **kwargs)
+
+        if self.verbose_gradients and self._pretrained_params_:
+            # Compute total weight change from pretrained snapshot
+            weight_change = {}
+            for name, p in self.finetuned_estimator_.model_.named_parameters():
+                if name not in self._pretrained_params_:
+                    continue
+                layer = name.split('.')[0]
+                delta = (p.data.cpu() - self._pretrained_params_[name]).norm().item()
+                base  = self._pretrained_params_[name].norm().item() + 1e-8
+                weight_change.setdefault(layer, []).append(delta / base * 100)
+            weight_change_pct = {k: float(np.mean(v)) for k, v in weight_change.items()}
+
+            print("\n[GradientMonitor] Total weight change from pretrained:")
+            for layer, pct in sorted(weight_change_pct.items(), key=lambda x: -x[1]):
+                bar = '█' * min(40, max(1, int(pct * 4)))
+                print(f"  {layer:<30} {pct:6.2f}%  {bar}")
+
+            self._weight_change_pct_ = weight_change_pct
+
+        # Build backward-compat _grad_log_ from _diagnostics_
+        self._grad_log_ = [
+            {'epoch': d['epoch'], **d['grad_weight_ratio']}
+            for d in self._diagnostics_ if d['epoch'] >= 0
+        ]
+
+        return result
+
+    def _capture_activations(self, model):
+        """Run forward pass with hooks, return {hook_name: flattened_activation [n, d]}."""
+        activations = {}
+        handles = []
+
+        def _make_hook(name):
+            def hook_fn(module, input, output):
+                act = output if isinstance(output, torch.Tensor) else output[0]
+                # Flatten all dims except first → [n, d]
+                activations[name] = act.detach().cpu().reshape(act.shape[0], -1).float()
+            return hook_fn
+
+        for name in self._cka_hook_names_:
+            try:
+                module = model
+                for attr in name.split('.'):
+                    module = module[int(attr)] if attr.isdigit() else getattr(module, attr)
+                handles.append(module.register_forward_hook(_make_hook(name)))
+            except (AttributeError, IndexError, KeyError):
+                print(f"[GradientMonitor] Warning: could not hook '{name}', skipping CKA for this layer")
+
+        x_input, y_input = self._cka_ref_inputs_
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            model(x_input, y_input, only_return_standard_out=True)
+        if was_training:
+            model.train()
+
+        for h in handles:
+            h.remove()
+
+        return activations
+
+    def _compute_weight_metrics(self, model):
+        """Per-layer weight displacement and cosine similarity vs pretrained."""
+        displacement = {}
+        cosine_sim = {}
+        update_ratio = {}
+        for name, p in model.named_parameters():
+            if name not in self._pretrained_params_:
+                continue
+            layer = name.split('.')[0]
+            w = p.data.cpu().flatten()
+            w0 = self._pretrained_params_[name].flatten()
+            diff = (w - w0).norm().item()
+            base = w0.norm().item() + 1e-8
+            displacement.setdefault(layer, []).append(diff)
+            update_ratio.setdefault(layer, []).append(diff / base * 100)
+            cos = torch.nn.functional.cosine_similarity(
+                w.unsqueeze(0), w0.unsqueeze(0)
+            ).item()
+            cosine_sim.setdefault(layer, []).append(cos)
+        return (
+            {k: float(np.mean(v)) for k, v in displacement.items()},
+            {k: float(np.mean(v)) for k, v in cosine_sim.items()},
+            {k: float(np.mean(v)) for k, v in update_ratio.items()},
+        )
+
+    def _log_epoch_evaluation(self, epoch, eval_result, mean_train_loss):
+        model = self.finetuned_estimator_.model_
+
+        if epoch == -1:
+            # Snapshot pretrained weights
+            self._pretrained_params_ = {
+                name: p.data.clone().cpu()
+                for name, p in model.named_parameters()
+            }
+
+            # Discover CKA hook layers
+            n_transformer_layers = len(model.transformer_encoder.layers)
+            mid = n_transformer_layers // 2
+            self._cka_hook_names_ = [
+                'encoder',
+                'transformer_encoder.layers.0',
+                f'transformer_encoder.layers.{mid}',
+                f'transformer_encoder.layers.{n_transformer_layers - 1}',
+            ]
+
+            # Prepare CKA reference tensors
+            device = next(model.parameters()).device
+            n_ref = len(self._cka_ref_X_)
+            n_ctx = n_ref // 2
+            x_input = torch.tensor(
+                self._cka_ref_X_, dtype=torch.float32, device=device
+            ).unsqueeze(1)  # [N, 1, n_feat]
+            y_input = torch.tensor(
+                self._cka_ref_y_[:n_ctx], dtype=torch.float32, device=device
+            ).unsqueeze(1)  # [N//2, 1]
+            self._cka_ref_inputs_ = (x_input, y_input)
+
+            # Capture pretrained activations
+            self._pretrained_acts_ = self._capture_activations(model)
+
+        else:
+            # --- Gradient-based metrics ---
+            grad_norm = {}
+            grad_weight_ratio = {}
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    continue
+                layer = name.split('.')[0]
+                g_norm = param.grad.norm().item()
+                w_norm = param.data.norm().item() + 1e-8
+                grad_norm.setdefault(layer, []).append(g_norm)
+                grad_weight_ratio.setdefault(layer, []).append(g_norm / w_norm * 100)
+
+            grad_norm_avg = {k: float(np.mean(v)) for k, v in grad_norm.items()}
+            grad_ratio_avg = {k: float(np.mean(v)) for k, v in grad_weight_ratio.items()}
+
+            # --- Weight-based metrics ---
+            w_disp, w_cos, w_update = self._compute_weight_metrics(model)
+
+            # --- CKA ---
+            cka_scores = {}
+            if self._pretrained_acts_ and self._cka_ref_inputs_ is not None:
+                current_acts = self._capture_activations(model)
+                for hook_name in self._cka_hook_names_:
+                    if hook_name in self._pretrained_acts_ and hook_name in current_acts:
+                        cka_scores[hook_name] = linear_cka(
+                            self._pretrained_acts_[hook_name],
+                            current_acts[hook_name],
+                        )
+
+            epoch_entry = {
+                'epoch': epoch,
+                'grad_norm': grad_norm_avg,
+                'grad_weight_ratio': grad_ratio_avg,
+                'update_to_param_ratio': w_update,
+                'weight_displacement': w_disp,
+                'cosine_similarity': w_cos,
+                'cka': cka_scores,
+            }
+            self._diagnostics_.append(epoch_entry)
+
+            if self.verbose_gradients:
+                print(f"\n[GradientMonitor] Epoch {epoch + 1} diagnostics:")
+                print(f"  Grad/weight ratio: {', '.join(f'{k}={v:.4f}%' for k, v in sorted(grad_ratio_avg.items()))}")
+                print(f"  Cosine sim:        {', '.join(f'{k}={v:.6f}' for k, v in sorted(w_cos.items()))}")
+                if cka_scores:
+                    print(f"  CKA:               {', '.join(f'{k}={v:.4f}' for k, v in cka_scores.items())}")
+
+        # Always call original implementation to preserve logging/early stopping
+        super()._log_epoch_evaluation(epoch, eval_result, mean_train_loss)
+
+
+def _make_finetuned_regressor(verbose_gradients=False, **kwargs):
+    """Factory: returns GradientMonitoredRegressor if verbose_gradients else FinetunedTabPFNRegressor."""
+    if verbose_gradients:
+        return GradientMonitoredRegressor(verbose_gradients=True, **kwargs)
+    return FinetunedTabPFNRegressor(**kwargs)
+
+
 def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
-                    n_augmentations=25):
+                    n_augmentations=25, verbose_gradients=False):
     """
     Fine-tune a TabPFNRegressor on augmented neurostimulation data.
 
@@ -64,6 +308,7 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
         lr: learning rate
         n_augmentations: augmentations per subject-EMG pair
         output_dir: directory to save the fine-tuned model
+        verbose_gradients: if True, print per-layer gradient/weight ratios each epoch
 
     Returns:
         model: The finetuned FinetunedTabPFNRegressor instance (in-memory)
@@ -78,7 +323,8 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
 
     print(f"Initializing FinetunedTabPFNRegressor for fine-tuning (epochs={epochs}, lr={lr}) ...")
 
-    model = FinetunedTabPFNRegressor(
+    model = _make_finetuned_regressor(
+        verbose_gradients=verbose_gradients,
         device=device,
         epochs=epochs,
         learning_rate=lr,
@@ -89,6 +335,11 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
 
     print("Fine-tuning ...")
     model.fit(X_train, y_train)
+    # Plot gradient diagnostics (standalone path — falls back to output/diagnostics/)
+    if verbose_gradients and hasattr(model, '_diagnostics_') and model._diagnostics_:
+        plot_gradient_metrics(model._diagnostics_)
+        plot_weight_metrics(model._diagnostics_)
+        plot_cka_similarity(model._diagnostics_)
     print("Fine-tuning complete.")
 
     return model
@@ -119,7 +370,7 @@ def extract_inference_model(finetuned_regressor):
 # ============================================
 
 def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
-                  n_init=5, budget=100, device='cpu'):
+                  n_init=5, budget=100, device='cpu', snapshot_iters=None):
     """
     Performs the Active Learning loop using a GP model.
     (This mirrors run_bo_loop from main.py but only for the GP case)
@@ -152,6 +403,7 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
     real_values = y_test[observed_indices].tolist()
 
     times = []
+    snapshots = {}
     n_steps = budget - n_init
 
     # --- LOOP ---
@@ -201,6 +453,26 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
         step_time = time.time() - step_start
         times.append(step_time)
 
+        # Capture snapshot if requested (refit on updated observations)
+        if snapshot_iters is not None and len(observed_indices) in snapshot_iters:
+            _X_snap = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
+            _y_snap = torch.tensor(observed_values, dtype=torch.float32, device=device)
+            _lik_snap = gpytorch.likelihoods.GaussianLikelihood().to(device)
+            _gp_snap = ExactGP(_X_snap, _y_snap, _lik_snap).to(device)
+            _gp_snap.train(); _lik_snap.train()
+            _opt_snap = torch.optim.Adam(_gp_snap.parameters(), lr=0.01)
+            _mll_snap = gpytorch.mlls.ExactMarginalLogLikelihood(_lik_snap, _gp_snap)
+            for _ in range(50):
+                _opt_snap.zero_grad()
+                _out = _gp_snap(_X_snap)
+                _loss = -_mll_snap(_out, _y_snap)
+                _loss.backward()
+                _opt_snap.step()
+            _gp_snap.eval(); _lik_snap.eval()
+            with torch.no_grad():
+                snap_post = _lik_snap(_gp_snap(torch.tensor(x_test, dtype=torch.float32, device=device)))
+                snapshots[len(observed_indices)] = snap_post.mean.cpu().numpy()
+
     # Final model fit on all observed data to predict on x_test
     X_train_final = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
     y_train_final = torch.tensor(observed_values, dtype=torch.float32, device=device)
@@ -223,7 +495,12 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
         posterior = likelihood(model(torch.tensor(x_test, dtype=torch.float32, device=device)))
         y_pred = posterior.mean.cpu().numpy()
 
-    return observed_indices, observed_values, real_values, times, y_pred
+    # Capture final snapshot (budget) if not already captured in loop
+    if snapshot_iters is not None and budget not in snapshots:
+        snapshots[budget] = y_pred.copy()
+
+    return observed_indices, observed_values, real_values, times, y_pred, \
+        (snapshots if snapshot_iters else None)
 
 
 # ============================================
@@ -332,12 +609,21 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
         r2_scores = []
         y_preds_all = []
 
+        n_init = max(3, int(0.05 * budget))
+        snapshot_rep = np.random.randint(n_reps)
+        snap_iters = _snapshot_iters(budget, n_init)
+        collected_snapshots = None
+
         for i in range(n_reps):
 
-            traj, observed_values, real_values, times, y_pred = run_gpbo_loop(
+            traj, observed_values, real_values, times, y_pred, snap = run_gpbo_loop(
                 X_train_full, y_train_full, X_test, y_test,
-                n_init=max(3, int(0.05 * budget)), budget=budget, device=device
+                n_init=n_init, budget=budget, device=device,
+                snapshot_iters=snap_iters if i == snapshot_rep else None,
             )
+
+            if snap is not None:
+                collected_snapshots = snap
 
             mean_times.append(times)
             values_all.append(real_values)
@@ -352,6 +638,15 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
         mean_times = np.mean(np.array(mean_times), axis=0)
         y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
 
+        # Inverse-transform snapshot predictions and compute R2
+        snapshot_results = None
+        if collected_snapshots is not None:
+            snapshot_results = {}
+            for it, s_pred in collected_snapshots.items():
+                s_pred_unscaled = scaler_y.inverse_transform(s_pred.reshape(-1, 1)).ravel()
+                s_r2 = float(np.clip(r2_score(y_test, s_pred_unscaled), 0.0, 1.0))
+                snapshot_results[it] = {'y_pred': s_pred_unscaled, 'r2': s_r2}
+
         return {
             'model_type': 'gp',
             'times': mean_times,
@@ -361,7 +656,8 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
             'y_pred': y_pred_mean,
             'dataset': dataset,
             'subject': subject_idx,
-            'emg': emg_idx
+            'emg': emg_idx,
+            'snapshots': snapshot_results,
         }
 
 
@@ -370,7 +666,7 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
 # ============================================
 
 def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
-                          n_init=5, budget=100, device='cpu'):
+                          n_init=5, budget=100, device='cpu', snapshot_iters=None):
     """
     Performs the Active Learning loop using a finetuned TabPFN model.
 
@@ -387,6 +683,7 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
         - real_values: True y values at observed indices
         - times: Time taken at each step
         - y_pred: Final predictions on x_test
+        - snapshots: dict or None — {iter: y_pred_array} at snapshot iterations
     """
     n_locs, n_reps = y_pool.shape
 
@@ -400,6 +697,7 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
     real_values = y_test[observed_indices].tolist()
 
     times = []
+    snapshots = {}
     n_steps = budget - n_init
 
     # --- LOOP ---
@@ -434,13 +732,24 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
         step_time = time.time() - step_start
         times.append(step_time)
 
+        # Capture snapshot if requested (refit on updated observations)
+        if snapshot_iters is not None and len(observed_indices) in snapshot_iters:
+            model.fit(X_pool[observed_indices], np.array(observed_values))
+            snap_pred = model.predict(x_test)
+            snapshots[len(observed_indices)] = np.asarray(snap_pred)
+
     # Final prediction with all observed data as context
     X_obs_final = X_pool[observed_indices]
     y_obs_final = np.array(observed_values)
     model.fit(X_obs_final, y_obs_final)
     y_pred = model.predict(x_test)
 
-    return observed_indices, observed_values, real_values, times, np.asarray(y_pred)
+    # Capture final snapshot (budget) if not already captured in loop
+    if snapshot_iters is not None and budget not in snapshots:
+        snapshots[budget] = np.asarray(y_pred).copy()
+
+    return observed_indices, observed_values, real_values, times, np.asarray(y_pred), \
+        (snapshots if snapshot_iters else None)
 
 
 # ============================================
@@ -536,12 +845,21 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
     bo_model = copy.deepcopy(model)
     bo_model.n_estimators = 1
 
+    n_init = max(3, int(0.05 * budget))
+    snapshot_rep = np.random.randint(n_reps)
+    snap_iters = _snapshot_iters(budget, n_init)
+    collected_snapshots = None
+
     for i in range(n_reps):
 
-        traj, observed_values, real_values, times, y_pred = run_finetunedbo_loop(
+        traj, observed_values, real_values, times, y_pred, snap = run_finetunedbo_loop(
             X_train_full, y_train_full, X_test, y_test, bo_model,
-            n_init=max(3, int(0.05 * budget)), budget=budget, device=device
+            n_init=n_init, budget=budget, device=device,
+            snapshot_iters=snap_iters if i == snapshot_rep else None,
         )
+
+        if snap is not None:
+            collected_snapshots = snap
 
         mean_times.append(times)
         values_all.append(real_values)
@@ -556,6 +874,15 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
     mean_times = np.mean(np.array(mean_times), axis=0)
     y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
 
+    # Inverse-transform snapshot predictions and compute R2
+    snapshot_results = None
+    if collected_snapshots is not None:
+        snapshot_results = {}
+        for it, s_pred in collected_snapshots.items():
+            s_pred_unscaled = scaler_y.inverse_transform(s_pred.reshape(-1, 1)).ravel()
+            s_r2 = float(np.clip(r2_score(y_test, s_pred_unscaled), 0.0, 1.0))
+            snapshot_results[it] = {'y_pred': s_pred_unscaled, 'r2': s_r2}
+
     return {
         'model_type': 'finetuned_tabpfn',
         'times': mean_times,
@@ -565,7 +892,8 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
         'y_pred': y_pred_mean,
         'dataset': dataset,
         'subject': subject_idx,
-        'emg': emg_idx
+        'emg': emg_idx,
+        'snapshots': snapshot_results,
     }
 
 
@@ -667,6 +995,8 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
 
     for b in budgets:
         print(f"  > Running budget: {b}...")
+        budget_results_ft = []
+        budget_results_gp = []
 
         for subj_idx in test_subjects:
             data = load_data(dataset_type, subj_idx)
@@ -684,6 +1014,7 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
                     budget=b,
                     n_reps=20
                 )
+                budget_results_ft.append(res_ft)
                 optimal_ft = res_ft['y_test'].max()
                 raw_ft = np.array(res_ft['values'])
                 best_ft = np.maximum.accumulate(raw_ft, axis=1)
@@ -702,6 +1033,7 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
                 res_gp = gp_baseline(dataset_type, subj_idx, emg_idx,
                                      mode='optimization',
                                      device=device, budget=b, n_reps=20)
+                budget_results_gp.append(res_gp)
                 optimal_gp = res_gp['y_test'].max()
                 raw_gp = np.array(res_gp['values'])
                 best_gp = np.maximum.accumulate(raw_gp, axis=1)
@@ -716,6 +1048,11 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
                         'R2': float(np.clip(r2, 0.0, 1.0)),
                         'ID': f"{res_gp['subject']}_{res_gp['emg']}"
                     })
+
+        if output_dir and budget_results_ft:
+            visualize_representation(
+                {'GP': budget_results_gp, 'TabPFN': budget_results_ft},
+                mode=f'_{split_type}_budget{b}', save=True, output_dir=output_dir)
 
     df = pd.DataFrame(plot_data)
     budget_sweep_plot_v2(df, eval_type='optimization', dataset=dataset_type,
@@ -741,6 +1078,7 @@ def finetuned_percentage(
     held_out_emg_idx=None,
     held_out_subj_idx=None,
     save=False,
+    verbose_gradients=False,
 ):
     """
     Ablation study: evaluate BO performance (R² + regret) across augmentation counts.
@@ -881,6 +1219,7 @@ def finetuned_percentage(
     print(f"[Aug Sweep] Vanilla TabPFN baseline (n_aug=0) | {dataset_type} | {split_type} | mode={mode}")
     print("=" * 60)
     vanilla_model = TabPFNRegressor(device=device)
+    vanilla_results = []
     for subj_idx, emg_idx in experiments:
         print(f"  Vanilla: subject={subj_idx}, emg={emg_idx}")
         if mode == 'optimization':
@@ -891,6 +1230,11 @@ def finetuned_percentage(
                                 device=device, budget=budget, n_reps=n_reps)
         res['n_aug'] = 0
         _accumulate(res)
+        if mode == 'optimization':
+            vanilla_results.append(res)
+    if vanilla_results and run_dir:
+        visualize_representation({'TabPFN': vanilla_results},
+                                 mode=f'_{exp_tag}_aug0', save=True, output_dir=run_dir)
 
     # --- Phase 2: Finetuned TabPFN sweep ---
     fraction_values = [v for v in n_augmentations if 0 < v < 1]
@@ -935,14 +1279,21 @@ def finetuned_percentage(
             )
             print(f"  Dataset size: {X_ft.shape[0]} rows")
 
-        ft_model_raw = FinetunedTabPFNRegressor(
+        ft_model_raw = _make_finetuned_regressor(
+            verbose_gradients=verbose_gradients,
             device=device, epochs=epochs, learning_rate=lr,
             n_estimators_finetune=8, n_estimators_validation=8,
             n_estimators_final_inference=8,
         )
         ft_model_raw.fit(X_ft, y_ft)
+        if verbose_gradients and hasattr(ft_model_raw, '_diagnostics_') and ft_model_raw._diagnostics_:
+            diag_dir = os.path.join(run_dir, 'diagnostics') if run_dir else None
+            plot_gradient_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
+            plot_weight_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
+            plot_cka_similarity(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
         ft_model = extract_inference_model(ft_model_raw)
 
+        aug_results = []
         for subj_idx, emg_idx in experiments:
             print(f"  n_aug={n_aug}: subject={subj_idx}, emg={emg_idx}")
             if mode == 'optimization':
@@ -953,6 +1304,13 @@ def finetuned_percentage(
                                     device=device, budget=budget, n_reps=n_reps)
             res['n_aug'] = n_aug
             _accumulate(res)
+            if mode == 'optimization':
+                aug_results.append(res)
+        if aug_results and run_dir:
+            aug_label = int(round(n_aug)) if n_aug >= 1 else f'{int(round(n_aug * 100))}pct'
+            visualize_representation({'TabPFN': aug_results},
+                                     mode=f'_{exp_tag}_aug{aug_label}',
+                                     save=True, output_dir=run_dir)
 
     # --- Phase 3: Visualize & save ---
     df = pd.DataFrame(plot_data)
@@ -990,6 +1348,7 @@ def run_experiment(
     held_out_subj_idx=None,
     budgets=None,
     save=False,
+    verbose_gradients=False,
 ):
     """
     Unified entry point for transfer learning evaluation.
@@ -1081,32 +1440,30 @@ def run_experiment(
             if emg_idx < n_emgs:
                 experiments.append((subj_idx, emg_idx))
 
-    # --- Create per-run output directory and write config ---
-    if save:
-        run_dir = create_run_dir(_save_tag)
-        write_run_config(run_dir, {
-            'run_type': 'run_experiment',
-            'experiment_tag': _save_tag,
-            'timestamp': datetime.now().isoformat(timespec='seconds'),
-            'dataset_type': dataset_type,
-            'split_type': split_type,
-            'mode': mode,
-            'device': device,
-            'budget': budget,
-            'n_reps': n_reps,
-            'epochs': epochs,
-            'lr': lr,
-            'n_augmentations': n_augmentations,
-            'held_out_emg_idx': held_out_emg_idx,
-            'held_out_subj_idx': held_out_subj_idx,
-            'budgets': budgets,
-            'train_subjects': train_subject_indices,
-            'test_subjects': test_subjects,
-            'test_emg_indices': test_emg_indices,
-            'n_experiments': len(experiments),
-        })
-    else:
-        run_dir = None
+    # --- Always create per-run output directory so plots land in runs/<tag>/ ---
+    run_dir = create_run_dir(_save_tag)
+    write_run_config(run_dir, {
+        'run_type': 'run_experiment',
+        'experiment_tag': _save_tag,
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'dataset_type': dataset_type,
+        'split_type': split_type,
+        'mode': mode,
+        'device': device,
+        'budget': budget,
+        'n_reps': n_reps,
+        'epochs': epochs,
+        'lr': lr,
+        'n_augmentations': n_augmentations,
+        'held_out_emg_idx': held_out_emg_idx,
+        'held_out_subj_idx': held_out_subj_idx,
+        'budgets': budgets,
+        'train_subjects': train_subject_indices,
+        'test_subjects': test_subjects,
+        'test_emg_indices': test_emg_indices,
+        'n_experiments': len(experiments),
+    })
+    print(f"[INFO] Run directory: {run_dir}")
 
     # --- Fine-tune on the correct split (once, shared across all modes) ---
     print("=" * 60)
@@ -1121,7 +1478,8 @@ def run_experiment(
         seed=42,
     )
     print(f"  Dataset size: {X_ft.shape[0]} rows")
-    ft_model_raw = FinetunedTabPFNRegressor(
+    ft_model_raw = _make_finetuned_regressor(
+        verbose_gradients=verbose_gradients,
         device=device,
         epochs=epochs,
         learning_rate=lr,
@@ -1132,6 +1490,12 @@ def run_experiment(
     )
     print(f"Fine-tuning (epochs={epochs}, lr={lr}) ...")
     ft_model_raw.fit(X_ft, y_ft)
+    # Plot gradient diagnostics to run directory
+    if verbose_gradients and hasattr(ft_model_raw, '_diagnostics_') and ft_model_raw._diagnostics_:
+        diag_dir = os.path.join(run_dir, 'diagnostics')
+        plot_gradient_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
+        plot_weight_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
+        plot_cka_similarity(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
     ft_model = extract_inference_model(ft_model_raw)
 
     # --- Run each requested mode ---
@@ -1199,6 +1563,8 @@ def run_experiment(
                              save=True, output_dir=run_dir, eval_type='optimization')
                 show_emg_map(results_gp, idx, 'GP', mode=f'_{exp_tag}_opt_baseline',
                              save=True, output_dir=run_dir, eval_type='optimization')
+            visualize_representation(results_dict, mode=f'_{exp_tag}',
+                                     save=True, output_dir=run_dir)
 
             all_r2 = [np.mean(r['r2']) for r in results_ft]
             print(f"\nDone. {len(results_ft)} experiments.")
@@ -1321,7 +1687,7 @@ def run_finetuning():
         description='Fine-tune TabPFN on neurostimulation data and run evaluation.',
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument('--dataset', type=str, default='nhp', choices=['rat', 'nhp'],
+    parser.add_argument('--dataset', type=str, default='nhp', choices=['rat', 'nhp', 'spinal'],
                         help='Dataset type (default: nhp)')
     parser.add_argument('--split', type=str, default='inter_subject',
                         choices=['inter_subject', 'intra_emg'],
@@ -1361,6 +1727,8 @@ def run_finetuning():
                              'always included as baseline.')
     parser.add_argument('--save', action='store_true', default=False,
                         help='Persist results to output/results/ (pkl + CSV summary)')
+    parser.add_argument('--verbose_gradients', action='store_true', default=False,
+                        help='Print and plot per-layer gradient/weight ratios during finetuning.')
 
     args = parser.parse_args()
 
@@ -1387,6 +1755,7 @@ def run_finetuning():
             held_out_subj_idx=args.held_out_subj,
             budgets=args.budgets,
             save=args.save,
+            verbose_gradients=args.verbose_gradients,
         )
 
     if 'aug_sweep_fit' in args.mode:
@@ -1403,6 +1772,7 @@ def run_finetuning():
             held_out_emg_idx=args.held_out_emg,
             held_out_subj_idx=args.held_out_subj,
             save=args.save,
+            verbose_gradients=args.verbose_gradients,
         )
 
     if 'aug_sweep_optimization' in args.mode:
@@ -1419,6 +1789,7 @@ def run_finetuning():
             held_out_emg_idx=args.held_out_emg,
             held_out_subj_idx=args.held_out_subj,
             save=args.save,
+            verbose_gradients=args.verbose_gradients,
         )
 
 

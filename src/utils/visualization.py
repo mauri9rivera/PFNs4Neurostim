@@ -22,6 +22,127 @@ _TRACE_COLORS = {
 }
 
 
+def _diag_save_dir(output_dir):
+    """Return diagnostics output directory, creating it if needed."""
+    base = output_dir if output_dir else os.path.join('output', 'diagnostics')
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _extract_metric(diagnostics, key):
+    """Extract per-epoch metric dict from diagnostics list → {layer: [values]}."""
+    epochs = []
+    layer_values = {}
+    for d in diagnostics:
+        if d['epoch'] < 0 or key not in d:
+            continue
+        epochs.append(d['epoch'] + 1)
+        for layer, val in d[key].items():
+            layer_values.setdefault(layer, []).append(val)
+    return epochs, layer_values
+
+
+def plot_gradient_metrics(diagnostics, save=True, output_dir=None):
+    """3-panel figure: gradient norm, gradient/weight ratio, update-to-parameter ratio."""
+    if not diagnostics:
+        return
+
+    metrics = [
+        ('grad_norm', 'Gradient Norm (L2)'),
+        ('grad_weight_ratio', 'Gradient / Weight Ratio (%)'),
+        ('update_to_param_ratio', 'Update-to-Parameter Ratio (%)'),
+    ]
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10))
+
+    for ax, (key, title) in zip(axes, metrics):
+        epochs, layer_values = _extract_metric(diagnostics, key)
+        if not epochs:
+            continue
+        for layer, values in sorted(layer_values.items()):
+            ax.plot(epochs[:len(values)], values, marker='o', markersize=3, label=layer)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(title)
+        ax.set_title(title)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+
+    base = _diag_save_dir(output_dir)
+    if save:
+        path = os.path.join(base, 'gradient_metrics.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved gradient metrics plot -> {path}")
+    plt.show()
+    plt.close()
+
+
+def plot_weight_metrics(diagnostics, save=True, output_dir=None):
+    """2-panel figure: weight displacement (L2) and cosine similarity vs pretrained."""
+    if not diagnostics:
+        return
+
+    metrics = [
+        ('weight_displacement', 'Weight Displacement (L2 from pretrained)'),
+        ('cosine_similarity', 'Cosine Similarity to Pretrained'),
+    ]
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7))
+
+    for ax, (key, title) in zip(axes, metrics):
+        epochs, layer_values = _extract_metric(diagnostics, key)
+        if not epochs:
+            continue
+        for layer, values in sorted(layer_values.items()):
+            ax.plot(epochs[:len(values)], values, marker='o', markersize=3, label=layer)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(title)
+        ax.set_title(title)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+        if key == 'cosine_similarity':
+            ax.set_ylim(bottom=0, top=1.05)
+
+    fig.tight_layout()
+
+    base = _diag_save_dir(output_dir)
+    if save:
+        path = os.path.join(base, 'weight_metrics.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved weight metrics plot -> {path}")
+    plt.show()
+    plt.close()
+
+
+def plot_cka_similarity(diagnostics, save=True, output_dir=None):
+    """CKA similarity to pretrained representations per hooked layer vs epoch."""
+    if not diagnostics:
+        return
+
+    epochs, layer_values = _extract_metric(diagnostics, 'cka')
+    if not epochs or not layer_values:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for layer, values in layer_values.items():
+        ax.plot(epochs[:len(values)], values, marker='o', markersize=4, label=layer)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('CKA')
+    ax.set_title('CKA Similarity to Pretrained Representations')
+    ax.set_ylim(bottom=0, top=1.05)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+
+    base = _diag_save_dir(output_dir)
+    if save:
+        path = os.path.join(base, 'cka_similarity.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved CKA similarity plot -> {path}")
+    plt.show()
+    plt.close()
+
+
 def _aug_label(v):
     """Human-readable x-axis label for an n_aug value."""
     if v == 0:
@@ -138,7 +259,8 @@ def show_emg_map(results, idx, model_type, mode='', save=False, output_dir=None,
 
     # Determine Grid Shape
     n_channels = len(y_true)
-    if n_channels == 96: grid_shape = (8, 12)
+    if n_channels == 100: grid_shape = (10, 10)
+    elif n_channels == 64: grid_shape = (8, 8)
     elif n_channels == 32: grid_shape = (4, 8)
     else: grid_shape = (1, n_channels)
 
@@ -171,15 +293,137 @@ def show_emg_map(results, idx, model_type, mode='', save=False, output_dir=None,
     ax[1].plot(max_idx_pred[1] + 0.5, max_idx_pred[0] + 0.5, 'ro', markersize=8)
 
     if eval_type == 'optimization':
-        base = os.path.join(output_dir, 'optimization') if output_dir else \
-               os.path.join('output', 'optimization')
+        base = os.path.join(output_dir, 'optimization', 'emg_maps') if output_dir else \
+               os.path.join('output', 'optimization', 'emg_maps')
     else:
-        base = os.path.join(output_dir, 'fitness') if output_dir else \
-               os.path.join('output', 'fitness', dataset)
+        base = os.path.join(output_dir, 'fitness', 'emg_maps') if output_dir else \
+               os.path.join('output', 'fitness', dataset, 'emg_maps')
     os.makedirs(base, exist_ok=True)
     plot_path = os.path.join(base, f'emg_map_{dataset}_s{subject}_emg{emg}_{model_type}{mode}.svg')
     if save:
         plt.savefig(plot_path, format="svg")
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def _infer_grid_shape(n_channels):
+    """Return (rows, cols) for a given number of channels."""
+    if n_channels == 100: return (10, 10)
+    elif n_channels == 96: return (8, 12)
+    elif n_channels == 64: return (8, 8)
+    elif n_channels == 32: return (4, 8)
+    else: return (1, n_channels)
+
+
+def visualize_representation(results_dict, mode='', save=False, output_dir=None):
+    """
+    Heatmap grid showing model predictions evolving across BO iterations.
+
+    Row 0: ground truth (repeated across columns).
+    Rows 1+: one row per model, columns at log2-spaced snapshot iterations.
+    Each cell shows the predicted EMG map; subtitle shows R².
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts.
+                      Each result dict must have 'snapshots' (from optimization mode).
+        mode: string suffix for the output filename.
+        save: whether to save the figure to disk.
+        output_dir: run directory (saves under optimization/emg_maps/).
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    # Pick ONE random experiment index (same for all models)
+    first_results = next(iter(results_dict.values()))
+    n_experiments = len(first_results)
+
+    # Find an experiment where at least one model has snapshots
+    candidates = []
+    for idx in range(n_experiments):
+        has_snap = any(
+            results_list[idx].get('snapshots') is not None
+            for results_list in results_dict.values()
+        )
+        if has_snap:
+            candidates.append(idx)
+
+    if not candidates:
+        print("[visualize_representation] No snapshots available, skipping.")
+        return
+
+    idx = candidates[np.random.randint(len(candidates))]
+
+    # Collect snapshot iterations (union across models)
+    all_iters = set()
+    for results_list in results_dict.values():
+        snaps = results_list[idx].get('snapshots')
+        if snaps:
+            all_iters.update(snaps.keys())
+    snapshot_iters = sorted(all_iters)
+
+    if not snapshot_iters:
+        return
+
+    ref_res = first_results[idx]
+    y_test = ref_res['y_test']
+    grid_shape = _infer_grid_shape(len(y_test))
+    v_min, v_max = float(y_test.min()), float(y_test.max())
+
+    model_names = list(results_dict.keys())
+    n_models = len(model_names)
+    n_cols = len(snapshot_iters)
+    n_rows = 1 + n_models  # ground truth row + one row per model
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(3 * n_cols, 3 * n_rows),
+                             squeeze=False)
+
+    heatmap_kw = dict(cmap='viridis', vmin=v_min, vmax=v_max,
+                      cbar=False, xticklabels=False, yticklabels=False)
+
+    subject = ref_res.get('subject', '?')
+    emg = ref_res.get('emg', '?')
+
+    # Row 0: ground truth
+    for col in range(n_cols):
+        ax = axes[0, col]
+        sns.heatmap(y_test.reshape(grid_shape), ax=ax, **heatmap_kw)
+        if col == 0:
+            ax.set_ylabel(f'Ground Truth\nS{subject} EMG{emg}', fontsize=8)
+        ax.set_title(f'Iter {snapshot_iters[col]}', fontsize=8)
+
+    # Rows 1+: model predictions
+    for row_i, model_name in enumerate(model_names):
+        snaps = results_dict[model_name][idx].get('snapshots')
+        for col, it in enumerate(snapshot_iters):
+            ax = axes[1 + row_i, col]
+            if snaps and it in snaps:
+                pred = snaps[it]['y_pred']
+                r2_val = snaps[it]['r2']
+                sns.heatmap(pred.reshape(grid_shape), ax=ax, **heatmap_kw)
+                ax.set_title(f'R²={r2_val:.2f}', fontsize=7)
+            else:
+                ax.set_visible(False)
+            if col == 0:
+                ax.set_ylabel(model_name, fontsize=8)
+
+    # Shared colorbar
+    fig.subplots_adjust(right=0.88)
+    cbar_ax = fig.add_axes([0.90, 0.15, 0.02, 0.7])
+    sm = plt.cm.ScalarMappable(cmap='viridis',
+                               norm=plt.Normalize(vmin=v_min, vmax=v_max))
+    fig.colorbar(sm, cax=cbar_ax)
+
+    dataset = ref_res.get('dataset', '')
+    fig.suptitle(f'Representation Evolution | {dataset} S{subject} EMG{emg}', fontsize=11)
+    fig.tight_layout(rect=[0, 0, 0.89, 0.95])
+
+    base = os.path.join(output_dir, 'optimization', 'emg_maps') if output_dir else \
+           os.path.join('output', 'optimization', 'emg_maps')
+    os.makedirs(base, exist_ok=True)
+    plot_path = os.path.join(base, f'visualize_representation{mode}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg')
         print(f"Saved plot to {plot_path}")
 
     plt.close()

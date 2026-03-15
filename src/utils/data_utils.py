@@ -6,11 +6,67 @@ import os
 import json
 from datetime import datetime
 import csv
+import matplotlib.pyplot as plt
+import seaborn as sns
+import math
 
 
 # ============================================
 #           Data Loader and Preprocessing
 # ============================================
+
+
+def _topographic_reorder(sorted_resp, sorted_respMean, sorted_respSD,
+                         sorted_isvalid, ch2xy, maps):
+    """Reorder channel-indexed arrays to row-major grid order, padding grounds.
+
+    The Utah microelectrode array has a scrambled pin-to-electrode mapping.
+    ch2xy[i] = [row, col] gives the physical grid position of channel i.
+    maps.shape gives the full grid dimensions (e.g. 10x10 for NHP).
+
+    After reordering, channel k in the output corresponds to grid position
+    (k // n_cols, k % n_cols), so array.reshape(grid_shape) gives the correct
+    topographic map. Ground positions (grid cells with no electrode) are filled
+    with 0.
+
+    Returns:
+        (sorted_resp, sorted_respMean, sorted_respSD, sorted_isvalid,
+         ch2xy, grid_shape) — all reordered/padded.
+    """
+    grid_shape = maps.shape[:2]
+    n_rows, n_cols = grid_shape
+    n_grid = n_rows * n_cols
+
+    # Map grid position → original channel index
+    grid_to_chan = {}
+    for i in range(ch2xy.shape[0]):
+        r, c = int(round(ch2xy[i, 0])), int(round(ch2xy[i, 1]))
+        grid_to_chan[(r, c)] = i
+
+    # Row-major ordering: grid position 0 = (0,0), 1 = (0,1), ...
+    topo_order = []
+    topo_coords = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            topo_order.append(grid_to_chan.get((r, c), -1))
+            topo_coords.append([r, c])
+
+    def _reorder(arr):
+        """Reorder first axis from channel order to row-major grid order."""
+        out = np.zeros((n_grid,) + arr.shape[1:], dtype=arr.dtype)
+        for g, ch in enumerate(topo_order):
+            if ch >= 0:
+                out[g] = arr[ch]
+        return out
+
+    return (
+        _reorder(sorted_resp),
+        _reorder(sorted_respMean),
+        _reorder(sorted_respSD),
+        _reorder(sorted_isvalid),
+        np.array(topo_coords, dtype=ch2xy.dtype),
+        grid_shape,
+    )
 
 
 def load_data(dataset_type, m_i):
@@ -54,11 +110,17 @@ def load_data(dataset_type, m_i):
             }
 
         nChan = data[mapping['nChan']][0][0]
+        evoked_emg = np.stack(data[mapping['evoked_emg']][0], axis=0)
 
         rN = data[mapping['sorted_isvalid']]
         j1, j2, j3 = rN.shape[0], rN.shape[1], rN[0][0].shape[0]
         sorted_isvalid = np.stack([np.squeeze(rN[i, j]) for i in range(j1) for j in range(j2)], axis=0)
         sorted_isvalid = sorted_isvalid.reshape(j1, j2, j3)
+
+        emgs = {
+            'emgs': [name[0] for name in data[mapping['emgs']][0]],
+            'emgsabr': [name[0] for name in data[mapping['emgsabr']][0]]
+        }
 
         ch2xy = data[mapping['ch2xy']] - 1
         se = data[mapping['sorted_evoked']]
@@ -72,6 +134,9 @@ def load_data(dataset_type, m_i):
             stim_channel = stim_channel[0]
 
         fs = data[mapping['sampFreqEMG']][0][0]
+        parameters = {'c': nChan, 'j': stim_channel.shape[0]}
+        n_muscles = data[mapping['emgs']].shape[1]
+        maps = data[mapping['map']]
         resp_region = data[mapping['resp_region']][0]
 
         stimProfile = data[mapping['stimProfile']][0]
@@ -103,16 +168,27 @@ def load_data(dataset_type, m_i):
 
         emgs = data[0][0]
 
+        # Topographic reorder: place channels at correct grid positions
+        sorted_resp, sorted_respMean, sorted_respSD, sorted_isvalid, ch2xy, grid_shape = \
+            _topographic_reorder(sorted_resp, sorted_respMean, sorted_respSD,
+                                 sorted_isvalid, ch2xy, maps)
+
         return {
+        'correspondance': mapping,
         'emgs': emgs,
-        'nChan': nChan,
+        'evoked_emg': evoked_emg,
+        'nChan': grid_shape[0] * grid_shape[1],
         'sorted_isvalid': sorted_isvalid,
         'sorted_resp': sorted_resp,
         'sorted_respMean': sorted_respMean,
         'sorted_respSD': sorted_respSD,
+        'sorted_evoked': sorted_evoked,
+        'sorted_filtered': sorted_filtered,
         'ch2xy': ch2xy,
-        'DimSearchSpace': 96
+        'parameters': parameters, 'n_muscles': n_muscles, 'maps': maps,
+        'DimSearchSpace': grid_shape[0] * grid_shape[1],
         }
+
     elif dataset_type=='rat':  # rat dataset has 6 subjects
         if m_i==0:
             data = scipy.io.loadmat(path_to_dataset+'/rat/rat1_M1_190716.mat')['rat1_M1_190716'][0][0]
@@ -153,10 +229,11 @@ def load_data(dataset_type, m_i):
             stim_channel = stim_channel[0]
 
         fs = data[mapping['sampFreqEMG']][0][0]
+        maps = data[mapping['map']]
         resp_region = data[mapping['resp_region']][0]
 
         stimProfile = data[mapping['stimProfile']][0]
-        
+
         # compute baseline
         where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
         window_size = int(fs * 30 * 10**(-3))
@@ -167,9 +244,9 @@ def load_data(dataset_type, m_i):
             # Compute mean over the last dimension (time), across those repetitions
             mean_baseline = np.mean(sorted_filtered[iChan, :, :n_rep, where_zero - window_size : where_zero], axis=-1)
             baseline.append(mean_baseline)
-        
+
         baseline = np.stack(baseline, axis=0)  # shape: (nChan, nSamples)
-        
+
         sorted_filtered = sorted_filtered - baseline[..., np.newaxis]
         sorted_resp = np.max(sorted_filtered[:,:,:n_rep,resp_region[0]:resp_region[1]], axis=-1)
         # Create a masked array where invalid points are masked
@@ -183,15 +260,20 @@ def load_data(dataset_type, m_i):
 
         emgs = data[0][0]
 
+        # Topographic reorder: place channels at correct grid positions
+        sorted_resp, sorted_respMean, sorted_respSD, sorted_isvalid, ch2xy, grid_shape = \
+            _topographic_reorder(sorted_resp, sorted_respMean, sorted_respSD,
+                                 sorted_isvalid, ch2xy, maps)
+
         return {
         'emgs': emgs,
-        'nChan': nChan,
+        'nChan': grid_shape[0] * grid_shape[1],
         'sorted_isvalid': sorted_isvalid,
         'sorted_resp': sorted_resp,
         'sorted_respMean': sorted_respMean,
         'sorted_respSD': sorted_respSD,
         'ch2xy': ch2xy,
-        'DimSearchSpace': 32
+        'DimSearchSpace': grid_shape[0] * grid_shape[1],
         }
     elif dataset_type =='spinal':
 
@@ -260,20 +342,26 @@ def load_data(dataset_type, m_i):
         #mask sorted_isvalid by n_rep
         sorted_isvalid = sorted_isvalid[:, :, :n_rep]
 
+        # Topographic reorder: place channels at correct grid positions
+        sorted_resp, sorted_respMean, sorted_respSD, sorted_isvalid, ch2xy, grid_shape = \
+            _topographic_reorder(sorted_resp, sorted_respMean, sorted_respSD,
+                                 sorted_isvalid, ch2xy, maps)
+        n_grid = grid_shape[0] * grid_shape[1]
+
         subject = {
             'emgs': emgs,
-            'nChan': 64,
-            'DimSearchSpace': 64,
+            'nChan': n_grid,
+            'DimSearchSpace': n_grid,
             'sorted_respMean': sorted_respMean,
             'ch2xy': ch2xy,
-            'evoked_emg': evoked_emg, 'filtered_emg':filtered_emg, 'sorted_resp': sorted_resp,  
+            'evoked_emg': evoked_emg, 'filtered_emg':filtered_emg, 'sorted_resp': sorted_resp,
             'sorted_isvalid': sorted_isvalid, 'sorted_respSD': sorted_respSD,
             'sorted_filtered': sorted_filtered, 'stim_channel': stim_channel, 'fs': fs,
         'parameters': parameters, 'n_muscles': n_muscles, 'maps': maps,
-        'resp_region': resp_region, 'stimProfile': stimProfile,  'baseline' : baseline    
+        'resp_region': resp_region, 'stimProfile': stimProfile,  'baseline' : baseline
         }
-        
-        return subject   
+
+        return subject
     else:
         raise ValueError('The dataset type should be 5d_rat, nhp, rat or spinal' )
 
@@ -282,9 +370,9 @@ def load_data(dataset_type, m_i):
 #      Held-Out / Train Subject Splits
 # ============================================
 
-HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [1]}
-TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 3]}
-ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 3]}
+HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [1], 'spinal': [0, 2, 5, 9]}
+TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 3], 'spinal': [1, 3, 4, 6, 7, 8, 10]}
+ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 3], 'spinal': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}
 
 
 def generate_experiment_tag(dataset_type, split_type, epochs, lr, n_augmentations,
@@ -314,7 +402,7 @@ def create_run_dir(exp_tag: str, base_dir='./output/runs') -> str:
     """Create output/runs/{exp_tag}_{timestamp}/ and return its path."""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = os.path.join(base_dir, f'{exp_tag}_{timestamp}')
-    for sub in ('fitness', 'optimization', 'results'):
+    for sub in ('fitness', 'fitness/emg_maps', 'optimization', 'optimization/emg_maps', 'results', 'diagnostics'):
         os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
     return run_dir
 
@@ -387,14 +475,14 @@ def plot_augmented_maps(subject_data, emg_idx, dataset_type, subj_idx,
         n_augmentations: total augmentations to generate before selecting n_show
         seed: random seed passed to augment_maps
     """
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    import math
+
 
     mean_map = subject_data['sorted_respMean'][:, emg_idx]  # (nChan,)
     nChan = len(mean_map)
-    if nChan == 96:
-        grid_shape = (8, 12)
+    if nChan == 100:
+        grid_shape = (10, 10)
+    elif nChan == 64:
+        grid_shape = (8, 8)
     elif nChan == 32:
         grid_shape = (4, 8)
     else:
@@ -634,10 +722,11 @@ def load_results(pickle_path):
 
 if __name__ == '__main__':
     DATASET  = 'nhp'
-    SUBJ_IDX = 1
-    EMG_IDX  = 4
-    N_SHOW   = 12
+    SUBJ_IDX = 2
+    EMG_IDX  = 3
+    N_SHOW   = 1
 
     data = load_data(DATASET, SUBJ_IDX)
+    #data = load_matlab_data(DATASET, SUBJ_IDX)
     plot_augmented_maps(data, EMG_IDX, DATASET, SUBJ_IDX, n_show=N_SHOW)
 
