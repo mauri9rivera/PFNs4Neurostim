@@ -2,8 +2,9 @@
 Fine-tuning orchestration for TabPFN on neurostimulation data.
 
 Two-phase workflow:
-  1. Backprop finetuning: finetune_tabpfn() trains a FinetunedTabPFNRegressor,
+  1. Backprop finetuning: finetune_tabpfn() trains a GradientMonitoredRegressor,
      adapting pretrained weights to neurostimulation data via gradient updates.
+     Diagnostics (gradient/weight metrics, CKA) are always collected.
   2. Extraction for evaluation: extract_inference_model() deep-copies the
      internal TabPFNRegressor with finetuned weights. This standalone model
      uses in-context learning (.fit() stores context, no gradients) and
@@ -12,292 +13,40 @@ Two-phase workflow:
 Usage:
     python finetuning.py --dataset rat --device cuda --epochs 30
     python finetuning.py --dataset nhp --device cuda --epochs 30
-    python finetuning.py --evaluate --dataset rat --device cpu
+    python finetuning.py --dataset nhp --mode optimization --budget 100 --n_reps 20
 """
 import argparse
-import copy
-import math
 import os
-import time
+import random
 from datetime import datetime
+
 import numpy as np
-import torch
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import r2_score
 
-import gpytorch
-
-from tabpfn import TabPFNRegressor
-from tabpfn.finetuning.finetuned_regressor import FinetunedTabPFNRegressor
-from tabpfn.model_loading import load_fitted_tabpfn_model, save_fitted_tabpfn_model
-from pathlib import Path
-
-from models.gaussians import ExactGP
+from models.regressors import _make_finetuned_regressor, extract_inference_model
+from evaluation import (
+    gp_baseline, finetuned_fit, finetuned_optimization,
+    finetuned_fit_budget, finetuned_optimization_budget,
+    finetuned_percentage, load_sweep_results,
+)
 from utils.data_utils import (
-    build_finetuning_dataset, load_data, preprocess_neural_data,
+    build_finetuning_dataset, load_data,
     HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS,
     generate_experiment_tag, save_results,
     create_run_dir, write_run_config,
 )
-from utils.gpbo_utils import expected_improvement, compute_ucb_kappa
 from utils.visualization import (
-    show_emg_map, r2_comparison, regret_curve, plot_runtime_trajectory,
-    r2_by_subject,
-    regret_by_subject, regret_by_emg,
-    budget_sweep_plot, budget_sweep_plot_v2, regret_with_timing,
-    augmentation_sweep_plot, n_augmentation_sweep_plot_v2,
-    plot_gradient_metrics, plot_weight_metrics, plot_cka_similarity,
+    r2_per_muscle, r2_by_subject, show_emg_map,
+    regret_with_timing, regret_by_subject, regret_by_emg,
+    budget_sweep_plot, augmentation_sweep_plot,
     visualize_representation,
+    plot_gradient_metrics, plot_weight_metrics, plot_cka_similarity,
 )
-import random
-
-
-def _snapshot_iters(budget, n_init):
-    """Compute log2-spaced iteration counts (total observations, 1-indexed) for snapshots."""
-    iters = set()
-    i = 1
-    while n_init + i <= budget:
-        iters.add(n_init + i)
-        i *= 2
-    iters.add(budget)  # always include final
-    return sorted(iters)
-
-
-# ============================================
-#       Gradient Monitoring
-# ============================================
-
-def linear_cka(X, Y):
-    """Linear CKA between activation matrices X, Y of shape [n, d]."""
-    X = X - X.mean(dim=0, keepdim=True)
-    Y = Y - Y.mean(dim=0, keepdim=True)
-    hsic_xy = (Y.T @ X).norm() ** 2
-    hsic_xx = (X.T @ X).norm()
-    hsic_yy = (Y.T @ Y).norm()
-    return (hsic_xy / (hsic_xx * hsic_yy + 1e-10)).item()
-
-
-class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
-    """
-    FinetunedTabPFNRegressor with comprehensive per-epoch finetuning diagnostics.
-
-    When verbose_gradients=True, collects three categories of metrics each epoch:
-      1. Gradient-based: gradient norm, gradient/weight ratio, update-to-parameter ratio
-      2. Weight-based: weight displacement (L2), cosine similarity vs pretrained
-      3. Representation-based: CKA similarity to pretrained activations (via forward hooks)
-
-    All metrics are stored in self._diagnostics_ (list of per-epoch dicts).
-    """
-
-    def __init__(self, *args, verbose_gradients=False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.verbose_gradients = verbose_gradients
-        self._diagnostics_ = []
-        self._cka_ref_X_ = None
-        self._cka_ref_y_ = None
-        self._pretrained_acts_ = {}
-        self._cka_hook_names_ = []
-        self._cka_ref_inputs_ = None
-
-    def fit(self, X, y, **kwargs):
-        self._grad_log_ = []
-        self._pretrained_params_ = {}
-        self._diagnostics_ = []
-        self._pretrained_acts_ = {}
-
-        # Store reference batch for CKA (fixed seed for reproducibility)
-        n_ref = min(100, len(X))
-        rng = np.random.RandomState(0)
-        ref_idx = rng.choice(len(X), n_ref, replace=False)
-        self._cka_ref_X_ = X[ref_idx]
-        self._cka_ref_y_ = y[ref_idx]
-
-        result = super().fit(X, y, **kwargs)
-
-        if self.verbose_gradients and self._pretrained_params_:
-            # Compute total weight change from pretrained snapshot
-            weight_change = {}
-            for name, p in self.finetuned_estimator_.model_.named_parameters():
-                if name not in self._pretrained_params_:
-                    continue
-                layer = name.split('.')[0]
-                delta = (p.data.cpu() - self._pretrained_params_[name]).norm().item()
-                base  = self._pretrained_params_[name].norm().item() + 1e-8
-                weight_change.setdefault(layer, []).append(delta / base * 100)
-            weight_change_pct = {k: float(np.mean(v)) for k, v in weight_change.items()}
-
-            print("\n[GradientMonitor] Total weight change from pretrained:")
-            for layer, pct in sorted(weight_change_pct.items(), key=lambda x: -x[1]):
-                bar = '█' * min(40, max(1, int(pct * 4)))
-                print(f"  {layer:<30} {pct:6.2f}%  {bar}")
-
-            self._weight_change_pct_ = weight_change_pct
-
-        # Build backward-compat _grad_log_ from _diagnostics_
-        self._grad_log_ = [
-            {'epoch': d['epoch'], **d['grad_weight_ratio']}
-            for d in self._diagnostics_ if d['epoch'] >= 0
-        ]
-
-        return result
-
-    def _capture_activations(self, model):
-        """Run forward pass with hooks, return {hook_name: flattened_activation [n, d]}."""
-        activations = {}
-        handles = []
-
-        def _make_hook(name):
-            def hook_fn(module, input, output):
-                act = output if isinstance(output, torch.Tensor) else output[0]
-                # Flatten all dims except first → [n, d]
-                activations[name] = act.detach().cpu().reshape(act.shape[0], -1).float()
-            return hook_fn
-
-        for name in self._cka_hook_names_:
-            try:
-                module = model
-                for attr in name.split('.'):
-                    module = module[int(attr)] if attr.isdigit() else getattr(module, attr)
-                handles.append(module.register_forward_hook(_make_hook(name)))
-            except (AttributeError, IndexError, KeyError):
-                print(f"[GradientMonitor] Warning: could not hook '{name}', skipping CKA for this layer")
-
-        x_input, y_input = self._cka_ref_inputs_
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            model(x_input, y_input, only_return_standard_out=True)
-        if was_training:
-            model.train()
-
-        for h in handles:
-            h.remove()
-
-        return activations
-
-    def _compute_weight_metrics(self, model):
-        """Per-layer weight displacement and cosine similarity vs pretrained."""
-        displacement = {}
-        cosine_sim = {}
-        update_ratio = {}
-        for name, p in model.named_parameters():
-            if name not in self._pretrained_params_:
-                continue
-            layer = name.split('.')[0]
-            w = p.data.cpu().flatten()
-            w0 = self._pretrained_params_[name].flatten()
-            diff = (w - w0).norm().item()
-            base = w0.norm().item() + 1e-8
-            displacement.setdefault(layer, []).append(diff)
-            update_ratio.setdefault(layer, []).append(diff / base * 100)
-            cos = torch.nn.functional.cosine_similarity(
-                w.unsqueeze(0), w0.unsqueeze(0)
-            ).item()
-            cosine_sim.setdefault(layer, []).append(cos)
-        return (
-            {k: float(np.mean(v)) for k, v in displacement.items()},
-            {k: float(np.mean(v)) for k, v in cosine_sim.items()},
-            {k: float(np.mean(v)) for k, v in update_ratio.items()},
-        )
-
-    def _log_epoch_evaluation(self, epoch, eval_result, mean_train_loss):
-        model = self.finetuned_estimator_.model_
-
-        if epoch == -1:
-            # Snapshot pretrained weights
-            self._pretrained_params_ = {
-                name: p.data.clone().cpu()
-                for name, p in model.named_parameters()
-            }
-
-            # Discover CKA hook layers
-            n_transformer_layers = len(model.transformer_encoder.layers)
-            mid = n_transformer_layers // 2
-            self._cka_hook_names_ = [
-                'encoder',
-                'transformer_encoder.layers.0',
-                f'transformer_encoder.layers.{mid}',
-                f'transformer_encoder.layers.{n_transformer_layers - 1}',
-            ]
-
-            # Prepare CKA reference tensors
-            device = next(model.parameters()).device
-            n_ref = len(self._cka_ref_X_)
-            n_ctx = n_ref // 2
-            x_input = torch.tensor(
-                self._cka_ref_X_, dtype=torch.float32, device=device
-            ).unsqueeze(1)  # [N, 1, n_feat]
-            y_input = torch.tensor(
-                self._cka_ref_y_[:n_ctx], dtype=torch.float32, device=device
-            ).unsqueeze(1)  # [N//2, 1]
-            self._cka_ref_inputs_ = (x_input, y_input)
-
-            # Capture pretrained activations
-            self._pretrained_acts_ = self._capture_activations(model)
-
-        else:
-            # --- Gradient-based metrics ---
-            grad_norm = {}
-            grad_weight_ratio = {}
-            for name, param in model.named_parameters():
-                if param.grad is None:
-                    continue
-                layer = name.split('.')[0]
-                g_norm = param.grad.norm().item()
-                w_norm = param.data.norm().item() + 1e-8
-                grad_norm.setdefault(layer, []).append(g_norm)
-                grad_weight_ratio.setdefault(layer, []).append(g_norm / w_norm * 100)
-
-            grad_norm_avg = {k: float(np.mean(v)) for k, v in grad_norm.items()}
-            grad_ratio_avg = {k: float(np.mean(v)) for k, v in grad_weight_ratio.items()}
-
-            # --- Weight-based metrics ---
-            w_disp, w_cos, w_update = self._compute_weight_metrics(model)
-
-            # --- CKA ---
-            cka_scores = {}
-            if self._pretrained_acts_ and self._cka_ref_inputs_ is not None:
-                current_acts = self._capture_activations(model)
-                for hook_name in self._cka_hook_names_:
-                    if hook_name in self._pretrained_acts_ and hook_name in current_acts:
-                        cka_scores[hook_name] = linear_cka(
-                            self._pretrained_acts_[hook_name],
-                            current_acts[hook_name],
-                        )
-
-            epoch_entry = {
-                'epoch': epoch,
-                'grad_norm': grad_norm_avg,
-                'grad_weight_ratio': grad_ratio_avg,
-                'update_to_param_ratio': w_update,
-                'weight_displacement': w_disp,
-                'cosine_similarity': w_cos,
-                'cka': cka_scores,
-            }
-            self._diagnostics_.append(epoch_entry)
-
-            if self.verbose_gradients:
-                print(f"\n[GradientMonitor] Epoch {epoch + 1} diagnostics:")
-                print(f"  Grad/weight ratio: {', '.join(f'{k}={v:.4f}%' for k, v in sorted(grad_ratio_avg.items()))}")
-                print(f"  Cosine sim:        {', '.join(f'{k}={v:.6f}' for k, v in sorted(w_cos.items()))}")
-                if cka_scores:
-                    print(f"  CKA:               {', '.join(f'{k}={v:.4f}' for k, v in cka_scores.items())}")
-
-        # Always call original implementation to preserve logging/early stopping
-        super()._log_epoch_evaluation(epoch, eval_result, mean_train_loss)
-
-
-def _make_finetuned_regressor(verbose_gradients=False, **kwargs):
-    """Factory: returns GradientMonitoredRegressor if verbose_gradients else FinetunedTabPFNRegressor."""
-    if verbose_gradients:
-        return GradientMonitoredRegressor(verbose_gradients=True, **kwargs)
-    return FinetunedTabPFNRegressor(**kwargs)
 
 
 def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
-                    n_augmentations=25, verbose_gradients=False):
+                    n_augmentations=25, subject_indices=None,
+                    held_out_emg_idx=None, seed=42,
+                    print_diagnostics=False, output_dir=None):
     """
     Fine-tune a TabPFNRegressor on augmented neurostimulation data.
 
@@ -307,24 +56,31 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
         epochs: number of fine-tuning epochs
         lr: learning rate
         n_augmentations: augmentations per subject-EMG pair
-        output_dir: directory to save the fine-tuned model
-        verbose_gradients: if True, print per-layer gradient/weight ratios each epoch
+        subject_indices: list of subject indices to train on (None = all training subjects)
+        held_out_emg_idx: EMG index to exclude from training data
+        seed: random seed for dataset building
+        print_diagnostics: if True, print per-layer gradient/weight ratios each epoch
+        output_dir: when set, saves diagnostic plots to {output_dir}/diagnostics/
 
     Returns:
-        model: The finetuned FinetunedTabPFNRegressor instance (in-memory)
+        (ft_model_raw, ft_model) tuple:
+          - ft_model_raw: the GradientMonitoredRegressor (with _diagnostics_)
+          - ft_model: extracted TabPFNRegressor for in-context learning
     """
     print(f"Building augmented dataset for '{dataset_type}' ...")
     X_train, y_train = build_finetuning_dataset(
         dataset_type,
+        subject_indices=subject_indices,
+        held_out_emg_idx=held_out_emg_idx,
         n_augmentations=n_augmentations,
-        seed=42
+        seed=seed,
     )
     print(f"  Dataset size: {X_train.shape[0]} rows, {X_train.shape[1]} features")
 
-    print(f"Initializing FinetunedTabPFNRegressor for fine-tuning (epochs={epochs}, lr={lr}) ...")
+    print(f"Initializing finetuned regressor (epochs={epochs}, lr={lr}) ...")
 
-    model = _make_finetuned_regressor(
-        verbose_gradients=verbose_gradients,
+    ft_model_raw = _make_finetuned_regressor(
+        print_diagnostics=print_diagnostics,
         device=device,
         epochs=epochs,
         learning_rate=lr,
@@ -334,997 +90,19 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
     )
 
     print("Fine-tuning ...")
-    model.fit(X_train, y_train)
-    # Plot gradient diagnostics (standalone path — falls back to output/diagnostics/)
-    if verbose_gradients and hasattr(model, '_diagnostics_') and model._diagnostics_:
-        plot_gradient_metrics(model._diagnostics_)
-        plot_weight_metrics(model._diagnostics_)
-        plot_cka_similarity(model._diagnostics_)
+    ft_model_raw.fit(X_train, y_train)
+
+    # Always save diagnostic plots when diagnostics are available
+    if hasattr(ft_model_raw, '_diagnostics_') and ft_model_raw._diagnostics_:
+        diag_dir = os.path.join(output_dir, 'diagnostics') if output_dir else None
+        plot_gradient_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
+        plot_weight_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
+        plot_cka_similarity(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
+
     print("Fine-tuning complete.")
 
-    return model
-
-
-def extract_inference_model(finetuned_regressor):
-    """Extract a TabPFNRegressor with finetuned weights for in-context learning.
-
-    After finetuning completes, the FinetunedTabPFNRegressor stores an internal
-    TabPFNRegressor with finetuned weights at `finetuned_inference_regressor_`.
-    This function deep-copies it to produce a standalone regressor where:
-      - .fit(X, y) stores context (no gradient updates)
-      - .predict() supports output_type="quantiles" and all other options
-    """
-    if not hasattr(finetuned_regressor, 'finetuned_inference_regressor_'):
-        raise AttributeError(
-            "FinetunedTabPFNRegressor has not been fit yet. "
-            "Call .fit() before extracting the inference model."
-        )
-    inference_model = copy.deepcopy(finetuned_regressor.finetuned_inference_regressor_)
-    print(f"  Extracted TabPFNRegressor with finetuned weights "
-          f"(fit_mode={inference_model.fit_mode!r})")
-    return inference_model
-
-
-# ============================================
-#       GP BO Loop (mirrors run_bo_loop, GP only)
-# ============================================
-
-def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
-                  n_init=5, budget=100, device='cpu', snapshot_iters=None):
-    """
-    Performs the Active Learning loop using a GP model.
-    (This mirrors run_bo_loop from main.py but only for the GP case)
-
-    Args:
-        X_pool: Feature matrix for the candidate pool (n_locs, n_features).
-        y_pool: Response matrix (n_locs, n_reps) with noisy observations.
-        x_test: Test feature matrix for final prediction.
-        y_test: Test response vector (mean across repetitions).
-        n_init: Number of random initial observations.
-        budget: Total number of observations (including initial).
-        device: 'cpu' or 'cuda'.
-
-    Returns:
-        - observed_indices: Indices of points chosen
-        - observed_values: Observed y values (with noise)
-        - real_values: True y values at observed indices
-        - times: Time taken at each step
-        - y_pred: Final predictions on x_test
-    """
-    n_locs, n_reps = y_pool.shape
-
-    def sample_from_pool(idx):
-        return float(y_pool[idx, :].mean())
-
-    # 1. Initialization (Random)
-    pool_indices = np.arange(n_locs)
-    observed_indices = np.random.choice(pool_indices, size=n_init, replace=False).tolist()
-    observed_values = [sample_from_pool(idx) for idx in observed_indices]
-    real_values = y_test[observed_indices].tolist()
-
-    times = []
-    snapshots = {}
-    n_steps = budget - n_init
-
-    # --- LOOP ---
-    for t in range(n_steps):
-        step_start = time.time()
-
-        X_train = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
-        y_train = torch.tensor(observed_values, dtype=torch.float32, device=device)
-        X_cand = torch.tensor(X_pool, dtype=torch.float32, device=device)
-
-        # Initialize Model & Likelihood
-        likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-        model = ExactGP(X_train, y_train, likelihood).to(device)
-
-        # Training Loop (Optimize Hyperparameters)
-        model.train()
-        likelihood.train()
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-
-        for _ in range(50):
-            optimizer.zero_grad()
-            output = model(X_train)
-            loss = -mll(output, y_train)
-            loss.backward()
-            optimizer.step()
-
-        # Select Next Point (UCB with cosine-annealed kappa)
-        kappa = compute_ucb_kappa(t, n_steps, kappa_0=5.0, kappa_min=1.0)
-        model.eval()
-        likelihood.eval()
-        with torch.no_grad():
-            posterior = likelihood(model(X_cand))
-            mean = posterior.mean
-            sigma = posterior.stddev
-        acq_vals = mean + kappa * sigma
-        # Prevent revisiting already-observed locations
-        for obs_idx in observed_indices:
-            acq_vals[obs_idx] = -float('inf')
-        next_idx = acq_vals.argmax().item()
-
-        observed_indices.append(next_idx)
-        new_val = sample_from_pool(next_idx)
-        observed_values.append(new_val)
-        real_values.append(y_test[next_idx])
-
-        step_time = time.time() - step_start
-        times.append(step_time)
-
-        # Capture snapshot if requested (refit on updated observations)
-        if snapshot_iters is not None and len(observed_indices) in snapshot_iters:
-            _X_snap = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
-            _y_snap = torch.tensor(observed_values, dtype=torch.float32, device=device)
-            _lik_snap = gpytorch.likelihoods.GaussianLikelihood().to(device)
-            _gp_snap = ExactGP(_X_snap, _y_snap, _lik_snap).to(device)
-            _gp_snap.train(); _lik_snap.train()
-            _opt_snap = torch.optim.Adam(_gp_snap.parameters(), lr=0.01)
-            _mll_snap = gpytorch.mlls.ExactMarginalLogLikelihood(_lik_snap, _gp_snap)
-            for _ in range(50):
-                _opt_snap.zero_grad()
-                _out = _gp_snap(_X_snap)
-                _loss = -_mll_snap(_out, _y_snap)
-                _loss.backward()
-                _opt_snap.step()
-            _gp_snap.eval(); _lik_snap.eval()
-            with torch.no_grad():
-                snap_post = _lik_snap(_gp_snap(torch.tensor(x_test, dtype=torch.float32, device=device)))
-                snapshots[len(observed_indices)] = snap_post.mean.cpu().numpy()
-
-    # Final model fit on all observed data to predict on x_test
-    X_train_final = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
-    y_train_final = torch.tensor(observed_values, dtype=torch.float32, device=device)
-
-    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-    model = ExactGP(X_train_final, y_train_final, likelihood).to(device)
-    model.train()
-    likelihood.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-    for _ in range(50):
-        optimizer.zero_grad()
-        output = model(X_train_final)
-        loss = -mll(output, y_train_final)
-        loss.backward()
-        optimizer.step()
-    model.eval()
-    likelihood.eval()
-    with torch.no_grad():
-        posterior = likelihood(model(torch.tensor(x_test, dtype=torch.float32, device=device)))
-        y_pred = posterior.mean.cpu().numpy()
-
-    # Capture final snapshot (budget) if not already captured in loop
-    if snapshot_iters is not None and budget not in snapshots:
-        snapshots[budget] = y_pred.copy()
-
-    return observed_indices, observed_values, real_values, times, y_pred, \
-        (snapshots if snapshot_iters else None)
-
-
-# ============================================
-#       GP Baseline (mirrors finetuned_fit / finetuned_optimization)
-# ============================================
-
-def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
-                device='cpu', budget=150, n_reps=30):
-    """
-    GP baseline that mirrors finetuned_fit / finetuned_optimization.
-
-    Takes the same inputs as finetuned_fit and finetuned_optimization
-    (minus finetuned_model) and builds a GP to perform the task instead.
-
-    Identical to the 'gp' options in evaluate_fit and evaluate_optimization
-    in main.py.
-
-    Args:
-        dataset: 'rat' or 'nhp'
-        subject_idx: subject index
-        emg_idx: EMG channel index
-        mode: 'fit' or 'optimization'
-        device: 'cpu' or 'cuda'
-        budget: number of training points (fit) or queries (optimization)
-        n_reps: number of repetitions
-
-    Returns:
-        dict with results matching the format of finetuned_fit (mode='fit')
-        or finetuned_optimization (mode='optimization').
-    """
-    data = load_data(dataset, subject_idx)
-
-    X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(
-        data, emg_idx, 'gp'
-    )
-
-    if mode == 'fit':
-        n_stims = y_train_full.shape[1]
-        y_train_full_flat = y_train_full.flatten()
-
-        r2_scores = []
-        y_preds_all = []
-        total_time = 0
-
-        for i in range(n_reps):
-
-            indices = np.random.choice(len(y_train_full_flat), budget, replace=False)
-            X_train = np.repeat(X_train_full, n_stims, axis=0)[indices]
-            y_train = y_train_full_flat[indices]
-
-            # Convert to Tensors
-            train_x = torch.tensor(X_train, dtype=torch.float32, device=device)
-            train_y = torch.tensor(y_train, dtype=torch.float32, device=device)
-
-            # Initialize Model & Likelihood
-            likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-            model = ExactGP(train_x, train_y, likelihood).to(device)
-
-            start = time.time()
-
-            # Training Loop (Optimize Hyperparameters)
-            model.train()
-            likelihood.train()
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-            mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-
-            for _ in range(50):
-                optimizer.zero_grad()
-                output = model(train_x)
-                loss = -mll(output, train_y)
-                loss.backward()
-                optimizer.step()
-
-            # Prediction
-            model.eval()
-            likelihood.eval()
-            test_x_tensor = torch.tensor(X_test, dtype=torch.float32, device=device)
-            with torch.no_grad():
-                posterior = likelihood(model(test_x_tensor))
-                y_pred = posterior.mean.cpu().numpy()
-
-            total_time += (time.time() - start)
-
-            og_shape = y_pred.shape
-            y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
-            r2 = r2_score(y_test, y_pred)
-            r2_scores.append(np.clip(r2, 0.0, 1.0))
-            y_preds_all.append(y_pred)
-
-        y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
-
-        return {
-            'model_type': 'gp',
-            'r2': r2_scores,
-            'times': total_time / n_reps,
-            'y_test': y_test,
-            'y_pred': y_pred_mean,
-            'dataset': dataset,
-            'subject': subject_idx,
-            'emg': emg_idx
-        }
-
-    elif mode == 'optimization':
-        mean_times = []
-        values_all = []
-        r2_scores = []
-        y_preds_all = []
-
-        n_init = max(3, int(0.05 * budget))
-        snapshot_rep = np.random.randint(n_reps)
-        snap_iters = _snapshot_iters(budget, n_init)
-        collected_snapshots = None
-
-        for i in range(n_reps):
-
-            traj, observed_values, real_values, times, y_pred, snap = run_gpbo_loop(
-                X_train_full, y_train_full, X_test, y_test,
-                n_init=n_init, budget=budget, device=device,
-                snapshot_iters=snap_iters if i == snapshot_rep else None,
-            )
-
-            if snap is not None:
-                collected_snapshots = snap
-
-            mean_times.append(times)
-            values_all.append(real_values)
-
-            # Compute R2 from the final model predictions
-            og_shape = y_pred.shape
-            y_pred_unscaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
-            r2 = r2_score(y_test, y_pred_unscaled)
-            r2_scores.append(np.clip(r2, 0.0, 1.0))
-            y_preds_all.append(y_pred_unscaled)
-
-        mean_times = np.mean(np.array(mean_times), axis=0)
-        y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
-
-        # Inverse-transform snapshot predictions and compute R2
-        snapshot_results = None
-        if collected_snapshots is not None:
-            snapshot_results = {}
-            for it, s_pred in collected_snapshots.items():
-                s_pred_unscaled = scaler_y.inverse_transform(s_pred.reshape(-1, 1)).ravel()
-                s_r2 = float(np.clip(r2_score(y_test, s_pred_unscaled), 0.0, 1.0))
-                snapshot_results[it] = {'y_pred': s_pred_unscaled, 'r2': s_r2}
-
-        return {
-            'model_type': 'gp',
-            'times': mean_times,
-            'values': values_all,
-            'y_test': y_test,
-            'r2': r2_scores,
-            'y_pred': y_pred_mean,
-            'dataset': dataset,
-            'subject': subject_idx,
-            'emg': emg_idx,
-            'snapshots': snapshot_results,
-        }
-
-
-# ============================================
-#       Finetuned BO Loop (mirrors run_bo_loop)
-# ============================================
-
-def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
-                          n_init=5, budget=100, device='cpu', snapshot_iters=None):
-    """
-    Performs the Active Learning loop using a finetuned TabPFN model.
-
-    This mirrors run_bo_loop from main.py but takes a TabPFNRegressor
-    extracted via extract_inference_model(). The .fit() call stores
-    in-context learning examples (no gradient updates).
-
-    Args:
-        model: A TabPFNRegressor from extract_inference_model()
-
-    Returns:
-        - observed_indices: Indices of points chosen
-        - observed_values: Observed y values (with noise)
-        - real_values: True y values at observed indices
-        - times: Time taken at each step
-        - y_pred: Final predictions on x_test
-        - snapshots: dict or None — {iter: y_pred_array} at snapshot iterations
-    """
-    n_locs, n_reps = y_pool.shape
-
-    def sample_from_pool(idx):
-        return float(y_pool[idx, :].mean())
-
-    # 1. Initialization (Random)
-    pool_indices = np.arange(n_locs)
-    observed_indices = np.random.choice(pool_indices, size=n_init, replace=False).tolist()
-    observed_values = [sample_from_pool(idx) for idx in observed_indices]
-    real_values = y_test[observed_indices].tolist()
-
-    times = []
-    snapshots = {}
-    n_steps = budget - n_init
-
-    # --- LOOP ---
-    for t in range(n_steps):
-        step_start = time.time()
-
-        X_obs_np = X_pool[observed_indices]
-        y_obs_np = np.array(observed_values)
-
-        # Fit provides in-context examples for the transformer
-        model.fit(X_obs_np, y_obs_np)
-
-        # Compute UCB directly from the bar distribution (no Gaussian assumption)
-        # kappa → rest_prob via: rest_prob = 0.5 * erfc(kappa / sqrt(2))
-        kappa = compute_ucb_kappa(t, n_steps, kappa_0=2.5, kappa_min=0.5)
-        rest_prob = 0.5 * math.erfc(kappa / math.sqrt(2))
-        full_output = model.predict(X_pool, output_type="full")
-        logits = full_output['logits']
-        criterion = full_output['criterion']
-        ucb_vals = criterion.ucb(logits, 0, rest_prob=rest_prob, maximize=True)
-        ucb_vals = ucb_vals.clone()
-        # Prevent revisiting already-observed locations
-        for obs_idx in observed_indices:
-            ucb_vals[obs_idx] = -float('inf')
-        next_idx = int(ucb_vals.argmax().item())
-
-        observed_indices.append(next_idx)
-        new_val = sample_from_pool(next_idx)
-        observed_values.append(new_val)
-        real_values.append(y_test[next_idx])
-
-        step_time = time.time() - step_start
-        times.append(step_time)
-
-        # Capture snapshot if requested (refit on updated observations)
-        if snapshot_iters is not None and len(observed_indices) in snapshot_iters:
-            model.fit(X_pool[observed_indices], np.array(observed_values))
-            snap_pred = model.predict(x_test)
-            snapshots[len(observed_indices)] = np.asarray(snap_pred)
-
-    # Final prediction with all observed data as context
-    X_obs_final = X_pool[observed_indices]
-    y_obs_final = np.array(observed_values)
-    model.fit(X_obs_final, y_obs_final)
-    y_pred = model.predict(x_test)
-
-    # Capture final snapshot (budget) if not already captured in loop
-    if snapshot_iters is not None and budget not in snapshots:
-        snapshots[budget] = np.asarray(y_pred).copy()
-
-    return observed_indices, observed_values, real_values, times, np.asarray(y_pred), \
-        (snapshots if snapshot_iters else None)
-
-
-# ============================================
-#       Finetuned Fit (mirrors evaluate_fit)
-# ============================================
-
-def finetuned_fit(dataset, subject_idx, emg_idx, model,
-                  device='cpu', budget=150, n_reps=30):
-    """
-    Evaluate fit quality using a finetuned TabPFN model.
-
-    The .fit() call stores in-context learning examples that the transformer
-    uses to make predictions (no gradient updates).
-
-    Args:
-        model: A TabPFNRegressor from extract_inference_model()
-    """
-    data = load_data(dataset, subject_idx)
-
-    # Use 'pfn' normalization (MinMax for X, Standard for y)
-    X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(
-        data, emg_idx, 'pfn'
-    )
-
-    n_stims = y_train_full.shape[1]
-    y_train_full = y_train_full.flatten()
-
-    r2_scores = []
-    y_preds_all = []
-    total_time = 0
-
-    for i in range(n_reps):
-
-        indices = np.random.choice(len(y_train_full), budget, replace=False)
-        X_train = np.repeat(X_train_full, n_stims, axis=0)[indices]
-        y_train = y_train_full[indices]
-
-        start = time.time()
-
-        # .fit() provides in-context examples for prediction
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-
-        total_time += (time.time() - start)
-
-        y_pred = np.asarray(y_pred)
-        og_shape = y_pred.shape
-        y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
-        r2 = r2_score(y_test, y_pred)
-        r2_scores.append(np.clip(r2, 0.0, 1.0))
-        y_preds_all.append(y_pred)
-
-    y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
-
-    return {
-        'model_type': 'finetuned_tabpfn',
-        'r2': r2_scores,
-        'times': total_time / n_reps,
-        'y_test': y_test,
-        'y_pred': y_pred_mean,
-        'dataset': dataset,
-        'subject': subject_idx,
-        'emg': emg_idx
-    }
-
-# ============================================
-#   Finetuned Optimization (mirrors evaluate_optimization)
-# ============================================
-
-def finetuned_optimization(dataset, subject_idx, emg_idx, model,
-                            device='cpu', budget=100, n_reps=20):
-    """
-    Evaluate optimization performance using a finetuned TabPFN model.
-
-    Args:
-        model: A TabPFNRegressor from extract_inference_model()
-    """
-    data = load_data(dataset, subject_idx)
-
-    # Use 'pfn' normalization
-    X_train_full, y_train_full, X_test, y_test, scaler_y = preprocess_neural_data(
-        data, emg_idx, 'pfn'
-    )
-
-    mean_times = []
-    values_all = []
-    r2_scores = []
-    y_preds_all = []
-
-    # Use a single-estimator copy for the BO loop: ensemble averaging
-    # (n_estimators=8) means 8 forward passes per step, making each step
-    # ~8× slower than necessary. One pass suffices for acquisition.
-    bo_model = copy.deepcopy(model)
-    bo_model.n_estimators = 1
-
-    n_init = max(3, int(0.05 * budget))
-    snapshot_rep = np.random.randint(n_reps)
-    snap_iters = _snapshot_iters(budget, n_init)
-    collected_snapshots = None
-
-    for i in range(n_reps):
-
-        traj, observed_values, real_values, times, y_pred, snap = run_finetunedbo_loop(
-            X_train_full, y_train_full, X_test, y_test, bo_model,
-            n_init=n_init, budget=budget, device=device,
-            snapshot_iters=snap_iters if i == snapshot_rep else None,
-        )
-
-        if snap is not None:
-            collected_snapshots = snap
-
-        mean_times.append(times)
-        values_all.append(real_values)
-
-        # Compute R2 from the final model predictions
-        og_shape = y_pred.shape
-        y_pred_unscaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
-        r2 = r2_score(y_test, y_pred_unscaled)
-        r2_scores.append(np.clip(r2, 0.0, 1.0))
-        y_preds_all.append(y_pred_unscaled)
-
-    mean_times = np.mean(np.array(mean_times), axis=0)
-    y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
-
-    # Inverse-transform snapshot predictions and compute R2
-    snapshot_results = None
-    if collected_snapshots is not None:
-        snapshot_results = {}
-        for it, s_pred in collected_snapshots.items():
-            s_pred_unscaled = scaler_y.inverse_transform(s_pred.reshape(-1, 1)).ravel()
-            s_r2 = float(np.clip(r2_score(y_test, s_pred_unscaled), 0.0, 1.0))
-            snapshot_results[it] = {'y_pred': s_pred_unscaled, 'r2': s_r2}
-
-    return {
-        'model_type': 'finetuned_tabpfn',
-        'times': mean_times,
-        'values': values_all,
-        'y_test': y_test,
-        'r2': r2_scores,
-        'y_pred': y_pred_mean,
-        'dataset': dataset,
-        'subject': subject_idx,
-        'emg': emg_idx,
-        'snapshots': snapshot_results,
-    }
-
-
-# ============================================
-#       Budget Sweep Functions
-# ============================================
-
-def finetuned_fit_budget(dataset_type, model, device='cpu',
-                          budgets=[10, 50, 100, 150, 200],
-                          test_subjects=None, test_emg_indices=None,
-                          split_type='', visualize=True, output_dir=None):
-    """
-    Run fit evaluation for varying budget levels on held-out subjects.
-
-    Args:
-        dataset_type: 'rat' or 'nhp'
-        model: A TabPFNRegressor from extract_inference_model()
-        device: 'cpu' or 'cuda'
-        budgets: List of training budgets to test
-        test_subjects: list of subject indices to test on. If None, uses
-            HELD_OUT_SUBJECTS[dataset_type] (inter-subject, existing behavior).
-        test_emg_indices: list of EMG indices to test on per subject. If None,
-            iterates over all EMGs for each subject (existing behavior).
-        visualize: if True, produce and save the budget-sweep line plot.
-    """
-    if test_subjects is None:
-        test_subjects = HELD_OUT_SUBJECTS[dataset_type]
-    plot_data = []
-
-    print(f"Starting Finetuned TabPFN Budget Sweep: {budgets}")
-
-    for b in budgets:
-        print(f"  > Running budget: {b}...")
-
-        for subj_idx in test_subjects:
-            data = load_data(dataset_type, subj_idx)
-            n_emgs = data['sorted_respMean'].shape[1]
-
-            emg_range = test_emg_indices if test_emg_indices is not None else range(n_emgs)
-            for emg_idx in emg_range:
-                if emg_idx >= n_emgs:
-                    continue
-                res_ft = finetuned_fit(
-                    dataset_type, subj_idx, emg_idx,
-                    model,
-                    device=device,
-                    budget=b,
-                    n_reps=15
-                )
-                for score in res_ft['r2']:
-                    plot_data.append({
-                        'Budget': b,
-                        'Model': 'TabPFN',
-                        'R2': np.clip(score, 0.0, 1.0),
-                        'ID': f"{res_ft['subject']}_{res_ft['emg']}"
-                    })
-
-                res_gp = gp_baseline(dataset_type, subj_idx, emg_idx, mode='fit',
-                                     device=device, budget=b, n_reps=15)
-                for score in res_gp['r2']:
-                    plot_data.append({
-                        'Budget': b,
-                        'Model': 'GP',
-                        'R2': np.clip(score, 0.0, 1.0),
-                        'ID': f"{res_gp['subject']}_{res_gp['emg']}"
-                    })
-
-    df = pd.DataFrame(plot_data)
-    if visualize:
-        budget_sweep_plot(df, eval_type='fit', dataset=dataset_type,
-                          split_type=split_type, save=True, output_dir=output_dir)
-
-    return df
-
-
-def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
-                                   device='cpu', budgets=[10, 50, 100, 150, 200],
-                                   test_subjects=None, test_emg_indices=None,
-                                   split_type='', output_dir=None):
-    """
-    Run optimization evaluation for varying budgets on held-out subjects.
-
-    Args:
-        dataset_type: 'rat' or 'nhp'
-        model: A TabPFNRegressor from extract_inference_model()
-        regret_metric: 'abs' (Final Simple Regret) or 'cum' (Mean Simple Regret)
-        device: 'cpu' or 'cuda'
-        budgets: List of budgets to sweep
-        test_subjects: list of subject indices to test on. If None, uses
-            HELD_OUT_SUBJECTS[dataset_type] (inter-subject, existing behavior).
-        test_emg_indices: list of EMG indices to test on per subject. If None,
-            iterates over all EMGs for each subject (existing behavior).
-    """
-    if test_subjects is None:
-        test_subjects = HELD_OUT_SUBJECTS[dataset_type]
-    plot_data = []
-
-    print(f"Starting Finetuned TabPFN Optimization Sweep ({regret_metric}): {budgets}")
-
-    for b in budgets:
-        print(f"  > Running budget: {b}...")
-        budget_results_ft = []
-        budget_results_gp = []
-
-        for subj_idx in test_subjects:
-            data = load_data(dataset_type, subj_idx)
-            n_emgs = data['sorted_respMean'].shape[1]
-
-            emg_range = test_emg_indices if test_emg_indices is not None else range(n_emgs)
-            for emg_idx in emg_range:
-                if emg_idx >= n_emgs:
-                    continue
-
-                res_ft = finetuned_optimization(
-                    dataset_type, subj_idx, emg_idx,
-                    model,
-                    device=device,
-                    budget=b,
-                    n_reps=20
-                )
-                budget_results_ft.append(res_ft)
-                optimal_ft = res_ft['y_test'].max()
-                raw_ft = np.array(res_ft['values'])
-                best_ft = np.maximum.accumulate(raw_ft, axis=1)
-                regret_ft = optimal_ft - best_ft
-                scores_ft = regret_ft[:, -1] if regret_metric == 'abs' \
-                    else np.mean(regret_ft, axis=1)
-                for score, r2 in zip(scores_ft, res_ft['r2']):
-                    plot_data.append({
-                        'Budget': b,
-                        'Model': 'TabPFN',
-                        'Regret': score,
-                        'R2': float(np.clip(r2, 0.0, 1.0)),
-                        'ID': f"{res_ft['subject']}_{res_ft['emg']}"
-                    })
-
-                res_gp = gp_baseline(dataset_type, subj_idx, emg_idx,
-                                     mode='optimization',
-                                     device=device, budget=b, n_reps=20)
-                budget_results_gp.append(res_gp)
-                optimal_gp = res_gp['y_test'].max()
-                raw_gp = np.array(res_gp['values'])
-                best_gp = np.maximum.accumulate(raw_gp, axis=1)
-                regret_gp = optimal_gp - best_gp
-                scores_gp = regret_gp[:, -1] if regret_metric == 'abs' \
-                    else np.mean(regret_gp, axis=1)
-                for score, r2 in zip(scores_gp, res_gp['r2']):
-                    plot_data.append({
-                        'Budget': b,
-                        'Model': 'GP',
-                        'Regret': score,
-                        'R2': float(np.clip(r2, 0.0, 1.0)),
-                        'ID': f"{res_gp['subject']}_{res_gp['emg']}"
-                    })
-
-        if output_dir and budget_results_ft:
-            visualize_representation(
-                {'GP': budget_results_gp, 'TabPFN': budget_results_ft},
-                mode=f'_{split_type}_budget{b}', save=True, output_dir=output_dir)
-
-    df = pd.DataFrame(plot_data)
-    budget_sweep_plot_v2(df, eval_type='optimization', dataset=dataset_type,
-                         split_type=split_type, save=True, output_dir=output_dir)
-
-    return df
-
-
-# ============================================
-#       Augmentation Ablation Study
-# ============================================
-
-def finetuned_percentage(
-    dataset_type,
-    split_type='inter_subject',
-    mode='optimization',
-    device='cpu',
-    budget=100,
-    n_reps=20,
-    epochs=50,
-    lr=1e-5,
-    n_augmentations=None,
-    held_out_emg_idx=None,
-    held_out_subj_idx=None,
-    save=False,
-    verbose_gradients=False,
-):
-    """
-    Ablation study: evaluate BO performance (R² + regret) across augmentation counts.
-
-    Compares vanilla TabPFN (n_aug=0, no finetuning) against finetuned TabPFN
-    for each value in n_augmentations, using the same train/test split logic as
-    run_experiment().
-
-    Args:
-        dataset_type: 'rat' or 'nhp'
-        split_type: 'inter_subject' or 'intra_emg'
-        mode: 'fit' or 'optimization'
-        device: 'cpu' or 'cuda'
-        budget: training points (fit) or BO queries (optimization)
-        n_reps: repetitions per experiment
-        epochs: finetuning epochs
-        lr: finetuning learning rate
-        n_augmentations: list of int aug counts to sweep; default [1, 2, 5, 7, 10, 25]
-        held_out_emg_idx: required when split_type='intra_emg'
-        held_out_subj_idx: optional override for the test subject
-        save: if True, save plot and DataFrame to disk
-
-    Returns:
-        DataFrame with columns: n_aug, R2, (Regret), ID
-    """
-    if n_augmentations is None:
-        n_augmentations = [1, 2, 5, 7, 10, 25]
-
-    for v in n_augmentations:
-        if v < 0:
-            raise ValueError(f"n_augmentations values must be >= 0, got {v}")
-        if v >= 1 and abs(v - round(v)) > 1e-9:
-            raise ValueError(
-                f"Values >= 1 must be whole numbers (got {v}). "
-                "Use a value in (0,1) for fractional dataset size."
-            )
-
-    # --- Resolve train / test sets (mirrors run_experiment logic) ---
-    if split_type == 'inter_subject':
-        if held_out_subj_idx is not None:
-            train_subject_indices = [s for s in ALL_SUBJECTS[dataset_type] if s != held_out_subj_idx]
-            test_subjects = [held_out_subj_idx]
-        else:
-            train_subject_indices = TRAIN_SUBJECTS[dataset_type]
-            test_subjects = HELD_OUT_SUBJECTS[dataset_type]
-        test_emg_indices = None
-        ft_held_out_emg = None
-    elif split_type == 'intra_emg':
-        if held_out_emg_idx is None:
-            raise ValueError("held_out_emg_idx must be set when split_type='intra_emg'")
-        if held_out_subj_idx is not None:
-            train_subject_indices = [s for s in ALL_SUBJECTS[dataset_type] if s != held_out_subj_idx]
-            test_subjects = [held_out_subj_idx]
-        else:
-            train_subject_indices = ALL_SUBJECTS[dataset_type]
-            test_subjects = ALL_SUBJECTS[dataset_type]
-        test_emg_indices = [held_out_emg_idx]
-        ft_held_out_emg = held_out_emg_idx
-    else:
-        raise ValueError(f"Unknown split_type={split_type!r}. Use 'inter_subject' or 'intra_emg'.")
-
-    # Build experiment tag for filenames
-    tag_parts = [split_type]
-    if held_out_subj_idx is not None:
-        tag_parts.append(f'subj{held_out_subj_idx}')
-    if held_out_emg_idx is not None:
-        tag_parts.append(f'emg{held_out_emg_idx}')
-    exp_tag = '_'.join(tag_parts)
-
-    aug_sweep_tag = (
-        f'{dataset_type}_{split_type}_aug_sweep_ep{epochs}_lr{lr:.2e}'
-        + (f'_subj{held_out_subj_idx}' if held_out_subj_idx is not None else '')
-        + (f'_emg{held_out_emg_idx}' if held_out_emg_idx is not None else '')
-    )
-
-    # Build list of (subj_idx, emg_idx) experiment pairs
-    experiments = []
-    for subj_idx in test_subjects:
-        data = load_data(dataset_type, subj_idx)
-        n_emgs = data['sorted_respMean'].shape[1]
-        emgs = test_emg_indices if test_emg_indices is not None else range(n_emgs)
-        for emg_idx in emgs:
-            if emg_idx < n_emgs:
-                experiments.append((subj_idx, emg_idx))
-
-    # --- Create per-run output directory and write config ---
-    if save:
-        run_dir = create_run_dir(aug_sweep_tag)
-        write_run_config(run_dir, {
-            'run_type': 'finetuned_percentage',
-            'experiment_tag': aug_sweep_tag,
-            'timestamp': datetime.now().isoformat(timespec='seconds'),
-            'dataset_type': dataset_type,
-            'split_type': split_type,
-            'mode': mode,
-            'device': device,
-            'budget': budget,
-            'n_reps': n_reps,
-            'epochs': epochs,
-            'lr': lr,
-            'n_augmentations': n_augmentations,
-            'held_out_emg_idx': held_out_emg_idx,
-            'held_out_subj_idx': held_out_subj_idx,
-            'train_subjects': train_subject_indices,
-            'test_subjects': test_subjects,
-            'test_emg_indices': test_emg_indices,
-            'n_experiments': len(experiments),
-        })
-    else:
-        run_dir = None
-
-    plot_data = []
-
-    def _accumulate(res):
-        """Append per-rep rows from a result dict into plot_data."""
-        if mode == 'optimization':
-            optimal = res['y_test'].max()
-            raw = np.array(res['values'])
-            best = np.maximum.accumulate(raw, axis=1)
-            regrets = optimal - best[:, -1]
-            for r2, reg in zip(res['r2'], regrets):
-                plot_data.append({
-                    'n_aug':  res['n_aug'],
-                    'R2':     float(np.clip(r2, 0.0, 1.0)),
-                    'Regret': float(reg),
-                    'ID':     f"{res['subject']}_{res['emg']}",
-                })
-        else:
-            for r2 in res['r2']:
-                plot_data.append({
-                    'n_aug': res['n_aug'],
-                    'R2':    float(np.clip(r2, 0.0, 1.0)),
-                    'ID':    f"{res['subject']}_{res['emg']}",
-                })
-
-    # --- Phase 1: Vanilla TabPFN baseline (n_aug = 0) ---
-    print("=" * 60)
-    print(f"[Aug Sweep] Vanilla TabPFN baseline (n_aug=0) | {dataset_type} | {split_type} | mode={mode}")
-    print("=" * 60)
-    vanilla_model = TabPFNRegressor(device=device)
-    vanilla_results = []
-    for subj_idx, emg_idx in experiments:
-        print(f"  Vanilla: subject={subj_idx}, emg={emg_idx}")
-        if mode == 'optimization':
-            res = finetuned_optimization(dataset_type, subj_idx, emg_idx, vanilla_model,
-                                         device=device, budget=budget, n_reps=n_reps)
-        else:
-            res = finetuned_fit(dataset_type, subj_idx, emg_idx, vanilla_model,
-                                device=device, budget=budget, n_reps=n_reps)
-        res['n_aug'] = 0
-        _accumulate(res)
-        if mode == 'optimization':
-            vanilla_results.append(res)
-    if vanilla_results and run_dir:
-        visualize_representation({'TabPFN': vanilla_results},
-                                 mode=f'_{exp_tag}_aug0', save=True, output_dir=run_dir)
-
-    # --- Phase 2: Finetuned TabPFN sweep ---
-    fraction_values = [v for v in n_augmentations if 0 < v < 1]
-    if fraction_values:
-        print("[Aug Sweep] Building 1-aug reference dataset for fraction subsampling...")
-        X_ref, y_ref = build_finetuning_dataset(
-            dataset_type,
-            subject_indices=train_subject_indices,
-            held_out_emg_idx=ft_held_out_emg,
-            n_augmentations=1,
-            seed=42,
-        )
-        n_ref = len(X_ref)
-        print(f"  Reference size: {n_ref} rows")
-    else:
-        X_ref = y_ref = n_ref = None
-
-    for n_aug in n_augmentations:
-        print("=" * 60)
-        print(f"[Aug Sweep] n_aug={n_aug} | {dataset_type} | {split_type}")
-        print("=" * 60)
-
-        if 0 < n_aug < 1:
-            # Fractional mode: subsample from reference dataset
-            n_sample = int(np.floor(n_aug * n_ref))
-            if n_sample == 0:
-                print(f"  WARNING: fraction {n_aug} × {n_ref} = 0 samples. Skipping.")
-                continue
-            rng = np.random.RandomState(42)
-            idx = rng.choice(n_ref, size=n_sample, replace=False)
-            X_ft, y_ft = X_ref[idx], y_ref[idx]
-            print(f"  Subsample: {n_sample}/{n_ref} rows ({int(round(n_aug * 100))}%)")
-        else:
-            # Integer mode: build full augmented dataset
-            n_aug_int = int(round(n_aug))
-            X_ft, y_ft = build_finetuning_dataset(
-                dataset_type,
-                subject_indices=train_subject_indices,
-                held_out_emg_idx=ft_held_out_emg,
-                n_augmentations=n_aug_int,
-                seed=42,
-            )
-            print(f"  Dataset size: {X_ft.shape[0]} rows")
-
-        ft_model_raw = _make_finetuned_regressor(
-            verbose_gradients=verbose_gradients,
-            device=device, epochs=epochs, learning_rate=lr,
-            n_estimators_finetune=8, n_estimators_validation=8,
-            n_estimators_final_inference=8,
-        )
-        ft_model_raw.fit(X_ft, y_ft)
-        if verbose_gradients and hasattr(ft_model_raw, '_diagnostics_') and ft_model_raw._diagnostics_:
-            diag_dir = os.path.join(run_dir, 'diagnostics') if run_dir else None
-            plot_gradient_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
-            plot_weight_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
-            plot_cka_similarity(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
-        ft_model = extract_inference_model(ft_model_raw)
-
-        aug_results = []
-        for subj_idx, emg_idx in experiments:
-            print(f"  n_aug={n_aug}: subject={subj_idx}, emg={emg_idx}")
-            if mode == 'optimization':
-                res = finetuned_optimization(dataset_type, subj_idx, emg_idx, ft_model,
-                                             device=device, budget=budget, n_reps=n_reps)
-            else:
-                res = finetuned_fit(dataset_type, subj_idx, emg_idx, ft_model,
-                                    device=device, budget=budget, n_reps=n_reps)
-            res['n_aug'] = n_aug
-            _accumulate(res)
-            if mode == 'optimization':
-                aug_results.append(res)
-        if aug_results and run_dir:
-            aug_label = int(round(n_aug)) if n_aug >= 1 else f'{int(round(n_aug * 100))}pct'
-            visualize_representation({'TabPFN': aug_results},
-                                     mode=f'_{exp_tag}_aug{aug_label}',
-                                     save=True, output_dir=run_dir)
-
-    # --- Phase 3: Visualize & save ---
-    df = pd.DataFrame(plot_data)
-    augmentation_sweep_plot(df, eval_type=mode, dataset=dataset_type,
-                            split_type=exp_tag, save=save, output_dir=run_dir)
-
-    if save:
-        results_dir = os.path.join(run_dir, 'results')
-        os.makedirs(results_dir, exist_ok=True)
-        pkl_path = os.path.join(results_dir, f'{aug_sweep_tag}.pkl')
-        df.to_pickle(pkl_path)
-        print(f"Saved aug sweep DataFrame -> {pkl_path}")
-
-    return df
+    ft_model = extract_inference_model(ft_model_raw)
+    return ft_model_raw, ft_model
 
 
 # ============================================
@@ -1348,7 +126,7 @@ def run_experiment(
     held_out_subj_idx=None,
     budgets=None,
     save=False,
-    verbose_gradients=False,
+    print_diagnostics=False,
 ):
     """
     Unified entry point for transfer learning evaluation.
@@ -1371,10 +149,9 @@ def run_experiment(
             held out from training and used as the test set.
         held_out_subj_idx: optional int. When set, overrides the default subject
             split: trains on all subjects except this one and tests on it alone.
-            Works for both split_type values.
         budgets: list of budgets for 'fit_budget' / 'optimization_budget' modes.
-            Defaults to [10, 50, 100, 150, 200].
         save: if True, persist results to output/results/ (pkl + CSV summary).
+        print_diagnostics: if True, print gradient diagnostics to stdout.
 
     Returns:
         dict keyed by mode name, each value being the result of that mode
@@ -1430,7 +207,7 @@ def run_experiment(
         held_out_emg_idx=held_out_emg_idx,
     )
 
-    # --- Build test experiment list (needed for config and mode evaluation) ---
+    # --- Build test experiment list ---
     experiments = []
     for subj_idx in test_subjects:
         data = load_data(dataset_type, subj_idx)
@@ -1469,34 +246,19 @@ def run_experiment(
     print("=" * 60)
     print(f"Fine-tuning TabPFN  [{dataset_type} | {split_type} | modes={mode}]")
     print("=" * 60)
-    print(f"Building augmented dataset ({split_type}) ...")
-    X_ft, y_ft = build_finetuning_dataset(
+
+    ft_model_raw, ft_model = finetune_tabpfn(
         dataset_type,
-        subject_indices=train_subject_indices,
-        held_out_emg_idx=ft_held_out_emg,
-        n_augmentations=n_augmentations,
-        seed=42,
-    )
-    print(f"  Dataset size: {X_ft.shape[0]} rows")
-    ft_model_raw = _make_finetuned_regressor(
-        verbose_gradients=verbose_gradients,
         device=device,
         epochs=epochs,
-        learning_rate=lr,
-        n_estimators_finetune=8,
-        n_estimators_validation=8,
-        n_estimators_final_inference=8,
-        #TODO: try eval_metric='r2' or 'rmse'
+        lr=lr,
+        n_augmentations=n_augmentations,
+        subject_indices=train_subject_indices,
+        held_out_emg_idx=ft_held_out_emg,
+        seed=42,
+        print_diagnostics=print_diagnostics,
+        output_dir=run_dir,
     )
-    print(f"Fine-tuning (epochs={epochs}, lr={lr}) ...")
-    ft_model_raw.fit(X_ft, y_ft)
-    # Plot gradient diagnostics to run directory
-    if verbose_gradients and hasattr(ft_model_raw, '_diagnostics_') and ft_model_raw._diagnostics_:
-        diag_dir = os.path.join(run_dir, 'diagnostics')
-        plot_gradient_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
-        plot_weight_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
-        plot_cka_similarity(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
-    ft_model = extract_inference_model(ft_model_raw)
 
     # --- Run each requested mode ---
     all_results = {}
@@ -1520,7 +282,7 @@ def run_experiment(
 
             results_dict = {'GP': results_gp, 'TabPFN': results_ft}
             tag = f'_{exp_tag}_finetuned_vs_gp'
-            r2_comparison(results_dict, mode=tag, save=True, output_dir=run_dir)
+            r2_per_muscle(results_dict, mode=tag, save=True, output_dir=run_dir)
             r2_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             n_maps = min(6, len(experiments))
             for idx in random.sample(range(len(experiments)), n_maps):
@@ -1551,9 +313,7 @@ def run_experiment(
 
             results_dict = {'GP': results_gp, 'TabPFN': results_ft}
             tag = f'_{exp_tag}_opt_finetuned_vs_gp'
-            r2_comparison(results_dict, mode=tag, save=True, output_dir=run_dir, eval_type='optimization')
-            regret_curve(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
-            plot_runtime_trajectory(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
+            r2_per_muscle(results_dict, mode=tag, save=True, output_dir=run_dir, eval_type='optimization')
             regret_with_timing(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_by_emg(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
@@ -1616,69 +376,6 @@ def run_experiment(
 
 
 # ============================================
-#       Post-hoc Result Merging
-# ============================================
-
-def load_sweep_results(tags, result_type, runs_dir='output/runs'):
-    """
-    Load and merge pickle DataFrames from multiple experiment tags.
-
-    For each tag, searches for a matching run directory under runs_dir and
-    loads the corresponding pkl file. Useful for aggregating family-1/2/3
-    results across subjects before producing cross-subject plots.
-
-    Args:
-        tags: list of experiment tags, e.g.
-              ['nhp_inter_subject_subj0_ep50_lr1.00e-05_aug25',
-               'nhp_inter_subject_subj1_ep50_lr1.00e-05_aug25']
-        result_type: 'optimization_budget' → loads {tag}_optimization_budget.pkl
-                     'fit_budget'          → loads {tag}_fit_budget.pkl
-                     'aug_sweep'           → loads {tag}.pkl
-        runs_dir: root directory containing run subdirectories (default: 'output/runs')
-
-    Returns:
-        Merged pd.DataFrame from all matched pickle files.
-
-    Raises:
-        FileNotFoundError: if no pkl is found for a given tag.
-    """
-    import glob as _glob
-
-    frames = []
-    for tag in tags:
-        # Each run dir is named {tag}_{timestamp}; find any matching dir
-        pattern = os.path.join(runs_dir, f'{tag}_*', 'results')
-        candidates = _glob.glob(pattern)
-        if not candidates:
-            # Also try without timestamp suffix (manual saves)
-            candidates = _glob.glob(os.path.join(runs_dir, tag, 'results'))
-        if not candidates:
-            raise FileNotFoundError(
-                f"No run directory found for tag '{tag}' under '{runs_dir}'. "
-                f"Searched: {os.path.join(runs_dir, tag + '_*', 'results')}"
-            )
-        # Use the most recently modified results dir if multiple matches
-        results_dir = sorted(candidates, key=os.path.getmtime)[-1]
-
-        if result_type == 'aug_sweep':
-            pkl_name = f'{tag}.pkl'
-        else:
-            pkl_name = f'{tag}_{result_type}.pkl'
-
-        pkl_path = os.path.join(results_dir, pkl_name)
-        if not os.path.exists(pkl_path):
-            raise FileNotFoundError(f"Expected pkl not found: {pkl_path}")
-
-        df = pd.read_pickle(pkl_path)
-        frames.append(df)
-        print(f"Loaded: {pkl_path}  ({len(df)} rows)")
-
-    merged = pd.concat(frames, ignore_index=True)
-    print(f"Merged {len(tags)} files → {len(merged)} total rows")
-    return merged
-
-
-# ============================================
 #       CLI Entry Point
 # ============================================
 
@@ -1727,8 +424,9 @@ def run_finetuning():
                              'always included as baseline.')
     parser.add_argument('--save', action='store_true', default=False,
                         help='Persist results to output/results/ (pkl + CSV summary)')
-    parser.add_argument('--verbose_gradients', action='store_true', default=False,
-                        help='Print and plot per-layer gradient/weight ratios during finetuning.')
+    parser.add_argument('--quiet_diagnostics', action='store_true', default=False,
+                        help='Suppress printing per-layer gradient/weight ratios during finetuning. '
+                             'Diagnostic plots are always produced.')
 
     args = parser.parse_args()
 
@@ -1737,6 +435,8 @@ def run_finetuning():
     if invalid:
         parser.error(f"Invalid mode(s): {', '.join(sorted(invalid))}. "
                      f"Valid: {', '.join(sorted(_CLI_MODES))}")
+
+    print_diagnostics = not args.quiet_diagnostics
 
     exp_modes = [m for m in args.mode if m in _VALID_MODES]
 
@@ -1755,7 +455,7 @@ def run_finetuning():
             held_out_subj_idx=args.held_out_subj,
             budgets=args.budgets,
             save=args.save,
-            verbose_gradients=args.verbose_gradients,
+            print_diagnostics=print_diagnostics,
         )
 
     if 'aug_sweep_fit' in args.mode:
@@ -1772,7 +472,7 @@ def run_finetuning():
             held_out_emg_idx=args.held_out_emg,
             held_out_subj_idx=args.held_out_subj,
             save=args.save,
-            verbose_gradients=args.verbose_gradients,
+            print_diagnostics=print_diagnostics,
         )
 
     if 'aug_sweep_optimization' in args.mode:
@@ -1789,10 +489,9 @@ def run_finetuning():
             held_out_emg_idx=args.held_out_emg,
             held_out_subj_idx=args.held_out_subj,
             save=args.save,
-            verbose_gradients=args.verbose_gradients,
+            print_diagnostics=print_diagnostics,
         )
 
 
 if __name__ == '__main__':
     run_finetuning()
-

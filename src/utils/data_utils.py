@@ -721,9 +721,9 @@ def load_results(pickle_path):
 
 
 if __name__ == '__main__':
-    DATASET  = 'nhp'
-    SUBJ_IDX = 2
-    EMG_IDX  = 3
+    DATASET  = 'spinal'
+    SUBJ_IDX = 1
+    EMG_IDX  = 0
     N_SHOW   = 1
 
     data = load_data(DATASET, SUBJ_IDX)
