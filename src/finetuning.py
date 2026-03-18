@@ -46,7 +46,7 @@ from utils.visualization import (
 def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
                     n_augmentations=25, subject_indices=None,
                     held_out_emg_idx=None, seed=42,
-                    print_diagnostics=False, output_dir=None):
+                    silence_diagnostics=True, output_dir=None):
     """
     Fine-tune a TabPFNRegressor on augmented neurostimulation data.
 
@@ -59,12 +59,13 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
         subject_indices: list of subject indices to train on (None = all training subjects)
         held_out_emg_idx: EMG index to exclude from training data
         seed: random seed for dataset building
-        print_diagnostics: if True, print per-layer gradient/weight ratios each epoch
+        silence_diagnostics: if True (default), skip gradient/CKA monitoring for faster
+            finetuning and lower memory. If False, use GradientMonitoredRegressor.
         output_dir: when set, saves diagnostic plots to {output_dir}/diagnostics/
 
     Returns:
         (ft_model_raw, ft_model) tuple:
-          - ft_model_raw: the GradientMonitoredRegressor (with _diagnostics_)
+          - ft_model_raw: the finetuned regressor (with _diagnostics_ when diagnostics enabled)
           - ft_model: extracted TabPFNRegressor for in-context learning
     """
     print(f"Building augmented dataset for '{dataset_type}' ...")
@@ -80,7 +81,7 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
     print(f"Initializing finetuned regressor (epochs={epochs}, lr={lr}) ...")
 
     ft_model_raw = _make_finetuned_regressor(
-        print_diagnostics=print_diagnostics,
+        silence_diagnostics=silence_diagnostics,
         device=device,
         epochs=epochs,
         learning_rate=lr,
@@ -126,7 +127,7 @@ def run_experiment(
     held_out_subj_idx=None,
     budgets=None,
     save=False,
-    print_diagnostics=False,
+    silence_diagnostics=True,
 ):
     """
     Unified entry point for transfer learning evaluation.
@@ -151,7 +152,7 @@ def run_experiment(
             split: trains on all subjects except this one and tests on it alone.
         budgets: list of budgets for 'fit_budget' / 'optimization_budget' modes.
         save: if True, persist results to output/results/ (pkl + CSV summary).
-        print_diagnostics: if True, print gradient diagnostics to stdout.
+        silence_diagnostics: if True (default), skip gradient/CKA monitoring.
 
     Returns:
         dict keyed by mode name, each value being the result of that mode
@@ -256,7 +257,7 @@ def run_experiment(
         subject_indices=train_subject_indices,
         held_out_emg_idx=ft_held_out_emg,
         seed=42,
-        print_diagnostics=print_diagnostics,
+        silence_diagnostics=silence_diagnostics,
         output_dir=run_dir,
     )
 
@@ -424,9 +425,9 @@ def run_finetuning():
                              'always included as baseline.')
     parser.add_argument('--save', action='store_true', default=False,
                         help='Persist results to output/results/ (pkl + CSV summary)')
-    parser.add_argument('--quiet_diagnostics', action='store_true', default=False,
-                        help='Suppress printing per-layer gradient/weight ratios during finetuning. '
-                             'Diagnostic plots are always produced.')
+    parser.add_argument('--diagnostics', action='store_true', default=False,
+                        help='Enable gradient/CKA monitoring via GradientMonitoredRegressor '
+                             '(slower finetuning, higher memory). Off by default.')
 
     args = parser.parse_args()
 
@@ -436,7 +437,7 @@ def run_finetuning():
         parser.error(f"Invalid mode(s): {', '.join(sorted(invalid))}. "
                      f"Valid: {', '.join(sorted(_CLI_MODES))}")
 
-    print_diagnostics = not args.quiet_diagnostics
+    silence_diagnostics = not args.diagnostics
 
     exp_modes = [m for m in args.mode if m in _VALID_MODES]
 
@@ -455,7 +456,7 @@ def run_finetuning():
             held_out_subj_idx=args.held_out_subj,
             budgets=args.budgets,
             save=args.save,
-            print_diagnostics=print_diagnostics,
+            silence_diagnostics=silence_diagnostics,
         )
 
     if 'aug_sweep_fit' in args.mode:
@@ -472,7 +473,7 @@ def run_finetuning():
             held_out_emg_idx=args.held_out_emg,
             held_out_subj_idx=args.held_out_subj,
             save=args.save,
-            print_diagnostics=print_diagnostics,
+            silence_diagnostics=silence_diagnostics,
         )
 
     if 'aug_sweep_optimization' in args.mode:
@@ -489,7 +490,7 @@ def run_finetuning():
             held_out_emg_idx=args.held_out_emg,
             held_out_subj_idx=args.held_out_subj,
             save=args.save,
-            print_diagnostics=print_diagnostics,
+            silence_diagnostics=silence_diagnostics,
         )
 
 

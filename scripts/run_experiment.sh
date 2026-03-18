@@ -31,7 +31,7 @@
 #SBATCH --gres=gpu:rtx8000:1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=7G
-#SBATCH --time=3:00:00
+#SBATCH --time=4:00:00
 
 set -euo pipefail
 
@@ -116,6 +116,7 @@ EXTRA_FLAGS=""
 [ -n "${HELD_OUT_SUBJ:-}"  ] && EXTRA_FLAGS="$EXTRA_FLAGS --held_out_subj $HELD_OUT_SUBJ"
 [ -n "${AUG_COUNTS:-}"     ] && EXTRA_FLAGS="$EXTRA_FLAGS --aug_counts $AUG_COUNTS"
 [ -n "${BUDGET_COUNTS:-}"  ] && EXTRA_FLAGS="$EXTRA_FLAGS --budgets $BUDGET_COUNTS"
+[ "${DIAGNOSTICS:-0}" = "1" ] && EXTRA_FLAGS="$EXTRA_FLAGS --diagnostics"
 
 # ── Environment ───────────────────────────────────────────────────────────────
 module load miniconda/3

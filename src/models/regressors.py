@@ -34,13 +34,11 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
 
     All metrics are stored in self._diagnostics_ (list of per-epoch dicts).
 
-    Args:
-        print_diagnostics: if True, print per-epoch diagnostics to stdout.
+    All metrics are printed to stdout each epoch.
     """
 
-    def __init__(self, *args, print_diagnostics=False, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.print_diagnostics = print_diagnostics
         self._diagnostics_ = []
         self._cka_ref_X_ = None
         self._cka_ref_y_ = None
@@ -75,11 +73,10 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
                 weight_change.setdefault(layer, []).append(delta / base * 100)
             weight_change_pct = {k: float(np.mean(v)) for k, v in weight_change.items()}
 
-            if self.print_diagnostics:
-                print("\n[GradientMonitor] Total weight change from pretrained:")
-                for layer, pct in sorted(weight_change_pct.items(), key=lambda x: -x[1]):
-                    bar = '█' * min(40, max(1, int(pct * 4)))
-                    print(f"  {layer:<30} {pct:6.2f}%  {bar}")
+            print("\n[GradientMonitor] Total weight change from pretrained:")
+            for layer, pct in sorted(weight_change_pct.items(), key=lambda x: -x[1]):
+                bar = '█' * min(40, max(1, int(pct * 4)))
+                print(f"  {layer:<30} {pct:6.2f}%  {bar}")
 
             self._weight_change_pct_ = weight_change_pct
 
@@ -226,20 +223,21 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
             }
             self._diagnostics_.append(epoch_entry)
 
-            if self.print_diagnostics:
-                print(f"\n[GradientMonitor] Epoch {epoch + 1} diagnostics:")
-                print(f"  Grad/weight ratio: {', '.join(f'{k}={v:.4f}%' for k, v in sorted(grad_ratio_avg.items()))}")
-                print(f"  Cosine sim:        {', '.join(f'{k}={v:.6f}' for k, v in sorted(w_cos.items()))}")
-                if cka_scores:
-                    print(f"  CKA:               {', '.join(f'{k}={v:.4f}' for k, v in cka_scores.items())}")
+            print(f"\n[GradientMonitor] Epoch {epoch + 1} diagnostics:")
+            print(f"  Grad/weight ratio: {', '.join(f'{k}={v:.4f}%' for k, v in sorted(grad_ratio_avg.items()))}")
+            print(f"  Cosine sim:        {', '.join(f'{k}={v:.6f}' for k, v in sorted(w_cos.items()))}")
+            if cka_scores:
+                print(f"  CKA:               {', '.join(f'{k}={v:.4f}' for k, v in cka_scores.items())}")
 
         # Always call original implementation to preserve logging/early stopping
         super()._log_epoch_evaluation(epoch, eval_result, mean_train_loss)
 
 
-def _make_finetuned_regressor(print_diagnostics=False, **kwargs):
-    """Factory: always returns GradientMonitoredRegressor (diagnostics always collected)."""
-    return GradientMonitoredRegressor(print_diagnostics=print_diagnostics, **kwargs)
+def _make_finetuned_regressor(silence_diagnostics=True, **kwargs):
+    """Factory: returns plain FinetunedTabPFNRegressor unless diagnostics are enabled."""
+    if silence_diagnostics:
+        return FinetunedTabPFNRegressor(**kwargs)
+    return GradientMonitoredRegressor(**kwargs)
 
 
 def extract_inference_model(finetuned_regressor):

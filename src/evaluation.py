@@ -501,7 +501,7 @@ def finetuned_percentage(
     held_out_emg_idx=None,
     held_out_subj_idx=None,
     save=False,
-    print_diagnostics=False,
+    silence_diagnostics=True,
 ):
     """
     Ablation study: evaluate BO performance (R² + regret) across augmentation counts.
@@ -523,7 +523,7 @@ def finetuned_percentage(
         held_out_emg_idx: required when split_type='intra_emg'
         held_out_subj_idx: optional override for the test subject
         save: if True, save plot and DataFrame to disk
-        print_diagnostics: if True, print gradient diagnostics to stdout
+        silence_diagnostics: if True (default), skip gradient/CKA monitoring
 
     Returns:
         DataFrame with columns: n_aug, R2, (Regret), ID
@@ -704,7 +704,7 @@ def finetuned_percentage(
             print(f"  Dataset size: {X_ft.shape[0]} rows")
 
         ft_model_raw = _make_finetuned_regressor(
-            print_diagnostics=print_diagnostics,
+            silence_diagnostics=silence_diagnostics,
             device=device, epochs=epochs, learning_rate=lr,
             n_estimators_finetune=8, n_estimators_validation=8,
             n_estimators_final_inference=8,
