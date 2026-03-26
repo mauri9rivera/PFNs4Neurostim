@@ -9,18 +9,19 @@ Two-phase workflow:
      internal TabPFNRegressor with finetuned weights. This standalone model
      uses in-context learning (.fit() stores context, no gradients) and
      supports the full predict API including output_type="quantiles".
-
 Usage:
     python finetuning.py --dataset rat --device cuda --epochs 30
     python finetuning.py --dataset nhp --device cuda --epochs 30
     python finetuning.py --dataset nhp --mode optimization --budget 100 --n_reps 20
 """
 import argparse
+import json
 import os
 import random
 from datetime import datetime
 
 import numpy as np
+import torch
 
 from models.regressors import _make_finetuned_regressor, extract_inference_model
 from evaluation import (
@@ -46,7 +47,9 @@ from utils.visualization import (
 def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
                     n_augmentations=25, subject_indices=None,
                     held_out_emg_idx=None, seed=42,
-                    silence_diagnostics=True, output_dir=None):
+                    silence_diagnostics=True, output_dir=None,
+                    use_lora=False, lora_rank=8, lora_alpha=16,
+                    lora_target='decoder_dict'):
     """
     Fine-tune a TabPFNRegressor on augmented neurostimulation data.
 
@@ -62,6 +65,10 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
         silence_diagnostics: if True (default), skip gradient/CKA monitoring for faster
             finetuning and lower memory. If False, use GradientMonitoredRegressor.
         output_dir: when set, saves diagnostic plots to {output_dir}/diagnostics/
+        use_lora: if True, use LoRA parameter-efficient finetuning
+        lora_rank: rank of low-rank matrices (default 8)
+        lora_alpha: scaling factor (default 16)
+        lora_target: which layers to adapt (default 'decoder_dict')
 
     Returns:
         (ft_model_raw, ft_model) tuple:
@@ -78,10 +85,15 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
     )
     print(f"  Dataset size: {X_train.shape[0]} rows, {X_train.shape[1]} features")
 
-    print(f"Initializing finetuned regressor (epochs={epochs}, lr={lr}) ...")
+    method = "LoRA" if use_lora else "full"
+    print(f"Initializing finetuned regressor ({method}, epochs={epochs}, lr={lr}) ...")
 
     ft_model_raw = _make_finetuned_regressor(
         silence_diagnostics=silence_diagnostics,
+        use_lora=use_lora,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_target=lora_target,
         device=device,
         epochs=epochs,
         learning_rate=lr,
@@ -92,6 +104,28 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
 
     print("Fine-tuning ...")
     ft_model_raw.fit(X_train, y_train)
+
+    # Save LoRA checkpoint if applicable
+    if use_lora and output_dir:
+        lora_dir = os.path.join(output_dir, 'lora')
+        # Use pre-merge state dict captured during training
+        if hasattr(ft_model_raw, '_lora_state_dict_'):
+            os.makedirs(lora_dir, exist_ok=True)
+            torch.save(ft_model_raw._lora_state_dict_,
+                       os.path.join(lora_dir, 'lora_weights.pt'))
+            config = {
+                'lora_rank': lora_rank,
+                'lora_alpha': lora_alpha,
+                'lora_target': lora_target,
+                'n_replaced': ft_model_raw._lora_n_replaced,
+                'dataset_type': dataset_type,
+                'epochs': epochs,
+                'lr': lr,
+                'n_augmentations': n_augmentations,
+            }
+            with open(os.path.join(lora_dir, 'lora_config.json'), 'w') as f:
+                json.dump(config, f, indent=2)
+            print(f"  [LoRA] Checkpoint saved -> {lora_dir}")
 
     # Always save diagnostic plots when diagnostics are available
     if hasattr(ft_model_raw, '_diagnostics_') and ft_model_raw._diagnostics_:
@@ -128,6 +162,11 @@ def run_experiment(
     budgets=None,
     save=False,
     silence_diagnostics=True,
+    use_lora=False,
+    lora_rank=8,
+    lora_alpha=16,
+    lora_target='decoder_dict',
+    lora_weights=None,
 ):
     """
     Unified entry point for transfer learning evaluation.
@@ -153,6 +192,12 @@ def run_experiment(
         budgets: list of budgets for 'fit_budget' / 'optimization_budget' modes.
         save: if True, persist results to output/results/ (pkl + CSV summary).
         silence_diagnostics: if True (default), skip gradient/CKA monitoring.
+        use_lora: if True, use LoRA parameter-efficient finetuning.
+        lora_rank: rank of low-rank matrices (default 8).
+        lora_alpha: scaling factor (default 16).
+        lora_target: which layers to adapt (default 'decoder_dict').
+        lora_weights: path to saved LoRA checkpoint directory. When set,
+            skips training and loads pre-trained adapters for evaluation.
 
     Returns:
         dict keyed by mode name, each value being the result of that mode
@@ -207,6 +252,10 @@ def run_experiment(
         held_out_subj_idx=held_out_subj_idx,
         held_out_emg_idx=held_out_emg_idx,
     )
+    if lora_weights:
+        _save_tag += '_lora_loaded'
+    elif use_lora:
+        _save_tag += f'_lora_r{lora_rank}_a{lora_alpha}'
 
     # --- Build test experiment list ---
     experiments = []
@@ -220,7 +269,7 @@ def run_experiment(
 
     # --- Always create per-run output directory so plots land in runs/<tag>/ ---
     run_dir = create_run_dir(_save_tag)
-    write_run_config(run_dir, {
+    run_config = {
         'run_type': 'run_experiment',
         'experiment_tag': _save_tag,
         'timestamp': datetime.now().isoformat(timespec='seconds'),
@@ -240,26 +289,53 @@ def run_experiment(
         'test_subjects': test_subjects,
         'test_emg_indices': test_emg_indices,
         'n_experiments': len(experiments),
-    })
+    }
+    if lora_weights:
+        run_config['lora_weights'] = lora_weights
+    elif use_lora:
+        run_config.update({
+            'use_lora': True,
+            'lora_rank': lora_rank,
+            'lora_alpha': lora_alpha,
+            'lora_target': lora_target,
+        })
+    write_run_config(run_dir, run_config)
     print(f"[INFO] Run directory: {run_dir}")
 
-    # --- Fine-tune on the correct split (once, shared across all modes) ---
-    print("=" * 60)
-    print(f"Fine-tuning TabPFN  [{dataset_type} | {split_type} | modes={mode}]")
-    print("=" * 60)
+    # --- Obtain finetuned model: load checkpoint or train from scratch ---
+    if lora_weights:
+        from models.regressors import load_lora_as_inference_model
+        print("=" * 60)
+        print(f"Loading LoRA checkpoint  [{lora_weights}]")
+        print("=" * 60)
+        ft_model, lora_cfg = load_lora_as_inference_model(
+            lora_weights, device=device,
+        )
+        ft_model_raw = None
+        if lora_cfg.get('dataset_type') and lora_cfg['dataset_type'] != dataset_type:
+            print(f"[WARNING] Checkpoint trained on {lora_cfg['dataset_type']!r}, "
+                  f"evaluating on {dataset_type!r}")
+    else:
+        print("=" * 60)
+        print(f"Fine-tuning TabPFN  [{dataset_type} | {split_type} | modes={mode}]")
+        print("=" * 60)
 
-    ft_model_raw, ft_model = finetune_tabpfn(
-        dataset_type,
-        device=device,
-        epochs=epochs,
-        lr=lr,
-        n_augmentations=n_augmentations,
-        subject_indices=train_subject_indices,
-        held_out_emg_idx=ft_held_out_emg,
-        seed=42,
-        silence_diagnostics=silence_diagnostics,
-        output_dir=run_dir,
-    )
+        ft_model_raw, ft_model = finetune_tabpfn(
+            dataset_type,
+            device=device,
+            epochs=epochs,
+            lr=lr,
+            n_augmentations=n_augmentations,
+            subject_indices=train_subject_indices,
+            held_out_emg_idx=ft_held_out_emg,
+            seed=42,
+            silence_diagnostics=silence_diagnostics,
+            output_dir=run_dir,
+            use_lora=use_lora,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_target=lora_target,
+        )
 
     # --- Run each requested mode ---
     all_results = {}
@@ -429,6 +505,22 @@ def run_finetuning():
                         help='Enable gradient/CKA monitoring via GradientMonitoredRegressor '
                              '(slower finetuning, higher memory). Off by default.')
 
+    # LoRA options
+    parser.add_argument('--lora', action='store_true', default=False,
+                        help='Use LoRA (Low-Rank Adaptation) for parameter-efficient finetuning. '
+                             'Only adapter weights are trained; base model is frozen.')
+    parser.add_argument('--lora_rank', type=int, default=8,
+                        help='Rank of LoRA low-rank matrices (default: 8)')
+    parser.add_argument('--lora_alpha', type=int, default=16,
+                        help='LoRA scaling factor alpha (default: 16)')
+    parser.add_argument('--lora_target', type=str, default='decoder_dict',
+                        choices=['decoder_dict', 'decoder_dict+mlp'],
+                        help='Which layers to apply LoRA to (default: decoder_dict)')
+    parser.add_argument('--lora_weights', type=str, default=None, metavar='PATH',
+                        help='Path to saved LoRA checkpoint directory (containing '
+                             'lora_weights.pt + lora_config.json). Skips training '
+                             'and goes straight to evaluation.')
+
     args = parser.parse_args()
 
     _CLI_MODES = _VALID_MODES | {'aug_sweep_fit', 'aug_sweep_optimization'}
@@ -436,6 +528,15 @@ def run_finetuning():
     if invalid:
         parser.error(f"Invalid mode(s): {', '.join(sorted(invalid))}. "
                      f"Valid: {', '.join(sorted(_CLI_MODES))}")
+
+    # Validate --lora_weights combinations
+    if args.lora_weights:
+        if any(m in args.mode for m in ('aug_sweep_fit', 'aug_sweep_optimization')):
+            parser.error("--lora_weights is not compatible with aug_sweep_* modes "
+                         "(those require training)")
+        if args.lora:
+            print("[WARNING] --lora is ignored when --lora_weights is set "
+                  "(config is read from lora_config.json)")
 
     silence_diagnostics = not args.diagnostics
 
@@ -457,6 +558,11 @@ def run_finetuning():
             budgets=args.budgets,
             save=args.save,
             silence_diagnostics=silence_diagnostics,
+            use_lora=args.lora,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_target=args.lora_target,
+            lora_weights=args.lora_weights,
         )
 
     if 'aug_sweep_fit' in args.mode:

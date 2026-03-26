@@ -2,15 +2,24 @@
 Finetuned TabPFN regressor wrappers and utilities.
 
 - GradientMonitoredRegressor: FinetunedTabPFNRegressor with per-epoch diagnostics
-- _make_finetuned_regressor(): factory that always returns GradientMonitoredRegressor
+- LoRAFinetunedRegressor: GradientMonitoredRegressor with LoRA adapter injection
+- _make_finetuned_regressor(): factory that returns the appropriate regressor class
 - extract_inference_model(): deep-copy the finetuned inference regressor
 - linear_cka(): linear CKA between activation matrices
 """
 import copy
+import os
 
 import numpy as np
 import torch
+from tabpfn import TabPFNRegressor
+from tabpfn.base import RegressorModelSpecs
 from tabpfn.finetuning.finetuned_regressor import FinetunedTabPFNRegressor
+
+from models.lora import (
+    apply_lora, merge_lora, count_params, save_lora_checkpoint,
+    load_lora_checkpoint,
+)
 
 
 def linear_cka(X, Y):
@@ -233,8 +242,146 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
         super()._log_epoch_evaluation(epoch, eval_result, mean_train_loss)
 
 
-def _make_finetuned_regressor(silence_diagnostics=True, **kwargs):
-    """Factory: returns plain FinetunedTabPFNRegressor unless diagnostics are enabled."""
+class LoRAFinetunedRegressor(GradientMonitoredRegressor):
+    """GradientMonitoredRegressor with LoRA adapter injection.
+
+    Injects low-rank adapters into target nn.Linear layers after model
+    initialisation but before optimizer creation, so only LoRA parameters
+    receive gradient updates.  Merges adapters back before the inference
+    model is cloned so downstream code sees plain nn.Linear layers.
+
+    Args (extra vs GradientMonitoredRegressor):
+        lora_rank: rank of the low-rank matrices (default 8)
+        lora_alpha: scaling factor (default 16)
+        lora_target: which layer group to adapt (default 'decoder_dict')
+    """
+
+    def __init__(self, *args, lora_rank=8, lora_alpha=16,
+                 lora_target='decoder_dict', **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lora_rank = lora_rank
+        self._lora_alpha = lora_alpha
+        self._lora_target = lora_target
+        self._lora_n_replaced = 0
+
+    # ------------------------------------------------------------------
+    #  Hook 1: inject LoRA after model weights are loaded
+    # ------------------------------------------------------------------
+    def _setup_estimator(self) -> None:
+        """Monkey-patch _initialize_model_variables to inject LoRA.
+
+        The base _fit flow is:
+            _create_estimator()          → self.finetuned_estimator_
+            _setup_estimator()           → (this method)
+            ...
+            _initialize_model_variables() → loads pretrained weights
+            model_.to(device)
+            get_and_init_optimizer(model_.parameters(), ...)
+
+        We wrap _initialize_model_variables so that after it loads the
+        pretrained weights, we inject LoRA adapters and freeze the base.
+        The optimizer then sees only LoRA params as trainable.
+        """
+        super()._setup_estimator()
+
+        estimator = self.finetuned_estimator_
+        original_init = estimator._initialize_model_variables
+
+        def _init_with_lora():
+            original_init()
+            model = estimator.model_
+            self._lora_n_replaced = apply_lora(
+                model,
+                target=self._lora_target,
+                rank=self._lora_rank,
+                alpha=self._lora_alpha,
+            )
+            trainable, total = count_params(model)
+            print(f"  [LoRA] Injected {self._lora_n_replaced} adapters "
+                  f"(rank={self._lora_rank}, alpha={self._lora_alpha}, "
+                  f"target={self._lora_target!r})")
+            print(f"  [LoRA] Trainable: {trainable:,} / {total:,} "
+                  f"({trainable / total * 100:.2f}%)")
+
+        estimator._initialize_model_variables = _init_with_lora
+
+    # ------------------------------------------------------------------
+    #  Hook 2: merge LoRA before inference model clone
+    # ------------------------------------------------------------------
+    def _setup_inference_model(self, final_inference_eval_config) -> None:
+        """Merge LoRA adapters into base weights before cloning.
+
+        clone_model_for_evaluation() deep-copies models_[0], so we need
+        the underlying nn.Linear layers to have the merged weights.
+        """
+        model = self.finetuned_estimator_.model_
+        n_merged = merge_lora(model)
+        print(f"  [LoRA] Merged {n_merged} adapters into base weights")
+        super()._setup_inference_model(final_inference_eval_config)
+
+    # ------------------------------------------------------------------
+    #  LoRA checkpoint saving (called externally after fit)
+    # ------------------------------------------------------------------
+    def save_lora(self, save_dir, extra_config=None):
+        """Save LoRA weights + config to disk.
+
+        Must be called BEFORE merge (i.e. before _setup_inference_model).
+        For normal usage this is called from finetune_tabpfn() between
+        the training loop and inference model setup — but since TabPFN
+        calls _setup_inference_model internally at the end of _fit, we
+        capture the state dict during training instead.
+
+        This method works with the already-merged model by re-applying
+        LoRA from saved state — but it's simpler to call it from the
+        _log_epoch_evaluation override at the last epoch.
+        """
+        config = {
+            'lora_rank': self._lora_rank,
+            'lora_alpha': self._lora_alpha,
+            'lora_target': self._lora_target,
+            'n_replaced': self._lora_n_replaced,
+        }
+        if extra_config:
+            config.update(extra_config)
+        return save_lora_checkpoint(
+            self.finetuned_estimator_.model_, save_dir, config,
+        )
+
+    def fit(self, X, y, **kwargs):
+        """Fit with LoRA, capturing adapter state before merge."""
+        from models.lora import get_lora_state_dict
+        result = super().fit(X, y, **kwargs)
+        # After super().fit(), _setup_inference_model has already merged.
+        # We save the pre-merge state by capturing it in _log_epoch_evaluation.
+        return result
+
+    def _log_epoch_evaluation(self, epoch, eval_result, mean_train_loss):
+        """Capture LoRA state dict at every epoch (overwritten each time).
+
+        The last captured state is the final pre-merge adapter weights.
+        """
+        if epoch >= 0:
+            from models.lora import get_lora_state_dict
+            self._lora_state_dict_ = get_lora_state_dict(
+                self.finetuned_estimator_.model_
+            )
+        super()._log_epoch_evaluation(epoch, eval_result, mean_train_loss)
+
+
+def _make_finetuned_regressor(silence_diagnostics=True, use_lora=False,
+                               lora_rank=8, lora_alpha=16,
+                               lora_target='decoder_dict', **kwargs):
+    """Factory: returns the appropriate regressor class.
+
+    - use_lora=True  → LoRAFinetunedRegressor (always includes diagnostics)
+    - silence_diagnostics=False → GradientMonitoredRegressor
+    - otherwise → plain FinetunedTabPFNRegressor
+    """
+    if use_lora:
+        return LoRAFinetunedRegressor(
+            lora_rank=lora_rank, lora_alpha=lora_alpha,
+            lora_target=lora_target, **kwargs,
+        )
     if silence_diagnostics:
         return FinetunedTabPFNRegressor(**kwargs)
     return GradientMonitoredRegressor(**kwargs)
@@ -258,3 +405,57 @@ def extract_inference_model(finetuned_regressor):
     print(f"  Extracted TabPFNRegressor with finetuned weights "
           f"(fit_mode={inference_model.fit_mode!r})")
     return inference_model
+
+
+def load_lora_as_inference_model(checkpoint_dir, device='cpu'):
+    """Load a LoRA checkpoint and return a TabPFNRegressor ready for inference.
+
+    Initialises a pretrained TabPFNRegressor, applies the saved LoRA adapters,
+    merges them into base weights, and wraps the result in a RegressorModelSpecs
+    so that subsequent .fit()/.predict() calls do not reload from disk.
+
+    Args:
+        checkpoint_dir: directory containing lora_weights.pt and lora_config.json
+        device: 'cpu' or 'cuda'
+
+    Returns:
+        (model, config) tuple:
+          - model: TabPFNRegressor with LoRA-merged weights, fit_mode='fit_preprocessors'
+          - config: dict from lora_config.json (rank, alpha, target, dataset_type, …)
+    """
+    # Validate checkpoint files exist
+    for fname in ('lora_config.json', 'lora_weights.pt'):
+        path = os.path.join(checkpoint_dir, fname)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"LoRA checkpoint missing {fname} in {checkpoint_dir}")
+
+    # 1. Initialise pretrained model
+    tmp = TabPFNRegressor(device=device)
+    tmp._initialize_model_variables()
+
+    # 2. Inject LoRA adapters + load saved weights
+    config = load_lora_checkpoint(tmp.models_[0], checkpoint_dir)
+
+    # 3. Merge adapters into base weights
+    n_merged = merge_lora(tmp.models_[0])
+    print(f"  [LoRA] Merged {n_merged} adapters from checkpoint")
+
+    # 4. Wrap in RegressorModelSpecs so .fit() won't reload from disk
+    specs = RegressorModelSpecs(
+        model=tmp.models_[0],
+        architecture_config=tmp.configs_[0],
+        inference_config=tmp.inference_config_,
+        norm_criterion=tmp.znorm_space_bardist_,
+    )
+
+    model = TabPFNRegressor(
+        model_path=specs,
+        fit_mode='fit_preprocessors',
+        ignore_pretraining_limits=True,
+        device=device,
+        n_estimators=8,
+    )
+
+    print(f"  [LoRA] Ready for inference (device={device})")
+    return model, config
