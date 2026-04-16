@@ -69,7 +69,7 @@ def generate_synthetic_gp_dataset(
 
 
 def generate_synthetic_gp_bank(
-    n_datasets=500, n_features=2, n_samples=100, seed=42,
+    n_datasets=500, n_features=2, n_samples=100, seed=None,
 ):
     """Bank of GP datasets with varied hyperparameters.
 
@@ -84,11 +84,14 @@ def generate_synthetic_gp_bank(
         n_datasets: number of datasets to generate
         n_features: input dimensionality
         n_samples: ignored (varied per dataset), kept for API consistency
-        seed: random seed
+        seed: optional integer seed.  When None (default), draws from system
+            entropy so consecutive calls produce independent realizations.
 
     Returns:
         List of (X, y) tuples.
     """
+    if seed is None:
+        seed = int(np.random.default_rng().integers(0, 2**31))
     rng = np.random.RandomState(seed)
     bank = []
 

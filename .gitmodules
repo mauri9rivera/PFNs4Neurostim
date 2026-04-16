@@ -4,3 +4,6 @@
 [submodule "libs/PFNs"]
 	path = libs/PFNs
 	url = https://github.com/automl/PFNs.git
+[submodule "libs/tabpfn-v1-prior"]
+	path = libs/tabpfn-v1-prior
+	url = https://github.com/automl/tabpfn-v1-prior.git

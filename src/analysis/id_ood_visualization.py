@@ -8,13 +8,17 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import seaborn as sns
 
 PALETTE = {
     'Neurostim': 'royalblue',
+    'Neurostim GT': 'steelblue',
     'Synthetic GP': 'sandybrown',
     'TabPFN Prior': 'seagreen',
     'Noise (OOD)': 'firebrick',
+    'Clustered OOD': 'darkorange',
+    'Correlated OOD': 'mediumorchid',
 }
 
 
@@ -26,11 +30,16 @@ def _save_dir(output_dir, subdir):
     return base
 
 
-def plot_entropy_distribution(entropy_results, save=False, output_dir=None):
-    """Violin/box plot: entropy distributions per dataset type.
+# ============================================================================
+#  Entropy Plots
+# ============================================================================
 
-    One panel per dataset. X-axis: subjects. Overlaid reference bands
-    from GP and/or Prior Bag synthetic data.
+def plot_entropy_distribution(entropy_results, save=False, output_dir=None):
+    """Overlaid KDE plot: entropy distributions for neurostim vs references.
+
+    One KDE per group: each neurostim dataset (pooled across subjects),
+    GP ref, Prior ref, Noise.  Replaces the prior violin + axhspan approach
+    for clearer comparison of distribution shapes and overlap.
 
     Args:
         entropy_results: dict from entropy_analysis()
@@ -38,76 +47,65 @@ def plot_entropy_distribution(entropy_results, save=False, output_dir=None):
         output_dir: base output directory
     """
     _ref_keys = {'synthetic_gp', 'synthetic_prior', 'noise'}
-    dataset_types = [k for k in entropy_results if k not in _ref_keys]
-    n_panels = max(1, len(dataset_types))
+    # Separate in-context keys (e.g. 'nhp') from ground-truth keys (e.g. 'nhp_gt')
+    _gt_suffix = '_gt'
+    gt_keys = {k for k in entropy_results if k.endswith(_gt_suffix)}
+    dataset_types = [k for k in entropy_results
+                     if k not in _ref_keys and k not in gt_keys]
 
-    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5), squeeze=False)
+    fig, ax = plt.subplots(figsize=(8, 5))
 
-    for ax_idx, dataset_type in enumerate(dataset_types):
-        ax = axes[0, ax_idx]
-        ds_data = entropy_results[dataset_type]
+    def _pool_nested_entropies(nested_data):
+        """Flatten {subj: {emg: array}} into a single list of values."""
+        vals = []
+        for subj_data in nested_data.values():
+            for entropy_arr in subj_data.values():
+                vals.extend(entropy_arr.tolist()
+                            if hasattr(entropy_arr, 'tolist')
+                            else list(entropy_arr))
+        return vals
 
-        # Collect per-subject entropy values
-        plot_data = []
-        for subj_idx, subj_data in sorted(ds_data.items()):
-            for emg_idx, entropy_arr in sorted(subj_data.items()):
-                for val in entropy_arr:
-                    plot_data.append({
-                        'Subject': f'S{subj_idx}',
-                        'Entropy': float(val),
-                    })
+    # Neurostim KDEs — in-context (one per dataset, pooled across subjects/EMGs)
+    for dataset_type in dataset_types:
+        all_vals = _pool_nested_entropies(entropy_results[dataset_type])
+        if all_vals:
+            sns.kdeplot(all_vals, ax=ax, fill=True, alpha=0.3,
+                        color=PALETTE['Neurostim'],
+                        label=f'{dataset_type.upper()} (in-context)',
+                        linewidth=2)
 
-        if not plot_data:
-            continue
+    # Neurostim KDEs — ground truth (full map as context)
+    for gt_key in sorted(gt_keys):
+        ds_name = gt_key[:-len(_gt_suffix)]
+        all_vals = _pool_nested_entropies(entropy_results[gt_key])
+        if all_vals:
+            sns.kdeplot(all_vals, ax=ax, fill=True, alpha=0.15,
+                        color=PALETTE['Neurostim GT'],
+                        label=f'{ds_name.upper()} (ground truth)',
+                        linestyle='--', linewidth=2)
 
-        import pandas as pd
-        df = pd.DataFrame(plot_data)
+    # Synthetic reference KDEs
+    ref_plot_config = {
+        'synthetic_gp': ('GP Reference', PALETTE['Synthetic GP'], '--'),
+        'synthetic_prior': ('TabPFN Prior', PALETTE['TabPFN Prior'], '-.'),
+        'noise': ('Noise (OOD)', PALETTE['Noise (OOD)'], ':'),
+    }
+    for ref_key, (label, color, ls) in ref_plot_config.items():
+        if ref_key in entropy_results and len(entropy_results[ref_key]) > 0:
+            ref_vals = entropy_results[ref_key]
+            sns.kdeplot(ref_vals.tolist() if hasattr(ref_vals, 'tolist')
+                        else list(ref_vals),
+                        ax=ax, fill=True, alpha=0.15,
+                        color=color, label=label,
+                        linestyle=ls, linewidth=2)
 
-        sns.violinplot(data=df, x='Subject', y='Entropy', ax=ax,
-                       color=PALETTE['Neurostim'], alpha=0.7, inner='box')
+    ax.set_xlabel('Shannon Entropy')
+    ax.set_ylabel('Density')
+    ax.set_title('Bar-Distribution Entropy: Neurostim vs Synthetic')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, axis='y')
 
-        # Reference bands
-        y_bottom, y_top = ax.get_ylim()
-        if 'synthetic_gp' in entropy_results:
-            gp_ent = entropy_results['synthetic_gp']
-            if len(gp_ent) > 0:
-                gp_mean = np.mean(gp_ent)
-                gp_std = np.std(gp_ent)
-                ax.axhspan(gp_mean - gp_std, gp_mean + gp_std,
-                           color=PALETTE['Synthetic GP'], alpha=0.15,
-                           label=f'GP ref (mean={gp_mean:.2f})')
-                ax.axhline(gp_mean, color=PALETTE['Synthetic GP'],
-                           linestyle='--', linewidth=1)
-
-        if 'synthetic_prior' in entropy_results:
-            pr_ent = entropy_results['synthetic_prior']
-            if len(pr_ent) > 0:
-                pr_mean = np.mean(pr_ent)
-                pr_std = np.std(pr_ent)
-                ax.axhspan(pr_mean - pr_std, pr_mean + pr_std,
-                           color=PALETTE['TabPFN Prior'], alpha=0.15,
-                           label=f'Prior ref (mean={pr_mean:.2f})')
-                ax.axhline(pr_mean, color=PALETTE['TabPFN Prior'],
-                           linestyle='--', linewidth=1)
-
-        if 'noise' in entropy_results:
-            noise_ent = entropy_results['noise']
-            if len(noise_ent) > 0:
-                noise_mean = np.mean(noise_ent)
-                noise_std = np.std(noise_ent)
-                ax.axhspan(noise_mean - noise_std, noise_mean + noise_std,
-                           color=PALETTE['Noise (OOD)'], alpha=0.15,
-                           label=f'Noise OOD (mean={noise_mean:.2f})')
-                ax.axhline(noise_mean, color=PALETTE['Noise (OOD)'],
-                           linestyle='--', linewidth=1)
-
-        ax.set_title(f'{dataset_type.upper()}')
-        ax.set_ylabel('Shannon Entropy')
-        ax.legend(fontsize=7, loc='upper right')
-        ax.grid(True, alpha=0.3, axis='y')
-
-    fig.suptitle('Bar-Distribution Entropy: Neurostim vs Synthetic', fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.tight_layout()
 
     if save:
         base = _save_dir(output_dir, 'entropy')
@@ -164,122 +162,369 @@ def plot_entropy_heatmap(entropy_results, dataset_type, save=False, output_dir=N
     plt.close()
 
 
-def plot_mmd_barplot(mmd_results, save=False, output_dir=None):
-    """Grouped bar chart: MMD vs GP ref and MMD vs Prior Bag ref.
+# ============================================================================
+#  MMD / Wasserstein Heatmap
+# ============================================================================
 
-    P-value annotations: * p<0.05, ** p<0.01, ns.
+def plot_mmd_heatmap(mmd_results, wasserstein_results=None,
+                     save=False, output_dir=None):
+    """Pairwise heatmap: rows = (dataset, subject), cols = reference types.
+
+    Shows MMD^2 values as color-coded heatmap with significance annotations.
+    If wasserstein_results provided, creates side-by-side MMD + W2 panels.
 
     Args:
         mmd_results: dict from mmd_analysis()
+        wasserstein_results: optional dict from wasserstein_analysis()
         save: whether to save figure
         output_dir: base output directory
     """
-    import pandas as pd
-
-    plot_data = []
-    for dataset_type, ds_data in mmd_results.items():
-        for subj_idx, subj_data in ds_data.items():
-            for emg_idx, emg_data in subj_data.items():
-                label = f'{dataset_type} S{subj_idx}\nEMG{emg_idx}'
-                ref_labels = {
-                    'gp': 'Synthetic GP',
-                    'prior': 'TabPFN Prior',
-                    'noise': 'Noise (OOD)',
-                }
-                for ref_name in ['gp', 'prior', 'noise']:
-                    mmd_key = f'mmd2_{ref_name}'
-                    p_key = f'p_{ref_name}'
-                    if mmd_key in emg_data:
-                        plot_data.append({
-                            'Experiment': label,
-                            'MMD²': emg_data[mmd_key],
-                            'p-value': emg_data[p_key],
-                            'Reference': ref_labels[ref_name],
-                        })
-
-    if not plot_data:
+    has_mmd = mmd_results is not None
+    has_w2 = wasserstein_results is not None
+    n_panels = int(has_mmd) + int(has_w2)
+    if n_panels == 0:
         return
 
-    df = pd.DataFrame(plot_data)
+    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5),
+                              squeeze=False)
 
-    # Aggregate per dataset-subject (mean across EMGs)
-    df['DS_Subj'] = df['Experiment'].str.split('\n').str[0]
-    agg = df.groupby(['DS_Subj', 'Reference']).agg(
-        MMD2_mean=('MMD²', 'mean'),
-        MMD2_sem=('MMD²', 'sem'),
-        p_mean=('p-value', 'mean'),
-    ).reset_index()
+    panel_idx = 0
+    if has_mmd:
+        _build_distance_heatmap(
+            axes[0, panel_idx], mmd_results, metric_prefix='mmd2',
+            p_prefix='p', title='MMD²', cmap='YlOrRd',
+        )
+        panel_idx += 1
 
-    n_groups = agg['DS_Subj'].nunique()
-    fig, ax = plt.subplots(figsize=(max(8, n_groups * 1.5), 5))
+    if has_w2:
+        _build_distance_heatmap(
+            axes[0, panel_idx], wasserstein_results, metric_prefix='w2',
+            p_prefix=None, title='Sliced Wasserstein-2', cmap='YlOrRd',
+        )
 
-    ref_types = agg['Reference'].unique()
-    x = np.arange(n_groups)
-    n_refs = len(ref_types)
-    width = 0.25
-    ds_subjects = sorted(agg['DS_Subj'].unique())
-
-    for i, ref in enumerate(ref_types):
-        ref_data = agg[agg['Reference'] == ref].set_index('DS_Subj')
-        vals = [ref_data.loc[ds, 'MMD2_mean'] if ds in ref_data.index else 0
-                for ds in ds_subjects]
-        errs = [ref_data.loc[ds, 'MMD2_sem'] if ds in ref_data.index else 0
-                for ds in ds_subjects]
-        p_vals = [ref_data.loc[ds, 'p_mean'] if ds in ref_data.index else 1
-                  for ds in ds_subjects]
-
-        color = PALETTE.get(ref, 'gray')
-        offset = (i - (n_refs - 1) / 2) * width
-        bars = ax.bar(x + offset, vals, width, yerr=errs,
-                      label=ref, color=color, alpha=0.8, capsize=3)
-
-        # P-value annotations
-        for j, (bar, p) in enumerate(zip(bars, p_vals)):
-            if p < 0.01:
-                annot = '**'
-            elif p < 0.05:
-                annot = '*'
-            else:
-                annot = 'ns'
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                    annot, ha='center', va='bottom', fontsize=8)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(ds_subjects, rotation=45, ha='right')
-    ax.set_ylabel('MMD²')
-    ax.set_title('MMD² vs Synthetic References')
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis='y')
-
-    fig.tight_layout()
+    fig.suptitle('Distributional Distance: Neurostim vs References',
+                 fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
 
     if save:
         base = _save_dir(output_dir, 'mmd')
-        path = os.path.join(base, 'mmd_barplot.svg')
+        path = os.path.join(base, 'mmd_heatmap.svg')
         plt.savefig(path, format='svg')
         print(f"Saved plot -> {path}")
 
     plt.close()
 
 
-def plot_mahalanobis_distribution(mahalanobis_results, save=False, output_dir=None):
-    """Violin plot: Mahalanobis distance distributions per dataset.
+def _build_distance_heatmap(ax, results, metric_prefix, p_prefix,
+                            title, cmap):
+    """Build a single distance heatmap on the given axes.
 
-    Overlays held-out synthetic reference distances for calibration.
+    Rows = (dataset, subject), columns = reference types.
+    """
+    ref_names = ['gp', 'prior', 'noise']
+    ref_labels = {'gp': 'Synthetic GP', 'prior': 'TabPFN Prior',
+                  'noise': 'Noise (OOD)'}
+
+    # Collect rows
+    row_labels = []
+    matrix_vals = []
+    annot_strs = []
+
+    for dataset_type, ds_data in results.items():
+        for subj_idx in sorted(ds_data.keys()):
+            subj_data = ds_data[subj_idx]
+            row_labels.append(f'{dataset_type} S{subj_idx}')
+            row_vals = []
+            row_annots = []
+
+            for ref in ref_names:
+                metric_key = f'{metric_prefix}_{ref}'
+                # Average across EMGs
+                vals = [emg_data[metric_key]
+                        for emg_data in subj_data.values()
+                        if metric_key in emg_data]
+                mean_val = np.mean(vals) if vals else np.nan
+                row_vals.append(mean_val)
+
+                # Significance annotation (if p-values available)
+                if p_prefix:
+                    p_key = f'{p_prefix}_{ref}'
+                    p_vals = [emg_data[p_key]
+                              for emg_data in subj_data.values()
+                              if p_key in emg_data]
+                    mean_p = np.mean(p_vals) if p_vals else 1.0
+                    if mean_p < 0.01:
+                        star = '**'
+                    elif mean_p < 0.05:
+                        star = '*'
+                    else:
+                        star = 'ns'
+                    row_annots.append(f'{mean_val:.3f}\n{star}')
+                else:
+                    row_annots.append(f'{mean_val:.3f}')
+
+            matrix_vals.append(row_vals)
+            annot_strs.append(row_annots)
+
+    if not matrix_vals:
+        return
+
+    matrix = np.array(matrix_vals)
+    annot = np.array(annot_strs)
+    col_labels = [ref_labels.get(r, r) for r in ref_names]
+
+    sns.heatmap(matrix, ax=ax, cmap=cmap, annot=annot, fmt='',
+                xticklabels=col_labels, yticklabels=row_labels,
+                linewidths=0.5)
+    ax.set_title(title)
+
+
+# Backward-compatible alias
+def plot_mmd_barplot(mmd_results, save=False, output_dir=None):
+    """Deprecated: redirects to plot_mmd_heatmap."""
+    plot_mmd_heatmap(mmd_results, save=save, output_dir=output_dir)
+
+
+# ============================================================================
+#  CKA Heatmap
+# ============================================================================
+
+def _get_cka_layers(cka_results):
+    """Extract analyzed layer indices from CKA results metadata."""
+    return cka_results.get('layers', [17])
+
+
+def _get_cka_dataset_types(cka_results):
+    """Extract dataset type keys (excluding metadata keys like 'layers')."""
+    return [k for k in cka_results if k != 'layers']
+
+
+def plot_cka_heatmap(cka_results, save=False, output_dir=None, layer=None):
+    """Heatmap: CKA similarity scores (subjects x reference types).
+
+    One panel per dataset type, at a single layer.  Green = high CKA
+    (in-distribution), red = low CKA (out-of-distribution).
+
+    Args:
+        cka_results: dict from cka_analysis() with multi-layer structure.
+        save: whether to save figure.
+        output_dir: base output directory.
+        layer: transformer layer index to display.
+            Defaults to the last (deepest) analyzed layer.
+    """
+    layers = _get_cka_layers(cka_results)
+    if layer is None:
+        layer = max(layers)
+
+    dataset_types = _get_cka_dataset_types(cka_results)
+    if not dataset_types:
+        return
+
+    n_panels = len(dataset_types)
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 4),
+                              squeeze=False)
+
+    ref_names = ['gp', 'prior', 'noise']
+    ref_labels = {'gp': 'Synthetic GP', 'prior': 'TabPFN Prior',
+                  'noise': 'Noise (OOD)'}
+
+    for ax_i, dataset_type in enumerate(dataset_types):
+        ax = axes[0, ax_i]
+        ds_data = cka_results[dataset_type]
+        subjects = sorted(ds_data.keys())
+
+        matrix = np.full((len(subjects), len(ref_names)), np.nan)
+        for i, subj in enumerate(subjects):
+            subj_data = ds_data[subj]
+            for j, ref in enumerate(ref_names):
+                key = f'cka_{ref}'
+                vals = [emg_data[layer][key]
+                        for emg_data in subj_data.values()
+                        if layer in emg_data and key in emg_data[layer]]
+                if vals:
+                    matrix[i, j] = np.mean(vals)
+
+        sns.heatmap(matrix, ax=ax, cmap='RdYlGn', vmin=0, vmax=1,
+                    annot=True, fmt='.2f',
+                    xticklabels=[ref_labels.get(r, r) for r in ref_names],
+                    yticklabels=[f'S{s}' for s in subjects],
+                    linewidths=0.5)
+        ax.set_title(f'CKA Similarity | {dataset_type.upper()}')
+
+    fig.suptitle(f'CKA: Representation Alignment (Layer {layer})', fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+
+    if save:
+        base = _save_dir(output_dir, 'cka')
+        path = os.path.join(base, f'cka_heatmap_layer{layer}.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
+
+
+def plot_cka_layerwise_heatmap(cka_results, save=False, output_dir=None):
+    """Layer-wise CKA heatmap: layers x references, averaged across subjects/EMGs.
+
+    Reveals WHERE in the network neurostim representations diverge from
+    reference distributions.  One panel per dataset type.
+
+    Args:
+        cka_results: dict from cka_analysis() with multi-layer structure.
+        save: whether to save figure.
+        output_dir: base output directory.
+    """
+    layers = _get_cka_layers(cka_results)
+    dataset_types = _get_cka_dataset_types(cka_results)
+    if not dataset_types or len(layers) < 2:
+        return
+
+    ref_names = ['gp', 'prior', 'noise']
+    ref_labels = {'gp': 'Synthetic GP', 'prior': 'TabPFN Prior',
+                  'noise': 'Noise (OOD)'}
+
+    n_panels = len(dataset_types)
+    fig, axes = plt.subplots(1, n_panels,
+                              figsize=(4 + 2 * len(ref_names), 1 + 0.5 * len(layers)),
+                              squeeze=False)
+
+    for ax_i, dataset_type in enumerate(dataset_types):
+        ax = axes[0, ax_i]
+        ds_data = cka_results[dataset_type]
+
+        # matrix: layers x references, averaged across all subjects/EMGs
+        matrix = np.full((len(layers), len(ref_names)), np.nan)
+        for li, layer_idx in enumerate(layers):
+            for rj, ref in enumerate(ref_names):
+                key = f'cka_{ref}'
+                vals = []
+                for subj_data in ds_data.values():
+                    for emg_data in subj_data.values():
+                        if layer_idx in emg_data and key in emg_data[layer_idx]:
+                            vals.append(emg_data[layer_idx][key])
+                if vals:
+                    matrix[li, rj] = np.mean(vals)
+
+        sns.heatmap(matrix, ax=ax, cmap='RdYlGn', vmin=0, vmax=1,
+                    annot=True, fmt='.2f',
+                    xticklabels=[ref_labels.get(r, r) for r in ref_names],
+                    yticklabels=[f'Layer {l}' for l in layers],
+                    linewidths=0.5)
+        ax.set_title(f'{dataset_type.upper()}')
+        ax.set_ylabel('Transformer Layer')
+
+    fig.suptitle('Layer-wise CKA: Where Do Representations Diverge?',
+                 fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+
+    if save:
+        base = _save_dir(output_dir, 'cka')
+        path = os.path.join(base, 'cka_layerwise_heatmap.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
+
+
+# ============================================================================
+#  Gradient Norm Bar Plot
+# ============================================================================
+
+def plot_gradient_norm_barplot(gradient_results, save=False, output_dir=None):
+    """Grouped bar plot: gradient L2 norms with log y-axis.
+
+    X-axis: (dataset, subject) groups.  Bars: neurostim gradient norm
+    (mean across EMGs).  Horizontal reference lines for synthetic baselines.
+
+    Args:
+        gradient_results: dict from gradient_norm_analysis()
+        save: whether to save figure
+        output_dir: base output directory
+    """
+    _ref_keys = {'synthetic_gp', 'synthetic_prior', 'noise'}
+    dataset_types = [k for k in gradient_results if k not in _ref_keys]
+
+    # Collect neurostim bars
+    labels = []
+    values = []
+    for dt in dataset_types:
+        ds_data = gradient_results[dt]
+        for subj_idx in sorted(ds_data.keys()):
+            subj_data = ds_data[subj_idx]
+            norms = [v for v in subj_data.values() if np.isfinite(v)]
+            if norms:
+                labels.append(f'{dt} S{subj_idx}')
+                values.append(np.mean(norms))
+
+    if not labels:
+        return
+
+    fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.2), 5))
+
+    x = np.arange(len(labels))
+    ax.bar(x, values, color=PALETTE['Neurostim'], alpha=0.8,
+           label='Neurostim')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+
+    # Reference baselines as horizontal lines
+    ref_line_config = {
+        'synthetic_gp': ('GP Ref', PALETTE['Synthetic GP'], '--'),
+        'synthetic_prior': ('Prior Ref', PALETTE['TabPFN Prior'], '-.'),
+        'noise': ('Noise OOD', PALETTE['Noise (OOD)'], ':'),
+    }
+    for ref_key, (label, color, ls) in ref_line_config.items():
+        if ref_key in gradient_results:
+            ref_vals = gradient_results[ref_key]
+            if len(ref_vals) > 0:
+                ref_mean = np.mean(ref_vals)
+                ax.axhline(ref_mean, color=color, linestyle=ls,
+                           linewidth=2, label=f'{label} (mean={ref_mean:.2f})')
+
+    ax.set_yscale('log')
+    ax.set_ylabel('Gradient L2 Norm (log scale)')
+    ax.set_title('Step-0 Gradient Norms: Neurostim vs Synthetic')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    fig.tight_layout()
+
+    if save:
+        base = _save_dir(output_dir, 'gradient_norm')
+        path = os.path.join(base, 'gradient_norm_barplot.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
+
+
+# ============================================================================
+#  Mahalanobis Violin Plot
+# ============================================================================
+
+def plot_mahalanobis_distribution(mahalanobis_results, save=False, output_dir=None):
+    """Violin plot: Mahalanobis distance distributions per reference.
+
+    Each panel (vs GP / vs Prior / vs Noise) shows three groups:
+      • Neurostim        — the data under investigation
+      • Reference self   — how the reference distribution looks to itself (calibration)
+      • OOD contrast     — a clearly-OOD distribution for comparison
+                           (vs GP and vs Prior: noise OOD bank;
+                            vs Noise: two structurally-different noise types)
 
     Args:
         mahalanobis_results: dict from mahalanobis_analysis()
         save: whether to save figure
         output_dir: base output directory
     """
-    import pandas as pd
-
-    dataset_types = [k for k in mahalanobis_results
-                     if k != 'ref_stats']
+    dataset_types = [k for k in mahalanobis_results if k != 'ref_stats']
     if not dataset_types:
         return
 
+    # ---- Neurostim distances (one row per test-point per EMG) ----
+    _ref_label = {'gp': 'vs GP', 'prior': 'vs Prior', 'noise': 'vs Noise'}
     plot_data = []
+
     for dataset_type in dataset_types:
         ds_data = mahalanobis_results[dataset_type]
         for subj_idx, subj_data in ds_data.items():
@@ -287,59 +532,67 @@ def plot_mahalanobis_distribution(mahalanobis_results, save=False, output_dir=No
                 for ref_name in ['gp', 'prior', 'noise']:
                     dist_key = f'distances_{ref_name}'
                     if dist_key in emg_data:
-                        ref_label_map = {
-                            'gp': 'vs GP', 'prior': 'vs Prior',
-                            'noise': 'vs Noise',
-                        }
                         for d in emg_data[dist_key]:
                             plot_data.append({
                                 'Dataset': dataset_type.upper(),
                                 'Distance': float(d),
                                 'Source': 'Neurostim',
-                                'Reference': ref_label_map[ref_name],
+                                'Reference': _ref_label[ref_name],
                             })
 
-    # Add reference self-distances
-    ref_label_map = {
-        'gp': ('Synthetic GP', 'vs GP'),
-        'prior': ('TabPFN Prior', 'vs Prior'),
-        'noise': ('Noise (OOD)', 'vs Noise'),
+    # ---- Reference self-distances + OOD contrasts ----
+    _self_source = {
+        'gp': 'Synthetic GP',
+        'prior': 'TabPFN Prior',
+        'noise': 'Noise (OOD)',
     }
     ref_stats = mahalanobis_results.get('ref_stats', {})
+
     for ref_name, stats in ref_stats.items():
-        label, ref_col = ref_label_map.get(
-            ref_name, (ref_name, f'vs {ref_name}'),
-        )
-        for d in stats['self_distances']:
+        ref_col = _ref_label.get(ref_name, f'vs {ref_name}')
+        self_label = _self_source.get(ref_name, ref_name)
+
+        # Self-distances (same for every neurostim dataset → duplicate across all)
+        for d in stats.get('self_distances', []):
             for dataset_type in dataset_types:
                 plot_data.append({
                     'Dataset': dataset_type.upper(),
                     'Distance': float(d),
-                    'Source': label,
+                    'Source': self_label,
                     'Reference': ref_col,
                 })
+
+        # OOD contrast for GP and Prior panels: single noise OOD bank
+        if ref_name in ('gp', 'prior'):
+            for d in stats.get('ood_distances', []):
+                for dataset_type in dataset_types:
+                    plot_data.append({
+                        'Dataset': dataset_type.upper(),
+                        'Distance': float(d),
+                        'Source': 'Noise (OOD)',
+                        'Reference': ref_col,
+                    })
+
 
     if not plot_data:
         return
 
     df = pd.DataFrame(plot_data)
 
-    refs = df['Reference'].unique()
+    refs = ['vs GP', 'vs Prior', 'vs Noise']
+    refs = [r for r in refs if r in df['Reference'].unique()]
     n_panels = len(refs)
     fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5), squeeze=False)
 
-    source_palette = {
-        'Neurostim': PALETTE['Neurostim'],
-        'Synthetic GP': PALETTE['Synthetic GP'],
-        'TabPFN Prior': PALETTE['TabPFN Prior'],
-        'Noise (OOD)': PALETTE['Noise (OOD)'],
-    }
+    source_palette = {k: v for k, v in PALETTE.items()}
 
     for ax_i, ref in enumerate(refs):
         ax = axes[0, ax_i]
         ref_df = df[df['Reference'] == ref]
+        hue_order = [s for s in source_palette if s in ref_df['Source'].unique()]
         sns.violinplot(data=ref_df, x='Dataset', y='Distance', hue='Source',
-                       palette=source_palette, ax=ax, inner='box', alpha=0.7)
+                       hue_order=hue_order, palette=source_palette,
+                       ax=ax, inner='box', alpha=0.7)
         ax.set_title(f'Mahalanobis Distance ({ref})')
         ax.set_ylabel('D_M')
         ax.legend(fontsize=7)
@@ -357,110 +610,82 @@ def plot_mahalanobis_distribution(mahalanobis_results, save=False, output_dir=No
     plt.close()
 
 
-def plot_summary_dashboard(entropy_results, mmd_results, mahalanobis_results,
-                           save=False, output_dir=None):
-    """3-panel paper-ready summary.
+# ============================================================================
+#  Summary Dashboard
+# ============================================================================
 
-    Panel A: Entropy | Panel B: MMD | Panel C: Mahalanobis
+def plot_summary_dashboard(entropy_results=None, mmd_results=None,
+                           mahalanobis_results=None, cka_results=None,
+                           wasserstein_results=None, gradient_results=None,
+                           save=False, output_dir=None):
+    """Multi-panel paper-ready summary.
+
+    Dynamically includes panels for each available result set.
+    Backward-compatible with old 3-positional-arg calls.
 
     Args:
         entropy_results: dict from entropy_analysis()
         mmd_results: dict from mmd_analysis()
         mahalanobis_results: dict from mahalanobis_analysis()
+        cka_results: dict from cka_analysis()
+        wasserstein_results: dict from wasserstein_analysis()
+        gradient_results: dict from gradient_norm_analysis()
         save: whether to save figure
         output_dir: base output directory
     """
-    import pandas as pd
+    # Build list of panels to render
+    panels = []
+    if entropy_results is not None:
+        panels.append(('A', 'Entropy', entropy_results))
+    if mmd_results is not None:
+        panels.append(('B', 'MMD²', mmd_results))
+    if mahalanobis_results is not None:
+        panels.append(('C', 'Mahalanobis', mahalanobis_results))
+    if cka_results is not None:
+        panels.append(('D', 'CKA', cka_results))
+    if wasserstein_results is not None:
+        panels.append(('E', 'Wasserstein-2', wasserstein_results))
+    if gradient_results is not None:
+        panels.append(('F', 'Gradient Norm', gradient_results))
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    if not panels:
+        return
 
-    # --- Panel A: Entropy summary ---
-    ax = axes[0]
-    _ref_keys = {'synthetic_gp', 'synthetic_prior', 'noise'}
-    dataset_types = [k for k in entropy_results if k not in _ref_keys]
-    box_data = []
-    for dt in dataset_types:
-        for subj_data in entropy_results[dt].values():
-            for entropy_arr in subj_data.values():
-                for val in entropy_arr:
-                    box_data.append({'Dataset': dt.upper(), 'Entropy': float(val)})
+    n = len(panels)
+    if n <= 3:
+        nrows, ncols = 1, n
+    else:
+        nrows, ncols = 2, 3
 
-    # Add synthetic
-    for synth_key, label in [('synthetic_gp', 'GP Ref'),
-                              ('synthetic_prior', 'Prior Ref'),
-                              ('noise', 'Noise OOD')]:
-        if synth_key in entropy_results:
-            for val in entropy_results[synth_key]:
-                box_data.append({'Dataset': label, 'Entropy': float(val)})
+    fig, axes = plt.subplots(nrows, ncols,
+                              figsize=(6 * ncols, 5 * nrows),
+                              squeeze=False)
 
-    if box_data:
-        df_ent = pd.DataFrame(box_data)
-        palette_a = {dt.upper(): PALETTE['Neurostim'] for dt in dataset_types}
-        palette_a['GP Ref'] = PALETTE['Synthetic GP']
-        palette_a['Prior Ref'] = PALETTE['TabPFN Prior']
-        palette_a['Noise OOD'] = PALETTE['Noise (OOD)']
-        sns.boxplot(data=df_ent, x='Dataset', y='Entropy', palette=palette_a,
-                    ax=ax, fliersize=2)
-    ax.set_title('A) Bar-Distribution Entropy')
-    ax.grid(True, alpha=0.3, axis='y')
+    for idx, (letter, title, data) in enumerate(panels):
+        row, col = divmod(idx, ncols)
+        ax = axes[row, col]
 
-    # --- Panel B: MMD summary ---
-    ax = axes[1]
-    mmd_data = []
-    for dt, ds_data in mmd_results.items():
-        for subj_data in ds_data.values():
-            for emg_data in subj_data.values():
-                ref_label_map = {
-                    'gp': 'vs GP', 'prior': 'vs Prior', 'noise': 'vs Noise',
-                }
-                for ref_name in ['gp', 'prior', 'noise']:
-                    mmd_key = f'mmd2_{ref_name}'
-                    if mmd_key in emg_data:
-                        mmd_data.append({
-                            'Dataset': dt.upper(),
-                            'MMD²': emg_data[mmd_key],
-                            'Reference': ref_label_map[ref_name],
-                        })
+        if title == 'Entropy':
+            _panel_entropy(ax, data)
+        elif title == 'MMD²':
+            _panel_mmd(ax, data)
+        elif title == 'Mahalanobis':
+            _panel_mahalanobis(ax, data)
+        elif title == 'CKA':
+            _panel_cka(ax, data)
+        elif title == 'Wasserstein-2':
+            _panel_wasserstein(ax, data)
+        elif title == 'Gradient Norm':
+            _panel_gradient_norm(ax, data)
 
-    if mmd_data:
-        df_mmd = pd.DataFrame(mmd_data)
-        sns.barplot(data=df_mmd, x='Dataset', y='MMD²', hue='Reference',
-                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
-                             PALETTE['Noise (OOD)']],
-                    ax=ax, capsize=0.1, errorbar=('ci', 95))
-    ax.set_title('B) MMD² vs References')
-    ax.grid(True, alpha=0.3, axis='y')
+        ax.set_title(f'{letter}) {title}')
 
-    # --- Panel C: Mahalanobis summary ---
-    ax = axes[2]
-    mah_data = []
-    m_dataset_types = [k for k in mahalanobis_results if k != 'ref_stats']
-    for dt in m_dataset_types:
-        for subj_data in mahalanobis_results[dt].values():
-            for emg_data in subj_data.values():
-                ref_label_map = {
-                    'gp': 'vs GP', 'prior': 'vs Prior', 'noise': 'vs Noise',
-                }
-                for ref_name in ['gp', 'prior', 'noise']:
-                    dist_key = f'distances_{ref_name}'
-                    if dist_key in emg_data:
-                        for d in emg_data[dist_key]:
-                            mah_data.append({
-                                'Dataset': dt.upper(),
-                                'D_M': float(d),
-                                'Reference': ref_label_map[ref_name],
-                            })
+    # Hide unused axes
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row, col].set_visible(False)
 
-    if mah_data:
-        df_mah = pd.DataFrame(mah_data)
-        sns.boxplot(data=df_mah, x='Dataset', y='D_M', hue='Reference',
-                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
-                             PALETTE['Noise (OOD)']],
-                    ax=ax, fliersize=2)
-    ax.set_title('C) Mahalanobis Distance')
-    ax.grid(True, alpha=0.3, axis='y')
-
-    fig.suptitle('ID/OOD Analysis: Is Neurostim Data Within TabPFN\'s Prior?',
+    fig.suptitle("ID/OOD Analysis: Is Neurostim Data Within TabPFN's Prior?",
                  fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.93])
 
@@ -472,3 +697,179 @@ def plot_summary_dashboard(entropy_results, mmd_results, mahalanobis_results,
         print(f"Saved plot -> {path}")
 
     plt.close()
+
+
+# --- Dashboard panel helpers ------------------------------------------------
+
+def _panel_entropy(ax, entropy_results):
+    """Compact entropy boxplot for dashboard."""
+    _ref_keys = {'synthetic_gp', 'synthetic_prior', 'noise'}
+    dataset_types = [k for k in entropy_results if k not in _ref_keys]
+    box_data = []
+    for dt in dataset_types:
+        for subj_data in entropy_results[dt].values():
+            for entropy_arr in subj_data.values():
+                for val in entropy_arr:
+                    box_data.append({'Dataset': dt.upper(),
+                                     'Entropy': float(val)})
+    for synth_key, label in [('synthetic_gp', 'GP Ref'),
+                              ('synthetic_prior', 'Prior Ref'),
+                              ('noise', 'Noise OOD')]:
+        if synth_key in entropy_results:
+            for val in entropy_results[synth_key]:
+                box_data.append({'Dataset': label, 'Entropy': float(val)})
+
+    if box_data:
+        df = pd.DataFrame(box_data)
+        palette = {dt.upper(): PALETTE['Neurostim'] for dt in dataset_types}
+        palette['GP Ref'] = PALETTE['Synthetic GP']
+        palette['Prior Ref'] = PALETTE['TabPFN Prior']
+        palette['Noise OOD'] = PALETTE['Noise (OOD)']
+        sns.boxplot(data=df, x='Dataset', y='Entropy', palette=palette,
+                    ax=ax, fliersize=2)
+    ax.grid(True, alpha=0.3, axis='y')
+
+
+def _panel_mmd(ax, mmd_results):
+    """Compact MMD barplot for dashboard."""
+    mmd_data = []
+    ref_label_map = {'gp': 'vs GP', 'prior': 'vs Prior', 'noise': 'vs Noise'}
+    for dt, ds_data in mmd_results.items():
+        for subj_data in ds_data.values():
+            for emg_data in subj_data.values():
+                for ref_name in ['gp', 'prior', 'noise']:
+                    mmd_key = f'mmd2_{ref_name}'
+                    if mmd_key in emg_data:
+                        mmd_data.append({
+                            'Dataset': dt.upper(),
+                            'MMD²': emg_data[mmd_key],
+                            'Reference': ref_label_map[ref_name],
+                        })
+    if mmd_data:
+        df = pd.DataFrame(mmd_data)
+        sns.barplot(data=df, x='Dataset', y='MMD²', hue='Reference',
+                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
+                             PALETTE['Noise (OOD)']],
+                    ax=ax, capsize=0.1, errorbar=('ci', 95))
+    ax.grid(True, alpha=0.3, axis='y')
+
+
+def _panel_mahalanobis(ax, mahalanobis_results):
+    """Compact Mahalanobis boxplot for dashboard."""
+    m_dataset_types = [k for k in mahalanobis_results if k != 'ref_stats']
+    mah_data = []
+    ref_label_map = {'gp': 'vs GP', 'prior': 'vs Prior', 'noise': 'vs Noise'}
+    for dt in m_dataset_types:
+        for subj_data in mahalanobis_results[dt].values():
+            for emg_data in subj_data.values():
+                for ref_name in ['gp', 'prior', 'noise']:
+                    dist_key = f'distances_{ref_name}'
+                    if dist_key in emg_data:
+                        for d in emg_data[dist_key]:
+                            mah_data.append({
+                                'Dataset': dt.upper(),
+                                'D_M': float(d),
+                                'Reference': ref_label_map[ref_name],
+                            })
+    if mah_data:
+        df = pd.DataFrame(mah_data)
+        sns.boxplot(data=df, x='Dataset', y='D_M', hue='Reference',
+                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
+                             PALETTE['Noise (OOD)']],
+                    ax=ax, fliersize=2)
+    ax.grid(True, alpha=0.3, axis='y')
+
+
+def _panel_cka(ax, cka_results):
+    """Compact CKA grouped bar for dashboard (uses deepest analyzed layer)."""
+    layers = _get_cka_layers(cka_results)
+    layer = max(layers)
+
+    cka_data = []
+    ref_label_map = {'gp': 'Synthetic GP', 'prior': 'TabPFN Prior',
+                     'noise': 'Noise (OOD)'}
+    for dt in _get_cka_dataset_types(cka_results):
+        ds_data = cka_results[dt]
+        for subj_data in ds_data.values():
+            for emg_data in subj_data.values():
+                if layer not in emg_data:
+                    continue
+                layer_data = emg_data[layer]
+                for ref_name in ['gp', 'prior', 'noise']:
+                    key = f'cka_{ref_name}'
+                    if key in layer_data:
+                        cka_data.append({
+                            'Dataset': dt.upper(),
+                            'CKA': layer_data[key],
+                            'Reference': ref_label_map[ref_name],
+                        })
+    if cka_data:
+        df = pd.DataFrame(cka_data)
+        sns.barplot(data=df, x='Dataset', y='CKA', hue='Reference',
+                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
+                             PALETTE['Noise (OOD)']],
+                    ax=ax, capsize=0.1, errorbar=('ci', 95))
+        ax.set_ylim(0, 1)
+    ax.set_title(f'CKA (Layer {layer})')
+    ax.grid(True, alpha=0.3, axis='y')
+
+
+def _panel_wasserstein(ax, wasserstein_results):
+    """Compact Wasserstein barplot for dashboard."""
+    w_data = []
+    ref_label_map = {'gp': 'vs GP', 'prior': 'vs Prior', 'noise': 'vs Noise'}
+    for dt, ds_data in wasserstein_results.items():
+        for subj_data in ds_data.values():
+            for emg_data in subj_data.values():
+                for ref_name in ['gp', 'prior', 'noise']:
+                    key = f'w2_{ref_name}'
+                    if key in emg_data:
+                        w_data.append({
+                            'Dataset': dt.upper(),
+                            'W2': emg_data[key],
+                            'Reference': ref_label_map[ref_name],
+                        })
+    if w_data:
+        df = pd.DataFrame(w_data)
+        sns.barplot(data=df, x='Dataset', y='W2', hue='Reference',
+                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
+                             PALETTE['Noise (OOD)']],
+                    ax=ax, capsize=0.1, errorbar=('ci', 95))
+    ax.grid(True, alpha=0.3, axis='y')
+
+
+def _panel_gradient_norm(ax, gradient_results):
+    """Compact gradient norm bars for dashboard."""
+    _ref_keys = {'synthetic_gp', 'synthetic_prior', 'noise'}
+    dataset_types = [k for k in gradient_results if k not in _ref_keys]
+
+    labels, values = [], []
+    for dt in dataset_types:
+        ds_data = gradient_results[dt]
+        for subj_idx in sorted(ds_data.keys()):
+            norms = [v for v in ds_data[subj_idx].values() if np.isfinite(v)]
+            if norms:
+                labels.append(f'{dt} S{subj_idx}')
+                values.append(np.mean(norms))
+
+    if values:
+        x = np.arange(len(labels))
+        ax.bar(x, values, color=PALETTE['Neurostim'], alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=7)
+        ax.set_yscale('log')
+
+        ref_line_config = {
+            'synthetic_gp': ('GP', PALETTE['Synthetic GP'], '--'),
+            'synthetic_prior': ('Prior', PALETTE['TabPFN Prior'], '-.'),
+            'noise': ('Noise', PALETTE['Noise (OOD)'], ':'),
+        }
+        for ref_key, (label, color, ls) in ref_line_config.items():
+            if ref_key in gradient_results and len(gradient_results[ref_key]) > 0:
+                ax.axhline(np.mean(gradient_results[ref_key]),
+                           color=color, linestyle=ls, linewidth=1.5,
+                           label=label)
+        ax.legend(fontsize=6)
+
+    ax.set_ylabel('Grad L2 (log)')
+    ax.grid(True, alpha=0.3, axis='y')

@@ -1,0 +1,32 @@
+# Canonical hyperparameters for NHP LoRA vs Full FT ablation.
+# Family: lora-ablation
+# Tests whether LoRA (decoder_dict only, rank=8) matches full finetuning quality
+# at a fraction of the trainable parameters.
+# Usage:
+#   python src/finetuning.py --config configs/nhp_lora_ablation.yaml
+
+family: lora-ablation
+dataset: nhp
+split: inter_subject
+mode:
+  - optimization
+
+# Training
+epochs: 50
+lr: 1.0e-5
+n_augmentations: 25
+
+# LoRA settings
+lora: true
+lora_rank: 8
+lora_alpha: 16
+lora_target: decoder_dict
+
+# Evaluation
+budget: 100
+n_reps: 30
+
+# Infrastructure
+device: cuda
+save: true
+diagnostics: false

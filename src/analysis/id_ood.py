@@ -1,5 +1,6 @@
 """
-Core ID/OOD analysis: Shannon entropy, MMD, and Mahalanobis distance.
+Core ID/OOD analysis: Shannon entropy, MMD, Wasserstein, Mahalanobis, CKA,
+and gradient L2-norm.
 
 Tests whether neurostim data lies within TabPFN's pre-training prior by
 comparing against synthetic reference distributions (GP and/or Prior Bag).
@@ -10,16 +11,38 @@ import warnings
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.spatial.distance import cdist
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from tabpfn import TabPFNRegressor
+
+from models.regressors import linear_cka
 
 from utils.data_utils import load_data, ALL_SUBJECTS
 
 from analysis.synthetic_gp import generate_synthetic_gp_bank
 from analysis.synthetic_noise import generate_noise_bank
 from analysis.synthetic_tabpfn_prior import generate_tabpfn_prior_bank
+
+# Phase-aligned layer indices for TabPFN v2 (18-layer model).
+# Maps the three-phase attention structure from Ye et al. (2025,
+# arXiv:2502.17361) Section 5, scaled from 12-layer to 18-layer:
+#   Early  (0-4):  label-token attention, attribute identity internalized
+#   Middle (5-12): uniform mixing, cross-attribute information exchange
+#   Deep   (13-17): selective attention on predictive attributes
+#
+# ID/OOD scalar metrics: phase boundaries capture WHERE representations diverge
+ID_OOD_LAYERS = [4, 13, 17]
+# Finetuning diagnostics: full phase coverage
+DIAGNOSTIC_LAYERS = [0, 4, 9, 13, 17]
+# Dense sweep for layer-wise CKA heatmap (Tier 2 experiment)
+LAYERWISE_HEATMAP_LAYERS = [0, 2, 4, 6, 8, 10, 12, 14, 16, 17]
+
+
+def _layer_name(idx: int) -> str:
+    """Convert layer index to module path for forward hooks."""
+    return f'transformer_encoder.layers.{idx}'
 
 
 def _normalize_for_tabpfn(X, y):
@@ -83,8 +106,8 @@ def compute_bar_distribution_entropy(model, X_train, y_train, X_test):
     return entropy.detach().cpu().numpy()
 
 
-def entropy_analysis(dataset_types, device='cpu', n_context=50,
-                     prior_source='both', n_synthetic=500, seed=42):
+def entropy_analysis(dataset_types, device='cpu', n_context=500,
+                     prior_source='tabpfn_prior', n_synthetic=500, seed=42):
     """Entropy across all datasets/subjects/EMGs + synthetic reference(s).
 
     For each subject-EMG pair:
@@ -109,41 +132,63 @@ def entropy_analysis(dataset_types, device='cpu', n_context=50,
     results = {}
 
     # --- Neurostim data ---
+    rng_ctx = np.random.RandomState(seed)
+
     for dataset_type in dataset_types:
         subjects = ALL_SUBJECTS[dataset_type]
-        dataset_results = {}
+        ctx_results = {}   # in-context (n_ctx random samples as context)
+        gt_results = {}    # ground truth (full map as context)
 
         for subj_idx in subjects:
             data = load_data(dataset_type, subj_idx)
-            coords = data['ch2xy']
+            coords = data['ch2xy']                        # [n_channels, 2]
             scaler_x = MinMaxScaler()
-            X = scaler_x.fit_transform(coords).astype(np.float32)
+            X = scaler_x.fit_transform(coords).astype(np.float32)  # [n_channels, 2]
+            n_channels = X.shape[0]
             n_emgs = data['sorted_respMean'].shape[1]
 
-            subj_results = {}
+            subj_ctx = {}
+            subj_gt = {}
             for emg_idx in range(n_emgs):
-                y_mean = data['sorted_respMean'][:, emg_idx]
+                # Fit scaler on ALL reps (matching preprocess_neural_data)
+                resp_all = data['sorted_resp'][:, emg_idx, :]
                 scaler_y = StandardScaler()
-                y = scaler_y.fit_transform(
+                scaler_y.fit(resp_all.reshape(-1, 1))
+                y_mean = data['sorted_respMean'][:, emg_idx]
+                y = scaler_y.transform(
                     y_mean.reshape(-1, 1),
-                ).ravel().astype(np.float32)
+                ).ravel().astype(np.float32)              # [n_channels]
 
-                # Split: first n_context as context, rest as test
-                n_ctx = min(n_context, len(X) - 1)
-                X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
-                X_tst = X[n_ctx:]
+                # --- Ground truth: full map as context, predict on full map ---
+                gt_entropy = compute_bar_distribution_entropy(
+                    model, X, y, X,
+                )
+                subj_gt[emg_idx] = gt_entropy
+
+                # --- In-context: n_ctx randomly sampled points as context,
+                #     remaining points as test (mirrors BO initialisation) ---
+                n_ctx = min(n_context, n_channels - 1)
+                all_idx = rng_ctx.permutation(n_channels)
+                ctx_idx = all_idx[:n_ctx]
+                tst_idx = all_idx[n_ctx:]
+
+                X_ctx = X[ctx_idx]                        # [n_ctx, 2]
+                y_ctx = y[ctx_idx]                        # [n_ctx]
+                X_tst = X[tst_idx]                        # [n_channels - n_ctx, 2]
 
                 if len(X_tst) == 0:
                     continue
 
-                entropy = compute_bar_distribution_entropy(
+                ctx_entropy = compute_bar_distribution_entropy(
                     model, X_ctx, y_ctx, X_tst,
                 )
-                subj_results[emg_idx] = entropy
+                subj_ctx[emg_idx] = ctx_entropy
 
-            dataset_results[subj_idx] = subj_results
+            ctx_results[subj_idx] = subj_ctx
+            gt_results[subj_idx] = subj_gt
 
-        results[dataset_type] = dataset_results
+        results[dataset_type] = ctx_results
+        results[f'{dataset_type}_gt'] = gt_results
 
     # --- Synthetic references ---
     rng = np.random.RandomState(seed)
@@ -164,7 +209,7 @@ def entropy_analysis(dataset_types, device='cpu', n_context=50,
 
     # Noise baseline (always included)
     noise_bank = generate_noise_bank(
-        n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
+        n_datasets=n_synthetic, n_features=2,
     )
     results['noise'] = _entropy_from_bank(model, noise_bank, n_context)
 
@@ -172,18 +217,23 @@ def entropy_analysis(dataset_types, device='cpu', n_context=50,
 
 
 def _entropy_from_bank(model, bank, n_context):
-    """Compute entropy for a bank of synthetic datasets."""
+    """Compute entropy for a bank of synthetic datasets.
+
+    Uses exactly n_context training points so that all conditions are
+    evaluated under identical context size.  Datasets with fewer than
+    n_context + 1 points are skipped (too small to provide full context).
+    """
     all_entropies = []
     for X, y in bank:
         normed = _normalize_for_tabpfn(X, y)
         if normed is None:
             continue
         X, y = normed
-        n_ctx = min(n_context, len(X) - 1)
-        if n_ctx < 2 or len(X) - n_ctx < 1:
+        # Require exactly n_context context points + at least 1 test point
+        if len(X) <= n_context:
             continue
-        X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
-        X_tst = X[n_ctx:]
+        X_ctx, y_ctx = X[:n_context], y[:n_context]
+        X_tst = X[n_context:]
         entropy = compute_bar_distribution_entropy(model, X_ctx, y_ctx, X_tst)
         all_entropies.append(entropy)
     return np.concatenate(all_entropies) if all_entropies else np.array([])
@@ -295,7 +345,7 @@ def mmd_analysis(dataset_types, prior_source='both', n_synthetic=500,
 
     # Noise baseline (always included)
     noise_bank = generate_noise_bank(
-        n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
+        n_datasets=n_synthetic, n_features=2,
     )
     ref_features['noise'] = _bank_to_features(noise_bank)
 
@@ -314,9 +364,12 @@ def mmd_analysis(dataset_types, prior_source='both', n_synthetic=500,
 
             subj_results = {}
             for emg_idx in range(n_emgs):
-                y_mean = data['sorted_respMean'][:, emg_idx]
+                # Fit scaler on ALL reps (matching preprocess_neural_data)
+                resp_all = data['sorted_resp'][:, emg_idx, :]
                 scaler_y = StandardScaler()
-                y = scaler_y.fit_transform(
+                scaler_y.fit(resp_all.reshape(-1, 1))
+                y_mean = data['sorted_respMean'][:, emg_idx]
+                y = scaler_y.transform(
                     y_mean.reshape(-1, 1),
                 ).ravel().astype(np.float32)
 
@@ -355,6 +408,144 @@ def _bank_to_features(bank, max_samples=5000):
         idx = rng.choice(len(combined), max_samples, replace=False)
         combined = combined[idx]
     return combined
+
+
+# ============================================================================
+#  3b′. Sliced Wasserstein-2 Distance
+# ============================================================================
+
+def sliced_wasserstein(X, Y, n_projections=200, seed=42):
+    """Sliced Wasserstein-2 distance between empirical distributions.
+
+    Projects X, Y onto random 1D directions, computes exact W2 on each
+    projection (sort + L2), averages over projections.
+
+    Args:
+        X: (n, d) array
+        Y: (m, d) array
+        n_projections: number of random 1D projections
+        seed: random seed
+
+    Returns:
+        float: sliced W2 distance
+    """
+    d = X.shape[1]
+    rng = np.random.RandomState(seed)
+
+    # Random unit vectors on the d-sphere
+    directions = rng.randn(n_projections, d)
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+    w2_sum = 0.0
+    for theta in directions:
+        # Project onto 1D
+        Xp = X @ theta
+        Yp = Y @ theta
+
+        # Sort projections
+        Xp_sorted = np.sort(Xp)
+        Yp_sorted = np.sort(Yp)
+
+        # Resample to equal length if n != m
+        n, m = len(Xp_sorted), len(Yp_sorted)
+        if n != m:
+            # Interpolate the shorter array to match the longer
+            target_len = max(n, m)
+            Xp_sorted = np.interp(
+                np.linspace(0, 1, target_len),
+                np.linspace(0, 1, n),
+                Xp_sorted,
+            )
+            Yp_sorted = np.interp(
+                np.linspace(0, 1, target_len),
+                np.linspace(0, 1, m),
+                Yp_sorted,
+            )
+
+        w2_sum += np.mean((Xp_sorted - Yp_sorted) ** 2)
+
+    return float(np.sqrt(w2_sum / n_projections))
+
+
+def wasserstein_analysis(dataset_types, prior_source='both',
+                         n_synthetic=500, n_projections=200, seed=42):
+    """Sliced Wasserstein-2 between neurostim data and synthetic references.
+
+    Feature vector: concatenate [X, y.reshape(-1,1)] → (n, 3).
+    Mirrors mmd_analysis() structure but uses sliced W2 instead of
+    kernel-based MMD.  W2 is parameter-free (no bandwidth choice).
+
+    Args:
+        dataset_types: list of dataset names
+        prior_source: 'gp' | 'tabpfn_prior' | 'both'
+        n_synthetic: number of synthetic datasets for reference
+        n_projections: number of 1D projections for sliced W2
+        seed: random seed
+
+    Returns:
+        dict with per-dataset, per-subject, per-EMG W2 results.
+    """
+    # Build synthetic reference feature matrices (reuse _bank_to_features)
+    ref_features = {}
+
+    if prior_source in ('gp', 'both'):
+        gp_bank = generate_synthetic_gp_bank(
+            n_datasets=n_synthetic, n_features=2, seed=seed,
+        )
+        ref_features['gp'] = _bank_to_features(gp_bank)
+
+    if prior_source in ('tabpfn_prior', 'both'):
+        prior_bank = generate_tabpfn_prior_bank(
+            n_datasets=n_synthetic, n_features=2, seed=seed,
+        )
+        ref_features['prior'] = _bank_to_features(prior_bank)
+
+    # Noise baseline (always included)
+    noise_bank = generate_noise_bank(
+        n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
+    )
+    ref_features['noise'] = _bank_to_features(noise_bank)
+
+    results = {}
+
+    for dataset_type in dataset_types:
+        subjects = ALL_SUBJECTS[dataset_type]
+        dataset_results = {}
+
+        for subj_idx in subjects:
+            data = load_data(dataset_type, subj_idx)
+            coords = data['ch2xy']
+            scaler_x = MinMaxScaler()
+            X = scaler_x.fit_transform(coords).astype(np.float32)
+            n_emgs = data['sorted_respMean'].shape[1]
+
+            subj_results = {}
+            for emg_idx in range(n_emgs):
+                resp_all = data['sorted_resp'][:, emg_idx, :]
+                scaler_y = StandardScaler()
+                scaler_y.fit(resp_all.reshape(-1, 1))
+                y_mean = data['sorted_respMean'][:, emg_idx]
+                y = scaler_y.transform(
+                    y_mean.reshape(-1, 1),
+                ).ravel().astype(np.float32)
+
+                neurostim_features = np.hstack([X, y.reshape(-1, 1)])
+
+                emg_result = {}
+                for ref_name, ref_feat in ref_features.items():
+                    w2 = sliced_wasserstein(
+                        neurostim_features, ref_feat,
+                        n_projections=n_projections, seed=seed,
+                    )
+                    emg_result[f'w2_{ref_name}'] = w2
+
+                subj_results[emg_idx] = emg_result
+
+            dataset_results[subj_idx] = subj_results
+
+        results[dataset_type] = dataset_results
+
+    return results
 
 
 # ============================================================================
@@ -403,10 +594,18 @@ def extract_embeddings_frozen(model, X_train, y_train, X_test,
 
     def hook_fn(mod, inp, output):
         act = output if isinstance(output, torch.Tensor) else output[0]
-        # Encoder output: (n_train + n_test, n_features, hidden_dim)
-        # Flatten per-point: (n_points, n_features * hidden_dim)
-        n_points = act.shape[0]
-        activations['target'] = act.detach().cpu().reshape(n_points, -1).float()
+        act = act.detach().cpu().float()
+        # Transformer layer output: (batch=1, seq_len, n_feat_groups, hidden_dim)
+        #   seq_len = n_thinking_tokens + n_train + n_test; n_feat_groups varies with dataset.
+        #   Squeeze batch, mean-pool over n_feat_groups → (seq_len, hidden_dim).
+        # Encoder output (legacy): (n_data, n_features, hidden_dim)
+        #   Mean-pool over n_features → (n_data, hidden_dim).
+        if act.ndim == 4:
+            act = act[0].mean(dim=1)   # (seq_len, hidden_dim)
+        elif act.ndim == 3:
+            act = act.mean(dim=1)      # (n_data, hidden_dim)
+        # act is now 2D: (n_rows, hidden_dim) — last n_test rows are test-point embeddings
+        activations['target'] = act
 
     handle = module.register_forward_hook(hook_fn)
 
@@ -446,8 +645,8 @@ def compute_mahalanobis_distance(z, mu, sigma_inv):
 
 
 def mahalanobis_analysis(dataset_types, device='cpu', prior_source='both',
-                         n_synthetic=500, n_context=50, regularization=1e-5,
-                         seed=42):
+                         n_synthetic=500, n_context=50, regularization=1e-2,
+                         seed=42, layer: int = 17):
     """Full Mahalanobis pipeline.
 
     Phase 1: Build reference embedding distribution from synthetic data.
@@ -458,13 +657,15 @@ def mahalanobis_analysis(dataset_types, device='cpu', prior_source='both',
     than regular inference).
 
     Args:
-        dataset_types: list of dataset names
-        device: 'cpu' or 'cuda'
-        prior_source: 'gp' | 'tabpfn_prior' | 'both'
-        n_synthetic: number of synthetic datasets for reference
-        n_context: context size for embedding extraction
-        regularization: Tikhonov regularization for covariance inversion
-        seed: random seed
+        dataset_types: list of dataset names.
+        device: 'cpu' or 'cuda'.
+        prior_source: 'gp' | 'tabpfn_prior' | 'both'.
+        n_synthetic: number of synthetic datasets for reference.
+        n_context: context size for embedding extraction.
+        regularization: Tikhonov regularization for covariance inversion.
+        seed: random seed.
+        layer: transformer layer index for embedding extraction.
+            Default 17 (last layer) — the most context-aware representation.
 
     Returns:
         dict with per-dataset Mahalanobis distances + reference statistics.
@@ -473,7 +674,7 @@ def mahalanobis_analysis(dataset_types, device='cpu', prior_source='both',
         return _mahalanobis_analysis_inner(
             dataset_types, device=device, prior_source=prior_source,
             n_synthetic=n_synthetic, n_context=n_context,
-            regularization=regularization, seed=seed,
+            regularization=regularization, seed=seed, layer=layer,
         )
     except _CudaError:
         if device == 'cpu':
@@ -484,13 +685,13 @@ def mahalanobis_analysis(dataset_types, device='cpu', prior_source='both',
         return _mahalanobis_analysis_inner(
             dataset_types, device='cpu', prior_source=prior_source,
             n_synthetic=n_synthetic, n_context=n_context,
-            regularization=regularization, seed=seed,
+            regularization=regularization, seed=seed, layer=layer,
         )
 
 
 def _mahalanobis_analysis_inner(
     dataset_types, device, prior_source, n_synthetic, n_context,
-    regularization, seed,
+    regularization, seed, layer,
 ):
     """Core Mahalanobis implementation (called by mahalanobis_analysis)."""
     model = TabPFNRegressor(device=device)
@@ -500,26 +701,68 @@ def _mahalanobis_analysis_inner(
     # Phase 1: Build reference embeddings
     ref_stats = {}
 
+    _LAST_LAYER = _layer_name(layer)
+
     if prior_source in ('gp', 'both'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
-        gp_embeds = _embeddings_from_bank(model, gp_bank, n_context)
+        gp_embeds = _embeddings_from_bank(model, gp_bank, n_context, _LAST_LAYER)
         ref_stats['gp'] = _fit_reference(gp_embeds, regularization)
 
     if prior_source in ('tabpfn_prior', 'both'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
-        prior_embeds = _embeddings_from_bank(model, prior_bank, n_context)
+        prior_embeds = _embeddings_from_bank(model, prior_bank, n_context, _LAST_LAYER)
         ref_stats['prior'] = _fit_reference(prior_embeds, regularization)
 
     # Noise baseline (always included)
     noise_bank = generate_noise_bank(
-        n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
+        n_datasets=n_synthetic, n_features=2, 
     )
-    noise_embeds = _embeddings_from_bank(model, noise_bank, n_context)
+    noise_embeds = _embeddings_from_bank(model, noise_bank, n_context, _LAST_LAYER)
     ref_stats['noise'] = _fit_reference(noise_embeds, regularization)
+
+    # ------------------------------------------------------------------
+    # OOD reference distances (Issue 4):
+    #   • "vs GP" and "vs Prior" panels: add Noise OOD distances as contrast
+    #   • "vs Noise" panel: add two structurally-different OOD types
+    # ------------------------------------------------------------------
+    print("  [Mahalanobis] Computing OOD reference distances...")
+    rng_ood = np.random.RandomState(seed + 99)
+
+    # Single noise OOD bank used against GP and Prior references
+    ood_bank = generate_noise_bank(
+        n_datasets=min(n_synthetic, 100), n_features=2
+    )
+    ood_embeds = _embeddings_from_bank(model, ood_bank, n_context, _LAST_LAYER)
+
+    for ref_name in ('gp', 'prior'):
+        if ref_name not in ref_stats:
+            continue
+        stats = ref_stats[ref_name]
+        z = ood_embeds
+        if stats['pca'] is not None:
+            z = stats['pca'].transform(z)
+        idx = rng_ood.choice(len(z), min(300, len(z)), replace=False)
+        ref_stats[ref_name]['ood_distances'] = compute_mahalanobis_distance(
+            z[idx], stats['mu'], stats['sigma_inv'],
+        )
+
+    # OOD distances from the correlated-noise bank (upper-bound reference)
+    if 'noise' in ref_stats:
+        extra_noise_bank = generate_noise_bank(
+            n_datasets=min(n_synthetic, 100), n_features=2, seed=seed + 30000,
+        )
+        noise_stats = ref_stats['noise']
+        z = _embeddings_from_bank(model, extra_noise_bank, n_context, _LAST_LAYER)
+        if noise_stats['pca'] is not None:
+            z = noise_stats['pca'].transform(z)
+        idx = rng_ood.choice(len(z), min(300, len(z)), replace=False)
+        noise_stats['ood_distances'] = compute_mahalanobis_distance(
+            z[idx], noise_stats['mu'], noise_stats['sigma_inv'],
+        )
 
     # Phase 2: Compute D_M for neurostim data
     results = {}
@@ -537,9 +780,12 @@ def _mahalanobis_analysis_inner(
 
             subj_results = {}
             for emg_idx in range(n_emgs):
-                y_mean = data['sorted_respMean'][:, emg_idx]
+                # Fit scaler on ALL reps (matching preprocess_neural_data)
+                resp_all = data['sorted_resp'][:, emg_idx, :]
                 scaler_y = StandardScaler()
-                y = scaler_y.fit_transform(
+                scaler_y.fit(resp_all.reshape(-1, 1))
+                y_mean = data['sorted_respMean'][:, emg_idx]
+                y = scaler_y.transform(
                     y_mean.reshape(-1, 1),
                 ).ravel().astype(np.float32)
 
@@ -552,6 +798,7 @@ def _mahalanobis_analysis_inner(
 
                 embeddings = extract_embeddings_frozen(
                     model, X_ctx, y_ctx, X_tst,
+                    layer_name=_LAST_LAYER,
                 )
 
                 emg_result = {}
@@ -573,13 +820,18 @@ def _mahalanobis_analysis_inner(
 
         results[dataset_type] = dataset_results
 
-    # Include reference self-distances for comparison
+    # Include reference statistics for comparison plots
     results['ref_stats'] = {}
     for ref_name, stats in ref_stats.items():
-        results['ref_stats'][ref_name] = {
+        entry = {
             'self_distances': stats['self_distances'],
             'mean_self_dist': float(np.mean(stats['self_distances'])),
         }
+        # Pass through OOD distance arrays added during Phase 1
+        for key in ('ood_distances', 'ood1_distances', 'ood2_distances'):
+            if key in stats:
+                entry[key] = stats[key]
+        results['ref_stats'][ref_name] = entry
 
     return results
 
@@ -595,8 +847,17 @@ def _is_cuda_error(exc):
     return 'cuda' in msg or 'cublas' in msg or 'cudnn' in msg
 
 
-def _embeddings_from_bank(model, bank, n_context):
-    """Extract embeddings for all datasets in a bank."""
+def _embeddings_from_bank(model, bank, n_context,
+                          layer_name='transformer_encoder.layers.17'):
+    """Extract embeddings for all datasets in a bank.
+
+    Args:
+        layer_name: module path to hook inside PerFeatureTransformer.
+            Default is the last transformer block, which produces contextualised
+            representations that discriminate in-distribution from OOD data.
+            The old 'encoder' target (TorchPreprocessingPipeline) was too shallow
+            to be discriminative — all datasets had CKA ≈ 0.05-0.07.
+    """
     all_embeds = []
     n_failed = 0
     n_nonfinite_input = 0
@@ -616,7 +877,9 @@ def _embeddings_from_bank(model, bank, n_context):
         X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
         X_tst = X[n_ctx:]
         try:
-            embeds = extract_embeddings_frozen(model, X_ctx, y_ctx, X_tst)
+            embeds = extract_embeddings_frozen(
+                model, X_ctx, y_ctx, X_tst, layer_name=layer_name,
+            )
             # Skip non-finite embeddings
             if not np.all(np.isfinite(embeds)):
                 n_failed += 1
@@ -657,7 +920,7 @@ def _embeddings_from_bank(model, bank, n_context):
     return np.vstack(all_embeds)
 
 
-def _fit_reference(embeddings, regularization, max_pca_components=50):
+def _fit_reference(embeddings, regularization, max_pca_components=30):
     """Fit Gaussian reference (mu, Sigma^{-1}) from embeddings.
 
     Applies PCA if embedding dim >> n_samples to avoid singular covariance.
@@ -702,12 +965,395 @@ def _fit_reference(embeddings, regularization, max_pca_components=50):
 
 
 # ============================================================================
-#  3d. Unified Runner
+#  3d. CKA (Centered Kernel Alignment) in Representation Space
+# ============================================================================
+
+def cka_analysis(dataset_types, device='cpu', prior_source='both',
+                 n_synthetic=500, n_context=50, n_bootstrap=10, seed=42,
+                 layers=None):
+    """Multi-layer CKA between neurostim and synthetic reference embeddings.
+
+    Measures whether TabPFN routes neurostim data through the same internal
+    circuitry as its pretraining data.  High CKA (->1) means representations
+    are geometrically similar; low CKA (->0) means they diverge.
+
+    Computing CKA at multiple phase-aligned layers reveals WHERE in the
+    network representations diverge — connecting to the three-phase attention
+    structure from Ye et al. (2025, arXiv:2502.17361):
+      - Layer 4 (end of early phase): attribute identity internalized
+      - Layer 13 (deep phase onset): selective attention begins
+      - Layer 17 (final): full context-aware representation
+
+    Args:
+        dataset_types: list of dataset names.
+        device: 'cpu' or 'cuda'.
+        prior_source: 'gp' | 'tabpfn_prior' | 'both'.
+        n_synthetic: number of synthetic datasets for reference.
+        n_context: context size for embedding extraction.
+        n_bootstrap: subsampling rounds to align row counts for CKA.
+        seed: random seed.
+        layers: list of transformer layer indices to analyze.
+            Defaults to ID_OOD_LAYERS ([4, 13, 17]).
+            Use LAYERWISE_HEATMAP_LAYERS for dense Tier 2 sweep.
+
+    Returns:
+        dict with structure:
+            results[dataset_type][subj_idx][emg_idx][layer_idx] = {
+                'cka_gp': float, 'cka_noise': float, ...
+            }
+        Plus results['layers'] = list of analyzed layer indices.
+    """
+    if layers is None:
+        layers = ID_OOD_LAYERS
+    try:
+        return _cka_analysis_inner(
+            dataset_types, device=device, prior_source=prior_source,
+            n_synthetic=n_synthetic, n_context=n_context,
+            n_bootstrap=n_bootstrap, seed=seed, layers=layers,
+        )
+    except _CudaError:
+        if device == 'cpu':
+            raise
+        print("  [CKA] CUDA error in embedding extraction, "
+              "falling back to CPU...")
+        torch.cuda.empty_cache()
+        return _cka_analysis_inner(
+            dataset_types, device='cpu', prior_source=prior_source,
+            n_synthetic=n_synthetic, n_context=n_context,
+            n_bootstrap=n_bootstrap, seed=seed, layers=layers,
+        )
+
+
+def _cka_analysis_inner(dataset_types, device, prior_source, n_synthetic,
+                        n_context, n_bootstrap, seed, layers):
+    """Core multi-layer CKA implementation.
+
+    Computes CKA at each layer in ``layers``, producing per-layer reference
+    embeddings and per-layer neurostim scores.  The result structure nests
+    by layer index so downstream code can build layer-wise heatmaps or
+    select a single layer for scalar summaries.
+    """
+    model = TabPFNRegressor(device=device)
+    model.n_estimators = 1
+
+    # Phase 1: Build reference embeddings per layer
+    # ref_embeddings[layer_idx][ref_name] = np.ndarray
+    ref_embeddings: dict[int, dict[str, np.ndarray]] = {}
+
+    for layer_idx in layers:
+        lname = _layer_name(layer_idx)
+        layer_refs: dict[str, np.ndarray] = {}
+
+        if prior_source in ('gp', 'both'):
+            gp_bank = generate_synthetic_gp_bank(
+                n_datasets=n_synthetic, n_features=2, seed=seed,
+            )
+            layer_refs['gp'] = _embeddings_from_bank(
+                model, gp_bank, n_context, lname,
+            )
+
+        if prior_source in ('tabpfn_prior', 'both'):
+            prior_bank = generate_tabpfn_prior_bank(
+                n_datasets=n_synthetic, n_features=2, seed=seed,
+            )
+            layer_refs['prior'] = _embeddings_from_bank(
+                model, prior_bank, n_context, lname,
+            )
+
+        noise_bank = generate_noise_bank(
+            n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
+        )
+        layer_refs['noise'] = _embeddings_from_bank(
+            model, noise_bank, n_context, lname,
+        )
+
+        ref_embeddings[layer_idx] = layer_refs
+
+    # Phase 2: Compute CKA for neurostim data at each layer
+    rng = np.random.RandomState(seed)
+    results: dict = {}
+
+    for dataset_type in dataset_types:
+        subjects = ALL_SUBJECTS[dataset_type]
+        dataset_results = {}
+
+        for subj_idx in subjects:
+            data = load_data(dataset_type, subj_idx)
+            coords = data['ch2xy']
+            scaler_x = MinMaxScaler()
+            X = scaler_x.fit_transform(coords).astype(np.float32)
+            n_emgs = data['sorted_respMean'].shape[1]
+
+            subj_results = {}
+            for emg_idx in range(n_emgs):
+                resp_all = data['sorted_resp'][:, emg_idx, :]
+                scaler_y = StandardScaler()
+                scaler_y.fit(resp_all.reshape(-1, 1))
+                y_mean = data['sorted_respMean'][:, emg_idx]
+                y = scaler_y.transform(
+                    y_mean.reshape(-1, 1),
+                ).ravel().astype(np.float32)
+
+                n_ctx = min(n_context, len(X) - 1)
+                X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
+                X_tst = X[n_ctx:]
+
+                if len(X_tst) == 0:
+                    continue
+
+                # Per-layer CKA scores for this EMG channel
+                emg_result: dict[int, dict[str, float]] = {}
+
+                for layer_idx in layers:
+                    lname = _layer_name(layer_idx)
+                    embeddings = extract_embeddings_frozen(
+                        model, X_ctx, y_ctx, X_tst,
+                        layer_name=lname,
+                    )
+                    n_test = len(embeddings)
+
+                    layer_scores: dict[str, float] = {}
+                    for ref_name, ref_emb in ref_embeddings[layer_idx].items():
+                        cka_scores = []
+                        for _ in range(n_bootstrap):
+                            idx = rng.choice(
+                                len(ref_emb), min(n_test, len(ref_emb)),
+                                replace=False,
+                            )
+                            ref_sub = ref_emb[idx]
+                            test_sub = embeddings[:len(ref_sub)]
+
+                            score = linear_cka(
+                                torch.from_numpy(ref_sub).float(),
+                                torch.from_numpy(test_sub).float(),
+                            )
+                            cka_scores.append(score)
+
+                        layer_scores[f'cka_{ref_name}'] = float(
+                            np.mean(cka_scores)
+                        )
+
+                    emg_result[layer_idx] = layer_scores
+
+                subj_results[emg_idx] = emg_result
+
+            dataset_results[subj_idx] = subj_results
+
+        results[dataset_type] = dataset_results
+
+    # Store analyzed layers as metadata for visualization
+    results['layers'] = list(layers)
+
+    return results
+
+
+# ============================================================================
+#  3e. Gradient L2-Norm at Step 0
+# ============================================================================
+
+def compute_gradient_norm_frozen(model, X_train, y_train, X_test, y_test):
+    """Gradient L2-norm from one backward pass through frozen TabPFN.
+
+    Fits TabPFN on (X_train, y_train), predicts on X_test to get bar-
+    distribution logits, computes cross-entropy loss against discretized
+    y_test, backprops, and returns total L2 gradient norm.
+
+    If the data is in-distribution, the pretrained weights are already near
+    a local minimum → gradient norms will be small.  OOD data produces
+    large gradients because the model needs significant updates.
+
+    Args:
+        model: TabPFNRegressor (will temporarily enable gradients)
+        X_train: (n_train, d) context features
+        y_train: (n_train,) context targets
+        X_test: (n_test, d) query features
+        y_test: (n_test,) query targets
+
+    Returns:
+        float: total gradient L2 norm across all parameters.
+    """
+    # Fit to establish context and preprocessing pipeline
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='overflow',
+                                category=RuntimeWarning)
+        model.fit(X_train, y_train)
+
+    inner_model = model.models_[0]
+
+    # Enable gradients on frozen parameters
+    for p in inner_model.parameters():
+        p.requires_grad_(True)
+
+    try:
+        # Bypass TabPFN's predict() which wraps in inference mode.
+        # Call the inner PerFeatureTransformer directly:
+        #   x: [N_train + N_test, 1, n_features]
+        #   y: [N_train, 1]
+        X_train_t = torch.tensor(
+            X_train, dtype=torch.float32,
+        ).unsqueeze(1)
+        y_train_t = torch.tensor(
+            y_train, dtype=torch.float32,
+        ).unsqueeze(1)
+        X_test_t = torch.tensor(
+            X_test, dtype=torch.float32,
+        ).unsqueeze(1)
+        x_input = torch.cat([X_train_t, X_test_t], dim=0)
+
+        with torch.enable_grad():
+            output = inner_model(
+                x_input, y_train_t, only_return_standard_out=True,
+            )
+        # output: [n_test, 1, n_bars] — squeeze the singleton dim
+        logits = output.squeeze(1)  # (n_test, n_bars)
+
+        # Discretize y_test into bar-distribution bin indices
+        borders = model.znorm_space_bardist_.borders  # 1D tensor of bin edges
+        y_tensor = torch.tensor(y_test, dtype=torch.float32,
+                                device=logits.device)
+        target_indices = torch.searchsorted(borders, y_tensor).clamp(
+            0, logits.shape[1] - 1,
+        )
+
+        loss = F.cross_entropy(logits, target_indices)
+        loss.backward()
+
+        # Collect total L2 norm
+        total_norm_sq = 0.0
+        for p in inner_model.parameters():
+            if p.grad is not None:
+                total_norm_sq += p.grad.norm().item() ** 2
+
+        return float(np.sqrt(total_norm_sq))
+
+    finally:
+        # Cleanup: zero grads and disable requires_grad
+        inner_model.zero_grad()
+        for p in inner_model.parameters():
+            p.requires_grad_(False)
+
+
+def _gradient_norm_from_bank(model, bank, n_context):
+    """Compute gradient norms for a bank of synthetic datasets."""
+    all_norms = []
+    for X, y in bank:
+        normed = _normalize_for_tabpfn(X, y)
+        if normed is None:
+            continue
+        X, y = normed
+        n_ctx = min(n_context, len(X) - 1)
+        if n_ctx < 2 or len(X) - n_ctx < 1:
+            continue
+        X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
+        X_tst, y_tst = X[n_ctx:], y[n_ctx:]
+        try:
+            norm = compute_gradient_norm_frozen(
+                model, X_ctx, y_ctx, X_tst, y_tst,
+            )
+            if np.isfinite(norm):
+                all_norms.append(norm)
+        except Exception:
+            continue
+    return np.array(all_norms) if all_norms else np.array([])
+
+
+def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
+                           n_synthetic=500, n_context=50, seed=42):
+    """Gradient L2-norm at step 0 for neurostim and synthetic data.
+
+    Creates a fresh TabPFNRegressor to avoid corrupting state for other
+    analyses.
+
+    Args:
+        dataset_types: list of dataset names
+        device: 'cpu' or 'cuda'
+        prior_source: 'gp' | 'tabpfn_prior' | 'both'
+        n_synthetic: number of synthetic datasets for reference
+        n_context: context size
+        seed: random seed
+
+    Returns:
+        dict with per-dataset/subject/EMG gradient norms + synthetic baselines.
+    """
+    # Fresh model to avoid state corruption from gradient computation
+    model = TabPFNRegressor(device=device)
+    results = {}
+
+    # --- Neurostim data ---
+    for dataset_type in dataset_types:
+        subjects = ALL_SUBJECTS[dataset_type]
+        dataset_results = {}
+
+        for subj_idx in subjects:
+            data = load_data(dataset_type, subj_idx)
+            coords = data['ch2xy']
+            scaler_x = MinMaxScaler()
+            X = scaler_x.fit_transform(coords).astype(np.float32)
+            n_emgs = data['sorted_respMean'].shape[1]
+
+            subj_results = {}
+            for emg_idx in range(n_emgs):
+                resp_all = data['sorted_resp'][:, emg_idx, :]
+                scaler_y = StandardScaler()
+                scaler_y.fit(resp_all.reshape(-1, 1))
+                y_mean = data['sorted_respMean'][:, emg_idx]
+                y = scaler_y.transform(
+                    y_mean.reshape(-1, 1),
+                ).ravel().astype(np.float32)
+
+                n_ctx = min(n_context, len(X) - 1)
+                X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
+                X_tst, y_tst = X[n_ctx:], y[n_ctx:]
+
+                if len(X_tst) == 0:
+                    continue
+
+                try:
+                    norm = compute_gradient_norm_frozen(
+                        model, X_ctx, y_ctx, X_tst, y_tst,
+                    )
+                    subj_results[emg_idx] = norm
+                except Exception as e:
+                    print(f"  [GradNorm] Failed {dataset_type} S{subj_idx} "
+                          f"EMG{emg_idx}: {e}")
+                    continue
+
+            dataset_results[subj_idx] = subj_results
+
+        results[dataset_type] = dataset_results
+
+    # --- Synthetic references ---
+    if prior_source in ('gp', 'both'):
+        gp_bank = generate_synthetic_gp_bank(
+            n_datasets=n_synthetic, n_features=2, seed=seed,
+        )
+        results['synthetic_gp'] = _gradient_norm_from_bank(
+            model, gp_bank, n_context,
+        )
+
+    if prior_source in ('tabpfn_prior', 'both'):
+        prior_bank = generate_tabpfn_prior_bank(
+            n_datasets=n_synthetic, n_features=2, seed=seed,
+        )
+        results['synthetic_prior'] = _gradient_norm_from_bank(
+            model, prior_bank, n_context,
+        )
+
+    noise_bank = generate_noise_bank(
+        n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
+    )
+    results['noise'] = _gradient_norm_from_bank(model, noise_bank, n_context)
+
+    return results
+
+
+# ============================================================================
+#  3f. Unified Runner
 # ============================================================================
 
 def run_id_ood_analysis(dataset_types=None, analyses=None,
                         prior_source='both', device='cpu',
-                        n_synthetic=500, n_context=50, seed=42,
+                        n_synthetic=500, n_context=100, seed=42,
                         save=False, output_dir=None):
     """Orchestrate all ID/OOD analyses.
 
@@ -715,7 +1361,8 @@ def run_id_ood_analysis(dataset_types=None, analyses=None,
 
     Args:
         dataset_types: list of dataset names (default: ['rat', 'nhp'])
-        analyses: list of analysis names (default: ['entropy', 'mmd', 'mahalanobis'])
+        analyses: list of analysis names (default: ['entropy', 'mmd', 'mahalanobis']).
+            Additional: 'cka', 'wasserstein', 'gradient_norm'.
         prior_source: 'gp' | 'tabpfn_prior' | 'both'
         device: 'cpu' or 'cuda'
         n_synthetic: number of synthetic datasets
@@ -778,7 +1425,7 @@ def run_id_ood_analysis(dataset_types=None, analyses=None,
         mahalanobis_results = mahalanobis_analysis(
             dataset_types, device=device, prior_source=prior_source,
             n_synthetic=n_synthetic, n_context=n_context,
-            regularization=1e-5, seed=seed,
+            regularization=1e-2, seed=seed,
         )
         all_results['mahalanobis'] = mahalanobis_results
 
@@ -789,4 +1436,57 @@ def run_id_ood_analysis(dataset_types=None, analyses=None,
                 pickle.dump(mahalanobis_results, f)
             print(f"Saved Mahalanobis results -> {out}")
 
+    if 'cka' in analyses:
+        print("=" * 60)
+        print("[ID/OOD] Running CKA analysis...")
+        print("=" * 60)
+        cka_results = cka_analysis(
+            dataset_types, device=device, prior_source=prior_source,
+            n_synthetic=n_synthetic, n_context=n_context, seed=seed,
+        )
+        all_results['cka'] = cka_results
+
+        if save:
+            out = os.path.join(output_dir, 'cka')
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, 'cka_results.pkl'), 'wb') as f:
+                pickle.dump(cka_results, f)
+            print(f"Saved CKA results -> {out}")
+
+    if 'wasserstein' in analyses:
+        print("=" * 60)
+        print("[ID/OOD] Running Wasserstein analysis...")
+        print("=" * 60)
+        wasserstein_results = wasserstein_analysis(
+            dataset_types, prior_source=prior_source,
+            n_synthetic=n_synthetic, seed=seed,
+        )
+        all_results['wasserstein'] = wasserstein_results
+
+        if save:
+            out = os.path.join(output_dir, 'wasserstein')
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, 'wasserstein_results.pkl'), 'wb') as f:
+                pickle.dump(wasserstein_results, f)
+            print(f"Saved Wasserstein results -> {out}")
+
+    if 'gradient_norm' in analyses:
+        print("=" * 60)
+        print("[ID/OOD] Running gradient norm analysis...")
+        print("=" * 60)
+        gradient_results = gradient_norm_analysis(
+            dataset_types, device=device, prior_source=prior_source,
+            n_synthetic=n_synthetic, n_context=n_context, seed=seed,
+        )
+        all_results['gradient_norm'] = gradient_results
+
+        if save:
+            out = os.path.join(output_dir, 'gradient_norm')
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, 'gradient_norm_results.pkl'), 'wb') as f:
+                pickle.dump(gradient_results, f)
+            print(f"Saved gradient norm results -> {out}")
+
     return all_results
+
+

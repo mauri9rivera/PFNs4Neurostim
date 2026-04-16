@@ -1,0 +1,22 @@
+# Canonical config for ID/OOD analysis using the GP synthetic reference only.
+# Family: gp
+# GP synthetic data serves as the ID lower-bound calibration anchor.
+# Usage:
+#   python src/id_ood_analysis.py --config configs/id_ood_gp.yaml
+
+family: gp
+datasets:
+  - rat
+  - nhp
+
+analyses:
+  - entropy
+  - mmd
+  - mahalanobis
+
+prior_source: gp
+device: cpu
+n_synthetic: 500
+n_context: 100
+seed: 42
+save: true

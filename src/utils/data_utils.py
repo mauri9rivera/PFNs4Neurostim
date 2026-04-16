@@ -1,3 +1,4 @@
+import hashlib
 import numpy as np
 import scipy.io
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -9,6 +10,8 @@ import csv
 import matplotlib.pyplot as plt
 import seaborn as sns
 import math
+from typing import Any, Dict, List, Optional
+import pandas as pd
 
 
 # ============================================
@@ -375,33 +378,75 @@ TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 3], 'spinal': [1, 3, 4, 6, 7, 
 ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 3], 'spinal': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}
 
 
-def generate_experiment_tag(dataset_type, split_type, epochs, lr, n_augmentations,
-                             held_out_subj_idx=None, held_out_emg_idx=None):
+def generate_experiment_tag(
+    dataset: str,
+    family: str,
+    config: dict[str, Any],
+) -> str:
+    """Build a short deterministic experiment tag.
+
+    Tag format: ``{dataset}-{family}-{5char_hash}``
+
+    The hash is derived from the full config dict so that the same
+    hyperparameter combination always produces the same tag.  Different
+    configs — even differing by a single value — produce different hashes,
+    making every experiment uniquely addressable without verbose filenames.
+
+    Args:
+        dataset: Dataset identifier, e.g. ``'nhp'`` or ``'rat'``.
+        family: Experiment family name, e.g. ``'optimization'`` or
+            ``'lora-ablation'``.
+        config: Full hyperparameter dict for this run.  All values must be
+            JSON-serialisable.  The dict is sorted by key before hashing so
+            insertion order does not affect the result.
+
+    Returns:
+        A tag string of the form ``{dataset}-{family}-{5char_hash}``, e.g.
+        ``nhp-optimization-a3f9c``.
+
+    Example:
+        >>> tag = generate_experiment_tag(
+        ...     'nhp', 'optimization',
+        ...     {'epochs': 50, 'lr': 1e-5, 'n_augmentations': 25},
+        ... )
+        >>> assert len(tag.split('-')) == 3
     """
-    Build a deterministic, human-readable tag encoding all training hyper-params.
+    serialised = json.dumps(config, sort_keys=True, default=str)
+    digest = hashlib.md5(serialised.encode()).hexdigest()[:5]
+    return f"{dataset}-{family}-{digest}"
 
-    Tag format:
-        {dataset}_{split}[_subj{N}][_emg{N}]_ep{E}_lr{LR}_aug{A}
 
-    Examples:
-        nhp_inter_subject_ep20_lr1.00e-06_aug25
-        rat_intra_emg_emg3_ep20_lr1.00e-06_aug25
-        nhp_inter_subject_subj0_ep30_lr1.00e-05_aug50
+def create_run_dir(
+    exp_tag: str,
+    base_dir: str = './output/runs',
+    tag: Optional[str] = None,
+) -> str:
+    """Create a run directory and its standard subdirectories.
+
+    The directory is placed at ``{base_dir}/{tag}/`` when *tag* is provided,
+    or at ``{base_dir}/{exp_tag}_{timestamp}/`` for backwards compatibility
+    when *tag* is ``None``.
+
+    All standard subdirectories (``fitness``, ``optimization``, ``results``,
+    ``diagnostics``, …) are created unconditionally.
+
+    Args:
+        exp_tag: Legacy experiment tag string used when *tag* is not provided.
+            Still required for the backwards-compatible path.
+        base_dir: Root directory for all run outputs.  Defaults to
+            ``'./output/runs'``.
+        tag: Short experiment tag from :func:`generate_experiment_tag`.
+            When provided, the run directory is ``{base_dir}/{tag}/`` — no
+            timestamp suffix is added.
+
+    Returns:
+        Absolute-or-relative path to the newly created run directory.
     """
-    lr_str = f"{lr:.2e}"
-    parts = [dataset_type, split_type]
-    if held_out_subj_idx is not None:
-        parts.append(f'subj{held_out_subj_idx}')
-    if held_out_emg_idx is not None:
-        parts.append(f'emg{held_out_emg_idx}')
-    parts += [f'ep{epochs}', f'lr{lr_str}', f'aug{n_augmentations}']
-    return '_'.join(parts)
-
-
-def create_run_dir(exp_tag: str, base_dir='./output/runs') -> str:
-    """Create output/runs/{exp_tag}_{timestamp}/ and return its path."""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = os.path.join(base_dir, f'{exp_tag}_{timestamp}')
+    if tag is not None:
+        run_dir = os.path.join(base_dir, tag)
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_dir = os.path.join(base_dir, f'{exp_tag}_{timestamp}')
     for sub in ('fitness', 'fitness/emg_maps', 'optimization', 'optimization/emg_maps', 'results', 'diagnostics'):
         os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
     return run_dir
@@ -631,16 +676,24 @@ def preprocess_neural_data(subject_data, emg_idx=0, normalization='pfn'):
 # ============================================
 
 
-def save_results(results_dict, evaluation_type, output_dir='./output/results', tag=''):
-    """
-    Persist experiment results as a full-fidelity pickle and a scalar summary CSV.
+def save_results(
+    results_dict: dict,
+    evaluation_type: str,
+    output_dir: str = './output/results',
+    tag: str = '',
+    metadata: Optional[dict] = None,
+) -> tuple:
+    """Persist experiment results as a full-fidelity pickle and a scalar summary CSV.
 
     Args:
         results_dict: dict[str, list[dict]] — model name -> list of result dicts
-                      (as returned by main() or the finetuning evaluation loops).
-        evaluation_type: 'fit' or 'optimization'
-        output_dir: directory to write into (created if absent).
-        tag: optional suffix for the filename (e.g. 'finetuned_vs_gp').
+                      (as returned by run_experiment() or the evaluation loops).
+        evaluation_type: 'fit' or 'optimization'.
+        output_dir: Directory to write into (created if absent).
+        tag: Optional suffix for the filename (e.g. 'finetuned_vs_gp').
+        metadata: Optional dict injected as ``_metadata`` key in the pickle.
+            Recommended keys: ``family``, ``dataset``, ``tag``, ``date``,
+            ``run_type``, ``held_out_subj``.
 
     Returns:
         (pickle_path, csv_path)
@@ -662,12 +715,16 @@ def save_results(results_dict, evaluation_type, output_dir='./output/results', t
     csv_path = os.path.join(output_dir, f'{base}_summary.csv')
 
     # --- Pickle (full fidelity) ---
+    if metadata is not None:
+        results_dict['_metadata'] = metadata
     with open(pkl_path, 'wb') as f:
         pickle.dump(results_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     # --- Summary CSV ---
     rows = []
     for model_name, result_list in results_dict.items():
+        if model_name == '_metadata':
+            continue
         for res in result_list:
             r2_arr = np.asarray(res['r2'])
             row = {
@@ -709,15 +766,169 @@ def save_results(results_dict, evaluation_type, output_dir='./output/results', t
     return pkl_path, csv_path
 
 
-def load_results(pickle_path):
-    """
-    Reload a results_dict from a pickle saved by save_results().
+def load_results(pickle_path: str) -> dict:
+    """Reload a results_dict from a pickle saved by save_results().
 
-    Returns the exact dict[str, list[dict]] for direct use with
-    r2_comparison, regret_curve, show_emg_map, plot_runtime_trajectory, etc.
+    Args:
+        pickle_path: Absolute or relative path to a ``.pkl`` file produced by
+            ``save_results()``.
+
+    Returns:
+        The exact ``dict[str, list[dict]]`` for direct use with
+        ``r2_per_muscle``, ``regret_with_timing``, etc.
     """
     with open(pickle_path, 'rb') as f:
         return pickle.load(f)
+
+
+def aggregate_results(
+    family: str,
+    dataset: str,
+    result_type: str,
+    runs_dir: str = './output/runs',
+) -> pd.DataFrame:
+    """Find all run directories matching ``{dataset}-{family}-*`` and merge results.
+
+    Scans ``runs_dir`` for subdirectories whose names start with
+    ``{dataset}-{family}-``, loads their pkl result files, and concatenates
+    them into a single flat DataFrame.
+
+    Args:
+        family: Experiment family string, e.g. ``'vanilla-benchmark'`` or
+            ``'optimization'``.
+        dataset: Dataset type — ``'rat'``, ``'nhp'``, or ``'spinal'``.
+        result_type: Which pkl type to load.  One of:
+
+            * ``'fit'`` — ``*_fit.pkl`` files (dict[str, list[dict]])
+            * ``'optimization'`` — ``*_optimization.pkl`` files (same schema)
+            * ``'optimization_budget'`` — ``*_optimization_budget.pkl``
+              (DataFrame pkl, columns: Budget|Model|Regret|R2|ID)
+
+        runs_dir: Root directory that contains per-run subdirectories.
+
+    Returns:
+        Concatenated DataFrame.  Schema for ``fit`` / ``optimization``:
+
+        .. code-block::
+
+            model | dataset | subject | emg | mean_r2 | std_r2 | n_reps |
+            mean_time_s [| mean_final_regret | budget] | tag | family
+
+        Schema for ``optimization_budget``:
+
+        .. code-block::
+
+            Budget | Model | Regret | R2 | ID | tag | family
+
+        Returns an empty DataFrame if no matching runs or pkl files are found.
+
+    Raises:
+        ValueError: If ``result_type`` is not one of the recognised values.
+    """
+    valid_types = {'fit', 'optimization', 'optimization_budget'}
+    if result_type not in valid_types:
+        raise ValueError(
+            f"result_type must be one of {sorted(valid_types)}, got {result_type!r}"
+        )
+
+    prefix = f"{dataset}-{family}-"
+
+    if not os.path.isdir(runs_dir):
+        return pd.DataFrame()
+
+    # Collect matching run directories
+    matching_dirs: List[str] = [
+        os.path.join(runs_dir, name)
+        for name in os.listdir(runs_dir)
+        if name.startswith(prefix) and os.path.isdir(os.path.join(runs_dir, name))
+    ]
+
+    if not matching_dirs:
+        return pd.DataFrame()
+
+    all_frames: List[pd.DataFrame] = []
+
+    for run_dir in sorted(matching_dirs):
+        tag = os.path.basename(run_dir)
+        results_dir = os.path.join(run_dir, 'results')
+        if not os.path.isdir(results_dir):
+            continue
+
+        pkl_files = [
+            os.path.join(results_dir, f)
+            for f in os.listdir(results_dir)
+            if f.endswith('.pkl')
+        ]
+
+        for pkl_path in sorted(pkl_files):
+            fname = os.path.basename(pkl_path)
+
+            # --- Route by result_type ---
+            # Pkl filenames from save_results() follow the pattern:
+            #   {dataset}_{evaluation_type}_{tag}_{timestamp}.pkl
+            # Budget pks saved directly via df.to_pickle() follow:
+            #   {tag}_optimization_budget.pkl
+            if result_type == 'optimization_budget':
+                if '_optimization_budget.pkl' not in fname:
+                    continue
+                try:
+                    df = pd.read_pickle(pkl_path)
+                except Exception:
+                    continue
+                df = df.copy()
+                df['tag'] = tag
+                df['family'] = family
+                all_frames.append(df)
+
+            else:
+                # 'fit' or 'optimization': match files that contain
+                # f'_{result_type}_' (the evaluation_type component).
+                # Exclude budget files (contain 'budget').
+                marker = f'_{result_type}_'
+                if 'budget' in fname:
+                    continue
+                if marker not in fname:
+                    continue
+                try:
+                    data = load_results(pkl_path)
+                except Exception:
+                    continue
+
+                rows: List[Dict[str, Any]] = []
+                for model_name, result_list in data.items():
+                    if model_name == '_metadata':
+                        continue
+                    for res in result_list:
+                        r2_arr = np.asarray(res['r2'])
+                        row: Dict[str, Any] = {
+                            'model': model_name,
+                            'dataset': res.get('dataset', dataset),
+                            'subject': res.get('subject', ''),
+                            'emg': res.get('emg', ''),
+                            'mean_r2': float(np.mean(r2_arr)),
+                            'std_r2': float(np.std(r2_arr)),
+                            'n_reps': int(len(r2_arr)),
+                            'mean_time_s': float(np.mean(res['times'])),
+                            'tag': tag,
+                            'family': family,
+                        }
+                        if result_type == 'optimization' and 'values' in res:
+                            values = np.asarray(res['values'])
+                            best_so_far = np.maximum.accumulate(values, axis=1)
+                            optimal = float(res['y_test'].max())
+                            final_regret = optimal - best_so_far[:, -1]
+                            row['mean_final_regret'] = float(np.mean(final_regret))
+                            row['std_final_regret'] = float(np.std(final_regret))
+                            row['budget'] = int(values.shape[1])
+                        rows.append(row)
+
+                if rows:
+                    all_frames.append(pd.DataFrame(rows))
+
+    if not all_frames:
+        return pd.DataFrame()
+
+    return pd.concat(all_frames, ignore_index=True)
 
 
 if __name__ == '__main__':

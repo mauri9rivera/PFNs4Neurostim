@@ -1,0 +1,24 @@
+# Canonical config for ID/OOD analysis using all reference distributions.
+# Family: all-priors
+# Runs all analyses against GP (ID anchor), TabPFN v1 Prior Bag, and Noise OOD
+# (upper bound) in a single pass.  Use for the primary paper figures.
+# Usage:
+#   python src/id_ood_analysis.py --config configs/id_ood_all_priors.yaml
+
+family: all-priors
+datasets:
+  - rat
+  - nhp
+  - spinal
+
+analyses:
+  - entropy
+  - mmd
+  - mahalanobis
+
+prior_source: all
+device: cpu
+n_synthetic: 500
+n_context: 50
+seed: 42
+save: true

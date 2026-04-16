@@ -1,6 +1,9 @@
 """
 Finetuned TabPFN regressor wrappers and utilities.
 
+- SurrogateModel: typing.Protocol for the unified BO surrogate interface
+- GPSurrogate: ExactGP wrapper conforming to SurrogateModel
+- TabPFNSurrogate: TabPFNRegressor wrapper conforming to SurrogateModel
 - GradientMonitoredRegressor: FinetunedTabPFNRegressor with per-epoch diagnostics
 - LoRAFinetunedRegressor: GradientMonitoredRegressor with LoRA adapter injection
 - _make_finetuned_regressor(): factory that returns the appropriate regressor class
@@ -8,18 +11,318 @@ Finetuned TabPFN regressor wrappers and utilities.
 - linear_cka(): linear CKA between activation matrices
 """
 import copy
+import math
 import os
+from typing import Any, Protocol, runtime_checkable
 
+import gpytorch
 import numpy as np
 import torch
 from tabpfn import TabPFNRegressor
 from tabpfn.base import RegressorModelSpecs
 from tabpfn.finetuning.finetuned_regressor import FinetunedTabPFNRegressor
 
+from models.gaussians import ExactGP
 from models.lora import (
     apply_lora, merge_lora, count_params, save_lora_checkpoint,
     load_lora_checkpoint,
 )
+
+
+# ---------------------------------------------------------------------------
+# SurrogateModel protocol — unified interface for all BO surrogate models
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class SurrogateModel(Protocol):
+    """Protocol for Bayesian optimisation surrogate models.
+
+    Any surrogate (GP, vanilla TabPFN, finetuned TabPFN, LoRA TabPFN) must
+    implement these two methods to be used with ``run_bo_loop()``.
+
+    The ``predict_ucb`` method is optional: surrogates that implement native
+    bar-distribution UCB (TabPFN variants) should override it; surrogates
+    that do not (GP) will fall back to the ``mean + kappa * std`` formula
+    computed by ``run_bo_loop`` from the ``predict`` return values.
+    """
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Fit or update the surrogate on observed data.
+
+        For GP surrogates this trains kernel hyperparameters via marginal
+        likelihood. For TabPFN surrogates this stores in-context examples
+        (no gradient updates).
+
+        Args:
+            X: Feature matrix of observed points, shape [N, D].
+            y: Response vector of observed targets, shape [N].
+        """
+        ...
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return predictive mean and standard deviation.
+
+        Args:
+            X: Query feature matrix, shape [M, D].
+
+        Returns:
+            Tuple of (mean, std), each shape [M].
+        """
+        ...
+
+    def predict_ucb(
+        self,
+        X: np.ndarray,
+        kappa: float,
+        t: int,
+        n_steps: int,
+    ) -> np.ndarray:
+        """Return UCB acquisition values for each candidate in X.
+
+        Surrogates with native uncertainty representations (e.g. the TabPFN
+        bar-distribution) should override this for a more accurate UCB.
+        The default implementation (used by ``run_bo_loop`` when the surrogate
+        does not override) computes ``mean + kappa * std``.
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].
+            kappa: Current UCB exploration coefficient.
+            t: Current BO step index (0-indexed), used for annealing.
+            n_steps: Total number of BO steps (``budget - n_init``).
+
+        Returns:
+            UCB values, shape [M].
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# GPSurrogate — ExactGP wrapper conforming to SurrogateModel
+# ---------------------------------------------------------------------------
+
+class GPSurrogate:
+    """ExactGP (RBF kernel) wrapper conforming to the ``SurrogateModel`` protocol.
+
+    Trains kernel hyperparameters via marginal likelihood optimisation at each
+    ``fit`` call.  ``predict`` returns the posterior mean and standard deviation
+    from the trained likelihood.
+
+    Args:
+        device: PyTorch device string ('cpu' or 'cuda').
+        n_opt_steps: Number of Adam optimiser steps for hyperparameter training.
+        lr: Learning rate for the Adam optimiser.
+        kappa_0: Initial UCB exploration coefficient (used in cosine annealing).
+        kappa_min: Minimum UCB exploration coefficient.
+    """
+
+    def __init__(
+        self,
+        device: str = 'cpu',
+        n_opt_steps: int = 50,
+        lr: float = 0.01,
+        kappa_0: float = 5.0,
+        kappa_min: float = 1.0,
+    ) -> None:
+        self._device = device
+        self._n_opt_steps = n_opt_steps
+        self._lr = lr
+        self._kappa_0 = kappa_0
+        self._kappa_min = kappa_min
+        self._model: ExactGP | None = None
+        self._likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Train GP hyperparameters via marginal likelihood on observed data.
+
+        Args:
+            X: Feature matrix of observed points, shape [N, D].  # [N, D]
+            y: Response vector of observed targets, shape [N].   # [N]
+        """
+        train_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [N, D]
+        train_y = torch.tensor(y, dtype=torch.float32, device=self._device)  # [N]
+
+        if torch.isnan(train_x).any() or torch.isnan(train_y).any():
+            raise RuntimeError(
+                "GPSurrogate.fit received NaN inputs. "
+                f"X has {torch.isnan(train_x).sum()} NaNs, "
+                f"y has {torch.isnan(train_y).sum()} NaNs."
+            )
+
+        self._likelihood = gpytorch.likelihoods.GaussianLikelihood().to(self._device)
+        self._model = ExactGP(train_x, train_y, self._likelihood).to(self._device)
+
+        self._model.train()
+        self._likelihood.train()
+
+        optimizer = torch.optim.Adam(self._model.parameters(), lr=self._lr)
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(self._likelihood, self._model)
+
+        for _ in range(self._n_opt_steps):
+            optimizer.zero_grad()
+            output = self._model(train_x)
+            loss = -mll(output, train_y)
+            loss.backward()
+            optimizer.step()
+
+        self._model.eval()
+        self._likelihood.eval()
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return GP posterior mean and standard deviation.
+
+        Args:
+            X: Query feature matrix, shape [M, D].  # [M, D]
+
+        Returns:
+            Tuple of (mean, std), each shape [M].   # [M], [M]
+
+        Raises:
+            RuntimeError: If ``fit`` has not been called yet.
+        """
+        if self._model is None or self._likelihood is None:
+            raise RuntimeError(
+                "GPSurrogate.predict called before fit. Call fit() first."
+            )
+        query_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [M, D]
+        with torch.no_grad():
+            posterior = self._likelihood(self._model(query_x))
+            mean = posterior.mean.cpu().numpy()   # [M]
+            std = posterior.stddev.cpu().numpy()  # [M]
+
+        if np.isnan(mean).any() or np.isnan(std).any():
+            raise RuntimeError(
+                f"GPSurrogate.predict returned NaN values. "
+                f"mean NaNs: {np.isnan(mean).sum()}, std NaNs: {np.isnan(std).sum()}."
+            )
+        return mean, std
+
+    def predict_ucb(
+        self,
+        X: np.ndarray,
+        kappa: float,
+        t: int,
+        n_steps: int,
+    ) -> np.ndarray:
+        """Return UCB values using GP posterior mean and standard deviation.
+
+        Uses cosine-annealed kappa internally (the ``kappa`` argument is the
+        pre-annealed value computed by ``run_bo_loop``).
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].  # [M, D]
+            kappa: Current (already-annealed) UCB exploration coefficient.
+            t: Current BO step index (unused; annealing done by caller).
+            n_steps: Total BO steps (unused; annealing done by caller).
+
+        Returns:
+            UCB values, shape [M].  # [M]
+        """
+        mean, std = self.predict(X)  # [M], [M]
+        return mean + kappa * std    # [M]
+
+
+# ---------------------------------------------------------------------------
+# TabPFNSurrogate — TabPFNRegressor wrapper conforming to SurrogateModel
+# ---------------------------------------------------------------------------
+
+class TabPFNSurrogate:
+    """TabPFNRegressor wrapper conforming to the ``SurrogateModel`` protocol.
+
+    Uses TabPFN's native bar-distribution UCB for acquisition, which is more
+    accurate than the Gaussian ``mean + kappa * std`` approximation.
+
+    Args:
+        model: A fitted ``TabPFNRegressor`` (from ``extract_inference_model()``
+            for finetuned models, or a plain ``TabPFNRegressor`` for vanilla).
+        kappa_0: Initial UCB exploration coefficient for cosine annealing.
+        kappa_min: Final UCB exploration coefficient.
+    """
+
+    def __init__(
+        self,
+        model: TabPFNRegressor,
+        kappa_0: float = 2.5,
+        kappa_min: float = 0.5,
+    ) -> None:
+        self._model = model
+        self._kappa_0 = kappa_0
+        self._kappa_min = kappa_min
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Store in-context examples for the TabPFN forward pass.
+
+        No gradient updates are performed; this call sets the context that
+        the transformer uses at prediction time.
+
+        Args:
+            X: Feature matrix of observed points, shape [N, D].  # [N, D]
+            y: Response vector of observed targets, shape [N].   # [N]
+        """
+        if np.isnan(X).any() or np.isnan(y).any():
+            raise RuntimeError(
+                "TabPFNSurrogate.fit received NaN inputs. "
+                f"X has {np.isnan(X).sum()} NaNs, y has {np.isnan(y).sum()} NaNs."
+            )
+        self._model.fit(X, y)
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return predictive mean and standard deviation from the bar distribution.
+
+        Uses quantile predictions to derive mean and std, matching the
+        ``std_from_quantiles`` approach used in the legacy BO loop.
+
+        Args:
+            X: Query feature matrix, shape [M, D].  # [M, D]
+
+        Returns:
+            Tuple of (mean, std), each shape [M].   # [M], [M]
+        """
+        from utils.gpbo_utils import std_from_quantiles  # avoid circular import
+
+        quantile_levels = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+        preds = self._model.predict(X, output_type="quantiles",
+                                     quantiles=quantile_levels)
+        quantiles = np.array(preds).T  # [7, M]
+        mean, std = std_from_quantiles(quantiles)  # [M], [M]
+
+        if np.isnan(mean).any() or np.isnan(std).any():
+            raise RuntimeError(
+                f"TabPFNSurrogate.predict returned NaN values. "
+                f"mean NaNs: {np.isnan(mean).sum()}, std NaNs: {np.isnan(std).sum()}."
+            )
+        return mean, std
+
+    def predict_ucb(
+        self,
+        X: np.ndarray,
+        kappa: float,
+        t: int,
+        n_steps: int,
+    ) -> np.ndarray:
+        """Return UCB values using the native TabPFN bar-distribution criterion.
+
+        Converts ``kappa`` to ``rest_prob`` as::
+
+            rest_prob = 0.5 * erfc(kappa / sqrt(2))
+
+        which maps the Gaussian tail probability to the correct quantile of
+        the bar distribution for UCB acquisition.
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].  # [M, D]
+            kappa: Current (already-annealed) UCB exploration coefficient.
+            t: Current BO step index (unused; annealing done by caller).
+            n_steps: Total BO steps (unused; annealing done by caller).
+
+        Returns:
+            UCB values, shape [M].  # [M]
+        """
+        rest_prob = 0.5 * math.erfc(kappa / math.sqrt(2))
+        full_output = self._model.predict(X, output_type="full")
+        logits = full_output['logits']
+        criterion = full_output['criterion']
+        ucb_vals = criterion.ucb(logits, 0, rest_prob=rest_prob, maximize=True)
+        return ucb_vals.clone().cpu().numpy()  # [M]
 
 
 def linear_cka(X, Y):
@@ -166,14 +469,16 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
                 for name, p in model.named_parameters()
             }
 
-            # Discover CKA hook layers
-            n_transformer_layers = len(model.transformer_encoder.layers)
-            mid = n_transformer_layers // 2
+            # Discover CKA hook layers — phase-aligned with TabPFN v2's
+            # three-phase attention structure (Ye et al., 2025, arXiv:2502.17361):
+            #   Early (0-4): label-token attention, attribute identity internalized
+            #   Middle (5-12): uniform mixing, cross-attribute information exchange
+            #   Deep (13-17): selective attention on predictive attributes
+            n_layers = len(model.transformer_encoder.layers)
+            phase_indices = [0, 4, 9, 13, n_layers - 1]  # [N, D]
             self._cka_hook_names_ = [
-                'encoder',
-                'transformer_encoder.layers.0',
-                f'transformer_encoder.layers.{mid}',
-                f'transformer_encoder.layers.{n_transformer_layers - 1}',
+                f'transformer_encoder.layers.{i}'
+                for i in phase_indices if i < n_layers
             ]
 
             # Prepare CKA reference tensors

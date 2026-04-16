@@ -1,0 +1,25 @@
+# Canonical hyperparameters for NHP inter-subject optimization experiment.
+# Family: optimization
+# Usage:
+#   python src/finetuning.py --config configs/nhp_optimization.yaml
+#   python src/finetuning.py --config configs/nhp_optimization.yaml --epochs 100
+
+family: optimization
+dataset: nhp
+split: inter_subject
+mode:
+  - optimization
+
+# Training
+epochs: 50
+lr: 1.0e-5
+n_augmentations: 25
+
+# Evaluation
+budget: 100
+n_reps: 30
+
+# Infrastructure
+device: cuda
+save: true
+diagnostics: false

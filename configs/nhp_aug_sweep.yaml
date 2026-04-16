@@ -1,0 +1,34 @@
+# Canonical hyperparameters for NHP augmentation sensitivity sweep.
+# Family: aug-sweep-opt
+# Tests whether R2 and regret plateau after n_augmentations ~ 25.
+# Usage:
+#   python src/finetuning.py --config configs/nhp_aug_sweep.yaml
+
+family: aug-sweep-opt
+dataset: nhp
+split: inter_subject
+mode:
+  - aug_sweep_optimization
+
+# Training — epochs/lr fixed; n_augmentations is swept via aug_counts
+epochs: 50
+lr: 1.0e-5
+n_augmentations: 25
+
+# Augmentation sweep values (0 = vanilla TabPFN baseline included automatically)
+aug_counts:
+  - 1
+  - 2
+  - 5
+  - 7
+  - 10
+  - 25
+
+# Evaluation
+budget: 100
+n_reps: 30
+
+# Infrastructure
+device: cuda
+save: true
+diagnostics: false

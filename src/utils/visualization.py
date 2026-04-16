@@ -338,10 +338,16 @@ def visualize_representation(results_dict, mode='', save=False, output_dir=None)
     subject = ref_res.get('subject', '?')
     emg = ref_res.get('emg', '?')
 
+    # Ground truth optimum location (shared across all columns)
+    gt_idx = int(np.argmax(y_test))
+    gt_row_2d, gt_col_2d = gt_idx // grid_shape[1], gt_idx % grid_shape[1]
+
     # Row 0: ground truth
     for col in range(n_cols):
         ax = axes[0, col]
         sns.heatmap(y_test.reshape(grid_shape), ax=ax, **heatmap_kw)
+        ax.plot(gt_col_2d + 0.5, gt_row_2d + 0.5, 'g*', markersize=10,
+                markeredgecolor='white', markeredgewidth=0.5)
         if col == 0:
             ax.set_ylabel(f'Ground Truth\nS{subject} EMG{emg}', fontsize=8)
         ax.set_title(f'Iter {snapshot_iters[col]}', fontsize=8)
@@ -355,6 +361,11 @@ def visualize_representation(results_dict, mode='', save=False, output_dir=None)
                 pred = snaps[it]['y_pred']
                 r2_val = snaps[it]['r2']
                 sns.heatmap(pred.reshape(grid_shape), ax=ax, **heatmap_kw)
+                opt_idx = int(np.argmax(pred.ravel()))
+                opt_row_2d = opt_idx // grid_shape[1]
+                opt_col_2d = opt_idx % grid_shape[1]
+                ax.plot(opt_col_2d + 0.5, opt_row_2d + 0.5, 'r*', markersize=10,
+                        markeredgecolor='white', markeredgewidth=0.5)
                 ax.set_title(f'R²={r2_val:.2f}', fontsize=7)
             else:
                 ax.set_visible(False)
@@ -450,12 +461,11 @@ def regret_by_subject(results_dict, split_type='', save=False, output_dir=None):
                 continue
             optimal = float(res['y_test'].max())
             raw_vals = np.array(res['values'])
-            best_so_far = np.maximum.accumulate(raw_vals, axis=1)
-            final_regrets = optimal - best_so_far[:, -1]
+            final_regrets = (optimal - raw_vals[:, -1]) / optimal * 100
             for regret in final_regrets:
                 data.append({
                     'Subject': f"S{res['subject']}",
-                    'Regret': float(regret),
+                    'Regret (%)': float(regret),
                     'Model': model_name
                 })
 
@@ -465,10 +475,10 @@ def regret_by_subject(results_dict, split_type='', save=False, output_dir=None):
     df = pd.DataFrame(data)
     n_subjects = df['Subject'].nunique()
     plt.figure(figsize=(max(6, 1.8 * n_subjects), 5))
-    sns.boxplot(data=df, x='Subject', y='Regret', hue='Model', palette=PALETTE)
+    sns.boxplot(data=df, x='Subject', y='Regret (%)', hue='Model', palette=PALETTE)
     plt.title("Final Simple Regret by Subject")
     plt.xlabel("Subject")
-    plt.ylabel("Final Simple Regret")
+    plt.ylabel("Final Simple Regret (%)")
     plt.legend(title='Model')
     plt.grid(True, alpha=0.3, axis='y')
 
@@ -505,12 +515,11 @@ def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
                 continue
             optimal = float(res['y_test'].max())
             raw_vals = np.array(res['values'])
-            best_so_far = np.maximum.accumulate(raw_vals, axis=1)
-            final_regrets = optimal - best_so_far[:, -1]
+            final_regrets = (optimal - raw_vals[:, -1]) / optimal * 100
             for regret in final_regrets:
                 data.append({
                     'EMG': f"EMG {res['emg']}",
-                    'Regret': float(regret),
+                    'Regret (%)': float(regret),
                     'Model': model_name
                 })
 
@@ -520,10 +529,10 @@ def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
     df = pd.DataFrame(data)
     n_emgs = df['EMG'].nunique()
     plt.figure(figsize=(max(6, 1.8 * n_emgs), 5))
-    sns.boxplot(data=df, x='EMG', y='Regret', hue='Model', palette=PALETTE)
+    sns.boxplot(data=df, x='EMG', y='Regret (%)', hue='Model', palette=PALETTE)
     plt.title("Final Simple Regret by EMG Channel")
     plt.xlabel("EMG")
-    plt.ylabel("Final Simple Regret")
+    plt.ylabel("Final Simple Regret (%)")
     plt.legend(title='Model')
     plt.grid(True, alpha=0.3, axis='y')
 
@@ -564,7 +573,7 @@ def budget_sweep_plot(df, eval_type, dataset='', split_type='', save=False, outp
         if 'R2' in df.columns:
             metrics.append(('R2', 'R² Score', (0, 1.05), 'R² vs Budget'))
         if 'Regret' in df.columns:
-            metrics.append(('Regret', 'Final Simple Regret', None, 'Regret vs Budget'))
+            metrics.append(('Regret', 'Final Simple Regret (%)', None, 'Regret vs Budget'))
 
     if not metrics:
         return
@@ -638,20 +647,20 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
     n_experiments = len(first_results)
 
     def get_regret_stats(values_list, optimal_val):
-        raw_vals = np.array(values_list)
-        best_so_far = np.maximum.accumulate(raw_vals, axis=1)
-        regret_all = optimal_val - best_so_far
+        raw_vals = np.maximum.accumulate(np.array(values_list), axis=1)  # running best
+        regret_all = (optimal_val - raw_vals) / optimal_val * 100
         mean_regret = np.mean(regret_all, axis=0)
         se_regret = np.std(regret_all, axis=0) / np.sqrt(raw_vals.shape[0])
         return mean_regret, se_regret
 
-    fig, axes = plt.subplots(2, n_experiments,
-                             figsize=(4 * n_experiments, 8),
+    fig, axes = plt.subplots(3, n_experiments,
+                             figsize=(4 * n_experiments, 12),
                              squeeze=False)
 
     for idx in range(n_experiments):
         ax_reg = axes[0, idx]
         ax_time = axes[1, idx]
+        ax_ee = axes[2, idx]
 
         ref_res = first_results[idx]
         optimal_val = ref_res['y_test'].max()
@@ -680,6 +689,28 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
                 times_arr = np.array(times)
                 ax_time.plot(times_arr, color=color, linewidth=2, label=model_name)
 
+            # --- exploration-exploitation row ---
+            if 'values' in res and 'exploit_values' in res:
+                exp_raw = np.maximum.accumulate(np.array(res['values']), axis=1) / optimal_val  # running best
+                exp_mean = np.mean(exp_raw, axis=0)
+                exp_se = np.std(exp_raw, axis=0) / np.sqrt(exp_raw.shape[0])
+                expl_raw = np.array(res['exploit_values']) / optimal_val
+                expl_mean = np.mean(expl_raw, axis=0)
+                expl_se = np.std(expl_raw, axis=0) / np.sqrt(expl_raw.shape[0])
+                x_ax = range(len(exp_mean))
+                ax_ee.plot(x_ax, exp_mean, color=color, linestyle='-',
+                           label=f'{model_name} Explore', linewidth=2)
+                ax_ee.fill_between(x_ax,
+                                   exp_mean - 1.96 * exp_se,
+                                   exp_mean + 1.96 * exp_se,
+                                   color=color, alpha=0.15)
+                ax_ee.plot(x_ax, expl_mean, color=color, linestyle='--',
+                           label=f'{model_name} Exploit', linewidth=2)
+                ax_ee.fill_between(x_ax,
+                                   expl_mean - 1.96 * expl_se,
+                                   expl_mean + 1.96 * expl_se,
+                                   color=color, alpha=0.10)
+
         ax_reg.set_title(f"S{ref_res['subject']} EMG {ref_res['emg']}", fontsize=9)
         ax_reg.set_xlabel('Iteration')
         ax_reg.grid(True, alpha=0.3)
@@ -689,8 +720,14 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
         ax_time.set_ylabel('Time (s)')
         ax_time.grid(True, alpha=0.3)
 
-    axes[0, 0].set_ylabel('Simple Regret')
+        ax_ee.set_xlabel('Iteration')
+        ax_ee.set_ylim(0, 1.05)
+        ax_ee.axhline(1.0, color='gray', linewidth=0.8, linestyle=':')
+        ax_ee.grid(True, alpha=0.3)
+
+    axes[0, 0].set_ylabel('Recommendation Regret (%)')
     axes[1, 0].set_ylabel('Inference Time (s)')
+    axes[2, 0].set_ylabel('Explore / Exploit\n(frac. of optimum)')
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper right', fontsize=9)

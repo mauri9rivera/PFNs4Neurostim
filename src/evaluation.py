@@ -22,8 +22,11 @@ from sklearn.metrics import r2_score
 from tabpfn import TabPFNRegressor
 
 from models.gaussians import ExactGP
-from models.regressors import _make_finetuned_regressor, extract_inference_model
-from utils.bo_loops import run_gpbo_loop, run_finetunedbo_loop, _snapshot_iters
+from models.regressors import (
+    _make_finetuned_regressor, extract_inference_model,
+    GPSurrogate, TabPFNSurrogate, SurrogateModel,
+)
+from utils.bo_loops import run_bo_loop, run_gpbo_loop, run_finetunedbo_loop, _snapshot_iters
 from utils.data_utils import (
     build_finetuning_dataset, load_data, preprocess_neural_data,
     HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS,
@@ -322,6 +325,141 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
         'r2': r2_scores,
         'y_pred': y_pred_mean,
         'dataset': dataset,
+        'subject': subject_idx,
+        'emg': emg_idx,
+        'snapshots': snapshot_results,
+    }
+
+
+def evaluate_optimization(
+    surrogate: SurrogateModel,
+    dataset_type: str,
+    subject_idx: int,
+    emg_idx: int,
+    device: str = 'cpu',
+    budget: int = 100,
+    n_reps: int = 20,
+    kappa_0: float = 2.5,
+    kappa_min: float = 0.5,
+    normalization: str = 'pfn',
+) -> dict:
+    """Evaluate Bayesian optimisation performance using any surrogate model.
+
+    This is the unified replacement for ``gp_baseline(mode='optimization')``
+    and ``finetuned_optimization()``.  It accepts any object conforming to
+    the ``SurrogateModel`` protocol (``GPSurrogate``, ``TabPFNSurrogate``, or
+    any custom wrapper) and delegates to ``run_bo_loop()``.
+
+    A single-estimator copy of the surrogate (if it is a ``TabPFNSurrogate``)
+    is used for the BO loop to avoid ensemble-averaging overhead during
+    acquisition; the original model is used for the final prediction.
+
+    Args:
+        surrogate: Any object conforming to the ``SurrogateModel`` protocol.
+            Use ``GPSurrogate(device=device)`` for GP or
+            ``TabPFNSurrogate(model)`` for TabPFN variants.
+        dataset_type: Dataset identifier, e.g. ``'rat'`` or ``'nhp'``.
+        subject_idx: Index of the held-out subject to evaluate.
+        emg_idx: Index of the EMG channel to evaluate.
+        device: PyTorch device string, ``'cpu'`` or ``'cuda'``.
+        budget: Total number of BO queries (including initial random points).
+        n_reps: Number of independent BO repetitions.
+        kappa_0: Initial UCB exploration coefficient (cosine annealing start).
+        kappa_min: Final UCB exploration coefficient (cosine annealing end).
+        normalization: Preprocessing scheme passed to ``preprocess_neural_data``;
+            use ``'pfn'`` for TabPFN surrogates and ``'gp'`` for GP surrogates.
+
+    Returns:
+        Dictionary with keys matching ``gp_baseline`` / ``finetuned_optimization``:
+          - ``'model_type'``: str — class name of the surrogate
+          - ``'times'``: np.ndarray shape [budget - n_init] — mean per-step times
+          - ``'values'``: list[list[float]] — observed real values per rep
+          - ``'y_test'``: np.ndarray — ground-truth test responses
+          - ``'r2'``: list[float] — per-rep R² on ``X_test`` (clipped to [0,1])
+          - ``'y_pred'``: np.ndarray — mean final prediction across reps
+          - ``'dataset'``: str — ``dataset_type``
+          - ``'subject'``: int — ``subject_idx``
+          - ``'emg'``: int — ``emg_idx``
+          - ``'snapshots'``: dict | None — R²+predictions at log-spaced budgets
+
+    Raises:
+        RuntimeError: If NaN/Inf values appear in predictions.
+    """
+    data = load_data(dataset_type, subject_idx)
+
+    X_pool, y_pool, X_test, y_test, scaler_y = preprocess_neural_data(
+        data, emg_idx, normalization
+    )
+    # X_pool: [N, D], y_pool: [N, n_stims], X_test: [M, D], y_test: [M]
+
+    n_init = max(3, int(0.05 * budget))
+    snap_iters = _snapshot_iters(budget, n_init)
+    snapshot_rep = np.random.randint(n_reps)
+
+    mean_times_all: list[list[float]] = []
+    values_all: list[list[float]] = []
+    r2_scores: list[float] = []
+    y_preds_all: list[np.ndarray] = []
+    collected_snapshots: dict | None = None
+
+    for i in range(n_reps):
+        loop_result = run_bo_loop(
+            model=surrogate,
+            X_pool=X_pool,
+            y_pool=y_pool,
+            X_test=X_test,
+            y_test=y_test,
+            n_init=n_init,
+            budget=budget,
+            kappa_0=kappa_0,
+            kappa_min=kappa_min,
+            snapshot_iters=snap_iters if i == snapshot_rep else None,
+        )
+
+        if loop_result['snapshots'] is not None:
+            collected_snapshots = loop_result['snapshots']
+
+        mean_times_all.append(loop_result['times'])
+        values_all.append(loop_result['real_values'])
+
+        y_pred = loop_result['y_pred']  # [M] — already in normalised space
+        og_shape = y_pred.shape
+        y_pred_unscaled = scaler_y.inverse_transform(
+            y_pred.reshape(-1, 1)
+        ).reshape(og_shape)  # [M]
+
+        if np.isnan(y_pred_unscaled).any():
+            raise RuntimeError(
+                f"evaluate_optimization: NaN in final predictions for "
+                f"subject={subject_idx}, emg={emg_idx}, rep={i}."
+            )
+
+        r2 = r2_score(y_test, y_pred_unscaled)
+        r2_scores.append(float(np.clip(r2, 0.0, 1.0)))
+        y_preds_all.append(y_pred_unscaled)
+
+    mean_times = np.mean(np.array(mean_times_all), axis=0)  # [budget - n_init]
+    y_pred_mean = np.mean(np.array(y_preds_all), axis=0)    # [M]
+
+    # Inverse-transform snapshot predictions and compute R²
+    snapshot_results: dict | None = None
+    if collected_snapshots is not None:
+        snapshot_results = {}
+        for it, s_pred in collected_snapshots.items():
+            s_pred_unscaled = scaler_y.inverse_transform(
+                s_pred.reshape(-1, 1)
+            ).ravel()  # [M]
+            s_r2 = float(np.clip(r2_score(y_test, s_pred_unscaled), 0.0, 1.0))
+            snapshot_results[it] = {'y_pred': s_pred_unscaled, 'r2': s_r2}
+
+    return {
+        'model_type': type(surrogate).__name__,
+        'times': mean_times,
+        'values': values_all,
+        'y_test': y_test,
+        'r2': r2_scores,
+        'y_pred': y_pred_mean,
+        'dataset': dataset_type,
         'subject': subject_idx,
         'emg': emg_idx,
         'snapshots': snapshot_results,

@@ -1,12 +1,17 @@
 """
 Bayesian optimization loop implementations for GP and finetuned TabPFN.
 
+Public API (use these):
+- run_bo_loop(): unified model-agnostic BO loop (canonical implementation)
+- _snapshot_iters(): compute log2-spaced snapshot iterations
+
+Deprecated (kept for backwards compatibility, will be removed):
 - run_gpbo_loop(): GP-based active learning loop
 - run_finetunedbo_loop(): TabPFN-based active learning loop
-- _snapshot_iters(): compute log2-spaced snapshot iterations
 """
 import math
 import time
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -27,9 +32,170 @@ def _snapshot_iters(budget, n_init):
     return sorted(iters)
 
 
+def run_bo_loop(
+    model: "SurrogateModel",
+    X_pool: np.ndarray,
+    y_pool: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    n_init: int = 5,
+    budget: int = 100,
+    kappa_0: float = 2.5,
+    kappa_min: float = 0.5,
+    snapshot_iters: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Unified model-agnostic Bayesian optimisation loop using UCB acquisition.
+
+    Performs a sequential active learning loop over a discrete candidate pool.
+    At each step the surrogate is refitted on all observed data and the next
+    query is selected by the surrogate's UCB acquisition function.
+
+    The ``model`` argument must conform to the ``SurrogateModel`` protocol
+    (defined in ``models.regressors``):
+      - ``model.fit(X, y)`` — update the surrogate on observed data
+      - ``model.predict(X)`` — return ``(mean, std)`` for candidate points
+      - ``model.predict_ucb(X, kappa, t, n_steps)`` — return UCB values
+        (falls back to ``mean + kappa * std`` if not implemented)
+
+    Observations are drawn as the mean across all repetitions in ``y_pool``
+    (``y_pool[idx].mean()``), matching the protocol used in the legacy loops.
+
+    Args:
+        model: Any object conforming to the ``SurrogateModel`` protocol.
+        X_pool: Feature matrix for all candidate locations, shape [N, D].
+        y_pool: Response matrix with repeated measurements, shape [N, n_reps].
+            Each row corresponds to one candidate location; the observation
+            returned for a queried location is the row mean.
+        X_test: Test feature matrix for final R² prediction, shape [M, D].
+        y_test: Test response vector (mean across repetitions), shape [M].
+        n_init: Number of randomly selected initial observations before the
+            optimisation loop starts.
+        budget: Total number of observations (including ``n_init``).
+        kappa_0: Initial UCB exploration coefficient (cosine annealing start).
+        kappa_min: Final UCB exploration coefficient (cosine annealing end).
+        snapshot_iters: Optional list of observation counts at which to record
+            a prediction snapshot on ``X_test`` (e.g. for R²-vs-budget plots).
+            The final budget iteration is always included if provided.
+
+    Returns:
+        Dictionary with keys:
+          - ``'observed_indices'``: list[int] — query indices into ``X_pool``
+          - ``'observed_values'``: list[float] — noisy (mean-rep) observations
+          - ``'real_values'``: list[float] — true test values at observed locs
+          - ``'times'``: list[float] — per-step wall-clock time in seconds
+          - ``'y_pred'``: np.ndarray shape [M] — final predictions on ``X_test``
+          - ``'snapshots'``: dict[int, np.ndarray] | None — predictions at each
+            snapshot iteration, or ``None`` if ``snapshot_iters`` is ``None``
+
+    Raises:
+        ValueError: If ``budget <= n_init``.
+        RuntimeError: If NaN/Inf values appear in UCB acquisition values.
+    """
+    if budget <= n_init:
+        raise ValueError(
+            f"budget ({budget}) must be greater than n_init ({n_init})."
+        )
+
+    n_locs = X_pool.shape[0]   # [N, D]
+    n_steps = budget - n_init
+
+    def _sample(idx: int) -> float:
+        """Return mean observation for pool index idx."""
+        return float(y_pool[idx].mean())
+
+    # --- Initialisation: random seed queries ---
+    pool_indices = np.arange(n_locs)
+    observed_indices: list[int] = np.random.choice(
+        pool_indices, size=n_init, replace=False
+    ).tolist()
+    observed_values: list[float] = [_sample(i) for i in observed_indices]
+    real_values: list[float] = [float(y_test[i]) for i in observed_indices]
+
+    times: list[float] = []
+    snapshots: dict[int, np.ndarray] = {}
+
+    # --- BO loop ---
+    for t in range(n_steps):
+        step_start = time.time()
+
+        X_obs = X_pool[observed_indices]          # [n_obs, D]
+        y_obs = np.array(observed_values)         # [n_obs]
+
+        # Refit surrogate on all observations so far
+        model.fit(X_obs, y_obs)
+
+        # Compute cosine-annealed kappa for this step
+        kappa = compute_ucb_kappa(t, n_steps, kappa_0=kappa_0, kappa_min=kappa_min)
+
+        # Compute UCB acquisition values for all candidates
+        # Prefer native predict_ucb if available; fall back to mean + kappa*std
+        if hasattr(model, 'predict_ucb') and callable(model.predict_ucb):
+            ucb_vals = model.predict_ucb(X_pool, kappa, t, n_steps)  # [N]
+            # Convert torch tensors if necessary
+            if hasattr(ucb_vals, 'numpy'):
+                ucb_vals = ucb_vals.numpy()
+            ucb_vals = np.asarray(ucb_vals, dtype=np.float64)         # [N]
+        else:
+            mean, std = model.predict(X_pool)   # [N], [N]
+            ucb_vals = mean + kappa * std        # [N]
+
+        if not np.isfinite(ucb_vals).any():
+            raise RuntimeError(
+                f"run_bo_loop: all UCB values are non-finite at step {t}. "
+                "Check surrogate fit and input data for NaN/Inf."
+            )
+
+        # Mask already-observed locations to prevent revisiting
+        for obs_idx in observed_indices:
+            ucb_vals[obs_idx] = -np.inf
+
+        next_idx = int(np.argmax(ucb_vals))
+        observed_indices.append(next_idx)
+        observed_values.append(_sample(next_idx))
+        real_values.append(float(y_test[next_idx]))
+
+        times.append(time.time() - step_start)
+
+        # Record snapshot if requested
+        n_obs_now = len(observed_indices)
+        if snapshot_iters is not None and n_obs_now in snapshot_iters:
+            # Refit on updated observations for the snapshot prediction
+            model.fit(X_pool[observed_indices], np.array(observed_values))
+            snap_pred, _ = model.predict(X_test)  # [M]
+            snapshots[n_obs_now] = np.asarray(snap_pred)  # [M]
+
+    # --- Final prediction on X_test using all observed data ---
+    model.fit(X_pool[observed_indices], np.array(observed_values))
+    y_pred, _ = model.predict(X_test)  # [M]
+    y_pred = np.asarray(y_pred)        # [M]
+
+    # Capture final budget snapshot if not already recorded
+    if snapshot_iters is not None and budget not in snapshots:
+        snapshots[budget] = y_pred.copy()  # [M]
+
+    return {
+        'observed_indices': observed_indices,
+        'observed_values': observed_values,
+        'real_values': real_values,
+        'times': times,
+        'y_pred': y_pred,
+        'snapshots': snapshots if snapshot_iters is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# DEPRECATED — kept for backwards compatibility; use run_bo_loop() instead
+# ---------------------------------------------------------------------------
+
+
 def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
                   n_init=5, budget=100, device='cpu', snapshot_iters=None):
     """
+    .. deprecated::
+        Use ``run_bo_loop(GPSurrogate(device=device), ...)`` instead.
+        This function is kept for backwards compatibility and will be removed
+        in a future sprint.
+
     Performs the Active Learning loop using a GP model.
 
     Args:
@@ -164,6 +330,11 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
 def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
                           n_init=5, budget=100, device='cpu', snapshot_iters=None):
     """
+    .. deprecated::
+        Use ``run_bo_loop(TabPFNSurrogate(model), ...)`` instead.
+        This function is kept for backwards compatibility and will be removed
+        in a future sprint.
+
     Performs the Active Learning loop using a finetuned TabPFN model.
 
     This mirrors run_bo_loop from main.py but takes a TabPFNRegressor

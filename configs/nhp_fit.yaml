@@ -1,0 +1,15 @@
+# Canonical config: NHP inter-subject fit
+# Usage (once --config support is implemented):
+#   python src/finetuning.py --config configs/nhp_fit.yaml
+
+family: fit
+dataset: nhp
+split: inter_subject
+mode: fit
+device: cuda
+epochs: 50
+lr: 1.0e-5
+n_augmentations: 25
+budget: 150
+n_reps: 30
+save: true

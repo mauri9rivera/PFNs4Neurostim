@@ -1,0 +1,24 @@
+# Canonical config for ID/OOD analysis using the TabPFN v1 Prior Bag reference.
+# Family: prior-bag
+# NOTE: Prior Bag v1 approximates the ICLR 2023 prior (MLP-dominant + GP mix).
+# Due to random MLP weights, entropy(Prior Bag) ~ entropy(Noise OOD).
+# Use GP reference as the reliable ID anchor; treat this as a secondary reference only.
+# Usage:
+#   python src/id_ood_analysis.py --config configs/id_ood_prior_bag.yaml
+
+family: prior-bag
+datasets:
+  - rat
+  - nhp
+
+analyses:
+  - entropy
+  - mmd
+  - mahalanobis
+
+prior_source: tabpfn_prior
+device: cpu
+n_synthetic: 500
+n_context: 50
+seed: 42
+save: true

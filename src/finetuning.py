@@ -19,6 +19,9 @@ import json
 import os
 import random
 from datetime import datetime
+from typing import Any
+
+import yaml
 
 import numpy as np
 import torch
@@ -247,15 +250,31 @@ def run_experiment(
         tag_parts.append(f'emg{held_out_emg_idx}')
     exp_tag = '_'.join(tag_parts)
 
-    _save_tag = generate_experiment_tag(
-        dataset_type, split_type, epochs, lr, n_augmentations,
-        held_out_subj_idx=held_out_subj_idx,
-        held_out_emg_idx=held_out_emg_idx,
-    )
-    if lora_weights:
-        _save_tag += '_lora_loaded'
-    elif use_lora:
-        _save_tag += f'_lora_r{lora_rank}_a{lora_alpha}'
+    # Determine experiment family from run parameters
+    if use_lora or lora_weights:
+        _family = 'lora-ablation'
+    elif budgets and any(m in (mode or ['fit']) for m in ('fit_budget', 'optimization_budget')):
+        _family = 'optimization-budget'
+    else:
+        _family = 'optimization' if 'optimization' in (mode or ['fit']) else 'fit'
+
+    _tag_config: dict[str, Any] = {
+        'dataset_type': dataset_type,
+        'split_type': split_type,
+        'epochs': epochs,
+        'lr': lr,
+        'n_augmentations': n_augmentations,
+        'held_out_subj_idx': held_out_subj_idx,
+        'held_out_emg_idx': held_out_emg_idx,
+    }
+    if use_lora or lora_weights:
+        _tag_config.update({
+            'lora_rank': lora_rank,
+            'lora_alpha': lora_alpha,
+            'lora_target': lora_target,
+            'lora_weights': lora_weights,
+        })
+    _save_tag = generate_experiment_tag(dataset_type, _family, _tag_config)
 
     # --- Build test experiment list ---
     experiments = []
@@ -301,6 +320,16 @@ def run_experiment(
         })
     write_run_config(run_dir, run_config)
     print(f"[INFO] Run directory: {run_dir}")
+
+    # --- Build metadata for pkl provenance ---
+    _metadata: dict[str, Any] = {
+        'family': _family,
+        'dataset': dataset_type,
+        'tag': _save_tag,
+        'date': datetime.now().isoformat(timespec='seconds'),
+        'run_type': 'run_experiment',
+        'held_out_subj': held_out_subj_idx,
+    }
 
     # --- Obtain finetuned model: load checkpoint or train from scratch ---
     if lora_weights:
@@ -373,7 +402,8 @@ def run_experiment(
             if save:
                 save_results(results_dict, 'fit',
                              output_dir=os.path.join(run_dir, 'results'),
-                             tag=_save_tag)
+                             tag=_save_tag,
+                             metadata=_metadata)
             all_results['fit'] = results_dict
 
         elif m == 'optimization':
@@ -410,7 +440,8 @@ def run_experiment(
             if save:
                 save_results(results_dict, 'optimization',
                              output_dir=os.path.join(run_dir, 'results'),
-                             tag=_save_tag)
+                             tag=_save_tag,
+                             metadata=_metadata)
             all_results['optimization'] = results_dict
 
         elif m == 'fit_budget':
@@ -456,12 +487,37 @@ def run_experiment(
 #       CLI Entry Point
 # ============================================
 
+def _load_yaml_config(path: str) -> dict[str, Any]:
+    """Load a YAML experiment config file.
+
+    Args:
+        path: Filesystem path to a ``.yaml`` config file.
+
+    Returns:
+        Dict of key-value pairs from the YAML document.
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+        ValueError: If the YAML document is not a mapping.
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config file must be a YAML mapping, got {type(cfg).__name__}: {path}")
+    return cfg
+
+
 def run_finetuning():
     parser = argparse.ArgumentParser(
         description='Fine-tune TabPFN on neurostimulation data and run evaluation.',
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument('--dataset', type=str, default='nhp', choices=['rat', 'nhp', 'spinal'],
+    parser.add_argument('--config', type=str, default=None, metavar='PATH',
+                        help='Path to a YAML config file.  All keys are used as defaults; '
+                             'any CLI flag that is explicitly provided overrides the YAML value.')
+    parser.add_argument('--dataset', type=str, default=None, choices=['rat', 'nhp', 'spinal'],
                         help='Dataset type (default: nhp)')
     parser.add_argument('--split', type=str, default='inter_subject',
                         choices=['inter_subject', 'intra_emg'],
@@ -522,6 +578,51 @@ def run_finetuning():
                              'and goes straight to evaluation.')
 
     args = parser.parse_args()
+
+    # --- YAML config loading: load first, then let explicit CLI args override ---
+    if args.config is not None:
+        yaml_cfg = _load_yaml_config(args.config)
+        # For each key in the YAML, set it on args only when the user did NOT
+        # explicitly pass the corresponding flag (i.e. the value is still None
+        # or the argparse default).  We detect "still default" conservatively
+        # by checking for None; boolean flags (store_true) default to False so
+        # they are only overridden when absent from the parsed namespace.
+        _bool_flags = {'save', 'diagnostics', 'lora'}
+        for key, value in yaml_cfg.items():
+            if key in _bool_flags:
+                # Only apply YAML value when the flag was NOT explicitly set
+                # (argparse store_true defaults to False; we can't distinguish
+                # "user passed --save" from "default False", so YAML wins for
+                # False-valued booleans only).
+                if not getattr(args, key, False):
+                    setattr(args, key, value)
+            elif getattr(args, key, None) is None:
+                setattr(args, key, value)
+        print(f"[config] Loaded YAML defaults from {args.config}")
+
+    # Apply argparse defaults for any remaining None values
+    _defaults = {
+        'dataset': 'nhp',
+        'split': 'inter_subject',
+        'mode': ['fit'],
+        'device': 'cuda',
+        'epochs': 50,
+        'lr': 1e-5,
+        'n_augmentations': 25,
+        'budget': 100,
+        'n_reps': 30,
+        'held_out_emg': None,
+        'held_out_subj': None,
+        'budgets': [10, 30, 50, 100],
+        'aug_counts': None,
+        'lora_rank': 8,
+        'lora_alpha': 16,
+        'lora_target': 'decoder_dict',
+        'lora_weights': None,
+    }
+    for key, default in _defaults.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, default)
 
     _CLI_MODES = _VALID_MODES | {'aug_sweep_fit', 'aug_sweep_optimization'}
     invalid = set(args.mode) - _CLI_MODES

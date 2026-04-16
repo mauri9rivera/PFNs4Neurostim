@@ -1,0 +1,24 @@
+# Canonical hyperparameters for rat inter-subject optimization experiment.
+# Family: optimization
+# Usage:
+#   python src/finetuning.py --config configs/rat_optimization.yaml
+
+family: optimization
+dataset: rat
+split: inter_subject
+mode:
+  - optimization
+
+# Training
+epochs: 50
+lr: 1.0e-5
+n_augmentations: 25
+
+# Evaluation — rat grid is 8x4=32 sites, so budget matches grid size
+budget: 32
+n_reps: 30
+
+# Infrastructure
+device: cuda
+save: true
+diagnostics: false

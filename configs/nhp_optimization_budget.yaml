@@ -1,0 +1,31 @@
+# Canonical hyperparameters for NHP budget sweep (optimization mode).
+# Family: optimization-budget
+# Sweeps BO query budgets to test TabPFN robustness at small training sizes.
+# Usage:
+#   python src/finetuning.py --config configs/nhp_optimization_budget.yaml
+
+family: optimization-budget
+dataset: nhp
+split: inter_subject
+mode:
+  - optimization_budget
+
+# Training
+epochs: 50
+lr: 1.0e-5
+n_augmentations: 25
+
+# Evaluation
+budget: 100
+n_reps: 30
+budgets:
+  - 10
+  - 30
+  - 50
+  - 100
+  - 200
+
+# Infrastructure
+device: cuda
+save: true
+diagnostics: false

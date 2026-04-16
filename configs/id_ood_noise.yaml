@@ -1,0 +1,23 @@
+# Canonical config for ID/OOD analysis using the Noise OOD reference only.
+# Family: noise
+# Noise (clustered/correlated/concentrated generators) serves as the OOD
+# upper-bound calibration anchor.
+# Usage:
+#   python src/id_ood_analysis.py --config configs/id_ood_noise.yaml
+
+family: noise
+datasets:
+  - rat
+  - nhp
+
+analyses:
+  - entropy
+  - mmd
+  - mahalanobis
+
+prior_source: noise
+device: cpu
+n_synthetic: 500
+n_context: 50
+seed: 42
+save: true
