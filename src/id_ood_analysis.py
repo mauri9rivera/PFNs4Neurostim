@@ -18,7 +18,11 @@ import yaml
 from analysis.id_ood import run_id_ood_analysis
 from analysis.id_ood_visualization import (
     plot_entropy_distribution, plot_entropy_heatmap,
-    plot_mmd_barplot, plot_mahalanobis_distribution,
+    plot_mmd_heatmap, plot_mahalanobis_distribution,
+    plot_cka_heatmap, plot_cka_layerwise_heatmap,
+    plot_gradient_norm_barplot,
+    plot_rsa_layerwise,
+    plot_procrustes_trajectory,
     plot_summary_dashboard,
 )
 
@@ -68,6 +72,10 @@ def write_id_ood_config(output_dir, args):
         'n_synthetic': args.n_synthetic,
         'n_context': args.n_context,
         'seed': args.seed,
+        'cka_layers': args.cka_layers,
+        'proc_budgets': args.proc_budgets,
+        'proc_layer': args.proc_layer,
+        'proc_n_synthetic': args.proc_n_synthetic,
     }
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, 'config.json')
@@ -89,7 +97,9 @@ def main():
                         help='Dataset types to analyze (default: rat nhp)')
     parser.add_argument('--analyses', nargs='+',
                         default=None,
-                        choices=['entropy', 'mmd', 'mahalanobis'],
+                        choices=['entropy', 'mmd', 'mahalanobis',
+                                 'cka', 'wasserstein', 'gradient_norm',
+                                 'rsa', 'procrustes'],
                         help='Which analyses to run (default: entropy mmd mahalanobis)')
     parser.add_argument('--prior_source', default=None,
                         choices=['gp', 'tabpfn_prior', 'noise', 'both', 'all'],
@@ -107,6 +117,19 @@ def main():
                              'remain reproducible post-hoc.')
     parser.add_argument('--save', action='store_true',
                         help='Save results and plots to disk')
+    parser.add_argument('--cka_layers', nargs='+', type=int, default=None,
+                        help='Transformer layer indices for CKA analysis. '
+                             'Default: ID_OOD_LAYERS=[4, 13, 17]. '
+                             'Dense sweep: --cka_layers 0 2 4 6 8 10 12 14 16 17')
+    parser.add_argument('--proc_budgets', nargs='+', type=int, default=None,
+                        help='BO budget steps for Procrustes trajectory '
+                             '(B7). Default: [2, 10, 30, 50, 100].')
+    parser.add_argument('--proc_layer', type=int, default=None,
+                        help='Transformer layer for Procrustes embedding '
+                             'extraction (default 17).')
+    parser.add_argument('--proc_n_synthetic', type=int, default=None,
+                        help='Synthetic datasets per reference for '
+                             'Procrustes trajectory (default 20).')
 
     args = parser.parse_args()
 
@@ -130,6 +153,8 @@ def main():
         'device': 'cpu',
         'n_synthetic': 500,
         'n_context': 50,
+        'proc_layer': 17,
+        'proc_n_synthetic': 20,
     }
     for key, default in _defaults.items():
         if getattr(args, key, None) is None:
@@ -162,6 +187,10 @@ def main():
         seed=args.seed,
         save=args.save,
         output_dir=output_dir,
+        cka_layers=args.cka_layers,
+        proc_budgets=args.proc_budgets,
+        proc_layer=args.proc_layer,
+        proc_n_synthetic=args.proc_n_synthetic,
     )
 
     # Generate visualizations
@@ -174,19 +203,54 @@ def main():
                                 output_dir=output_dir)
 
     if 'mmd' in all_results:
-        plot_mmd_barplot(all_results['mmd'], save=args.save,
-                         output_dir=output_dir)
+        plot_mmd_heatmap(
+            all_results['mmd'],
+            wasserstein_results=all_results.get('wasserstein'),
+            save=args.save, output_dir=output_dir,
+        )
+
+    if 'wasserstein' in all_results and 'mmd' not in all_results:
+        plot_mmd_heatmap(
+            None,
+            wasserstein_results=all_results['wasserstein'],
+            save=args.save, output_dir=output_dir,
+        )
 
     if 'mahalanobis' in all_results:
         plot_mahalanobis_distribution(all_results['mahalanobis'],
                                       save=args.save, output_dir=output_dir)
 
-    # Summary dashboard (only if all three analyses ran)
-    if all(k in all_results for k in ['entropy', 'mmd', 'mahalanobis']):
+    if 'cka' in all_results:
+        plot_cka_heatmap(all_results['cka'], save=args.save,
+                         output_dir=output_dir)
+        plot_cka_layerwise_heatmap(all_results['cka'], save=args.save,
+                                   output_dir=output_dir)
+
+    if 'gradient_norm' in all_results:
+        plot_gradient_norm_barplot(all_results['gradient_norm'],
+                                   save=args.save, output_dir=output_dir)
+
+    if 'rsa' in all_results:
+        plot_rsa_layerwise(all_results['rsa'], save=args.save,
+                           output_dir=output_dir)
+
+    if 'procrustes' in all_results:
+        plot_procrustes_trajectory(all_results['procrustes'],
+                                   save=args.save, output_dir=output_dir)
+
+    # Summary dashboard — passes all result dicts; each is None if not run
+    if any(k in all_results for k in
+           ['entropy', 'mmd', 'mahalanobis', 'cka', 'wasserstein',
+            'gradient_norm', 'rsa', 'procrustes']):
         plot_summary_dashboard(
-            all_results['entropy'],
-            all_results['mmd'],
-            all_results['mahalanobis'],
+            entropy_results=all_results.get('entropy'),
+            mmd_results=all_results.get('mmd'),
+            mahalanobis_results=all_results.get('mahalanobis'),
+            cka_results=all_results.get('cka'),
+            wasserstein_results=all_results.get('wasserstein'),
+            gradient_results=all_results.get('gradient_norm'),
+            rsa_results=all_results.get('rsa'),
+            procrustes_results=all_results.get('procrustes'),
             save=args.save, output_dir=output_dir,
         )
 

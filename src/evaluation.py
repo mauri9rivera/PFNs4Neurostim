@@ -339,8 +339,7 @@ def evaluate_optimization(
     device: str = 'cpu',
     budget: int = 100,
     n_reps: int = 20,
-    kappa_0: float = 2.5,
-    kappa_min: float = 0.5,
+    kappa_schedule: float = 0.0,
     normalization: str = 'pfn',
 ) -> dict:
     """Evaluate Bayesian optimisation performance using any surrogate model.
@@ -364,8 +363,9 @@ def evaluate_optimization(
         device: PyTorch device string, ``'cpu'`` or ``'cuda'``.
         budget: Total number of BO queries (including initial random points).
         n_reps: Number of independent BO repetitions.
-        kappa_0: Initial UCB exploration coefficient (cosine annealing start).
-        kappa_min: Final UCB exploration coefficient (cosine annealing end).
+        kappa_schedule: UCB coefficient control passed to ``run_bo_loop``.
+            ``0.0`` → auto cosine-annealed schedule (GP-UCB theory scaling).
+            Any other value → fixed kappa throughout the BO loop.
         normalization: Preprocessing scheme passed to ``preprocess_neural_data``;
             use ``'pfn'`` for TabPFN surrogates and ``'gp'`` for GP surrogates.
 
@@ -411,8 +411,7 @@ def evaluate_optimization(
             y_test=y_test,
             n_init=n_init,
             budget=budget,
-            kappa_0=kappa_0,
-            kappa_min=kappa_min,
+            kappa_schedule=kappa_schedule,
             snapshot_iters=snap_iters if i == snapshot_rep else None,
         )
 
@@ -445,12 +444,20 @@ def evaluate_optimization(
     snapshot_results: dict | None = None
     if collected_snapshots is not None:
         snapshot_results = {}
-        for it, s_pred in collected_snapshots.items():
+        for it, snap_data in collected_snapshots.items():
+            s_pred = snap_data['y_pred']
             s_pred_unscaled = scaler_y.inverse_transform(
                 s_pred.reshape(-1, 1)
             ).ravel()  # [M]
             s_r2 = float(np.clip(r2_score(y_test, s_pred_unscaled), 0.0, 1.0))
-            snapshot_results[it] = {'y_pred': s_pred_unscaled, 'r2': s_r2}
+            best_pred_unscaled = float(
+                scaler_y.inverse_transform([[snap_data['best_pred_val']]])[0, 0]
+            )
+            snapshot_results[it] = {
+                'y_pred': s_pred_unscaled,
+                'r2': s_r2,
+                'best_pred_val': best_pred_unscaled,
+            }
 
     return {
         'model_type': type(surrogate).__name__,
@@ -728,7 +735,7 @@ def finetuned_percentage(
 
     # --- Create per-run output directory and write config ---
     if save:
-        run_dir = create_run_dir(aug_sweep_tag)
+        run_dir = create_run_dir(aug_sweep_tag, tag=aug_sweep_tag)
         write_run_config(run_dir, {
             'run_type': 'finetuned_percentage',
             'experiment_tag': aug_sweep_tag,

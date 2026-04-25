@@ -35,7 +35,7 @@ from utils.visualization import (
     r2_per_muscle,
     r2_by_subject,
     regret_with_timing,
-    regret_by_subject,
+    regret_curve,
 )
 
 
@@ -226,6 +226,7 @@ def _load_combined_results_dict(
     dataset: str,
     result_type: str,
     runs_dir: str,
+    tags: Optional[List[str]] = None,
 ) -> Optional[Dict[str, list]]:
     """Reconstruct a combined ``results_dict`` from all matching run pkl files.
 
@@ -237,12 +238,15 @@ def _load_combined_results_dict(
         dataset: Dataset type.
         result_type: ``'fit'`` or ``'optimization'``.
         runs_dir: Root directory for runs.
+        tags: Optional list of 5-char hash suffixes to restrict loading.
+            ``None`` loads all runs matching the family prefix.
 
     Returns:
         Combined ``{'ModelName': [list of result dicts], ...}`` or ``None``
         if no pkl files matched.
     """
     prefix = f"{dataset}-{family}-"
+    tag_set = set(tags) if tags is not None else None
     if not os.path.isdir(runs_dir):
         return None
 
@@ -254,6 +258,8 @@ def _load_combined_results_dict(
 
     for name in sorted(os.listdir(runs_dir)):
         if not name.startswith(prefix):
+            continue
+        if tag_set is not None and name[len(prefix):] not in tag_set:
             continue
         run_dir = os.path.join(runs_dir, name)
         if not os.path.isdir(run_dir):
@@ -290,6 +296,7 @@ def run_aggregation(
     result_types: Optional[List[str]] = None,
     runs_dir: str = './output/runs',
     output_dir: str = './output/aggregated',
+    tags: Optional[List[str]] = None,
 ) -> None:
     """Run full aggregation pipeline for a canonical YAML config.
 
@@ -335,7 +342,7 @@ def run_aggregation(
                 f"(runs_dir={runs_dir})"
             )
 
-            df = aggregate_results(family, dataset, result_type, runs_dir)
+            df = aggregate_results(family, dataset, result_type, runs_dir, tags=tags)
 
             if df.empty:
                 print(
@@ -370,7 +377,7 @@ def run_aggregation(
             # --- Generate plots ---
             if result_type in _DICT_RESULT_TYPES:
                 combined = _load_combined_results_dict(
-                    family, dataset, result_type, runs_dir
+                    family, dataset, result_type, runs_dir, tags=tags
                 )
                 if combined is not None:
                     tag_label = f"{dataset}_{family}_aggregated"
@@ -389,9 +396,14 @@ def run_aggregation(
                                 combined, split_type=tag_label,
                                 save=True, output_dir=out_subdir,
                             )
-                            regret_by_subject(
+                            regret_curve(
                                 combined, split_type=tag_label,
                                 save=True, output_dir=out_subdir,
+                            )
+                            r2_by_subject(
+                                combined, split_type=tag_label,
+                                save=True, output_dir=out_subdir,
+                                output_subdir='optimization',
                             )
                     except Exception as exc:
                         print(f"  [WARNING] Plot generation failed: {exc}")
@@ -442,6 +454,13 @@ def main() -> None:
         '--output_dir', type=str, default='./output/aggregated',
         help='Root directory for aggregated output (default: ./output/aggregated)',
     )
+    parser.add_argument(
+        '--tags', type=str, nargs='+', default=None,
+        metavar='TAG',
+        help='Restrict aggregation to runs with these 5-char hash suffixes.\n'
+             'Example: --tags 32c2b 15h5p\n'
+             'Default: aggregate all runs matching the family prefix.',
+    )
 
     args = parser.parse_args()
 
@@ -450,6 +469,7 @@ def main() -> None:
         result_types=args.result_types,
         runs_dir=args.runs_dir,
         output_dir=args.output_dir,
+        tags=args.tags,
     )
 
 

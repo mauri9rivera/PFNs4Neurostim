@@ -4,6 +4,8 @@ Dedicated plots for ID/OOD analysis results.
 Follows conventions from src/utils/visualization.py:
 matplotlib/seaborn, SVG output, save flag, output_dir.
 """
+from __future__ import annotations
+
 import os
 
 import matplotlib.pyplot as plt
@@ -617,6 +619,7 @@ def plot_mahalanobis_distribution(mahalanobis_results, save=False, output_dir=No
 def plot_summary_dashboard(entropy_results=None, mmd_results=None,
                            mahalanobis_results=None, cka_results=None,
                            wasserstein_results=None, gradient_results=None,
+                           rsa_results=None, procrustes_results=None,
                            save=False, output_dir=None):
     """Multi-panel paper-ready summary.
 
@@ -630,6 +633,7 @@ def plot_summary_dashboard(entropy_results=None, mmd_results=None,
         cka_results: dict from cka_analysis()
         wasserstein_results: dict from wasserstein_analysis()
         gradient_results: dict from gradient_norm_analysis()
+        rsa_results: dict from rsa_analysis()
         save: whether to save figure
         output_dir: base output directory
     """
@@ -647,6 +651,10 @@ def plot_summary_dashboard(entropy_results=None, mmd_results=None,
         panels.append(('E', 'Wasserstein-2', wasserstein_results))
     if gradient_results is not None:
         panels.append(('F', 'Gradient Norm', gradient_results))
+    if rsa_results is not None:
+        panels.append(('G', 'RSA', rsa_results))
+    if procrustes_results is not None:
+        panels.append(('H', 'Procrustes', procrustes_results))
 
     if not panels:
         return
@@ -654,8 +662,10 @@ def plot_summary_dashboard(entropy_results=None, mmd_results=None,
     n = len(panels)
     if n <= 3:
         nrows, ncols = 1, n
-    else:
+    elif n <= 6:
         nrows, ncols = 2, 3
+    else:
+        nrows, ncols = 3, 3
 
     fig, axes = plt.subplots(nrows, ncols,
                               figsize=(6 * ncols, 5 * nrows),
@@ -677,6 +687,10 @@ def plot_summary_dashboard(entropy_results=None, mmd_results=None,
             _panel_wasserstein(ax, data)
         elif title == 'Gradient Norm':
             _panel_gradient_norm(ax, data)
+        elif title == 'RSA':
+            _panel_rsa(ax, data)
+        elif title == 'Procrustes':
+            _panel_procrustes(ax, data)
 
         ax.set_title(f'{letter}) {title}')
 
@@ -872,4 +886,269 @@ def _panel_gradient_norm(ax, gradient_results):
         ax.legend(fontsize=6)
 
     ax.set_ylabel('Grad L2 (log)')
+    ax.grid(True, alpha=0.3, axis='y')
+
+
+# ============================================================================
+#  RSA Line Plot
+# ============================================================================
+
+def plot_rsa_layerwise(
+    rsa_results: dict,
+    save: bool = False,
+    output_dir: str | None = None,
+) -> None:
+    """Line plot: RSA Spearman rho vs transformer layer index.
+
+    One subplot per dataset type; one line per reference type.
+    Reveals where neurostim geometry tracks the prior's geometry.
+
+    Args:
+        rsa_results: dict from rsa_analysis().
+        save: Whether to save the figure to disk.
+        output_dir: Base output directory. Saves to
+            <output_dir>/rsa/rsa_by_layer.svg.
+    """
+    dataset_types = [k for k in rsa_results if k != 'layers']
+    layers = rsa_results.get('layers', [4, 13, 17])
+    refs = ['gp', 'prior', 'noise']
+    ref_labels = {
+        'gp': 'Synthetic GP',
+        'prior': 'TabPFN Prior',
+        'noise': 'Noise (OOD)',
+    }
+
+    n_datasets = len(dataset_types)
+    if n_datasets == 0:
+        return
+
+    fig, axes = plt.subplots(1, n_datasets,
+                              figsize=(6 * n_datasets, 4),
+                              squeeze=False)
+
+    for col, dataset_type in enumerate(dataset_types):
+        ax = axes[0, col]
+        for ref in refs:
+            rho_per_layer = []
+            for layer_idx in layers:
+                rhos = [
+                    rsa_results[dataset_type][subj][emg][layer_idx].get(
+                        f'rsa_{ref}', np.nan,
+                    )
+                    for subj in rsa_results[dataset_type]
+                    for emg in rsa_results[dataset_type][subj]
+                    if layer_idx in rsa_results[dataset_type][subj][emg]
+                ]
+                rho_per_layer.append(np.nanmean(rhos) if rhos else np.nan)
+
+            label = ref_labels[ref]
+            ax.plot(layers, rho_per_layer,
+                    label=label,
+                    color=PALETTE[label],
+                    marker='o',
+                    linewidth=1.8)
+
+        ax.set_xlabel('Transformer layer')
+        ax.set_ylabel('RSA Spearman ρ')
+        ax.set_title(f'{dataset_type.upper()} — RSA by Layer')
+        ax.set_ylim(-1, 1)
+        ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3, axis='y')
+
+    fig.suptitle('RSA: Neurostim Geometry vs Synthetic Reference Embeddings',
+                 fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+
+    if save:
+        base = _save_dir(output_dir, 'rsa')
+        path = os.path.join(base, 'rsa_by_layer.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
+
+
+# ============================================================================
+#  Procrustes BO-Trajectory (B7)
+# ============================================================================
+
+def plot_procrustes_trajectory(
+    trajectory_results: dict,
+    save: bool = False,
+    output_dir: str | None = None,
+) -> None:
+    """Plot Procrustes disparity vs BO budget (B7).
+
+    One line per source (neurostim datasets + synthetic GP / TabPFN Prior /
+    Noise).  Mean ± 1 std across trajectories (one trajectory per neurostim
+    (subject, EMG) pair or per synthetic dataset).  Disparity at
+    budgets[0] is 0 by construction (self-comparison baseline).
+
+    Args:
+        trajectory_results: dict from ``embedding_trajectory_analysis()``.
+        save: Whether to save the figure.
+        output_dir: Base output directory.  Saves to
+            ``<output_dir>/trajectory/procrustes_disparity_vs_budget.svg``.
+    """
+    budgets = trajectory_results.get('budgets', [])
+    layer = trajectory_results.get('layer', 17)
+    if not budgets:
+        print("  [Procrustes] No budgets in results, skipping plot")
+        return
+
+    # Group trajectories per labelled source
+    curves: dict[str, np.ndarray] = {}
+
+    meta_keys = {'budgets', 'layer'}
+    synthetic_prefix = 'synthetic_'
+    dataset_types = [k for k in trajectory_results
+                     if k not in meta_keys and not k.startswith(synthetic_prefix)]
+
+    # Neurostim: one curve per dataset, pooling subj/emg pairs
+    for dt in dataset_types:
+        trajs = []
+        for subj_data in trajectory_results[dt].values():
+            for traj in subj_data.values():
+                trajs.append(traj)
+        if trajs:
+            curves[f'{dt.upper()} Neurostim'] = np.asarray(trajs, dtype=float)
+
+    # Synthetic references
+    synth_labels = {
+        'synthetic_gp': 'Synthetic GP',
+        'synthetic_prior': 'TabPFN Prior',
+        'synthetic_noise': 'Noise (OOD)',
+    }
+    for key, label in synth_labels.items():
+        trajs = trajectory_results.get(key, [])
+        if trajs:
+            curves[label] = np.asarray(trajs, dtype=float)
+
+    if not curves:
+        print("  [Procrustes] No trajectories to plot")
+        return
+
+    neurostim_palette = {
+        'NHP Neurostim': PALETTE['Neurostim'],
+        'RAT Neurostim': PALETTE['Neurostim GT'],
+        'SPINAL Neurostim': '#2f6fa0',
+    }
+    synth_palette = {
+        'Synthetic GP': PALETTE['Synthetic GP'],
+        'TabPFN Prior': PALETTE['TabPFN Prior'],
+        'Noise (OOD)': PALETTE['Noise (OOD)'],
+    }
+    palette = {**neurostim_palette, **synth_palette}
+
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    for label, arr in curves.items():
+        # arr: [n_trajectories, n_budgets]
+        mean = np.nanmean(arr, axis=0)
+        std = np.nanstd(arr, axis=0)
+        color = palette.get(label, 'gray')
+        ax.plot(budgets, mean, label=f'{label} (n={len(arr)})',
+                color=color, marker='o', linewidth=1.8)
+        ax.fill_between(budgets, mean - std, mean + std,
+                        color=color, alpha=0.18)
+
+    ax.set_xlabel('BO budget (# context observations)')
+    ax.set_ylabel(f'Procrustes disparity vs E(t={budgets[0]})')
+    ax.set_title(
+        f'B7 — Embedding Geometry Trajectory during BO (layer {layer})',
+    )
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, loc='best')
+    fig.tight_layout()
+
+    if save:
+        base = _save_dir(output_dir, 'trajectory')
+        path = os.path.join(base, 'procrustes_disparity_vs_budget.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
+
+
+def _panel_procrustes(ax: plt.Axes, trajectory_results: dict) -> None:
+    """Compact Procrustes trajectory line plot for summary dashboard."""
+    budgets = trajectory_results.get('budgets', [])
+    if not budgets:
+        ax.set_visible(False)
+        return
+
+    meta_keys = {'budgets', 'layer'}
+    synthetic_prefix = 'synthetic_'
+    dataset_types = [k for k in trajectory_results
+                     if k not in meta_keys and not k.startswith(synthetic_prefix)]
+
+    sources: dict[str, tuple[np.ndarray, str]] = {}
+    for dt in dataset_types:
+        trajs = [traj for subj in trajectory_results[dt].values()
+                 for traj in subj.values()]
+        if trajs:
+            sources[f'{dt.upper()}'] = (np.asarray(trajs, dtype=float),
+                                        PALETTE['Neurostim'])
+    for key, (label, color) in {
+        'synthetic_gp':    ('GP',    PALETTE['Synthetic GP']),
+        'synthetic_prior': ('Prior', PALETTE['TabPFN Prior']),
+        'synthetic_noise': ('Noise', PALETTE['Noise (OOD)']),
+    }.items():
+        if trajectory_results.get(key):
+            sources[label] = (np.asarray(trajectory_results[key], dtype=float),
+                              color)
+
+    for label, (arr, color) in sources.items():
+        mean = np.nanmean(arr, axis=0)
+        ax.plot(budgets, mean, label=label, color=color,
+                marker='o', linewidth=1.5)
+
+    ax.set_xlabel('BO budget')
+    ax.set_ylabel('Procrustes disp.')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=6)
+
+
+def _panel_rsa(ax: plt.Axes, rsa_results: dict) -> None:
+    """Compact RSA barplot for summary dashboard at deepest analyzed layer.
+
+    Args:
+        ax: Axes to draw on.
+        rsa_results: dict from rsa_analysis().
+    """
+    layers = rsa_results.get('layers', [4, 13, 17])
+    layer = max(layers)
+    dataset_types = [k for k in rsa_results if k != 'layers']
+    refs = ['gp', 'prior', 'noise']
+    ref_labels = {
+        'gp': 'Synthetic GP',
+        'prior': 'TabPFN Prior',
+        'noise': 'Noise (OOD)',
+    }
+
+    rsa_data = []
+    for dt in dataset_types:
+        for subj_data in rsa_results[dt].values():
+            for emg_data in subj_data.values():
+                if layer not in emg_data:
+                    continue
+                for ref in refs:
+                    key = f'rsa_{ref}'
+                    if key in emg_data[layer]:
+                        rsa_data.append({
+                            'Dataset': dt.upper(),
+                            'RSA ρ': emg_data[layer][key],
+                            'Reference': ref_labels[ref],
+                        })
+
+    if rsa_data:
+        df = pd.DataFrame(rsa_data)
+        sns.barplot(data=df, x='Dataset', y='RSA ρ', hue='Reference',
+                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
+                             PALETTE['Noise (OOD)']],
+                    ax=ax, capsize=0.1, errorbar=('ci', 95))
+
+    ax.set_ylim(-1, 1)
+    ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+    ax.set_title(f'RSA ρ (Layer {layer})')
     ax.grid(True, alpha=0.3, axis='y')

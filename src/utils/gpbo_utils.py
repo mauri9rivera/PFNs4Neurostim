@@ -6,28 +6,78 @@ from scipy.stats import norm as sp_norm
 import numpy as np
 
 
-def compute_ucb_kappa(t, n_steps, kappa_0, kappa_min, alpha: float = 0.5):
+def compute_ucb_kappa(t, n_steps, kappa_max, kappa_min, alpha: float = 0.5):
     """
     Cosine annealing of UCB exploration parameter kappa.
 
-    At t=0: returns kappa_min + 2*alpha*(kappa_0 - kappa_min).
+    At t=0: returns kappa_min + 2*alpha*(kappa_max - kappa_min).
     At t=n_steps: returns kappa_min (maximum exploitation).
-    At t=n_steps/2: returns kappa_min + alpha*(kappa_0 - kappa_min).
+    At t=n_steps/2: returns kappa_min + alpha*(kappa_max - kappa_min).
 
-    With alpha=0.5 (default): range is exactly [kappa_min, kappa_0].
-    With alpha<0.5: starts below kappa_0 (more exploitative from start).
-    With alpha>0.5: starts above kappa_0 (more exploratory from start).
+    With alpha=0.5 (default): range is exactly [kappa_min, kappa_max].
+    With alpha<0.5: starts below kappa_max (more exploitative from start).
+    With alpha>0.5: starts above kappa_max (more exploratory from start).
 
     Args:
         t: current step (0-indexed)
         n_steps: total number of BO steps (budget - n_init)
-        kappa_0: reference kappa (equals starting value when alpha=0.5)
+        kappa_max: reference kappa (equals starting value when alpha=0.5)
         kappa_min: final (minimum) kappa
         alpha: amplitude scale for cosine annealing (default 0.5)
     """
     if n_steps <= 0:
         return kappa_min
-    return kappa_min + alpha * (kappa_0 - kappa_min) * (1 + math.cos(math.pi * t / n_steps))
+    return kappa_min + alpha * (kappa_max - kappa_min) * (1 + math.cos(math.pi * t / n_steps))
+
+
+def _auto_kappa_max(
+    d: int, n_iter: int, alpha: float = 2.5, kappa_floor: float = 3.0
+) -> float:
+    """Compute upper UCB kappa bound from GP-UCB theory scaling.
+
+    k_max = max(alpha * sqrt(d * log(n_iter)), kappa_floor)
+
+    Derived from the Srinivas et al. (2010) GP-UCB beta_t formula, rescaled to
+    be dimension- and budget-aware. The kappa_floor prevents near-zero exploration
+    when n_iter is very small.
+
+    Example values (alpha=2.5, kappa_floor=3.0):
+        NHP  (d=2, n_iter=95):  k_max ≈ 7.54
+        Rat  (d=2, n_iter=27):  k_max ≈ 6.01
+
+    Args:
+        d: Input dimensionality.
+        n_iter: Number of active BO steps (budget - n_init).
+        alpha: Scale coefficient (default 2.5).
+        kappa_floor: Minimum allowed value (default 3.0).
+
+    Returns:
+        Scalar kappa upper bound.
+    """
+    return max(alpha * np.sqrt(d * np.log(max(n_iter, 2))), kappa_floor)
+
+
+def _auto_kappa_min(d: int, n_iter: int, beta: float = 0.2) -> float:
+    """Compute lower UCB kappa bound from GP-UCB theory scaling.
+
+    k_min = beta * sqrt(d * log(n_iter))
+
+    Maintains a constant ratio k_max / k_min = alpha / beta = 12.5x (default)
+    regardless of d and n_iter.
+
+    Example values (beta=0.2):
+        NHP  (d=2, n_iter=95):  k_min ≈ 0.60
+        Rat  (d=2, n_iter=27):  k_min ≈ 0.48
+
+    Args:
+        d: Input dimensionality.
+        n_iter: Number of active BO steps (budget - n_init).
+        beta: Scale coefficient (default 0.2).
+
+    Returns:
+        Scalar kappa lower bound.
+    """
+    return beta * np.sqrt(d * np.log(max(n_iter, 2)))
 
 
 def expected_improvement(model, likelihood, X_candidates, y_best, device):

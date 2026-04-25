@@ -287,7 +287,7 @@ def run_experiment(
                 experiments.append((subj_idx, emg_idx))
 
     # --- Always create per-run output directory so plots land in runs/<tag>/ ---
-    run_dir = create_run_dir(_save_tag)
+    run_dir = create_run_dir(_save_tag, tag=_save_tag)
     run_config = {
         'run_type': 'run_experiment',
         'experiment_tag': _save_tag,

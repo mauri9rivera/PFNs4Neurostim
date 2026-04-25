@@ -13,7 +13,7 @@ Finetuned TabPFN regressor wrappers and utilities.
 import copy
 import math
 import os
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable
 
 import gpytorch
 import numpy as np
@@ -111,8 +111,6 @@ class GPSurrogate:
         device: PyTorch device string ('cpu' or 'cuda').
         n_opt_steps: Number of Adam optimiser steps for hyperparameter training.
         lr: Learning rate for the Adam optimiser.
-        kappa_0: Initial UCB exploration coefficient (used in cosine annealing).
-        kappa_min: Minimum UCB exploration coefficient.
     """
 
     def __init__(
@@ -120,14 +118,10 @@ class GPSurrogate:
         device: str = 'cpu',
         n_opt_steps: int = 50,
         lr: float = 0.01,
-        kappa_0: float = 5.0,
-        kappa_min: float = 1.0,
     ) -> None:
         self._device = device
         self._n_opt_steps = n_opt_steps
         self._lr = lr
-        self._kappa_0 = kappa_0
-        self._kappa_min = kappa_min
         self._model: ExactGP | None = None
         self._likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
 
@@ -231,28 +225,30 @@ class TabPFNSurrogate:
     Uses TabPFN's native bar-distribution UCB for acquisition, which is more
     accurate than the Gaussian ``mean + kappa * std`` approximation.
 
+    The UCB exploration coefficient (kappa) is controlled externally via
+    ``run_bo_loop(kappa_schedule=...)``, not stored here.
+
     Args:
         model: A fitted ``TabPFNRegressor`` (from ``extract_inference_model()``
             for finetuned models, or a plain ``TabPFNRegressor`` for vanilla).
-        kappa_0: Initial UCB exploration coefficient for cosine annealing.
-        kappa_min: Final UCB exploration coefficient.
     """
 
     def __init__(
         self,
         model: TabPFNRegressor,
-        kappa_0: float = 2.5,
-        kappa_min: float = 0.5,
     ) -> None:
         self._model = model
-        self._kappa_0 = kappa_0
-        self._kappa_min = kappa_min
+        # Logit cache: populated by predict_ucb, invalidated by fit.
+        # Allows predict(X) to skip a second forward pass when called with the
+        # same X and context as the preceding predict_ucb(X) call.
+        self._logit_cache: Optional[tuple] = None  # (X_ref, logits, criterion)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         """Store in-context examples for the TabPFN forward pass.
 
         No gradient updates are performed; this call sets the context that
-        the transformer uses at prediction time.
+        the transformer uses at prediction time.  Invalidates the logit cache
+        since the context has changed.
 
         Args:
             X: Feature matrix of observed points, shape [N, D].  # [N, D]
@@ -263,13 +259,17 @@ class TabPFNSurrogate:
                 "TabPFNSurrogate.fit received NaN inputs. "
                 f"X has {np.isnan(X).sum()} NaNs, y has {np.isnan(y).sum()} NaNs."
             )
+        self._logit_cache = None
         self._model.fit(X, y)
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Return predictive mean and standard deviation from the bar distribution.
 
-        Uses quantile predictions to derive mean and std, matching the
-        ``std_from_quantiles`` approach used in the legacy BO loop.
+        If a logit cache is valid for this X (populated by a preceding
+        ``predict_ucb(X)`` call with the same context), derives quantiles
+        directly from the cached logits via ``criterion.icdf`` — avoiding a
+        second transformer forward pass.  Falls back to a full
+        ``output_type='quantiles'`` forward pass otherwise.
 
         Args:
             X: Query feature matrix, shape [M, D].  # [M, D]
@@ -280,9 +280,28 @@ class TabPFNSurrogate:
         from utils.gpbo_utils import std_from_quantiles  # avoid circular import
 
         quantile_levels = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+
+        # --- Try logit cache ---
+        if self._logit_cache is not None:
+            X_ref, cached_logits, cached_criterion = self._logit_cache
+            if X.shape == X_ref.shape and np.array_equal(X, X_ref):
+                try:
+                    q_rows = [
+                        cached_criterion.icdf(cached_logits, float(q))
+                        .detach().cpu().numpy()
+                        for q in quantile_levels
+                    ]  # each [M]
+                    quantiles = np.stack(q_rows, axis=0)  # [7, M]
+                    mean, std = std_from_quantiles(quantiles)  # [M], [M]
+                    if not (np.isnan(mean).any() or np.isnan(std).any()):
+                        return mean, std
+                except Exception:
+                    pass  # cache unusable — fall through to forward pass
+
+        # --- Full forward pass ---
         preds = self._model.predict(X, output_type="quantiles",
                                      quantiles=quantile_levels)
-        quantiles = np.array(preds).T  # [7, M]
+        quantiles = np.array(preds)  # [7, M]
         mean, std = std_from_quantiles(quantiles)  # [M], [M]
 
         if np.isnan(mean).any() or np.isnan(std).any():
@@ -308,6 +327,10 @@ class TabPFNSurrogate:
         which maps the Gaussian tail probability to the correct quantile of
         the bar distribution for UCB acquisition.
 
+        Caches the bar-distribution logits so that a subsequent ``predict(X)``
+        call on the same ``X`` (without an intervening ``fit``) can skip the
+        second transformer forward pass.
+
         Args:
             X: Candidate feature matrix, shape [M, D].  # [M, D]
             kappa: Current (already-annealed) UCB exploration coefficient.
@@ -319,8 +342,9 @@ class TabPFNSurrogate:
         """
         rest_prob = 0.5 * math.erfc(kappa / math.sqrt(2))
         full_output = self._model.predict(X, output_type="full")
-        logits = full_output['logits']
+        logits = full_output['logits']       # [M, num_bars]
         criterion = full_output['criterion']
+        self._logit_cache = (X.copy(), logits.detach(), criterion)
         ucb_vals = criterion.ucb(logits, 0, rest_prob=rest_prob, maximize=True)
         return ucb_vals.clone().cpu().numpy()  # [M]
 

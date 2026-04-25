@@ -5,6 +5,7 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import pickle
 import os
 import json
+import yaml
 from datetime import datetime
 import csv
 import matplotlib.pyplot as plt
@@ -453,10 +454,10 @@ def create_run_dir(
 
 
 def write_run_config(run_dir: str, config: dict) -> str:
-    """Serialize config dict to {run_dir}/config.json. Returns the file path."""
-    path = os.path.join(run_dir, 'config.json')
+    """Serialize config dict to {run_dir}/config.yaml. Returns the file path."""
+    path = os.path.join(run_dir, 'config.yaml')
     with open(path, 'w') as f:
-        json.dump(config, f, indent=2, default=str)
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
     print(f"Saved config  -> {path}")
     return path
 
@@ -786,6 +787,7 @@ def aggregate_results(
     dataset: str,
     result_type: str,
     runs_dir: str = './output/runs',
+    tags: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """Find all run directories matching ``{dataset}-{family}-*`` and merge results.
 
@@ -805,6 +807,9 @@ def aggregate_results(
               (DataFrame pkl, columns: Budget|Model|Regret|R2|ID)
 
         runs_dir: Root directory that contains per-run subdirectories.
+        tags: Optional list of 5-char hash suffixes (e.g. ``['32c2b', '15h5p']``).
+            When provided only run directories whose suffix matches are loaded.
+            ``None`` means load all directories matching the family prefix.
 
     Returns:
         Concatenated DataFrame.  Schema for ``fit`` / ``optimization``:
@@ -836,11 +841,14 @@ def aggregate_results(
     if not os.path.isdir(runs_dir):
         return pd.DataFrame()
 
-    # Collect matching run directories
+    # Collect matching run directories, optionally filtered to specific hash tags
+    tag_set = set(tags) if tags is not None else None
     matching_dirs: List[str] = [
         os.path.join(runs_dir, name)
         for name in os.listdir(runs_dir)
-        if name.startswith(prefix) and os.path.isdir(os.path.join(runs_dir, name))
+        if name.startswith(prefix)
+        and os.path.isdir(os.path.join(runs_dir, name))
+        and (tag_set is None or name[len(prefix):] in tag_set)
     ]
 
     if not matching_dirs:

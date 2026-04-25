@@ -19,6 +19,7 @@ Usage::
 import argparse
 import os
 import random
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +34,7 @@ from models.regressors import GPSurrogate, TabPFNSurrogate
 from utils.data_utils import (
     load_data,
     HELD_OUT_SUBJECTS,
+    ALL_SUBJECTS,
     generate_experiment_tag,
     save_results,
     create_run_dir,
@@ -46,15 +48,17 @@ from utils.visualization import (
     regret_by_subject,
     regret_by_emg,
     budget_sweep_plot,
+    regret_curve,
     visualize_representation,
+    kappa_regret_curves,
+    kappa_auc_bar,
 )
 
 
-_VALID_MODES: frozenset = frozenset({'fit', 'optimization', 'optimization_budget'})
+_VALID_MODES: frozenset = frozenset({'fit', 'optimization', 'optimization_budget', 'kappa_search'})
 
-# GP kappa values are fixed to match legacy GP BO behaviour
-_GP_KAPPA_0: float = 5.0
-_GP_KAPPA_MIN: float = 1.0
+# Default kappa values for kappa hyperparameter search
+_DEFAULT_KAPPA_VALUES: List[float] = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0]
 
 
 # ============================================
@@ -126,26 +130,31 @@ def _build_vanilla_tabpfn(
 def _build_experiments(
     dataset_type: str,
     held_out_subj_idx: Optional[int] = None,
+    subjects_mode: str = 'held_out',
 ) -> List[tuple]:
     """Build the list of (subject_idx, emg_idx) pairs to evaluate.
 
-    Uses ``HELD_OUT_SUBJECTS[dataset_type]`` x all valid EMG indices for
-    each held-out subject.  When *held_out_subj_idx* is given, only that
-    subject is evaluated (used by SLURM job-array Family 7).
+    Subject selection priority (highest to lowest):
+    1. ``held_out_subj_idx`` — single subject (SLURM job-array mode)
+    2. ``subjects_mode='all'`` — all valid subjects (LOO cross-validation)
+    3. ``subjects_mode='held_out'`` (default) — ``HELD_OUT_SUBJECTS`` only
 
     Args:
         dataset_type: ``'rat'`` or ``'nhp'``.
         held_out_subj_idx: If provided, restrict evaluation to this single
-            held-out subject index instead of all ``HELD_OUT_SUBJECTS``.
+            subject index (overrides ``subjects_mode``).
+        subjects_mode: ``'held_out'`` uses ``HELD_OUT_SUBJECTS[dataset_type]``;
+            ``'all'`` uses ``ALL_SUBJECTS[dataset_type]`` for LOO cross-validation.
 
     Returns:
         List of (subject_idx, emg_idx) tuples.
     """
-    subjects = (
-        [held_out_subj_idx]
-        if held_out_subj_idx is not None
-        else HELD_OUT_SUBJECTS[dataset_type]
-    )
+    if held_out_subj_idx is not None:
+        subjects = [held_out_subj_idx]
+    elif subjects_mode == 'all':
+        subjects = ALL_SUBJECTS[dataset_type]
+    else:
+        subjects = HELD_OUT_SUBJECTS[dataset_type]
     experiments: List[tuple] = []
     for subj_idx in subjects:
         data = load_data(dataset_type, subj_idx)
@@ -257,8 +266,7 @@ def _vanilla_optimization(
     device: str,
     budget: int,
     n_reps: int,
-    kappa_0: float,
-    kappa_min: float,
+    kappa_schedule: float,
     run_dir: str,
     exp_tag: str,
     save: bool,
@@ -267,11 +275,9 @@ def _vanilla_optimization(
 ) -> Dict[str, list]:
     """Run BO optimization evaluation for vanilla TabPFN and GP.
 
-    Uses ``evaluate_optimization()`` (Step 2 unified pipeline) for both
-    models, validating the surrogate-agnostic BO loop end-to-end.
-
-    GP uses fixed kappa values ``_GP_KAPPA_0`` / ``_GP_KAPPA_MIN`` and
-    ``normalization='gp'``, regardless of the TabPFN kappa settings.
+    Uses ``evaluate_optimization()`` (unified pipeline) for both models.
+    GP always uses the auto kappa schedule (``kappa_schedule=0.0``).
+    TabPFN uses the caller-supplied ``kappa_schedule``.
 
     Args:
         dataset_type: ``'rat'`` or ``'nhp'``.
@@ -279,8 +285,8 @@ def _vanilla_optimization(
         device: PyTorch device string.
         budget: Total BO query budget.
         n_reps: Repetitions per experiment.
-        kappa_0: Initial UCB coefficient for TabPFN surrogate.
-        kappa_min: Final UCB coefficient for TabPFN surrogate.
+        kappa_schedule: UCB coefficient for TabPFN.  ``0.0`` = auto cosine-
+            annealed schedule; any other value = fixed kappa throughout.
         run_dir: Output directory.
         exp_tag: Tag suffix for plot filenames.
         save: If True, persist results.
@@ -297,9 +303,7 @@ def _vanilla_optimization(
 
         # TabPFN: n_estimators=1 for BO speed
         tabpfn_base = _build_vanilla_tabpfn(device, n_estimators=1)
-        tabpfn_surrogate = TabPFNSurrogate(
-            model=tabpfn_base, kappa_0=kappa_0, kappa_min=kappa_min,
-        )
+        tabpfn_surrogate = TabPFNSurrogate(model=tabpfn_base)
         res_tabpfn = evaluate_optimization(
             surrogate=tabpfn_surrogate,
             dataset_type=dataset_type,
@@ -308,13 +312,12 @@ def _vanilla_optimization(
             device=device,
             budget=budget,
             n_reps=n_reps,
-            kappa_0=kappa_0,
-            kappa_min=kappa_min,
+            kappa_schedule=kappa_schedule,
             normalization='pfn',
         )
         res_tabpfn['model_type'] = 'vanilla_tabpfn'
 
-        # GP: fixed kappa values appropriate for GP scale
+        # GP: auto kappa schedule (GP-UCB theory scaling)
         gp_surrogate = GPSurrogate(device=device)
         res_gp = evaluate_optimization(
             surrogate=gp_surrogate,
@@ -324,8 +327,7 @@ def _vanilla_optimization(
             device=device,
             budget=budget,
             n_reps=n_reps,
-            kappa_0=_GP_KAPPA_0,
-            kappa_min=_GP_KAPPA_MIN,
+            kappa_schedule=0.0,
             normalization='gp',
         )
         res_gp['model_type'] = 'gp'
@@ -379,8 +381,7 @@ def _vanilla_optimization_budget(
     device: str,
     budgets: List[int],
     n_reps: int,
-    kappa_0: float,
-    kappa_min: float,
+    kappa_schedule: float,
     run_dir: str,
     exp_tag: str,
     save: bool,
@@ -398,8 +399,8 @@ def _vanilla_optimization_budget(
         device: PyTorch device string.
         budgets: List of integer query budgets to evaluate.
         n_reps: Repetitions per (subject, emg, budget) combination.
-        kappa_0: Initial UCB coefficient for TabPFN.
-        kappa_min: Final UCB coefficient for TabPFN.
+        kappa_schedule: UCB coefficient for TabPFN.  ``0.0`` = auto cosine-
+            annealed schedule; any other value = fixed kappa throughout.
         run_dir: Output directory.
         exp_tag: Tag suffix.
         save: If True, persist DataFrame as pkl.
@@ -417,9 +418,7 @@ def _vanilla_optimization_budget(
 
             # --- TabPFN ---
             tabpfn_base = _build_vanilla_tabpfn(device, n_estimators=1)
-            tabpfn_surrogate = TabPFNSurrogate(
-                model=tabpfn_base, kappa_0=kappa_0, kappa_min=kappa_min,
-            )
+            tabpfn_surrogate = TabPFNSurrogate(model=tabpfn_base)
             res_tabpfn = evaluate_optimization(
                 surrogate=tabpfn_surrogate,
                 dataset_type=dataset_type,
@@ -428,15 +427,14 @@ def _vanilla_optimization_budget(
                 device=device,
                 budget=b,
                 n_reps=n_reps,
-                kappa_0=kappa_0,
-                kappa_min=kappa_min,
+                kappa_schedule=kappa_schedule,
                 normalization='pfn',
             )
             _collect_budget_rows(
                 plot_data, res_tabpfn, 'TabPFN', b, subj_idx, emg_idx,
             )
 
-            # --- GP ---
+            # --- GP: auto kappa schedule ---
             gp_surrogate = GPSurrogate(device=device)
             res_gp = evaluate_optimization(
                 surrogate=gp_surrogate,
@@ -446,8 +444,7 @@ def _vanilla_optimization_budget(
                 device=device,
                 budget=b,
                 n_reps=n_reps,
-                kappa_0=_GP_KAPPA_0,
-                kappa_min=_GP_KAPPA_MIN,
+                kappa_schedule=0.0,
                 normalization='gp',
             )
             _collect_budget_rows(
@@ -468,6 +465,192 @@ def _vanilla_optimization_budget(
         print(f"Saved budget DataFrame -> {pkl_path}")
 
     return df
+
+def _vanilla_kappa_search(
+    dataset_type: str,
+    experiments: List[tuple],
+    device: str,
+    budget: int,
+    n_reps: int,
+    kappa_values: List[float],
+    run_dir: str,
+    exp_tag: str,
+    save: bool,
+    save_tag: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Kappa hyperparameter search for vanilla TabPFN BO.
+
+    Evaluates TabPFN with each value in *kappa_values* as a fixed UCB
+    coefficient, then runs GP with the auto schedule as a reference.
+    Produces an aggregated regret-curve plot (one line per kappa) and an
+    AUC bar chart — both saved as SVG.
+
+    The search is intended to run over ALL subjects for a dataset (i.e.,
+    pass experiments built from ``ALL_SUBJECTS``).  The results help the
+    practitioner select a single fixed kappa appropriate for clinical use.
+
+    Args:
+        dataset_type: ``'rat'`` or ``'nhp'``.
+        experiments: List of (subject_idx, emg_idx) from ``_build_experiments``
+            with ``subjects_mode='all'``.
+        device: PyTorch device string.
+        budget: Total BO query budget per experiment.
+        n_reps: Repetitions per (subject, emg) pair.
+        kappa_values: Fixed kappa values to evaluate (must be non-zero).
+        run_dir: Output directory from ``create_run_dir()``.
+        exp_tag: Experiment tag suffix for filenames.
+        save: If True, persist raw results and AUC CSV.
+        save_tag: Full experiment tag from ``generate_experiment_tag()``.
+        metadata: Optional provenance dict written into saved pkl files.
+
+    Returns:
+        Dict with keys:
+          - ``'kappa_results'``: ``{kappa: [result_dicts]}`` for each kappa.
+          - ``'gp_results'``: ``[result_dicts]`` for the GP reference.
+          - ``'auc_df'``: ``pd.DataFrame`` with columns
+            ``['kappa', 'model', 'mean_auc', 'std_auc']``.
+    """
+    kappa_results: Dict[float, List[dict]] = {}
+    gp_results: List[dict] = []
+
+    # --- GP reference (run once, auto kappa schedule) ---
+    print('\n  [kappa_search] Running GP reference (auto kappa schedule)...')
+    for subj_idx, emg_idx in experiments:
+        gp_surrogate = GPSurrogate(device=device)
+        res_gp = evaluate_optimization(
+            surrogate=gp_surrogate,
+            dataset_type=dataset_type,
+            subject_idx=subj_idx,
+            emg_idx=emg_idx,
+            device=device,
+            budget=budget,
+            n_reps=n_reps,
+            kappa_schedule=0.0,
+            normalization='gp',
+        )
+        res_gp['model_type'] = 'gp'
+        gp_results.append(res_gp)
+        print(f"    GP  subject={subj_idx}, emg={emg_idx}  "
+              f"R2={np.mean(res_gp['r2']):.3f}")
+
+    # --- TabPFN with each fixed kappa ---
+    for kappa in kappa_values:
+        if kappa == 0.0:
+            raise ValueError(
+                f"kappa_values must not contain 0.0 (reserved for auto schedule). "
+                f"Got kappa_values={kappa_values}."
+            )
+        print(f'\n  [kappa_search] TabPFN kappa={kappa:.3g}')
+        kappa_results[kappa] = []
+        for subj_idx, emg_idx in experiments:
+            tabpfn_base = _build_vanilla_tabpfn(device, n_estimators=1)
+            tabpfn_surrogate = TabPFNSurrogate(model=tabpfn_base)
+            res = evaluate_optimization(
+                surrogate=tabpfn_surrogate,
+                dataset_type=dataset_type,
+                subject_idx=subj_idx,
+                emg_idx=emg_idx,
+                device=device,
+                budget=budget,
+                n_reps=n_reps,
+                kappa_schedule=kappa,
+                normalization='pfn',
+            )
+            res['model_type'] = 'vanilla_tabpfn'
+            kappa_results[kappa].append(res)
+            print(f"    κ={kappa:.3g}  subject={subj_idx}, emg={emg_idx}  "
+                  f"R2={np.mean(res['r2']):.3f}")
+            
+    def _compute_auc(results_list: List[dict]) -> tuple:
+        """Compute mean and std AUC (area under normalized regret curve) across experiments.
+
+        Each experiment's regret curve is normalized by the response range before
+        averaging, so channels with different absolute magnitudes contribute equally.
+        AUC is defined as the mean regret over all BO steps (budget-agnostic).
+
+        Args:
+            results_list: List of result dicts from ``evaluate_optimization()``,
+                each containing ``'values'`` ([n_reps, budget]) and ``'y_test'``.
+
+        Returns:
+            Tuple ``(mean_auc, std_auc)`` across experiments.
+        """
+        auc_values: List[float] = []
+        for res in results_list:
+            if 'values' not in res or 'y_test' not in res:
+                continue
+            y_range = float(res['y_test'].max() - res['y_test'].min())
+            if y_range < 1e-8:
+                continue
+            optimal = float(res['y_test'].max())
+            running_best = np.maximum.accumulate(
+                np.array(res['values']), axis=1
+            )                                           # [n_reps, budget]
+            regret_norm = (optimal - running_best) / y_range  # [n_reps, budget]
+            # Mean over steps, then over reps → single AUC per experiment
+            auc_values.append(float(np.mean(regret_norm)))
+        if not auc_values:
+            return 0.0, 0.0
+        return float(np.mean(auc_values)), float(np.std(auc_values))
+
+    # --- Compute AUC ---
+    auc_rows: List[dict] = []
+    for kappa, res_list in sorted(kappa_results.items()):
+        mean_auc, std_auc = _compute_auc(res_list)
+        auc_rows.append({'kappa': kappa, 'model': 'TabPFN',
+                         'mean_auc': mean_auc, 'std_auc': std_auc})
+    gp_mean_auc, gp_std_auc = _compute_auc(gp_results)
+    auc_rows.append({'kappa': 0.0, 'model': 'GP',
+                     'mean_auc': gp_mean_auc, 'std_auc': gp_std_auc})
+    auc_df = pd.DataFrame(auc_rows)
+
+    tabpfn_auc_df = auc_df[auc_df['model'] == 'TabPFN'].reset_index(drop=True)
+    print(f'\n[kappa_search] AUC summary (dataset={dataset_type}):')
+    print(tabpfn_auc_df[['kappa', 'mean_auc', 'std_auc']].to_string(index=False))
+    print(f'  GP reference AUC: {gp_mean_auc:.4f} ± {gp_std_auc:.4f}')
+
+    # --- Plots ---
+    kappa_regret_curves(
+        kappa_results={k: v for k, v in kappa_results.items()},
+        gp_results=gp_results,
+        dataset=dataset_type,
+        split_type=exp_tag,
+        save=True,
+        output_dir=run_dir,
+    )
+    kappa_auc_bar(
+        auc_df=tabpfn_auc_df,
+        gp_auc=gp_mean_auc,
+        dataset=dataset_type,
+        split_type=exp_tag,
+        save=True,
+        output_dir=run_dir,
+    )
+
+    # --- Persistence ---
+    if save:
+        results_dir = os.path.join(run_dir, 'results')
+        os.makedirs(results_dir, exist_ok=True)
+        auc_csv = os.path.join(results_dir, f'{save_tag}_kappa_search_auc.csv')
+        auc_df.to_csv(auc_csv, index=False)
+        print(f'Saved AUC CSV -> {auc_csv}')
+
+        import pickle
+        raw_pkl = os.path.join(results_dir, f'{save_tag}_kappa_search_raw.pkl')
+        with open(raw_pkl, 'wb') as f:
+            pickle.dump({
+                'kappa_results': kappa_results,
+                'gp_results': gp_results,
+                '_metadata': metadata or {},
+            }, f)
+        print(f'Saved raw results pkl -> {raw_pkl}')
+
+    return {
+        'kappa_results': kappa_results,
+        'gp_results': gp_results,
+        'auc_df': auc_df,
+    }
 
 
 def _collect_budget_rows(
@@ -515,17 +698,25 @@ def run_vanilla_benchmark(
     budget: int = 100,
     n_reps: int = 30,
     budgets: Optional[List[int]] = None,
-    kappa_0: float = 2.5,
-    kappa_min: float = 0.5,
+    kappa_schedule: float = 0.0,
+    kappa_values: Optional[List[float]] = None,
     held_out_subj_idx: Optional[int] = None,
+    subjects_mode: str = 'held_out',
     save: bool = False,
     seed: int = 42,
 ) -> Dict[str, Any]:
     """Orchestrate vanilla TabPFN vs GP benchmark for one or more modes.
 
-    Sets random seeds, builds the experiment list (held-out subjects x EMGs),
-    creates a run directory with ``config.json``, then dispatches to the
-    mode-specific inner functions.
+    Sets random seeds, builds the experiment list, creates a run directory
+    with ``config.json``, then dispatches to mode-specific inner functions.
+
+    Subject selection (highest-priority first):
+    - ``held_out_subj_idx`` given → single subject (SLURM job-array)
+    - ``subjects_mode='all'`` → ``ALL_SUBJECTS`` (LOO cross-validation)
+    - ``subjects_mode='held_out'`` (default) → ``HELD_OUT_SUBJECTS``
+
+    Note: ``'kappa_search'`` mode always overrides subject selection to
+    ``ALL_SUBJECTS`` regardless of ``subjects_mode`` or ``held_out_subj_idx``.
 
     Args:
         dataset_type: ``'rat'`` or ``'nhp'``.
@@ -535,18 +726,22 @@ def run_vanilla_benchmark(
         n_reps: Repetitions per experiment.
         budgets: Budget list for ``'optimization_budget'`` mode.
             Defaults to ``[10, 30, 50, 100, 200]``.
-        kappa_0: Initial UCB coefficient for TabPFN BO.
-        kappa_min: Final UCB coefficient for TabPFN BO.
-        held_out_subj_idx: If given, restrict evaluation to this single held-out
-            subject (used by SLURM job-array Family 7 where one job = one subject).
-            When ``None``, all ``HELD_OUT_SUBJECTS`` are evaluated.
+        kappa_schedule: UCB coefficient for TabPFN BO.
+            ``0.0`` (default) = auto cosine-annealed schedule from GP-UCB theory.
+            Any other value = fixed kappa throughout the BO loop.
+        kappa_values: Fixed kappa values for ``'kappa_search'`` mode.
+            Defaults to ``[0.5, 1.0, 2.0, 3.0, 5.0]``.  Must not contain 0.0.
+        held_out_subj_idx: If given, restrict evaluation to this single subject
+            (used by SLURM job-array; overrides ``subjects_mode``).
+        subjects_mode: ``'held_out'`` (default) or ``'all'`` for LOO.
         save: If True, persist results (pkl + CSV).
         seed: Master random seed.
 
     Returns:
         Dict keyed by mode name.  Values are either
-        ``dict[str, list[dict]]`` (fit/optimization) or ``pd.DataFrame``
-        (optimization_budget).
+        ``dict[str, list[dict]]`` (fit/optimization),
+        ``pd.DataFrame`` (optimization_budget), or
+        ``dict`` (kappa_search).
 
     Raises:
         ValueError: If mode contains invalid values or dataset_type is unknown.
@@ -562,14 +757,35 @@ def run_vanilla_benchmark(
         )
     if budgets is None:
         budgets = [10, 30, 50, 100, 200]
+    if kappa_values is None:
+        kappa_values = list(_DEFAULT_KAPPA_VALUES)
 
     # --- Seeds ---
     set_seed(seed)
 
     # --- Build experiment list ---
-    experiments = _build_experiments(dataset_type, held_out_subj_idx=held_out_subj_idx)
-    n_held_out = 1 if held_out_subj_idx is not None else len(HELD_OUT_SUBJECTS[dataset_type])
-    print(f"[INFO] {len(experiments)} experiments ({n_held_out} held-out subject(s))")
+    # kappa_search always runs over ALL subjects for a dataset-wide estimate.
+    _kappa_search_mode = 'kappa_search' in mode
+    if _kappa_search_mode:
+        kappa_search_experiments = _build_experiments(
+            dataset_type, held_out_subj_idx=None, subjects_mode='all'
+        )
+        _ks_subjects = list(ALL_SUBJECTS[dataset_type])
+        print(f"[INFO] kappa_search: {len(kappa_search_experiments)} experiments "
+              f"across ALL subjects {_ks_subjects}")
+
+    experiments = _build_experiments(
+        dataset_type,
+        held_out_subj_idx=held_out_subj_idx,
+        subjects_mode=subjects_mode,
+    )
+    if held_out_subj_idx is not None:
+        _eval_subjects = [held_out_subj_idx]
+    elif subjects_mode == 'all':
+        _eval_subjects = list(ALL_SUBJECTS[dataset_type])
+    else:
+        _eval_subjects = list(HELD_OUT_SUBJECTS[dataset_type])
+    print(f"[INFO] {len(experiments)} experiments ({len(_eval_subjects)} subject(s): {_eval_subjects})")
 
     # --- Experiment tag and run directory ---
     tag_config: Dict[str, Any] = {
@@ -577,8 +793,7 @@ def run_vanilla_benchmark(
         'mode': sorted(mode),
         'budget': budget,
         'n_reps': n_reps,
-        'kappa_0': kappa_0,
-        'kappa_min': kappa_min,
+        'kappa_schedule': kappa_schedule,
         'seed': seed,
     }
     if held_out_subj_idx is not None:
@@ -586,7 +801,7 @@ def run_vanilla_benchmark(
     save_tag = generate_experiment_tag(dataset_type, 'vanilla-benchmark', tag_config)
     exp_tag = 'vanilla_benchmark'
 
-    run_dir = create_run_dir(save_tag)
+    run_dir = create_run_dir(save_tag, tag=save_tag)
     run_config = {
         'run_type': 'vanilla_benchmark',
         'experiment_tag': save_tag,
@@ -597,14 +812,12 @@ def run_vanilla_benchmark(
         'budget': budget,
         'n_reps': n_reps,
         'budgets': budgets,
-        'kappa_0': kappa_0,
-        'kappa_min': kappa_min,
+        'kappa_schedule': kappa_schedule,
+        'kappa_values': kappa_values,
         'seed': seed,
         'held_out_subj': held_out_subj_idx,
-        'held_out_subjects': (
-            [held_out_subj_idx] if held_out_subj_idx is not None
-            else HELD_OUT_SUBJECTS[dataset_type]
-        ),
+        'subjects_mode': subjects_mode,
+        'eval_subjects': _eval_subjects,
         'n_experiments': len(experiments),
     }
     write_run_config(run_dir, run_config)
@@ -622,6 +835,7 @@ def run_vanilla_benchmark(
 
     # --- Dispatch ---
     all_results: Dict[str, Any] = {}
+    _t0 = time.time()
 
     for m in mode:
         print(f"\n{'=' * 60}")
@@ -638,7 +852,7 @@ def run_vanilla_benchmark(
         elif m == 'optimization':
             all_results['optimization'] = _vanilla_optimization(
                 dataset_type, experiments, device, budget, n_reps,
-                kappa_0, kappa_min,
+                kappa_schedule,
                 run_dir, exp_tag, save, save_tag,
                 metadata=_metadata,
             )
@@ -646,9 +860,21 @@ def run_vanilla_benchmark(
         elif m == 'optimization_budget':
             all_results['optimization_budget'] = _vanilla_optimization_budget(
                 dataset_type, experiments, device, budgets, n_reps,
-                kappa_0, kappa_min,
+                kappa_schedule,
                 run_dir, exp_tag, save, save_tag,
             )
+
+        elif m == 'kappa_search':
+            all_results['kappa_search'] = _vanilla_kappa_search(
+                dataset_type, kappa_search_experiments, device, budget, n_reps,
+                kappa_values,
+                run_dir, exp_tag, save, save_tag,
+                metadata=_metadata,
+            )
+
+    # --- Update config with total wall time and re-write ---
+    run_config['total_wall_time_s'] = round(time.time() - _t0, 2)
+    write_run_config(run_dir, run_config)
 
     return all_results
 
@@ -689,14 +915,23 @@ def run_benchmark() -> None:
     parser.add_argument('--budgets', type=int, nargs='+', default=None,
                         help='Budget sweep values for optimization_budget\n'
                              '(default: 10 30 50 100 200)')
-    parser.add_argument('--kappa_0', type=float, default=None,
-                        help='Initial UCB coefficient for TabPFN BO (default: 2.5)')
-    parser.add_argument('--kappa_min', type=float, default=None,
-                        help='Final UCB coefficient for TabPFN BO (default: 0.5)')
+    parser.add_argument('--kappa_schedule', type=float, default=None,
+                        help='UCB coefficient for TabPFN BO.\n'
+                             '  0.0 (default) = auto cosine-annealed schedule (GP-UCB theory)\n'
+                             '  any other value = fixed kappa throughout the BO loop')
+    parser.add_argument('--kappa_values', type=float, nargs='+', default=None,
+                        help='Fixed kappa values for kappa_search mode\n'
+                             '(default: 0.5 1.0 2.0 3.0 5.0)')
+    parser.add_argument('--subjects', type=str, default=None,
+                        choices=['held_out', 'all'],
+                        dest='subjects_mode',
+                        help='Subject selection mode:\n'
+                             '  held_out (default) — evaluate HELD_OUT_SUBJECTS only\n'
+                             '  all — evaluate ALL_SUBJECTS (LOO cross-validation)')
     parser.add_argument('--held_out_subj', type=int, default=None,
-                        help='Restrict evaluation to a single held-out subject index.\n'
-                             'When omitted, all HELD_OUT_SUBJECTS are evaluated.\n'
-                             'Used by SLURM Family 7 job arrays (one job per subject).')
+                        help='Restrict evaluation to a single subject index.\n'
+                             'Overrides --subjects. Used by SLURM job arrays\n'
+                             '(one job per subject).')
     parser.add_argument('--save', action='store_true', default=False,
                         help='Persist results to output/runs/<tag>/results/')
     parser.add_argument('--seed', type=int, default=None,
@@ -724,8 +959,9 @@ def run_benchmark() -> None:
         'budget': 100,
         'n_reps': 30,
         'budgets': [10, 30, 50, 100, 200],
-        'kappa_0': 2.5,
-        'kappa_min': 0.5,
+        'kappa_schedule': 0.0,
+        'kappa_values': list(_DEFAULT_KAPPA_VALUES),
+        'subjects_mode': 'held_out',
         'seed': 42,
     }
     for key, default in _defaults.items():
@@ -748,9 +984,10 @@ def run_benchmark() -> None:
         budget=args.budget,
         n_reps=args.n_reps,
         budgets=args.budgets,
-        kappa_0=args.kappa_0,
-        kappa_min=args.kappa_min,
+        kappa_schedule=args.kappa_schedule,
+        kappa_values=args.kappa_values,
         held_out_subj_idx=args.held_out_subj,
+        subjects_mode=args.subjects_mode,
         save=args.save,
         seed=args.seed,
     )

@@ -18,7 +18,7 @@ import torch
 import gpytorch
 
 from models.gaussians import ExactGP
-from utils.gpbo_utils import compute_ucb_kappa
+from utils.gpbo_utils import compute_ucb_kappa, _auto_kappa_max, _auto_kappa_min
 
 
 def _snapshot_iters(budget, n_init):
@@ -40,8 +40,7 @@ def run_bo_loop(
     y_test: np.ndarray,
     n_init: int = 5,
     budget: int = 100,
-    kappa_0: float = 2.5,
-    kappa_min: float = 0.5,
+    kappa_schedule: float = 0.0,
     snapshot_iters: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Unified model-agnostic Bayesian optimisation loop using UCB acquisition.
@@ -60,6 +59,12 @@ def run_bo_loop(
     Observations are drawn as the mean across all repetitions in ``y_pool``
     (``y_pool[idx].mean()``), matching the protocol used in the legacy loops.
 
+    Kappa schedule: controlled by ``kappa_schedule``.  ``0.0`` activates cosine
+    annealing from an auto-computed upper bound (``_auto_kappa_max``) down to an
+    auto-computed lower bound (``_auto_kappa_min``), both derived from input
+    dimensionality and number of active steps via GP-UCB theory scaling.  Any
+    non-zero value fixes kappa at that constant throughout the loop.
+
     Args:
         model: Any object conforming to the ``SurrogateModel`` protocol.
         X_pool: Feature matrix for all candidate locations, shape [N, D].
@@ -71,8 +76,12 @@ def run_bo_loop(
         n_init: Number of randomly selected initial observations before the
             optimisation loop starts.
         budget: Total number of observations (including ``n_init``).
-        kappa_0: Initial UCB exploration coefficient (cosine annealing start).
-        kappa_min: Final UCB exploration coefficient (cosine annealing end).
+        kappa_schedule: UCB exploration coefficient control.
+            ``0.0`` (default) → cosine-annealed auto schedule:
+              kappa_max = 2.5 * sqrt(d * log(n_steps)), floor 3.0;
+              kappa_min = 0.2 * sqrt(d * log(n_steps)).
+            Any other value → fixed kappa throughout (no annealing).
+            Use fixed values for dataset-specific hyperparameter search.
         snapshot_iters: Optional list of observation counts at which to record
             a prediction snapshot on ``X_test`` (e.g. for R²-vs-budget plots).
             The final budget iteration is always included if provided.
@@ -84,8 +93,9 @@ def run_bo_loop(
           - ``'real_values'``: list[float] — true test values at observed locs
           - ``'times'``: list[float] — per-step wall-clock time in seconds
           - ``'y_pred'``: np.ndarray shape [M] — final predictions on ``X_test``
-          - ``'snapshots'``: dict[int, np.ndarray] | None — predictions at each
-            snapshot iteration, or ``None`` if ``snapshot_iters`` is ``None``
+          - ``'snapshots'``: dict[int, dict] | None — at each snapshot iteration:
+            ``{'y_pred': np.ndarray [M], 'best_pred_val': float}`` (normalised
+            space), or ``None`` if ``snapshot_iters`` is ``None``
 
     Raises:
         ValueError: If ``budget <= n_init``.
@@ -97,7 +107,13 @@ def run_bo_loop(
         )
 
     n_locs = X_pool.shape[0]   # [N, D]
+    d = X_pool.shape[1]        # [N, D]
     n_steps = budget - n_init
+
+    # Pre-compute auto kappa bounds once (only used when kappa_schedule == 0.0)
+    if kappa_schedule == 0.0:
+        _kappa_max = _auto_kappa_max(d, n_steps)
+        _kappa_min = _auto_kappa_min(d, n_steps)
 
     def _sample(idx: int) -> float:
         """Return mean observation for pool index idx."""
@@ -124,8 +140,11 @@ def run_bo_loop(
         # Refit surrogate on all observations so far
         model.fit(X_obs, y_obs)
 
-        # Compute cosine-annealed kappa for this step
-        kappa = compute_ucb_kappa(t, n_steps, kappa_0=kappa_0, kappa_min=kappa_min)
+        # Compute kappa for this step
+        if kappa_schedule == 0.0:
+            kappa = compute_ucb_kappa(t, n_steps, kappa_max=_kappa_max, kappa_min=_kappa_min)
+        else:
+            kappa = kappa_schedule
 
         # Compute UCB acquisition values for all candidates
         # Prefer native predict_ucb if available; fall back to mean + kappa*std
@@ -161,8 +180,12 @@ def run_bo_loop(
         if snapshot_iters is not None and n_obs_now in snapshot_iters:
             # Refit on updated observations for the snapshot prediction
             model.fit(X_pool[observed_indices], np.array(observed_values))
-            snap_pred, _ = model.predict(X_test)  # [M]
-            snapshots[n_obs_now] = np.asarray(snap_pred)  # [M]
+            snap_pred, _ = model.predict(X_test)   # [M] — for R² computation
+            pool_mean, _ = model.predict(X_pool)   # [N] — for exploration score
+            snapshots[n_obs_now] = {
+                'y_pred': np.asarray(snap_pred),                          # [M]
+                'best_pred_val': float(np.max(np.asarray(pool_mean))),   # scalar (normalised)
+            }
 
     # --- Final prediction on X_test using all observed data ---
     model.fit(X_pool[observed_indices], np.array(observed_values))
@@ -171,7 +194,11 @@ def run_bo_loop(
 
     # Capture final budget snapshot if not already recorded
     if snapshot_iters is not None and budget not in snapshots:
-        snapshots[budget] = y_pred.copy()  # [M]
+        pool_mean_final, _ = model.predict(X_pool)  # [N]
+        snapshots[budget] = {
+            'y_pred': y_pred.copy(),                                           # [M]
+            'best_pred_val': float(np.max(np.asarray(pool_mean_final))),      # scalar (normalised)
+        }
 
     return {
         'observed_indices': observed_indices,
@@ -218,7 +245,7 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
     n_locs, n_reps = y_pool.shape
 
     def sample_from_pool(idx):
-        return float(y_pool[idx, :].mean())
+        return float(y_pool[idx, :].mean())     
 
     # 1. Initialization (Random)
     pool_indices = np.arange(n_locs)
@@ -256,7 +283,7 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
             optimizer.step()
 
         # Select Next Point (UCB with cosine-annealed kappa)
-        kappa = compute_ucb_kappa(t, n_steps, kappa_0=5.0, kappa_min=1.0)
+        kappa = compute_ucb_kappa(t, n_steps, kappa_max=5.0, kappa_min=1.0)
         model.eval()
         likelihood.eval()
         with torch.no_grad():
@@ -379,7 +406,7 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
 
         # Compute UCB directly from the bar distribution (no Gaussian assumption)
         # kappa → rest_prob via: rest_prob = 0.5 * erfc(kappa / sqrt(2))
-        kappa = compute_ucb_kappa(t, n_steps, kappa_0=2.5, kappa_min=0.5)
+        kappa = compute_ucb_kappa(t, n_steps, kappa_max=2.5, kappa_min=0.5)
         rest_prob = 0.5 * math.erfc(kappa / math.sqrt(2))
         full_output = model.predict(X_pool, output_type="full")
         logits = full_output['logits']

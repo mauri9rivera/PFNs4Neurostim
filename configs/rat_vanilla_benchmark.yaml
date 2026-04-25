@@ -20,9 +20,20 @@ budgets:
   - 50
   - 100
 
-# UCB coefficients (TabPFN only; GP uses hardcoded kappa_0=5.0, kappa_min=1.0)
-kappa_0: 2.5
-kappa_min: 0.5
+# UCB kappa control:
+#   kappa_schedule: 0.0  →  auto cosine-annealed schedule (GP-UCB theory scaling)
+#                           kappa_max = max(2.5 * sqrt(d * log(n_steps)), 3.0)
+#                           kappa_min = 0.2 * sqrt(d * log(n_steps))
+#   kappa_schedule: 2.5  →  fixed kappa=2.5 throughout (no annealing)
+kappa_schedule: 0.0
+
+# kappa values tested in kappa_search mode
+kappa_values:
+  - 0.5
+  - 1.0
+  - 2.0
+  - 3.0
+  - 5.0
 
 # Infrastructure
 device: cuda

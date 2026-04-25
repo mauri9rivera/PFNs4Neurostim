@@ -1,3 +1,5 @@
+from typing import Optional
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -394,14 +396,17 @@ def visualize_representation(results_dict, mode='', save=False, output_dir=None)
     plt.close()
 
 
-def r2_by_subject(results_dict, split_type='', save=False, output_dir=None):
-    """
-    Box plot of R² values grouped by subject index, one bar per model.
+def r2_by_subject(results_dict, split_type='', save=False, output_dir=None,
+                  output_subdir='fitness'):
+    """Box plot of R² values grouped by subject index, one bar per model.
 
     Args:
         results_dict: dict[str, list[dict]] — model name -> list of result dicts
         split_type: string suffix for the output filename
         save: whether to save the figure to disk
+        output_subdir: subfolder under ``output_dir`` to write into.
+            Use ``'fitness'`` for fit-mode results and ``'optimization'`` for
+            optimization-mode results.
     """
     results_dict = _normalize_results_dict(results_dict)
 
@@ -428,8 +433,8 @@ def r2_by_subject(results_dict, split_type='', save=False, output_dir=None):
 
     first_results = next(iter(results_dict.values()))
     dataset = first_results[0].get('dataset', '')
-    base = os.path.join(output_dir, 'fitness') if output_dir else \
-           os.path.join('output', 'fitness', dataset)
+    base = os.path.join(output_dir, output_subdir) if output_dir else \
+           os.path.join('output', output_subdir, dataset)
     os.makedirs(base, exist_ok=True)
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
     plot_path = os.path.join(base, f'r2_by_subject{suffix}.svg')
@@ -440,65 +445,32 @@ def r2_by_subject(results_dict, split_type='', save=False, output_dir=None):
     plt.close()
 
 
-def regret_by_subject(results_dict, split_type='', save=False, output_dir=None):
+def _final_normalized_regret(res: dict) -> np.ndarray:
+    """Compute per-rep final simple regret normalized by the response range.
+
+    Uses the running best (not the last queried value) so the metric is
+    monotonically non-increasing.  Normalizes by ``y_test`` range so results
+    are comparable across subjects/EMGs regardless of absolute scale.
+
+    Returns:
+        1-D array of shape [n_reps] with values in [0, 1].
+        0 = optimum found; 1 = never improved beyond the worst observed.
     """
-    Box plot of final simple regret grouped by subject index.
+    y_range = float(res['y_test'].max() - res['y_test'].min())
+    if y_range < 1e-8:
+        return np.array([])
+    optimal = float(res['y_test'].max())
+    running_best = np.maximum.accumulate(np.array(res['values']), axis=1)  # [n_reps, budget]
+    best_found = running_best[:, -1]                                        # [n_reps]
+    return (optimal - best_found) / y_range                                 # [n_reps]
 
-    Final simple regret = optimal_value - best_observed_at_last_step.
-
-    Args:
-        results_dict: dict[str, list[dict]] — model name -> list of result dicts
-                      (optimization mode; each result must have 'values' and 'y_test')
-        split_type: string suffix for the output filename
-        save: whether to save the figure to disk
-    """
-    results_dict = _normalize_results_dict(results_dict)
-
-    data = []
-    for model_name, results_list in results_dict.items():
-        for res in results_list:
-            if 'values' not in res:
-                continue
-            optimal = float(res['y_test'].max())
-            raw_vals = np.array(res['values'])
-            final_regrets = (optimal - raw_vals[:, -1]) / optimal * 100
-            for regret in final_regrets:
-                data.append({
-                    'Subject': f"S{res['subject']}",
-                    'Regret (%)': float(regret),
-                    'Model': model_name
-                })
-
-    if not data:
-        return
-
-    df = pd.DataFrame(data)
-    n_subjects = df['Subject'].nunique()
-    plt.figure(figsize=(max(6, 1.8 * n_subjects), 5))
-    sns.boxplot(data=df, x='Subject', y='Regret (%)', hue='Model', palette=PALETTE)
-    plt.title("Final Simple Regret by Subject")
-    plt.xlabel("Subject")
-    plt.ylabel("Final Simple Regret (%)")
-    plt.legend(title='Model')
-    plt.grid(True, alpha=0.3, axis='y')
-
-    first_results = next(iter(results_dict.values()))
-    dataset = first_results[0].get('dataset', '')
-    base = os.path.join(output_dir, 'optimization') if output_dir else \
-           os.path.join('output', 'optimization')
-    os.makedirs(base, exist_ok=True)
-    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    plot_path = os.path.join(base, f'regret_by_subject{suffix}.svg')
-    if save:
-        plt.savefig(plot_path, format="svg")
-        print(f"Saved plot to {plot_path}")
-
-    plt.close()
 
 
 def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
-    """
-    Box plot of final simple regret grouped by EMG index.
+    """Box plot of final simple regret grouped by EMG index.
+
+    Regret is normalized by the response range so values are comparable across
+    EMG channels with different absolute magnitudes.
 
     Args:
         results_dict: dict[str, list[dict]] — model name -> list of result dicts
@@ -513,13 +485,11 @@ def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
         for res in results_list:
             if 'values' not in res:
                 continue
-            optimal = float(res['y_test'].max())
-            raw_vals = np.array(res['values'])
-            final_regrets = (optimal - raw_vals[:, -1]) / optimal * 100
+            final_regrets = _final_normalized_regret(res)
             for regret in final_regrets:
                 data.append({
                     'EMG': f"EMG {res['emg']}",
-                    'Regret (%)': float(regret),
+                    'Normalized Regret': float(regret),
                     'Model': model_name
                 })
 
@@ -529,10 +499,11 @@ def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
     df = pd.DataFrame(data)
     n_emgs = df['EMG'].nunique()
     plt.figure(figsize=(max(6, 1.8 * n_emgs), 5))
-    sns.boxplot(data=df, x='EMG', y='Regret (%)', hue='Model', palette=PALETTE)
+    sns.boxplot(data=df, x='EMG', y='Normalized Regret', hue='Model', palette=PALETTE)
+    plt.ylim(bottom=0)
     plt.title("Final Simple Regret by EMG Channel")
     plt.xlabel("EMG")
-    plt.ylabel("Final Simple Regret (%)")
+    plt.ylabel("Final Simple Regret\n(normalized by response range, lower is better)")
     plt.legend(title='Model')
     plt.grid(True, alpha=0.3, axis='y')
 
@@ -547,6 +518,295 @@ def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
 
+    plt.close()
+
+
+def regret_by_subject(results_dict, split_type='', save=False, output_dir=None):
+    """Box plot of final simple regret grouped by subject index.
+
+    Regret is normalized by the response range so values are comparable across
+    subjects with different absolute magnitudes.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+                      (optimization mode; each result must have 'values' and 'y_test')
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+        output_dir: run-level directory (saves under optimization/)
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    data = []
+    for model_name, results_list in results_dict.items():
+        for res in results_list:
+            if 'values' not in res:
+                continue
+            final_regrets = _final_normalized_regret(res)
+            for regret in final_regrets:
+                data.append({
+                    'Subject': f"S{res['subject']}",
+                    'Normalized Regret': float(regret),
+                    'Model': model_name,
+                })
+
+    if not data:
+        return
+
+    df = pd.DataFrame(data)
+    n_subjects = df['Subject'].nunique()
+    plt.figure(figsize=(max(6, 1.8 * n_subjects), 5))
+    sns.boxplot(data=df, x='Subject', y='Normalized Regret', hue='Model', palette=PALETTE)
+    plt.ylim(bottom=0)
+    plt.title('Final Simple Regret by Subject')
+    plt.xlabel('Subject')
+    plt.ylabel('Final Simple Regret\n(normalized by response range, lower is better)')
+    plt.legend(title='Model')
+    plt.grid(True, alpha=0.3, axis='y')
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'regret_by_subject{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg')
+        print(f'Saved plot to {plot_path}')
+
+    plt.close()
+
+
+def regret_curve(results_dict, split_type='', save=False, output_dir=None):
+    """Average regret curve across all subjects and EMGs, with 95% CI shading.
+
+    Aggregates the running-best regret trajectory across every experiment
+    (subject × EMG pair) and every repetition.  Each experiment's regret is
+    range-normalized before averaging so that channels with different absolute
+    magnitudes contribute equally.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+                      (optimization mode; must have 'values' and 'y_test').
+        split_type: string suffix for the output filename.
+        save: whether to save the figure to disk.
+        output_dir: run-level directory (saves under optimization/).
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    dataset = ''
+    for model_name, results_list in results_dict.items():
+        color = PALETTE.get(model_name, 'gray')
+        per_exp_mean_curves = []
+
+        for res in results_list:
+            if 'values' not in res or 'y_test' not in res:
+                continue
+            dataset = res.get('dataset', dataset)
+            y_range = float(res['y_test'].max() - res['y_test'].min())
+            if y_range < 1e-8:
+                continue
+            optimal = float(res['y_test'].max())
+            running_best = np.maximum.accumulate(
+                np.array(res['values']), axis=1
+            )                                                  # [n_reps, budget]
+            regret_norm = (optimal - running_best) / y_range  # [n_reps, budget]
+            per_exp_mean_curves.append(np.mean(regret_norm, axis=0))  # [budget]
+
+        if not per_exp_mean_curves:
+            continue
+
+        # Pad to common length (in case budgets differ across experiments)
+        max_len = max(len(c) for c in per_exp_mean_curves)
+        padded = np.array([
+            np.pad(c, (0, max_len - len(c)), constant_values=np.nan)
+            for c in per_exp_mean_curves
+        ])                                                     # [n_exp, budget]
+
+        mean_curve = np.nanmean(padded, axis=0)               # [budget]
+        # SE across experiments (not reps — reps already averaged per experiment)
+        n_exp = np.sum(~np.isnan(padded), axis=0)
+        se_curve = np.nanstd(padded, axis=0) / np.sqrt(np.maximum(n_exp, 1))
+
+        x = np.arange(len(mean_curve))
+        ax.plot(x, mean_curve, color=color, linewidth=2.5, label=model_name)
+        ax.fill_between(
+            x,
+            mean_curve - 1.96 * se_curve,
+            mean_curve + 1.96 * se_curve,
+            color=color, alpha=0.2,
+        )
+
+    ax.set_xlabel('BO Iteration')
+    ax.set_ylabel('Simple Regret\n(normalized by response range, lower is better)')
+    ax.set_ylim(bottom=0)
+    ax.set_title(f'Average Regret Curve — All Subjects & EMGs ({dataset})')
+    ax.legend(title='Model')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'regret_curve{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg')
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def kappa_regret_curves(
+    kappa_results: dict,
+    gp_results: list,
+    dataset: str = '',
+    split_type: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """Aggregated regret curves for each tested kappa value, with GP reference.
+
+    Each curve shows mean ± 95 % CI normalized regret (by response range)
+    averaged across all experiments (subjects × EMGs) and all repetitions.
+    A sequential colormap encodes kappa magnitude; the GP reference is shown
+    as a dashed line in its canonical colour.
+
+    Args:
+        kappa_results: ``{kappa_val: list[result_dict]}`` — TabPFN results for
+            each tested fixed kappa value.
+        gp_results: List of result dicts for the GP reference (kappa_schedule=0.0).
+        dataset: Dataset name used in title and output filename.
+        split_type: String suffix appended to the output filename.
+        save: If True, save the figure to disk as SVG.
+        output_dir: Run-level directory; figure is saved under
+            ``{output_dir}/optimization/``.
+    """
+    kappa_vals = sorted(kappa_results.keys())
+    n_kappas = len(kappa_vals)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    cmap = plt.cm.plasma
+    colors = [cmap(i / max(n_kappas - 1, 1)) for i in range(n_kappas)]
+
+    def _mean_regret_curve(results_list):
+        per_exp = []
+        for res in results_list:
+            if 'values' not in res or 'y_test' not in res:
+                continue
+            y_range = float(res['y_test'].max() - res['y_test'].min())
+            if y_range < 1e-8:
+                continue
+            optimal = float(res['y_test'].max())
+            rb = np.maximum.accumulate(np.array(res['values']), axis=1)  # [n_reps, budget]
+            per_exp.append(np.mean((optimal - rb) / y_range, axis=0))    # [budget]
+        if not per_exp:
+            return None, None, None
+        max_len = max(len(c) for c in per_exp)
+        padded = np.array([
+            np.pad(c, (0, max_len - len(c)), constant_values=np.nan)
+            for c in per_exp
+        ])                                                                # [n_exp, budget]
+        mean_c = np.nanmean(padded, axis=0)
+        n_exp_arr = np.sum(~np.isnan(padded), axis=0)
+        se_c = np.nanstd(padded, axis=0) / np.sqrt(np.maximum(n_exp_arr, 1))
+        return np.arange(len(mean_c)), mean_c, se_c
+
+    for kappa_val, color in zip(kappa_vals, colors):
+        x, mean_c, se_c = _mean_regret_curve(kappa_results[kappa_val])
+        if mean_c is None:
+            continue
+        label = f'κ={kappa_val:.2g}'
+        ax.plot(x, mean_c, color=color, linewidth=2, label=label)
+        ax.fill_between(x, mean_c - 1.96 * se_c, mean_c + 1.96 * se_c,
+                        color=color, alpha=0.15)
+
+    if gp_results:
+        x, mean_c, se_c = _mean_regret_curve(gp_results)
+        if mean_c is not None:
+            ax.plot(x, mean_c, color=PALETTE.get('GP', 'sandybrown'),
+                    linewidth=2.5, linestyle='--', label='GP (auto-κ)')
+            ax.fill_between(x, mean_c - 1.96 * se_c, mean_c + 1.96 * se_c,
+                            color=PALETTE.get('GP', 'sandybrown'), alpha=0.15)
+
+    ax.set_xlabel('BO Iteration')
+    ax.set_ylabel('Simple Regret\n(normalized by response range, lower is better)')
+    ax.set_ylim(bottom=0)
+    ax.set_title(f'Kappa Search — Aggregated Regret Curves ({dataset})')
+    ax.legend(title='Model / κ', fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'kappa_search_regret{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg')
+        print(f'Saved plot to {plot_path}')
+    plt.close()
+
+
+def kappa_auc_bar(
+    auc_df: "pd.DataFrame",
+    gp_auc: float,
+    dataset: str = '',
+    split_type: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """Bar chart of AUC scores per kappa value, with GP reference line.
+
+    Lower AUC = faster convergence to the optimum.  The GP reference is shown
+    as a horizontal dashed line to allow direct comparison.
+
+    Args:
+        auc_df: DataFrame with columns ``['kappa', 'mean_auc', 'std_auc']``.
+            Rows correspond to individual TabPFN fixed-kappa runs.
+        gp_auc: Mean AUC for the GP reference (single float).
+        dataset: Dataset name for title and filename.
+        split_type: String suffix appended to the output filename.
+        save: If True, save the figure to disk as SVG.
+        output_dir: Run-level directory; figure is saved under
+            ``{output_dir}/optimization/``.
+    """
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    kappa_vals = auc_df['kappa'].tolist()
+    means = auc_df['mean_auc'].tolist()
+    stds = auc_df['std_auc'].tolist()
+    x = np.arange(len(kappa_vals))
+
+    cmap = plt.cm.plasma
+    colors = [cmap(i / max(len(kappa_vals) - 1, 1)) for i in range(len(kappa_vals))]
+
+    bars = ax.bar(x, means, yerr=stds, capsize=4, color=colors, alpha=0.85,
+                  error_kw={'elinewidth': 1.5, 'ecolor': 'black'})
+
+    if gp_auc > 0:
+        ax.axhline(gp_auc, color=PALETTE.get('GP', 'sandybrown'),
+                   linewidth=2, linestyle='--', label=f'GP ref (AUC={gp_auc:.3f})')
+        ax.legend(fontsize=8)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'{k:.2g}' for k in kappa_vals])
+    ax.set_xlabel('Fixed κ')
+    ax.set_ylabel('Mean AUC (norm. regret, lower is better)')
+    ax.set_title(f'Kappa Search — AUC Scores ({dataset})')
+    ax.grid(True, axis='y', alpha=0.3)
+    fig.tight_layout()
+
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'kappa_search_auc{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg')
+        print(f'Saved plot to {plot_path}')
     plt.close()
 
 
@@ -689,27 +949,18 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
                 times_arr = np.array(times)
                 ax_time.plot(times_arr, color=color, linewidth=2, label=model_name)
 
-            # --- exploration-exploitation row ---
-            if 'values' in res and 'exploit_values' in res:
-                exp_raw = np.maximum.accumulate(np.array(res['values']), axis=1) / optimal_val  # running best
-                exp_mean = np.mean(exp_raw, axis=0)
-                exp_se = np.std(exp_raw, axis=0) / np.sqrt(exp_raw.shape[0])
-                expl_raw = np.array(res['exploit_values']) / optimal_val
-                expl_mean = np.mean(expl_raw, axis=0)
-                expl_se = np.std(expl_raw, axis=0) / np.sqrt(expl_raw.shape[0])
-                x_ax = range(len(exp_mean))
-                ax_ee.plot(x_ax, exp_mean, color=color, linestyle='-',
-                           label=f'{model_name} Explore', linewidth=2)
-                ax_ee.fill_between(x_ax,
-                                   exp_mean - 1.96 * exp_se,
-                                   exp_mean + 1.96 * exp_se,
-                                   color=color, alpha=0.15)
-                ax_ee.plot(x_ax, expl_mean, color=color, linestyle='--',
-                           label=f'{model_name} Exploit', linewidth=2)
-                ax_ee.fill_between(x_ax,
-                                   expl_mean - 1.96 * expl_se,
-                                   expl_mean + 1.96 * expl_se,
-                                   color=color, alpha=0.10)
+            # --- exploration score row ---
+            # exploration(t) = max(model.predict(X_pool)[0]) at iter t / optimal
+            # best_pred_val is the model's predicted maximum over the full candidate pool.
+            snaps = res.get('snapshots')
+            if snaps and optimal_val > 1e-8:
+                iters = sorted(snaps.keys())
+                scores = [
+                    snaps[it]['best_pred_val'] / optimal_val
+                    for it in iters
+                ]
+                ax_ee.plot(iters, scores, color=color, linewidth=2,
+                           marker='o', markersize=4, label=model_name)
 
         ax_reg.set_title(f"S{ref_res['subject']} EMG {ref_res['emg']}", fontsize=9)
         ax_reg.set_xlabel('Iteration')
@@ -720,14 +971,18 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
         ax_time.set_ylabel('Time (s)')
         ax_time.grid(True, alpha=0.3)
 
+        budget = len(ref_res['values'][0]) if 'values' in ref_res else 0
         ax_ee.set_xlabel('Iteration')
         ax_ee.set_ylim(0, 1.05)
+        if budget:
+            ax_ee.set_xlim(0, budget)
+            ax_ee.xaxis.set_major_locator(plt.MultipleLocator(max(1, budget // 10)))
         ax_ee.axhline(1.0, color='gray', linewidth=0.8, linestyle=':')
         ax_ee.grid(True, alpha=0.3)
 
     axes[0, 0].set_ylabel('Recommendation Regret (%)')
     axes[1, 0].set_ylabel('Inference Time (s)')
-    axes[2, 0].set_ylabel('Explore / Exploit\n(frac. of optimum)')
+    axes[2, 0].set_ylabel('Exploration Score\n(max predicted / optimal)')
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper right', fontsize=9)

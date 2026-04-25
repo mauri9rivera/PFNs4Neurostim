@@ -5,6 +5,8 @@ and gradient L2-norm.
 Tests whether neurostim data lies within TabPFN's pre-training prior by
 comparing against synthetic reference distributions (GP and/or Prior Bag).
 """
+from __future__ import annotations
+
 import os
 import pickle
 import warnings
@@ -12,7 +14,9 @@ import warnings
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.spatial import procrustes as scipy_procrustes
 from scipy.spatial.distance import cdist
+from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from tabpfn import TabPFNRegressor
@@ -1148,6 +1152,493 @@ def _cka_analysis_inner(dataset_types, device, prior_source, n_synthetic,
 
 
 # ============================================================================
+#  3d-ii. RSA (Representational Similarity Analysis)
+# ============================================================================
+
+def compute_rsa(
+    Z1: np.ndarray,
+    Z2: np.ndarray,
+    n_subsample: int = 300,
+    seed: int = 42,
+) -> float:
+    """Compute RSA Spearman rho between two embedding clouds.
+
+    Subsamples both Z1 and Z2 to n_subsample rows, computes pairwise
+    Euclidean RDMs, vectorizes the upper triangle (k=1), and returns the
+    Spearman rank correlation between the two RDM vectors.
+
+    Args:
+        Z1: First embedding matrix, shape (n1, D).
+        Z2: Second embedding matrix, shape (n2, D).
+        n_subsample: Max rows to draw from each matrix. Capped to
+            min(n1, n2, n_subsample) automatically.
+        seed: Random seed for subsampling reproducibility.
+
+    Returns:
+        Spearman rho in [-1, 1]. Returns 0.0 if either RDM vector has
+        zero variance (degenerate case).
+    """
+    rng = np.random.RandomState(seed)
+    n = min(len(Z1), len(Z2), n_subsample)
+    idx1 = rng.choice(len(Z1), n, replace=False)
+    idx2 = rng.choice(len(Z2), n, replace=False)
+    Z1s = Z1[idx1]   # [n, D]
+    Z2s = Z2[idx2]   # [n, D]
+
+    rdm1 = cdist(Z1s, Z1s, metric='euclidean')  # [n, n]
+    rdm2 = cdist(Z2s, Z2s, metric='euclidean')  # [n, n]
+
+    triu_idx = np.triu_indices(n, k=1)
+    v1 = rdm1[triu_idx]
+    v2 = rdm2[triu_idx]
+
+    if v1.std() == 0.0 or v2.std() == 0.0:
+        return 0.0
+
+    return float(spearmanr(v1, v2).statistic)
+
+
+def rsa_analysis(
+    dataset_types: list[str],
+    device: str = 'cpu',
+    prior_source: str = 'both',
+    n_synthetic: int = 500,
+    n_context: int = 50,
+    n_subsample: int = 300,
+    seed: int = 42,
+    layers: list[int] | None = None,
+) -> dict:
+    """Multi-layer RSA between neurostim and synthetic reference embeddings.
+
+    Computes RSA Spearman rho at each transformer layer, revealing where
+    neurostim geometry tracks the prior's geometry vs. the noise baseline.
+    High rho (->1) at a given layer means the pairwise distance structure
+    of neurostim embeddings matches the reference; near-zero or negative
+    rho means geometric dissimilarity.
+
+    Args:
+        dataset_types: List of dataset names.
+        device: 'cpu' or 'cuda'.
+        prior_source: 'gp' | 'tabpfn_prior' | 'both'.
+        n_synthetic: Number of synthetic datasets for reference embeddings.
+        n_context: Context size for embedding extraction.
+        n_subsample: Points to subsample per cloud for RDM computation.
+        seed: Random seed.
+        layers: Transformer layer indices to analyze.
+            Defaults to ID_OOD_LAYERS ([4, 13, 17]).
+
+    Returns:
+        dict with structure::
+
+            results[dataset_type][subj_idx][emg_idx][layer_idx] = {
+                'rsa_gp': float, 'rsa_prior': float, 'rsa_noise': float
+            }
+
+        Plus results['layers'] = list of analyzed layer indices.
+    """
+    if layers is None:
+        layers = ID_OOD_LAYERS
+    try:
+        return _rsa_analysis_inner(
+            dataset_types, device=device, prior_source=prior_source,
+            n_synthetic=n_synthetic, n_context=n_context,
+            n_subsample=n_subsample, seed=seed, layers=layers,
+        )
+    except _CudaError:
+        if device == 'cpu':
+            raise
+        print("  [RSA] CUDA error in embedding extraction, "
+              "falling back to CPU...")
+        torch.cuda.empty_cache()
+        return _rsa_analysis_inner(
+            dataset_types, device='cpu', prior_source=prior_source,
+            n_synthetic=n_synthetic, n_context=n_context,
+            n_subsample=n_subsample, seed=seed, layers=layers,
+        )
+
+
+def _rsa_analysis_inner(
+    dataset_types: list[str],
+    device: str,
+    prior_source: str,
+    n_synthetic: int,
+    n_context: int,
+    n_subsample: int,
+    seed: int,
+    layers: list[int],
+) -> dict:
+    """Core multi-layer RSA implementation.
+
+    Mirrors _cka_analysis_inner() but calls compute_rsa() instead of
+    linear_cka(), omitting the bootstrap loop (RSA subsamples internally).
+    """
+    model = TabPFNRegressor(device=device)
+    model.n_estimators = 1
+
+    # Phase 1: Build reference embeddings per layer
+    ref_embeddings: dict[int, dict[str, np.ndarray]] = {}
+
+    for layer_idx in layers:
+        lname = _layer_name(layer_idx)
+        layer_refs: dict[str, np.ndarray] = {}
+
+        if prior_source in ('gp', 'both'):
+            gp_bank = generate_synthetic_gp_bank(
+                n_datasets=n_synthetic, n_features=2, seed=seed,
+            )
+            layer_refs['gp'] = _embeddings_from_bank(
+                model, gp_bank, n_context, lname,
+            )
+
+        if prior_source in ('tabpfn_prior', 'both'):
+            prior_bank = generate_tabpfn_prior_bank(
+                n_datasets=n_synthetic, n_features=2, seed=seed,
+            )
+            layer_refs['prior'] = _embeddings_from_bank(
+                model, prior_bank, n_context, lname,
+            )
+
+        noise_bank = generate_noise_bank(
+            n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
+        )
+        layer_refs['noise'] = _embeddings_from_bank(
+            model, noise_bank, n_context, lname,
+        )
+
+        ref_embeddings[layer_idx] = layer_refs
+
+    # Phase 2: Compute RSA for neurostim data at each layer
+    results: dict = {}
+
+    for dataset_type in dataset_types:
+        subjects = ALL_SUBJECTS[dataset_type]
+        dataset_results: dict = {}
+
+        for subj_idx in subjects:
+            data = load_data(dataset_type, subj_idx)
+            coords = data['ch2xy']
+            scaler_x = MinMaxScaler()
+            X = scaler_x.fit_transform(coords).astype(np.float32)
+            n_emgs = data['sorted_respMean'].shape[1]
+
+            subj_results: dict = {}
+            for emg_idx in range(n_emgs):
+                resp_all = data['sorted_resp'][:, emg_idx, :]
+                scaler_y = StandardScaler()
+                scaler_y.fit(resp_all.reshape(-1, 1))
+                y_mean = data['sorted_respMean'][:, emg_idx]
+                y = scaler_y.transform(
+                    y_mean.reshape(-1, 1),
+                ).ravel().astype(np.float32)
+
+                n_ctx = min(n_context, len(X) - 1)
+                X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
+                X_tst = X[n_ctx:]
+
+                if len(X_tst) == 0:
+                    continue
+
+                emg_result: dict[int, dict[str, float]] = {}
+
+                for layer_idx in layers:
+                    lname = _layer_name(layer_idx)
+                    embeddings = extract_embeddings_frozen(
+                        model, X_ctx, y_ctx, X_tst,
+                        layer_name=lname,
+                    )
+
+                    layer_scores: dict[str, float] = {}
+                    for ref_name, ref_emb in ref_embeddings[layer_idx].items():
+                        rho = compute_rsa(
+                            embeddings, ref_emb,
+                            n_subsample=n_subsample,
+                            seed=seed,
+                        )
+                        layer_scores[f'rsa_{ref_name}'] = rho
+
+                    emg_result[layer_idx] = layer_scores
+
+                subj_results[emg_idx] = emg_result
+
+            dataset_results[subj_idx] = subj_results
+
+        results[dataset_type] = dataset_results
+
+    results['layers'] = list(layers)
+    return results
+
+
+# ============================================================================
+#  3d-iii. Procrustes BO-Trajectory (B7)
+# ============================================================================
+
+# Default BO budget steps for the trajectory sweep.  Budget=2 is the minimum
+# valid context size for TabPFN.fit() and serves as the disparity baseline.
+PROC_BUDGETS_DEFAULT: list[int] = [2, 10, 30, 50, 100]
+
+
+def compute_procrustes_disparity(
+    Z1: np.ndarray,
+    Z2: np.ndarray,
+    n_subsample: int = 300,
+    seed: int = 42,
+) -> float:
+    """Procrustes disparity between two embedding clouds with row correspondence.
+
+    ``scipy.spatial.procrustes`` centers each cloud, scales to unit Frobenius
+    norm, and finds the rotation/reflection R minimizing ``||X - YR||_F`` via
+    SVD.  Disparity = ``1 - ||YR^T X^T||_F^2`` in ``[0, 1]``.
+
+    Procrustes assumes rows are ordered (row *i* of Z1 corresponds to row *i*
+    of Z2).  The intended use is to compare embeddings of the *same* query
+    points under two different contexts — rows naturally align by query
+    point index.
+
+    Args:
+        Z1: First embedding matrix, shape ``(n, D)``.
+        Z2: Second embedding matrix, shape ``(n, D)`` — must match Z1's shape.
+        n_subsample: Subsample this many rows (applied to both clouds with
+            the same indices so correspondence is preserved).
+        seed: Random seed for subsampling.
+
+    Returns:
+        Disparity in ``[0, 1]``.  Returns ``np.nan`` if either cloud contains
+        non-finite values or has zero Frobenius norm after centering.
+    """
+    if Z1.shape != Z2.shape:
+        raise ValueError(
+            f"Procrustes requires matching shapes: {Z1.shape} vs {Z2.shape}"
+        )
+    n = min(len(Z1), n_subsample)
+    if n < 2:
+        return float('nan')
+
+    rng = np.random.RandomState(seed)
+    idx = np.sort(rng.choice(len(Z1), n, replace=False))
+
+    X = Z1[idx].astype(np.float64)
+    Y = Z2[idx].astype(np.float64)
+
+    if not (np.all(np.isfinite(X)) and np.all(np.isfinite(Y))):
+        return float('nan')
+
+    try:
+        _, _, disparity = scipy_procrustes(X, Y)
+    except ValueError:
+        return float('nan')
+    return float(disparity)
+
+
+def _trajectory_disparities(
+    model: TabPFNRegressor,
+    X: np.ndarray,
+    y: np.ndarray,
+    budgets: list[int],
+    rng: np.random.RandomState,
+    layer_name: str,
+    n_subsample: int,
+) -> list[float] | None:
+    """Single BO-trajectory disparity curve.
+
+    Picks a random permutation of X.  At each budget t, uses the first t
+    permuted points as TabPFN context and extracts embeddings for the full
+    search space at ``layer_name``.  Returns the Procrustes disparity between
+    E(budgets[0]) and each E(t).
+
+    Returns:
+        List of len(budgets) disparities, or None if any embedding extraction
+        fails or produces non-finite values (signals caller to skip this
+        trajectory).
+    """
+    n = len(X)
+    perm = rng.permutation(n)
+
+    embeddings: list[np.ndarray] = []
+    for t in budgets:
+        t_clamped = max(2, min(int(t), n - 1))
+        ctx = perm[:t_clamped]
+        try:
+            emb = extract_embeddings_frozen(
+                model, X[ctx], y[ctx], X, layer_name=layer_name,
+            )                                                       # [n, d_hidden]
+        except Exception as exc:
+            if _is_cuda_error(exc):
+                raise _CudaError(str(exc)) from exc
+            return None
+        if not np.all(np.isfinite(emb)):
+            return None
+        embeddings.append(emb)
+
+    baseline = embeddings[0]
+    return [
+        compute_procrustes_disparity(baseline, emb, n_subsample=n_subsample,
+                                     seed=0)
+        for emb in embeddings
+    ]
+
+
+def embedding_trajectory_analysis(
+    dataset_types: list[str],
+    device: str = 'cpu',
+    prior_source: str = 'tabpfn_prior',
+    n_synthetic: int = 20,
+    budgets: list[int] | None = None,
+    layer: int = 17,
+    n_subsample: int = 300,
+    seed: int = 42,
+) -> dict:
+    """Procrustes BO-trajectory analysis (B7).
+
+    For each (subject, EMG) pair and each synthetic reference dataset, extracts
+    embeddings of the full search space at transformer ``layer`` for a sweep
+    of BO budgets.  Disparity is computed against the smallest-budget
+    embedding — measuring how the internal geometry evolves as more context
+    accumulates.  Smooth convergence is predicted for ID data; erratic drift
+    is predicted for OOD data.
+
+    Args:
+        dataset_types: Dataset names (e.g. ``['rat', 'nhp']``).
+        device: ``'cpu'`` or ``'cuda'``.  Auto-falls back to CPU on CUDA error.
+        prior_source: ``'gp' | 'tabpfn_prior' | 'both'``.
+        n_synthetic: Number of synthetic datasets per reference source.
+            Kept small (default 20) because each dataset yields a full
+            budget sweep.
+        budgets: BO budget steps.  Default ``PROC_BUDGETS_DEFAULT``.
+        layer: Transformer layer index for embedding extraction.
+        n_subsample: Subsample size for Procrustes computation.
+        seed: Random seed.
+
+    Returns:
+        dict with structure::
+
+            {
+                'budgets': [...],
+                'layer': int,
+                <dataset_type>: {subj_idx: {emg_idx: [disparities]}},
+                'synthetic_gp':    [ [disparities], ... ],     # optional
+                'synthetic_prior': [ [disparities], ... ],     # optional
+                'synthetic_noise': [ [disparities], ... ],
+            }
+    """
+    if budgets is None:
+        budgets = list(PROC_BUDGETS_DEFAULT)
+    try:
+        return _embedding_trajectory_inner(
+            dataset_types, device=device, prior_source=prior_source,
+            n_synthetic=n_synthetic, budgets=budgets, layer=layer,
+            n_subsample=n_subsample, seed=seed,
+        )
+    except _CudaError:
+        if device == 'cpu':
+            raise
+        print("  [Procrustes] CUDA error in embedding extraction, "
+              "falling back to CPU...")
+        torch.cuda.empty_cache()
+        return _embedding_trajectory_inner(
+            dataset_types, device='cpu', prior_source=prior_source,
+            n_synthetic=n_synthetic, budgets=budgets, layer=layer,
+            n_subsample=n_subsample, seed=seed,
+        )
+
+
+def _embedding_trajectory_inner(
+    dataset_types: list[str],
+    device: str,
+    prior_source: str,
+    n_synthetic: int,
+    budgets: list[int],
+    layer: int,
+    n_subsample: int,
+    seed: int,
+) -> dict:
+    """Core trajectory implementation (called by embedding_trajectory_analysis)."""
+    model = TabPFNRegressor(device=device)
+    model.n_estimators = 1
+
+    layer_name = _layer_name(layer)
+    max_budget = max(budgets)
+
+    results: dict = {'budgets': list(budgets), 'layer': layer}
+
+    # ── Neurostim trajectories ────────────────────────────────────────────
+    for dataset_type in dataset_types:
+        subjects = ALL_SUBJECTS[dataset_type]
+        ds_traj: dict = {}
+        for subj_idx in subjects:
+            data = load_data(dataset_type, subj_idx)
+            coords = data['ch2xy']
+            scaler_x = MinMaxScaler()
+            X = scaler_x.fit_transform(coords).astype(np.float32)   # [n, 2]
+            n_emgs = data['sorted_respMean'].shape[1]
+
+            if len(X) < max_budget + 1:
+                print(f"  [Procrustes] Skipping {dataset_type} S{subj_idx}: "
+                      f"grid size {len(X)} < max budget {max_budget}")
+                continue
+
+            subj_traj: dict = {}
+            for emg_idx in range(n_emgs):
+                resp_all = data['sorted_resp'][:, emg_idx, :]
+                scaler_y = StandardScaler()
+                scaler_y.fit(resp_all.reshape(-1, 1))
+                y_mean = data['sorted_respMean'][:, emg_idx]
+                y = scaler_y.transform(
+                    y_mean.reshape(-1, 1),
+                ).ravel().astype(np.float32)                         # [n]
+
+                rng_pair = np.random.RandomState(
+                    seed + 1000 * (subj_idx + 1) + 11 * emg_idx,
+                )
+                traj = _trajectory_disparities(
+                    model, X, y, budgets, rng_pair, layer_name, n_subsample,
+                )
+                if traj is not None:
+                    subj_traj[emg_idx] = traj
+            ds_traj[subj_idx] = subj_traj
+        results[dataset_type] = ds_traj
+
+    # ── Synthetic reference trajectories ──────────────────────────────────
+    synthetic_banks: dict[str, list] = {}
+    if prior_source in ('gp', 'both'):
+        synthetic_banks['gp'] = generate_synthetic_gp_bank(
+            n_datasets=n_synthetic, n_features=2, seed=seed,
+        )
+    if prior_source in ('tabpfn_prior', 'both'):
+        synthetic_banks['prior'] = generate_tabpfn_prior_bank(
+            n_datasets=n_synthetic, n_features=2, seed=seed,
+        )
+    synthetic_banks['noise'] = generate_noise_bank(
+        n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
+    )
+
+    for src_name, bank in synthetic_banks.items():
+        src_trajs: list[list[float]] = []
+        n_skipped = 0
+        for ds_idx, (X_raw, y_raw) in enumerate(bank):
+            normed = _normalize_for_tabpfn(X_raw, y_raw)
+            if normed is None:
+                n_skipped += 1
+                continue
+            X_n, y_n = normed
+            if len(X_n) < max_budget + 1:
+                n_skipped += 1
+                continue
+            rng_pair = np.random.RandomState(seed + 100_000 + ds_idx)
+            traj = _trajectory_disparities(
+                model, X_n, y_n, budgets, rng_pair, layer_name, n_subsample,
+            )
+            if traj is not None:
+                src_trajs.append(traj)
+            else:
+                n_skipped += 1
+        print(f"  [Procrustes] synthetic_{src_name}: {len(src_trajs)} valid, "
+              f"{n_skipped} skipped")
+        results[f'synthetic_{src_name}'] = src_trajs
+
+    return results
+
+
+# ============================================================================
 #  3e. Gradient L2-Norm at Step 0
 # ============================================================================
 
@@ -1354,7 +1845,11 @@ def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
 def run_id_ood_analysis(dataset_types=None, analyses=None,
                         prior_source='both', device='cpu',
                         n_synthetic=500, n_context=100, seed=42,
-                        save=False, output_dir=None):
+                        save=False, output_dir=None,
+                        cka_layers=None,
+                        proc_budgets=None,
+                        proc_layer=17,
+                        proc_n_synthetic=20):
     """Orchestrate all ID/OOD analyses.
 
     Generates synthetic bank(s) once, shared across analyses.
@@ -1362,7 +1857,8 @@ def run_id_ood_analysis(dataset_types=None, analyses=None,
     Args:
         dataset_types: list of dataset names (default: ['rat', 'nhp'])
         analyses: list of analysis names (default: ['entropy', 'mmd', 'mahalanobis']).
-            Additional: 'cka', 'wasserstein', 'gradient_norm'.
+            Additional: 'cka', 'wasserstein', 'gradient_norm', 'rsa',
+            'procrustes'.
         prior_source: 'gp' | 'tabpfn_prior' | 'both'
         device: 'cpu' or 'cuda'
         n_synthetic: number of synthetic datasets
@@ -1370,6 +1866,15 @@ def run_id_ood_analysis(dataset_types=None, analyses=None,
         seed: random seed
         save: whether to save results to disk
         output_dir: base output directory
+        cka_layers: transformer layer indices for CKA analysis. None uses
+            ID_OOD_LAYERS default inside cka_analysis().
+        proc_budgets: BO budget steps for Procrustes trajectory (B7).
+            None uses ``PROC_BUDGETS_DEFAULT``.
+        proc_layer: Transformer layer for Procrustes embedding extraction
+            (default 17).
+        proc_n_synthetic: Synthetic datasets per reference source for the
+            Procrustes trajectory (default 20 — smaller than other analyses
+            because each dataset yields a full budget sweep).
 
     Returns:
         dict with results per analysis type.
@@ -1443,6 +1948,7 @@ def run_id_ood_analysis(dataset_types=None, analyses=None,
         cka_results = cka_analysis(
             dataset_types, device=device, prior_source=prior_source,
             n_synthetic=n_synthetic, n_context=n_context, seed=seed,
+            layers=cka_layers,
         )
         all_results['cka'] = cka_results
 
@@ -1486,6 +1992,41 @@ def run_id_ood_analysis(dataset_types=None, analyses=None,
             with open(os.path.join(out, 'gradient_norm_results.pkl'), 'wb') as f:
                 pickle.dump(gradient_results, f)
             print(f"Saved gradient norm results -> {out}")
+
+    if 'rsa' in analyses:
+        print("=" * 60)
+        print("[ID/OOD] Running RSA analysis...")
+        print("=" * 60)
+        rsa_results = rsa_analysis(
+            dataset_types, device=device, prior_source=prior_source,
+            n_synthetic=n_synthetic, n_context=n_context, seed=seed,
+        )
+        all_results['rsa'] = rsa_results
+
+        if save:
+            out = os.path.join(output_dir, 'rsa')
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, 'rsa_results.pkl'), 'wb') as f:
+                pickle.dump(rsa_results, f)
+            print(f"Saved RSA results -> {out}")
+
+    if 'procrustes' in analyses:
+        print("=" * 60)
+        print("[ID/OOD] Running Procrustes BO-trajectory analysis (B7)...")
+        print("=" * 60)
+        procrustes_results = embedding_trajectory_analysis(
+            dataset_types, device=device, prior_source=prior_source,
+            n_synthetic=proc_n_synthetic, budgets=proc_budgets,
+            layer=proc_layer, seed=seed,
+        )
+        all_results['procrustes'] = procrustes_results
+
+        if save:
+            out = os.path.join(output_dir, 'trajectory')
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, 'procrustes_results.pkl'), 'wb') as f:
+                pickle.dump(procrustes_results, f)
+            print(f"Saved Procrustes trajectory results -> {out}")
 
     return all_results
 
