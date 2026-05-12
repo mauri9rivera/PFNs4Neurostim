@@ -19,6 +19,6 @@ analyses:
 prior_source: tabpfn_prior
 device: cpu
 n_synthetic: 500
-n_context: 50
+n_context: 0.5
 seed: 42
 save: true

@@ -17,6 +17,27 @@ PALETTE = {
 }
 
 
+def _to_grid(values: np.ndarray, ch2xy: np.ndarray, grid_shape: tuple) -> np.ndarray:
+    """Scatter ``values`` (one per real electrode) into a NaN-padded display grid.
+
+    ``ch2xy[i] = (row, col)`` is the grid position of the *i-th* electrode in
+    ``values``.  Cells without an electrode stay NaN; downstream heatmaps
+    render those as the colormap's "bad colour" (set by ``cmap.set_bad``)
+    so empty grid positions are visibly absent rather than spuriously zero.
+    """
+    img = np.full(tuple(grid_shape), np.nan, dtype=float)
+    values = np.asarray(values).ravel()
+    for i, (r, c) in enumerate(ch2xy):
+        img[int(r), int(c)] = values[i]
+    return img
+
+
+def _grid_argmax(values: np.ndarray, ch2xy: np.ndarray) -> tuple:
+    """Return ``(row, col)`` of the maximum value, looked up via ``ch2xy``."""
+    flat_idx = int(np.argmax(np.asarray(values).ravel()))
+    return int(ch2xy[flat_idx, 0]), int(ch2xy[flat_idx, 1])
+
+
 def _diag_save_dir(output_dir):
     """Return diagnostics output directory, creating it if needed."""
     base = output_dir if output_dir else os.path.join('output', 'diagnostics')
@@ -162,116 +183,6 @@ def _normalize_results_dict(first_arg, second_arg=None):
     return results
 
 
-def r2_per_muscle(results_dict_or_gp, pfn_results=None, mode='', save=False, output_dir=None, eval_type='fit'):
-    """Bar plot of R² per subject-EMG pair (muscle), one bar per model."""
-    results_dict = _normalize_results_dict(results_dict_or_gp, pfn_results)
-
-    data = []
-    n_experiments = 0
-
-    for model_name, results_list in results_dict.items():
-        n_experiments = max(n_experiments, len(results_list))
-        for res in results_list:
-            for score in res['r2']:
-                data.append({
-                    'muscle': f"S{res['subject']} EMG {res['emg']}",
-                    'R2': score,
-                    'Model': model_name
-                })
-
-    df = pd.DataFrame(data)
-    plt.figure(figsize=(1.4 * n_experiments, 6))
-    plt.ylim(0, 1)
-    plt.xticks(rotation=45, ha='right')
-    sns.barplot(data=df, x='muscle', y='R2', hue='Model', palette=PALETTE,
-                errorbar=('ci', 95))
-
-    model_names = ' vs '.join(results_dict.keys())
-    plt.title(f"R2 Score Comparison: {model_names}")
-
-    # Determine dataset from first available result
-    first_results = next(iter(results_dict.values()))
-    base = os.path.join(output_dir, 'fitness') if output_dir else \
-           os.path.join('output', 'fitness', first_results[0]['dataset'])
-    os.makedirs(base, exist_ok=True)
-    plot_path = os.path.join(base, f'r2_comparison{mode}.svg')
-    if save:
-        plt.savefig(plot_path, format="svg")
-        print(f"Saved plot to {plot_path}")
-
-    plt.close()
-
-
-# Backward-compatible alias
-r2_comparison = r2_per_muscle
-
-
-def show_emg_map(results, idx, model_type, mode='', save=False, output_dir=None, eval_type='fit'):
-    res = results[idx]
-
-    y_true = res['y_test']
-    y_pred = res['y_pred']
-    r2_score = np.mean(np.array(res['r2']))
-
-    # Determine Grid Shape
-    n_channels = len(y_true)
-    if n_channels == 100: grid_shape = (10, 10)
-    elif n_channels == 64: grid_shape = (8, 8)
-    elif n_channels == 32: grid_shape = (4, 8)
-    else: grid_shape = (1, n_channels)
-
-    v_min = min(y_true.min(), y_pred.min())
-    v_max = max(y_true.max(), y_pred.max())
-
-    map_true = y_true.reshape(grid_shape)
-    map_pred = y_pred.reshape(grid_shape)
-
-    max_idx_true = np.unravel_index(np.argmax(map_true), grid_shape)
-    max_idx_pred = np.unravel_index(np.argmax(map_pred), grid_shape)
-
-    dataset, subject, emg = res['dataset'], res['subject'], res['emg']
-
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle(f'{model_type} EMG Map | {dataset} Subj {subject} EMG {emg}')
-
-    heatmap_kwargs = {
-        'cmap': 'viridis',
-        'vmin': v_min,
-        'vmax': v_max,
-    }
-
-    sns.heatmap(map_true, ax=ax[0], **heatmap_kwargs)
-    ax[0].set_title(f"Ground Truth (S{subject} EMG{emg})")
-    ax[0].plot(max_idx_true[1] + 0.5, max_idx_true[0] + 0.5, 'ro', markersize=8)
-
-    sns.heatmap(map_pred, ax=ax[1], **heatmap_kwargs)
-    ax[1].set_title(f"Prediction | R2:{r2_score:.2f}")
-    ax[1].plot(max_idx_pred[1] + 0.5, max_idx_pred[0] + 0.5, 'ro', markersize=8)
-
-    if eval_type == 'optimization':
-        base = os.path.join(output_dir, 'optimization', 'emg_maps') if output_dir else \
-               os.path.join('output', 'optimization', 'emg_maps')
-    else:
-        base = os.path.join(output_dir, 'fitness', 'emg_maps') if output_dir else \
-               os.path.join('output', 'fitness', dataset, 'emg_maps')
-    os.makedirs(base, exist_ok=True)
-    plot_path = os.path.join(base, f'emg_map_{dataset}_s{subject}_emg{emg}_{model_type}{mode}.svg')
-    if save:
-        plt.savefig(plot_path, format="svg")
-        print(f"Saved plot to {plot_path}")
-
-    plt.close()
-
-
-def _infer_grid_shape(n_channels):
-    """Return (rows, cols) for a given number of channels."""
-    if n_channels == 100: return (10, 10)
-    elif n_channels == 96: return (8, 12)
-    elif n_channels == 64: return (8, 8)
-    elif n_channels == 32: return (4, 8)
-    else: return (1, n_channels)
-
-
 def visualize_representation(results_dict, mode='', save=False, output_dir=None):
     """
     Heatmap grid showing model predictions evolving across BO iterations.
@@ -321,8 +232,9 @@ def visualize_representation(results_dict, mode='', save=False, output_dir=None)
         return
 
     ref_res = first_results[idx]
-    y_test = ref_res['y_test']
-    grid_shape = _infer_grid_shape(len(y_test))
+    y_test = np.asarray(ref_res['y_test'])
+    ch2xy = ref_res['ch2xy']
+    grid_shape = ref_res['grid_shape']
     v_min, v_max = float(y_test.min()), float(y_test.max())
 
     model_names = list(results_dict.keys())
@@ -334,20 +246,22 @@ def visualize_representation(results_dict, mode='', save=False, output_dir=None)
                              figsize=(3 * n_cols, 3 * n_rows),
                              squeeze=False)
 
-    heatmap_kw = dict(cmap='viridis', vmin=v_min, vmax=v_max,
+    cmap = plt.get_cmap('viridis').copy()
+    cmap.set_bad('lightgrey')
+    heatmap_kw = dict(cmap=cmap, vmin=v_min, vmax=v_max,
                       cbar=False, xticklabels=False, yticklabels=False)
 
     subject = ref_res.get('subject', '?')
     emg = ref_res.get('emg', '?')
 
     # Ground truth optimum location (shared across all columns)
-    gt_idx = int(np.argmax(y_test))
-    gt_row_2d, gt_col_2d = gt_idx // grid_shape[1], gt_idx % grid_shape[1]
+    gt_row_2d, gt_col_2d = _grid_argmax(y_test, ch2xy)
+    y_test_grid = _to_grid(y_test, ch2xy, grid_shape)
 
     # Row 0: ground truth
     for col in range(n_cols):
         ax = axes[0, col]
-        sns.heatmap(y_test.reshape(grid_shape), ax=ax, **heatmap_kw)
+        sns.heatmap(y_test_grid, ax=ax, **heatmap_kw)
         ax.plot(gt_col_2d + 0.5, gt_row_2d + 0.5, 'g*', markersize=10,
                 markeredgecolor='white', markeredgewidth=0.5)
         if col == 0:
@@ -360,12 +274,10 @@ def visualize_representation(results_dict, mode='', save=False, output_dir=None)
         for col, it in enumerate(snapshot_iters):
             ax = axes[1 + row_i, col]
             if snaps and it in snaps:
-                pred = snaps[it]['y_pred']
+                pred = np.asarray(snaps[it]['y_pred'])
                 r2_val = snaps[it]['r2']
-                sns.heatmap(pred.reshape(grid_shape), ax=ax, **heatmap_kw)
-                opt_idx = int(np.argmax(pred.ravel()))
-                opt_row_2d = opt_idx // grid_shape[1]
-                opt_col_2d = opt_idx % grid_shape[1]
+                sns.heatmap(_to_grid(pred, ch2xy, grid_shape), ax=ax, **heatmap_kw)
+                opt_row_2d, opt_col_2d = _grid_argmax(pred, ch2xy)
                 ax.plot(opt_col_2d + 0.5, opt_row_2d + 0.5, 'r*', markersize=10,
                         markeredgecolor='white', markeredgewidth=0.5)
                 ax.set_title(f'R²={r2_val:.2f}', fontsize=7)
@@ -396,18 +308,15 @@ def visualize_representation(results_dict, mode='', save=False, output_dir=None)
     plt.close()
 
 
-def r2_by_subject(results_dict, split_type='', save=False, output_dir=None,
-                  output_subdir='fitness'):
+def r2_by_subject(results_dict, split_type='', save=False, output_dir=None):
     """Box plot of R² values grouped by subject index, one bar per model.
 
     Args:
         results_dict: dict[str, list[dict]] — model name -> list of result dicts
         split_type: string suffix for the output filename
         save: whether to save the figure to disk
-        output_subdir: subfolder under ``output_dir`` to write into.
-            Use ``'fitness'`` for fit-mode results and ``'optimization'`` for
-            optimization-mode results.
     """
+    output_subdir = 'optimization'
     results_dict = _normalize_results_dict(results_dict)
 
     data = []
@@ -810,7 +719,8 @@ def kappa_auc_bar(
     plt.close()
 
 
-def budget_sweep_plot(df, eval_type, dataset='', split_type='', save=False, output_dir=None):
+def budget_sweep_plot(df, dataset='', split_type='', save=False, output_dir=None,
+                      eval_type='optimization'):
     """
     Budget sweep with per-subject light traces and bold cross-subject mean.
 
@@ -818,22 +728,23 @@ def budget_sweep_plot(df, eval_type, dataset='', split_type='', save=False, outp
     the bold line shows the mean across subjects +/- SE. One trace per model.
 
     Args:
-        df: DataFrame with columns Budget, Model, ID, and R2 and/or Regret.
+        df: DataFrame with columns Budget, Model, ID, R2, Regret.
             ID format: '{subject}_{emg}'.
-        eval_type: 'fit' -> R² panel; 'optimization' -> Regret panel (+ R² if present).
         dataset, split_type, save, output_dir: plotting options.
+        eval_type: kept for callsite back-compat; only ``'optimization'`` is supported.
     """
+    if eval_type != 'optimization':
+        raise ValueError(
+            f"budget_sweep_plot supports only eval_type='optimization', got {eval_type!r}."
+        )
     df = df.copy()
     df['Subject'] = df['ID'].str.split('_').str[0]
 
     metrics = []
-    if eval_type == 'fit' and 'R2' in df.columns:
-        metrics = [('R2', 'R² Score', (0, 1.05), 'R² vs Budget')]
-    elif eval_type == 'optimization':
-        if 'R2' in df.columns:
-            metrics.append(('R2', 'R² Score', (0, 1.05), 'R² vs Budget'))
-        if 'Regret' in df.columns:
-            metrics.append(('Regret', 'Final Simple Regret (%)', None, 'Regret vs Budget'))
+    if 'R2' in df.columns:
+        metrics.append(('R2', 'R² Score', (0, 1.05), 'R² vs Budget'))
+    if 'Regret' in df.columns:
+        metrics.append(('Regret', 'Final Simple Regret (%)', None, 'Regret vs Budget'))
 
     if not metrics:
         return
@@ -873,15 +784,9 @@ def budget_sweep_plot(df, eval_type, dataset='', split_type='', save=False, outp
     fig.tight_layout()
 
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    if eval_type == 'fit':
-        base = os.path.join(output_dir, 'fitness') if output_dir else \
-               os.path.join('output', 'fitness', dataset)
-        plot_path = os.path.join(base, f'budget_sweep_fit{suffix}.svg')
-    else:
-        base = os.path.join(output_dir, 'optimization') if output_dir else \
-               os.path.join('output', 'optimization')
-        plot_path = os.path.join(base, f'budget_sweep_optimization{suffix}.svg')
-
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    plot_path = os.path.join(base, f'budget_sweep_optimization{suffix}.svg')
     os.makedirs(base, exist_ok=True)
     if save:
         plt.savefig(plot_path, format='svg')
@@ -922,12 +827,11 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
         ax_time = axes[1, idx]
         ax_ee = axes[2, idx]
 
-        ref_res = first_results[idx]
-        optimal_val = ref_res['y_test'].max()
-
         for model_name, results_list in results_dict.items():
             res = results_list[idx]
             color = PALETTE.get(model_name, 'gray')
+            # Use each model's own raw-scale optimal so cross-model comparison is valid.
+            optimal_val = float(res['y_test'].max())
 
             # --- regret row ---
             if 'values' in res:
@@ -949,19 +853,28 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
                 times_arr = np.array(times)
                 ax_time.plot(times_arr, color=color, linewidth=2, label=model_name)
 
-            # --- exploration score row ---
-            # exploration(t) = max(model.predict(X_pool)[0]) at iter t / optimal
-            # best_pred_val is the model's predicted maximum over the full candidate pool.
-            snaps = res.get('snapshots')
-            if snaps and optimal_val > 1e-8:
-                iters = sorted(snaps.keys())
-                scores = [
-                    snaps[it]['best_pred_val'] / optimal_val
-                    for it in iters
-                ]
-                ax_ee.plot(iters, scores, color=color, linewidth=2,
-                           marker='o', markersize=4, label=model_name)
+            # --- exploitation score row ---
+            # Dense path: perf_explore[t] = cummax(y_test_raw[argmax(mean_pred)] / optimal)
+            # Fallback: sparse best_pred_val from log-spaced snapshots (legacy pkl files).
+            perf_explore = res.get('perf_explore')
+            n_init_res = res.get('n_init', 0)
+            if perf_explore is not None and optimal_val > 1e-8:
+                explore_arr = np.asarray(perf_explore)          # [n_steps]
+                x_explore = np.arange(n_init_res, n_init_res + len(explore_arr))
+                ax_ee.plot(x_explore, explore_arr, color=color, linewidth=2,
+                           label=model_name)
+            else:
+                snaps = res.get('snapshots')
+                if snaps and optimal_val > 1e-8:
+                    iters = sorted(snaps.keys())
+                    scores = [
+                        snaps[it]['best_pred_val'] / optimal_val
+                        for it in iters
+                    ]
+                    ax_ee.plot(iters, scores, color=color, linewidth=2,
+                               marker='o', markersize=4, label=model_name)
 
+        ref_res = first_results[idx]
         ax_reg.set_title(f"S{ref_res['subject']} EMG {ref_res['emg']}", fontsize=9)
         ax_reg.set_xlabel('Iteration')
         ax_reg.grid(True, alpha=0.3)
@@ -982,7 +895,7 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
 
     axes[0, 0].set_ylabel('Recommendation Regret (%)')
     axes[1, 0].set_ylabel('Inference Time (s)')
-    axes[2, 0].set_ylabel('Exploration Score\n(max predicted / optimal)')
+    axes[2, 0].set_ylabel('Exploitation Score\n(running best recommendation / optimal)')
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper right', fontsize=9)
@@ -1003,16 +916,15 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
     plt.close()
 
 
-def augmentation_sweep_plot(df, eval_type, dataset='', split_type='', save=False, output_dir=None):
+def augmentation_sweep_plot(df, dataset='', split_type='', save=False, output_dir=None):
     """
-    Point plot of R² and (optionally) Final Regret vs number of augmentations.
+    Point plot of R² and Final Regret vs number of augmentations (optimization mode).
 
     n_aug=0 represents vanilla TabPFN (no finetuning); n_aug>0 represents
     finetuned TabPFN with that many augmentations per subject-EMG pair.
 
     Args:
-        df: DataFrame with columns n_aug, R2, (Regret), ID
-        eval_type: 'fit' (R² only) or 'optimization' (R² + Regret, 2 rows)
+        df: DataFrame with columns n_aug, R2, Regret, ID
         dataset: dataset name used for output path and title
         split_type: string suffix for the output filename
         save: whether to save the figure to disk
@@ -1030,44 +942,28 @@ def augmentation_sweep_plot(df, eval_type, dataset='', split_type='', save=False
 
     suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
 
-    if eval_type == 'fit':
-        fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-        sns.pointplot(data=df, x='Aug', y='R2', order=x_labels,
-                      color=color, capsize=0.15, errorbar=('ci', 95), ax=ax)
-        ax.set_xlabel('Number of Augmentations')
-        ax.set_ylabel('R² Score')
-        ax.set_ylim(0, 1)
-        ax.set_title(f'R² vs Augmentations ({dataset})')
-        ax.grid(True, alpha=0.3, axis='y')
+    fig, axes = plt.subplots(2, 1, figsize=(8, 9), sharex=True)
 
-        base = os.path.join(output_dir, 'fitness') if output_dir else \
-               os.path.join('output', 'fitness', dataset)
-        os.makedirs(base, exist_ok=True)
-        plot_path = os.path.join(base, f'aug_sweep_fit{suffix}.svg')
+    sns.pointplot(data=df, x='Aug', y='R2', order=x_labels,
+                  color=color, capsize=0.15, errorbar=('ci', 95), ax=axes[0])
+    axes[0].set_ylabel('R² Score')
+    axes[0].set_ylim(0, 1)
+    axes[0].set_title(f'R² vs Augmentations ({dataset})')
+    axes[0].grid(True, alpha=0.3, axis='y')
 
-    else:  # optimization
-        fig, axes = plt.subplots(2, 1, figsize=(8, 9), sharex=True)
+    sns.pointplot(data=df, x='Aug', y='Regret', order=x_labels,
+                  color=color, capsize=0.15, errorbar=('ci', 95), ax=axes[1])
+    axes[1].set_ylabel('Final Simple Regret')
+    axes[1].set_xlabel('Number of Augmentations')
+    axes[1].set_title(f'Final Regret vs Augmentations ({dataset})')
+    axes[1].grid(True, alpha=0.3, axis='y')
 
-        sns.pointplot(data=df, x='Aug', y='R2', order=x_labels,
-                      color=color, capsize=0.15, errorbar=('ci', 95), ax=axes[0])
-        axes[0].set_ylabel('R² Score')
-        axes[0].set_ylim(0, 1)
-        axes[0].set_title(f'R² vs Augmentations ({dataset})')
-        axes[0].grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
 
-        sns.pointplot(data=df, x='Aug', y='Regret', order=x_labels,
-                      color=color, capsize=0.15, errorbar=('ci', 95), ax=axes[1])
-        axes[1].set_ylabel('Final Simple Regret')
-        axes[1].set_xlabel('Number of Augmentations')
-        axes[1].set_title(f'Final Regret vs Augmentations ({dataset})')
-        axes[1].grid(True, alpha=0.3, axis='y')
-
-        fig.tight_layout()
-
-        base = os.path.join(output_dir, 'optimization') if output_dir else \
-               os.path.join('output', 'optimization')
-        os.makedirs(base, exist_ok=True)
-        plot_path = os.path.join(base, f'aug_sweep_optimization{suffix}.svg')
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
+    plot_path = os.path.join(base, f'aug_sweep_optimization{suffix}.svg')
 
     if save:
         plt.savefig(plot_path, format='svg')

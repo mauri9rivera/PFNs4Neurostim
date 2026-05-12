@@ -1,23 +1,23 @@
-# Canonical hyperparameters for rat vanilla TabPFN vs GP benchmark.
+# Canonical hyperparameters for spinal cord vanilla TabPFN vs GP benchmark.
 # Family: vanilla-benchmark
 # Usage:
-#   python src/vanilla_benchmark.py --config configs/rat_vanilla_benchmark.yaml
+#   python src/vanilla_benchmark.py --config configs/spinal_vanilla_benchmark.yaml
 
 family: vanilla-benchmark
-dataset: rat
+dataset: spinal
 mode:
   - optimization
   - optimization_budget
 
-# Evaluation — rat grid is 8x4=32 sites, so budget matches grid size
-budget: 32
+# Evaluation — spinal grid is 8x8=64 sites, so budget matches grid size
+budget: 64
 n_reps: 30
 budgets:
   - 10
   - 20
   - 32
   - 50
-  - 100
+  - 64
 
 # UCB kappa control:
 #   kappa_schedule: 0.0  →  auto cosine-annealed schedule (GP-UCB theory scaling)

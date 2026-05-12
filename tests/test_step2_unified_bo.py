@@ -156,10 +156,9 @@ class TestGPSurrogateConstructor:
 
     def test_custom_construction(self):
         GP = self._import()
-        s = GP(device="cpu", n_opt_steps=10, lr=0.05, kappa_0=3.0, kappa_min=0.5)
+        s = GP(device="cpu", n_opt_steps=10, lr=0.05)
         assert s._n_opt_steps == 10
         assert abs(s._lr - 0.05) < 1e-9
-        assert abs(s._kappa_0 - 3.0) < 1e-9
 
     def test_predict_before_fit_raises(self):
         GP = self._import()
@@ -196,16 +195,16 @@ class TestTabPFNSurrogateConstructor:
         s = TabPFNSurrogate(mock)
         assert s._model is mock
 
-    def test_default_kappa_values(self):
+    def test_stores_logit_cache_as_none_initially(self):
         from models.regressors import TabPFNSurrogate
         s = TabPFNSurrogate(MagicMock())
-        assert abs(s._kappa_0 - 2.5) < 1e-9
-        assert abs(s._kappa_min - 0.5) < 1e-9
+        assert s._logit_cache is None
 
-    def test_custom_kappa(self):
+    def test_model_reference_stored_correctly(self):
         from models.regressors import TabPFNSurrogate
-        s = TabPFNSurrogate(MagicMock(), kappa_0=5.0, kappa_min=1.0)
-        assert abs(s._kappa_0 - 5.0) < 1e-9
+        mock = MagicMock()
+        s = TabPFNSurrogate(mock)
+        assert s._model is mock
 
     def test_fit_delegates_to_inner_model(self):
         from models.regressors import TabPFNSurrogate
@@ -311,16 +310,6 @@ class TestRunBoLoop:
                 X_test=X_test, y_test=y_test, n_init=3, budget=6,
             )
 
-    def test_no_repeated_queries(self, small_pool):
-        from utils.bo_loops import run_bo_loop
-        X_pool, y_pool, X_test, y_test = small_pool
-        np.random.seed(42)
-        result = run_bo_loop(
-            model=_DummySurrogate(), X_pool=X_pool, y_pool=y_pool,
-            X_test=X_test, y_test=y_test, n_init=3, budget=10,
-        )
-        assert len(set(result["observed_indices"])) == len(result["observed_indices"])
-
     def test_snapshots_none_when_not_requested(self, small_pool):
         from utils.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
@@ -355,7 +344,10 @@ class TestRunBoLoop:
             X_test=X_test, y_test=y_test, n_init=3, budget=budget,
             snapshot_iters=[budget],
         )
-        assert result["snapshots"][budget].shape == (X_test.shape[0],)
+        snap = result["snapshots"][budget]
+        assert isinstance(snap, dict) and "y_pred" in snap and "best_pred_val" in snap
+        assert snap["y_pred"].shape == (X_test.shape[0],)
+        assert isinstance(snap["best_pred_val"], float)
 
     def test_accepts_surrogate_without_predict_ucb(self, small_pool):
         from utils.bo_loops import run_bo_loop

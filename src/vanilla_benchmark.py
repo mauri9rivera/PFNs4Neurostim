@@ -6,9 +6,11 @@ performed -- this replaces the deleted ``src/main.py`` which incorrectly
 used PFNs4BO ``TransformerBOMethod`` (PFN v1).
 
 Three evaluation modes:
-  - ``fit``                -- R² comparison on held-out subjects (A1)
-  - ``optimization``       -- Cumulative regret + timing via BO loop (A2, A3)
+  - ``optimization``       -- Cumulative regret + timing via BO loop (A2, A3);
+                              R² of the surrogate's final prediction is
+                              reported as a secondary metric.
   - ``optimization_budget``-- Budget sweep over multiple query budgets (A4)
+  - ``kappa_search``       -- Fixed-kappa hyperparameter search
 
 Usage::
 
@@ -29,7 +31,7 @@ import torch
 import yaml
 from tabpfn import TabPFNRegressor
 
-from evaluation import gp_baseline, finetuned_fit, evaluate_optimization
+from evaluation import evaluate_optimization
 from models.regressors import GPSurrogate, TabPFNSurrogate
 from utils.data_utils import (
     load_data,
@@ -41,9 +43,7 @@ from utils.data_utils import (
     write_run_config,
 )
 from utils.visualization import (
-    r2_per_muscle,
     r2_by_subject,
-    show_emg_map,
     regret_with_timing,
     regret_by_subject,
     regret_by_emg,
@@ -55,7 +55,7 @@ from utils.visualization import (
 )
 
 
-_VALID_MODES: frozenset = frozenset({'fit', 'optimization', 'optimization_budget', 'kappa_search'})
+_VALID_MODES: frozenset = frozenset({'optimization', 'optimization_budget', 'kappa_search'})
 
 # Default kappa values for kappa hyperparameter search
 _DEFAULT_KAPPA_VALUES: List[float] = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0]
@@ -169,97 +169,6 @@ def _build_experiments(
 # ============================================
 
 
-def _vanilla_fit(
-    dataset_type: str,
-    experiments: List[tuple],
-    device: str,
-    budget: int,
-    n_reps: int,
-    run_dir: str,
-    exp_tag: str,
-    save: bool,
-    save_tag: str,
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, list]:
-    """Run fit evaluation for vanilla TabPFN and GP on held-out experiments.
-
-    For each (subject, emg) pair:
-      - TabPFN: calls ``finetuned_fit()`` with a freshly constructed vanilla
-        TabPFNRegressor (n_estimators=8 for accuracy).
-      - GP: calls ``gp_baseline(mode='fit')``.
-
-    Args:
-        dataset_type: ``'rat'`` or ``'nhp'``.
-        experiments: List of (subject_idx, emg_idx) from ``_build_experiments()``.
-        device: PyTorch device string.
-        budget: Number of training points sampled per repetition.
-        n_reps: Number of repetitions per (subject, emg) pair.
-        run_dir: Output directory from ``create_run_dir()``.
-        exp_tag: Experiment tag suffix for plot filenames.
-        save: If True, persist results as pkl + CSV.
-        save_tag: Full experiment tag from ``generate_experiment_tag()``.
-
-    Returns:
-        ``{'GP': list[dict], 'TabPFN': list[dict]}``.
-    """
-    results_tabpfn: List[dict] = []
-    results_gp: List[dict] = []
-
-    for subj_idx, emg_idx in experiments:
-        print(f"  Fit: subject={subj_idx}, emg={emg_idx}")
-
-        # Fresh model per experiment to avoid context bleed
-        tabpfn_model = _build_vanilla_tabpfn(device, n_estimators=8)
-        res_tabpfn = finetuned_fit(
-            dataset_type, subj_idx, emg_idx,
-            model=tabpfn_model,
-            device=device, budget=budget, n_reps=n_reps,
-        )
-        res_tabpfn['model_type'] = 'vanilla_tabpfn'
-
-        if np.isnan(res_tabpfn['y_pred']).any():
-            raise RuntimeError(
-                f"NaN in TabPFN fit predictions: subject={subj_idx}, emg={emg_idx}"
-            )
-
-        res_gp = gp_baseline(
-            dataset_type, subj_idx, emg_idx, mode='fit',
-            device=device, budget=budget, n_reps=n_reps,
-        )
-
-        results_tabpfn.append(res_tabpfn)
-        results_gp.append(res_gp)
-        print(f"    TabPFN R2={np.mean(res_tabpfn['r2']):.3f}  |  "
-              f"GP R2={np.mean(res_gp['r2']):.3f}")
-
-    results_dict = {'GP': results_gp, 'TabPFN': results_tabpfn}
-
-    # --- Plots ---
-    tag = f'_vanilla_{exp_tag}'
-    r2_per_muscle(results_dict, mode=tag, save=True, output_dir=run_dir)
-    r2_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
-
-    n_maps = min(6, len(experiments))
-    for idx in random.sample(range(len(experiments)), n_maps):
-        show_emg_map(results_tabpfn, idx, 'TabPFN',
-                     mode=f'_vanilla_{exp_tag}', save=True, output_dir=run_dir)
-        show_emg_map(results_gp, idx, 'GP',
-                     mode=f'_vanilla_{exp_tag}_gp', save=True, output_dir=run_dir)
-
-    all_r2 = [np.mean(r['r2']) for r in results_tabpfn]
-    print(f"\nFit done. {len(results_tabpfn)} experiments.")
-    print(f"Vanilla TabPFN mean R2: {np.mean(all_r2):.3f} +/- {np.std(all_r2):.3f}")
-
-    if save:
-        save_results(
-            results_dict, 'fit',
-            output_dir=os.path.join(run_dir, 'results'),
-            tag=save_tag,
-            metadata=metadata,
-        )
-    return results_dict
-
-
 def _vanilla_optimization(
     dataset_type: str,
     experiments: List[tuple],
@@ -340,24 +249,13 @@ def _vanilla_optimization(
     results_dict = {'GP': results_gp, 'TabPFN': results_tabpfn}
 
     # --- Plots ---
-    tag = f'_vanilla_{exp_tag}_opt'
-    r2_per_muscle(results_dict, mode=tag, save=True,
-                  output_dir=run_dir, eval_type='optimization')
+    r2_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
     regret_with_timing(results_dict, split_type=exp_tag, save=True,
                        output_dir=run_dir)
     regret_by_subject(results_dict, split_type=exp_tag, save=True,
                       output_dir=run_dir)
     regret_by_emg(results_dict, split_type=exp_tag, save=True,
                   output_dir=run_dir)
-
-    n_maps = min(6, len(experiments))
-    for idx in random.sample(range(len(experiments)), n_maps):
-        show_emg_map(results_tabpfn, idx, 'TabPFN',
-                     mode=f'_vanilla_{exp_tag}_opt', save=True,
-                     output_dir=run_dir, eval_type='optimization')
-        show_emg_map(results_gp, idx, 'GP',
-                     mode=f'_vanilla_{exp_tag}_opt_gp', save=True,
-                     output_dir=run_dir, eval_type='optimization')
     visualize_representation(results_dict, mode=f'_vanilla_{exp_tag}',
                              save=True, output_dir=run_dir)
 
@@ -722,7 +620,7 @@ def run_vanilla_benchmark(
         dataset_type: ``'rat'`` or ``'nhp'``.
         mode: List of evaluation modes (see ``_VALID_MODES``).
         device: PyTorch device string.
-        budget: Training points (fit) or BO queries (optimization).
+        budget: BO query budget.
         n_reps: Repetitions per experiment.
         budgets: Budget list for ``'optimization_budget'`` mode.
             Defaults to ``[10, 30, 50, 100, 200]``.
@@ -739,7 +637,7 @@ def run_vanilla_benchmark(
 
     Returns:
         Dict keyed by mode name.  Values are either
-        ``dict[str, list[dict]]`` (fit/optimization),
+        ``dict[str, list[dict]]`` (optimization),
         ``pd.DataFrame`` (optimization_budget), or
         ``dict`` (kappa_search).
 
@@ -747,8 +645,10 @@ def run_vanilla_benchmark(
         ValueError: If mode contains invalid values or dataset_type is unknown.
     """
     # --- Validate ---
-    if dataset_type not in ('rat', 'nhp'):
-        raise ValueError(f"Unknown dataset_type={dataset_type!r}. Use 'rat' or 'nhp'.")
+    if dataset_type not in ('rat', 'nhp', 'spinal'):
+        raise ValueError(
+            f"Unknown dataset_type={dataset_type!r}. Use 'rat', 'nhp', or 'spinal'."
+        )
     invalid = set(mode) - _VALID_MODES
     if invalid:
         raise ValueError(
@@ -842,14 +742,7 @@ def run_vanilla_benchmark(
         print(f"Running mode: {m}")
         print('=' * 60)
 
-        if m == 'fit':
-            all_results['fit'] = _vanilla_fit(
-                dataset_type, experiments, device, budget, n_reps,
-                run_dir, exp_tag, save, save_tag,
-                metadata=_metadata,
-            )
-
-        elif m == 'optimization':
+        if m == 'optimization':
             all_results['optimization'] = _vanilla_optimization(
                 dataset_type, experiments, device, budget, n_reps,
                 kappa_schedule,
@@ -899,17 +792,16 @@ def run_benchmark() -> None:
                         help='Path to a YAML config file.  All keys are used as defaults;\n'
                              'any CLI flag that is explicitly provided overrides the YAML value.')
     parser.add_argument('--dataset', type=str, default=None,
-                        choices=['rat', 'nhp'],
+                        choices=['rat', 'nhp', 'spinal'],
                         help='Dataset type (default: nhp)')
     parser.add_argument('--mode', type=lambda s: s.split(','), default=None,
                         metavar='MODE[,MODE,...]',
-                        help='Comma-separated modes: fit, optimization, optimization_budget\n'
-                             '(default: fit)')
+                        help='Comma-separated modes: optimization, optimization_budget,\n'
+                             'kappa_search (default: optimization)')
     parser.add_argument('--device', type=str, default=None,
                         help='Device: cpu or cuda (default: cuda)')
     parser.add_argument('--budget', type=int, default=None,
-                        help='Training points (fit) or BO queries (optimization)\n'
-                             '(default: 100)')
+                        help='BO query budget (default: 100)')
     parser.add_argument('--n_reps', type=int, default=None,
                         help='Repetitions per experiment (default: 30)')
     parser.add_argument('--budgets', type=int, nargs='+', default=None,
@@ -954,7 +846,7 @@ def run_benchmark() -> None:
     # --- Apply hardcoded defaults for any remaining None values ---
     _defaults = {
         'dataset': 'nhp',
-        'mode': ['fit'],
+        'mode': ['optimization'],
         'device': 'cuda',
         'budget': 100,
         'n_reps': 30,

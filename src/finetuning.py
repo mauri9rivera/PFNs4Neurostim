@@ -17,7 +17,6 @@ Usage:
 import argparse
 import json
 import os
-import random
 from datetime import datetime
 from typing import Any
 
@@ -28,8 +27,8 @@ import torch
 
 from models.regressors import _make_finetuned_regressor, extract_inference_model
 from evaluation import (
-    gp_baseline, finetuned_fit, finetuned_optimization,
-    finetuned_fit_budget, finetuned_optimization_budget,
+    gp_baseline, finetuned_optimization,
+    finetuned_optimization_budget,
     finetuned_percentage, load_sweep_results,
 )
 from utils.data_utils import (
@@ -39,9 +38,9 @@ from utils.data_utils import (
     create_run_dir, write_run_config,
 )
 from utils.visualization import (
-    r2_per_muscle, r2_by_subject, show_emg_map,
+    r2_by_subject,
     regret_with_timing, regret_by_subject, regret_by_emg,
-    budget_sweep_plot, augmentation_sweep_plot,
+    augmentation_sweep_plot,
     visualize_representation,
     plot_gradient_metrics, plot_weight_metrics, plot_cka_similarity,
 )
@@ -147,7 +146,7 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=1, lr=1e-5,
 #       High-Level Experiment Runner
 # ============================================
 
-_VALID_MODES = {'fit', 'optimization', 'fit_budget', 'optimization_budget'}
+_VALID_MODES = {'optimization', 'optimization_budget'}
 
 
 def run_experiment(
@@ -170,6 +169,7 @@ def run_experiment(
     lora_alpha=16,
     lora_target='decoder_dict',
     lora_weights=None,
+    kappa_schedule: float = 0.0,
 ):
     """
     Unified entry point for transfer learning evaluation.
@@ -179,11 +179,11 @@ def run_experiment(
         split_type: 'inter_subject' — train on TRAIN_SUBJECTS, test on HELD_OUT_SUBJECTS;
                     'intra_emg'     — train on ALL_SUBJECTS (excluding held_out_emg_idx),
                                       test on that EMG across ALL_SUBJECTS.
-        mode: str or list of str — any combination of 'fit', 'optimization',
-              'fit_budget', 'optimization_budget'. The model is finetuned once
-              and all requested modes are evaluated sequentially.
+        mode: str or list of str — any combination of 'optimization' /
+              'optimization_budget'. The model is finetuned once and all
+              requested modes are evaluated sequentially.
         device: 'cpu' or 'cuda'
-        budget: number of training points (fit) or BO queries (optimization)
+        budget: number of BO queries (optimization)
         n_reps: number of repetitions per experiment
         epochs: fine-tuning epochs
         lr: fine-tuning learning rate
@@ -192,7 +192,7 @@ def run_experiment(
             held out from training and used as the test set.
         held_out_subj_idx: optional int. When set, overrides the default subject
             split: trains on all subjects except this one and tests on it alone.
-        budgets: list of budgets for 'fit_budget' / 'optimization_budget' modes.
+        budgets: list of budgets for 'optimization_budget' mode.
         save: if True, persist results to output/results/ (pkl + CSV summary).
         silence_diagnostics: if True (default), skip gradient/CKA monitoring.
         use_lora: if True, use LoRA parameter-efficient finetuning.
@@ -201,14 +201,17 @@ def run_experiment(
         lora_target: which layers to adapt (default 'decoder_dict').
         lora_weights: path to saved LoRA checkpoint directory. When set,
             skips training and loads pre-trained adapters for evaluation.
+        kappa_schedule: UCB exploration coefficient for the finetuned TabPFN BO
+            loop.  ``0.0`` (default) = auto cosine-annealed schedule;
+            any other value = fixed kappa throughout.  GP always uses auto.
 
     Returns:
         dict keyed by mode name, each value being the result of that mode
-        ('fit'/'optimization' → {'TabPFN': [...], 'GP': [...]},
-         budget modes → DataFrame).
+        ('optimization' → {'TabPFN': [...], 'GP': [...]},
+         'optimization_budget' → DataFrame).
     """
     if mode is None:
-        mode = ['fit']
+        mode = ['optimization']
     if isinstance(mode, str):
         mode = [mode]
     invalid = set(mode) - _VALID_MODES
@@ -253,10 +256,10 @@ def run_experiment(
     # Determine experiment family from run parameters
     if use_lora or lora_weights:
         _family = 'lora-ablation'
-    elif budgets and any(m in (mode or ['fit']) for m in ('fit_budget', 'optimization_budget')):
+    elif budgets and 'optimization_budget' in (mode or ['optimization']):
         _family = 'optimization-budget'
     else:
-        _family = 'optimization' if 'optimization' in (mode or ['fit']) else 'fit'
+        _family = 'optimization'
 
     _tag_config: dict[str, Any] = {
         'dataset_type': dataset_type,
@@ -374,44 +377,13 @@ def run_experiment(
         print(f"Running mode: {m}")
         print('=' * 60)
 
-        if m == 'fit':
-            results_ft, results_gp = [], []
-            for subj_idx, emg_idx in experiments:
-                print(f"  Fit: subject={subj_idx}, emg={emg_idx}")
-                res_ft = finetuned_fit(dataset_type, subj_idx, emg_idx, ft_model,
-                                       device=device, budget=budget, n_reps=n_reps)
-                res_gp = gp_baseline(dataset_type, subj_idx, emg_idx, mode='fit',
-                                      device=device, budget=budget, n_reps=n_reps)
-                results_ft.append(res_ft)
-                results_gp.append(res_gp)
-                print(f"    TabPFN R2={np.mean(res_ft['r2']):.3f}  |  GP R2={np.mean(res_gp['r2']):.3f}")
-
-            results_dict = {'GP': results_gp, 'TabPFN': results_ft}
-            tag = f'_{exp_tag}_finetuned_vs_gp'
-            r2_per_muscle(results_dict, mode=tag, save=True, output_dir=run_dir)
-            r2_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
-            n_maps = min(6, len(experiments))
-            for idx in random.sample(range(len(experiments)), n_maps):
-                show_emg_map(results_ft, idx, 'TabPFN', mode=f'_{exp_tag}_finetuned', save=True, output_dir=run_dir)
-                show_emg_map(results_gp, idx, 'GP', mode=f'_{exp_tag}_baseline', save=True, output_dir=run_dir)
-
-            all_r2 = [np.mean(r['r2']) for r in results_ft]
-            print(f"\nDone. {len(results_ft)} experiments.")
-            print(f"Finetuned TabPFN mean R²: {np.mean(all_r2):.3f} ± {np.std(all_r2):.3f}")
-
-            if save:
-                save_results(results_dict, 'fit',
-                             output_dir=os.path.join(run_dir, 'results'),
-                             tag=_save_tag,
-                             metadata=_metadata)
-            all_results['fit'] = results_dict
-
-        elif m == 'optimization':
+        if m == 'optimization':
             results_ft, results_gp = [], []
             for subj_idx, emg_idx in experiments:
                 print(f"  Optimization: subject={subj_idx}, emg={emg_idx}")
                 res_ft = finetuned_optimization(dataset_type, subj_idx, emg_idx, ft_model,
-                                                 device=device, budget=budget, n_reps=n_reps)
+                                                 device=device, budget=budget, n_reps=n_reps,
+                                                 kappa_schedule=kappa_schedule)
                 res_gp = gp_baseline(dataset_type, subj_idx, emg_idx, mode='optimization',
                                       device=device, budget=budget, n_reps=n_reps)
                 results_ft.append(res_ft)
@@ -419,17 +391,10 @@ def run_experiment(
                 print(f"    TabPFN R2={np.mean(res_ft['r2']):.3f}  |  GP R2={np.mean(res_gp['r2']):.3f}")
 
             results_dict = {'GP': results_gp, 'TabPFN': results_ft}
-            tag = f'_{exp_tag}_opt_finetuned_vs_gp'
-            r2_per_muscle(results_dict, mode=tag, save=True, output_dir=run_dir, eval_type='optimization')
+            r2_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_with_timing(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_by_emg(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
-            n_maps = min(6, len(experiments))
-            for idx in random.sample(range(len(experiments)), n_maps):
-                show_emg_map(results_ft, idx, 'TabPFN', mode=f'_{exp_tag}_opt_finetuned',
-                             save=True, output_dir=run_dir, eval_type='optimization')
-                show_emg_map(results_gp, idx, 'GP', mode=f'_{exp_tag}_opt_baseline',
-                             save=True, output_dir=run_dir, eval_type='optimization')
             visualize_representation(results_dict, mode=f'_{exp_tag}',
                                      save=True, output_dir=run_dir)
 
@@ -444,24 +409,6 @@ def run_experiment(
                              metadata=_metadata)
             all_results['optimization'] = results_dict
 
-        elif m == 'fit_budget':
-            df = finetuned_fit_budget(
-                dataset_type, ft_model,
-                device=device,
-                budgets=budgets,
-                test_subjects=test_subjects,
-                test_emg_indices=test_emg_indices,
-                split_type=exp_tag,
-                output_dir=run_dir,
-            )
-            if save:
-                results_dir = os.path.join(run_dir, 'results')
-                os.makedirs(results_dir, exist_ok=True)
-                pkl_path = os.path.join(results_dir, f'{_save_tag}_fit_budget.pkl')
-                df.to_pickle(pkl_path)
-                print(f"Saved budget DataFrame -> {pkl_path}")
-            all_results['fit_budget'] = df
-
         elif m == 'optimization_budget':
             df = finetuned_optimization_budget(
                 dataset_type, ft_model,
@@ -471,6 +418,7 @@ def run_experiment(
                 test_emg_indices=test_emg_indices,
                 split_type=exp_tag,
                 output_dir=run_dir,
+                kappa_schedule=kappa_schedule,
             )
             if save:
                 results_dir = os.path.join(run_dir, 'results')
@@ -525,12 +473,12 @@ def run_finetuning():
                              '  inter_subject — train on TRAIN_SUBJECTS, test on HELD_OUT_SUBJECTS\n'
                              '  intra_emg     — train on ALL_SUBJECTS excl. held_out_emg, test on that EMG\n'
                              '(default: inter_subject)')
-    parser.add_argument('--mode', type=lambda s: s.split(','), default=['fit'],
+    parser.add_argument('--mode', type=lambda s: s.split(','), default=['optimization'],
                         metavar='MODE[,MODE,...]',
                         help='Comma-separated evaluation modes. Valid values: '
-                             'fit, optimization, fit_budget, optimization_budget, '
-                             'aug_sweep_fit, aug_sweep_optimization. '
-                             '(default: fit, example: --mode aug_sweep_optimization)')
+                             'optimization, optimization_budget, '
+                             'aug_sweep_optimization. '
+                             '(default: optimization)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device for training: cpu or cuda (default: cuda)')
     parser.add_argument('--epochs', type=int, default=50,
@@ -540,7 +488,7 @@ def run_finetuning():
     parser.add_argument('--n_augmentations', type=int, default=25,
                         help='Augmentations per subject-EMG pair (default: 25)')
     parser.add_argument('--budget', type=int, default=100,
-                        help='Training points (fit) or BO queries (optimization) (default: 100)')
+                        help='BO query budget (default: 100)')
     parser.add_argument('--n_reps', type=int, default=30,
                         help='Repetitions per experiment (default: 30)')
     parser.add_argument('--held_out_emg', type=int, default=None,
@@ -557,6 +505,11 @@ def run_finetuning():
                              'always included as baseline.')
     parser.add_argument('--save', action='store_true', default=False,
                         help='Persist results to output/results/ (pkl + CSV summary)')
+    parser.add_argument('--kappa_schedule', type=float, default=None,
+                        help='UCB exploration coefficient for the finetuned TabPFN BO loop.\n'
+                             '  0.0 (default) = auto cosine-annealed schedule (GP-UCB theory)\n'
+                             '  any other value = fixed kappa throughout the BO loop\n'
+                             'GP always uses the auto schedule regardless of this setting.')
     parser.add_argument('--diagnostics', action='store_true', default=False,
                         help='Enable gradient/CKA monitoring via GradientMonitoredRegressor '
                              '(slower finetuning, higher memory). Off by default.')
@@ -604,7 +557,7 @@ def run_finetuning():
     _defaults = {
         'dataset': 'nhp',
         'split': 'inter_subject',
-        'mode': ['fit'],
+        'mode': ['optimization'],
         'device': 'cuda',
         'epochs': 50,
         'lr': 1e-5,
@@ -615,6 +568,7 @@ def run_finetuning():
         'held_out_subj': None,
         'budgets': [10, 30, 50, 100],
         'aug_counts': None,
+        'kappa_schedule': 0.0,
         'lora_rank': 8,
         'lora_alpha': 16,
         'lora_target': 'decoder_dict',
@@ -624,7 +578,7 @@ def run_finetuning():
         if getattr(args, key, None) is None:
             setattr(args, key, default)
 
-    _CLI_MODES = _VALID_MODES | {'aug_sweep_fit', 'aug_sweep_optimization'}
+    _CLI_MODES = _VALID_MODES | {'aug_sweep_optimization'}
     invalid = set(args.mode) - _CLI_MODES
     if invalid:
         parser.error(f"Invalid mode(s): {', '.join(sorted(invalid))}. "
@@ -632,9 +586,9 @@ def run_finetuning():
 
     # Validate --lora_weights combinations
     if args.lora_weights:
-        if any(m in args.mode for m in ('aug_sweep_fit', 'aug_sweep_optimization')):
-            parser.error("--lora_weights is not compatible with aug_sweep_* modes "
-                         "(those require training)")
+        if 'aug_sweep_optimization' in args.mode:
+            parser.error("--lora_weights is not compatible with aug_sweep_optimization "
+                         "(it requires training)")
         if args.lora:
             print("[WARNING] --lora is ignored when --lora_weights is set "
                   "(config is read from lora_config.json)")
@@ -664,30 +618,13 @@ def run_finetuning():
             lora_alpha=args.lora_alpha,
             lora_target=args.lora_target,
             lora_weights=args.lora_weights,
-        )
-
-    if 'aug_sweep_fit' in args.mode:
-        finetuned_percentage(
-            dataset_type=args.dataset,
-            split_type=args.split,
-            mode='fit',
-            device=args.device,
-            budget=args.budget,
-            n_reps=args.n_reps,
-            epochs=args.epochs,
-            lr=args.lr,
-            n_augmentations=args.aug_counts,
-            held_out_emg_idx=args.held_out_emg,
-            held_out_subj_idx=args.held_out_subj,
-            save=args.save,
-            silence_diagnostics=silence_diagnostics,
+            kappa_schedule=args.kappa_schedule,
         )
 
     if 'aug_sweep_optimization' in args.mode:
         finetuned_percentage(
             dataset_type=args.dataset,
             split_type=args.split,
-            mode='optimization',
             device=args.device,
             budget=args.budget,
             n_reps=args.n_reps,
@@ -698,6 +635,7 @@ def run_finetuning():
             held_out_subj_idx=args.held_out_subj,
             save=args.save,
             silence_diagnostics=silence_diagnostics,
+            kappa_schedule=args.kappa_schedule,
         )
 
 

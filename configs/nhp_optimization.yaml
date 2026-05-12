@@ -19,6 +19,9 @@ n_augmentations: 25
 budget: 100
 n_reps: 30
 
+#UCB Kappa Schedule
+kappa_schedule: 0.0
+
 # Infrastructure
 device: cuda
 save: true

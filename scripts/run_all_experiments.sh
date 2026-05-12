@@ -92,19 +92,11 @@ mkdir -p logs output/runs output/id_ood
 
 # ── Phase 1 — Vanilla Benchmark ───────────────────────────────────────────────
 
-if [ "$JOB" = "A1" ]; then
+if [ "$JOB" = "A1" ] || [ "$JOB" = "A2" ]; then
+    # A1 (R² of final prediction) is now reported as a secondary metric inside
+    # the optimization run; the standalone fit task was removed 2026-04-27.
     CFG=${VANILLA_CONFIG:-configs/nhp_vanilla_benchmark.yaml}
-    echo "[$(date)] A1 — vanilla fit (TabPFN v2 vs GP, inter-subject, n_reps=30) config=$CFG ${VANILLA_OVERRIDES:+overrides=$VANILLA_OVERRIDES}"
-    # shellcheck disable=SC2086
-    python src/vanilla_benchmark.py \
-        --config "$CFG" \
-        --mode fit \
-        --save \
-        $VANILLA_OVERRIDES
-
-elif [ "$JOB" = "A2" ]; then
-    CFG=${VANILLA_CONFIG:-configs/nhp_vanilla_benchmark.yaml}
-    echo "[$(date)] A2 — vanilla optimization (BO regret, inter-subject, n_reps=30) config=$CFG ${VANILLA_OVERRIDES:+overrides=$VANILLA_OVERRIDES}"
+    echo "[$(date)] $JOB — vanilla optimization (BO regret + R² of final prediction, inter-subject, n_reps=30) config=$CFG ${VANILLA_OVERRIDES:+overrides=$VANILLA_OVERRIDES}"
     # shellcheck disable=SC2086
     python src/vanilla_benchmark.py \
         --config "$CFG" \
@@ -114,7 +106,7 @@ elif [ "$JOB" = "A2" ]; then
 
 elif [ "$JOB" = "A3" ]; then
     CFG=${VANILLA_CONFIG:-configs/rat_vanilla_benchmark.yaml}
-    echo "[$(date)] A3 — Rat vanilla benchmark (fit + optimization) config=$CFG ${VANILLA_OVERRIDES:+overrides=$VANILLA_OVERRIDES}"
+    echo "[$(date)] A3 — Rat vanilla benchmark (optimization with embedded R²) config=$CFG ${VANILLA_OVERRIDES:+overrides=$VANILLA_OVERRIDES}"
     # shellcheck disable=SC2086
     python src/vanilla_benchmark.py \
         --config "$CFG" \

@@ -1,10 +1,8 @@
 """
 Evaluation functions for finetuned TabPFN and GP baselines.
 
-- gp_baseline(): GP fit/optimization evaluation
-- finetuned_fit(): evaluate fit quality with finetuned TabPFN
+- gp_baseline(): GP optimization evaluation
 - finetuned_optimization(): evaluate optimization with finetuned TabPFN
-- finetuned_fit_budget(): budget sweep for fit evaluation
 - finetuned_optimization_budget(): budget sweep for optimization evaluation
 - finetuned_percentage(): augmentation ablation study
 - load_sweep_results(): load and merge sweep DataFrames from disk
@@ -34,12 +32,45 @@ from utils.data_utils import (
     create_run_dir, write_run_config,
 )
 from utils.visualization import (
-    r2_per_muscle, r2_by_subject, show_emg_map,
+    r2_by_subject,
     regret_with_timing, regret_by_subject, regret_by_emg,
     budget_sweep_plot, augmentation_sweep_plot,
     visualize_representation,
     plot_gradient_metrics, plot_weight_metrics, plot_cka_similarity,
 )
+
+
+def _valid_site_mask(data: dict, emg_idx: int) -> np.ndarray:
+    """Boolean mask over channels with at least one valid rep at ``emg_idx``.
+
+    Mirrors the per-site filter in :func:`utils.data_utils.preprocess_neural_data`
+    so callers can align side-channel arrays (``ch2xy``, …) with the filtered
+    ``y_test`` / ``y_pred`` length.
+    """
+    if 'sorted_isvalid' not in data:
+        return np.ones(data['sorted_resp'].shape[0], dtype=bool)
+    return (data['sorted_isvalid'][:, emg_idx, :] != 0).any(axis=-1)
+
+
+def _flatten_valid_pool(
+    X_pool: np.ndarray, Y_train: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flatten ``Y_train`` ``[N, n_reps]`` into per-trial (X, y) pairs, dropping
+    NaN entries from sites whose corresponding trial was flagged invalid by
+    ``sorted_isvalid`` (see ``preprocess_neural_data``).
+
+    The flatten uses C-order, matching ``np.repeat(X_pool, n_reps, axis=0)``,
+    so X-y alignment is preserved when the same valid mask filters both.
+
+    Returns:
+        ``(X_flat, y_flat)``: aligned arrays of shape ``[n_valid, D]`` and
+        ``[n_valid]`` containing only finite trials.
+    """
+    n_reps = Y_train.shape[1]
+    X_rep = np.repeat(X_pool, n_reps, axis=0)     # [N * n_reps, D]
+    y_flat = Y_train.flatten()                     # [N * n_reps]
+    valid = ~np.isnan(y_flat)
+    return X_rep[valid], y_flat[valid]
 
 
 def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
@@ -70,8 +101,13 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
     )
 
     if mode == 'fit':
-        n_stims = y_train_full.shape[1]
-        y_train_full_flat = y_train_full.flatten()
+        # Drop NaN-masked invalid trials before flat-sampling.
+        X_flat, y_flat = _flatten_valid_pool(X_train_full, y_train_full)
+        if budget > len(y_flat):
+            raise RuntimeError(
+                f"gp_baseline(fit): budget={budget} exceeds valid trial count "
+                f"{len(y_flat)} for subject={subject_idx}, emg={emg_idx}."
+            )
 
         r2_scores = []
         y_preds_all = []
@@ -79,9 +115,9 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
 
         for i in range(n_reps):
 
-            indices = np.random.choice(len(y_train_full_flat), budget, replace=False)
-            X_train = np.repeat(X_train_full, n_stims, axis=0)[indices]
-            y_train = y_train_full_flat[indices]
+            indices = np.random.choice(len(y_flat), budget, replace=False)
+            X_train = X_flat[indices]
+            y_train = y_flat[indices]
 
             # Convert to Tensors
             train_x = torch.tensor(X_train, dtype=torch.float32, device=device)
@@ -116,10 +152,8 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
 
             total_time += (time.time() - start)
 
-            og_shape = y_pred.shape
-            y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
-            r2 = r2_score(y_test, y_pred)
-            r2_scores.append(np.clip(r2, 0.0, 1.0))
+            r2 = r2_score(y_test, y_pred)            # both standardized
+            r2_scores.append(float(r2))
             y_preds_all.append(y_pred)
 
         y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
@@ -132,7 +166,9 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
             'y_pred': y_pred_mean,
             'dataset': dataset,
             'subject': subject_idx,
-            'emg': emg_idx
+            'emg': emg_idx,
+            'ch2xy': data['ch2xy'][_valid_site_mask(data, emg_idx)],
+            'grid_shape': data.get('grid_shape'),
         }
 
     elif mode == 'optimization':
@@ -148,7 +184,7 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
 
         for i in range(n_reps):
 
-            traj, observed_values, real_values, times, y_pred, snap = run_gpbo_loop(
+            traj, observed_values, real_values, times, y_pred, snap, best_rec_indices_rep = run_gpbo_loop(
                 X_train_full, y_train_full, X_test, y_test,
                 n_init=n_init, budget=budget, device=device,
                 snapshot_iters=snap_iters if i == snapshot_rep else None,
@@ -160,24 +196,25 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
             mean_times.append(times)
             values_all.append(real_values)
 
-            # Compute R2 from the final model predictions
-            og_shape = y_pred.shape
-            y_pred_unscaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
-            r2 = r2_score(y_test, y_pred_unscaled)
-            r2_scores.append(np.clip(r2, 0.0, 1.0))
-            y_preds_all.append(y_pred_unscaled)
+            # Compute R2 (both y_test and y_pred in standardized space)
+            r2 = r2_score(y_test, y_pred)
+            r2_scores.append(float(r2))
+            y_preds_all.append(y_pred)
 
         mean_times = np.mean(np.array(mean_times), axis=0)
         y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
 
-        # Inverse-transform snapshot predictions and compute R2
         snapshot_results = None
         if collected_snapshots is not None:
             snapshot_results = {}
-            for it, s_pred in collected_snapshots.items():
-                s_pred_unscaled = scaler_y.inverse_transform(s_pred.reshape(-1, 1)).ravel()
-                s_r2 = float(np.clip(r2_score(y_test, s_pred_unscaled), 0.0, 1.0))
-                snapshot_results[it] = {'y_pred': s_pred_unscaled, 'r2': s_r2}
+            for it, s_data in collected_snapshots.items():
+                s_pred = np.asarray(s_data['y_pred']).ravel()
+                s_r2 = float(r2_score(y_test, s_pred))
+                snapshot_results[it] = {
+                    'y_pred': s_pred,
+                    'r2': s_r2,
+                    'best_pred_val': s_data['best_pred_val'],
+                }
 
         return {
             'model_type': 'gp',
@@ -190,6 +227,8 @@ def gp_baseline(dataset, subject_idx, emg_idx, mode='fit',
             'subject': subject_idx,
             'emg': emg_idx,
             'snapshots': snapshot_results,
+            'ch2xy': data['ch2xy'][_valid_site_mask(data, emg_idx)],
+            'grid_shape': data.get('grid_shape'),
         }
 
 
@@ -211,8 +250,13 @@ def finetuned_fit(dataset, subject_idx, emg_idx, model,
         data, emg_idx, 'pfn'
     )
 
-    n_stims = y_train_full.shape[1]
-    y_train_full = y_train_full.flatten()
+    # Drop NaN-masked invalid trials before flat-sampling.
+    X_flat, y_flat = _flatten_valid_pool(X_train_full, y_train_full)
+    if budget > len(y_flat):
+        raise RuntimeError(
+            f"finetuned_fit: budget={budget} exceeds valid trial count "
+            f"{len(y_flat)} for subject={subject_idx}, emg={emg_idx}."
+        )
 
     r2_scores = []
     y_preds_all = []
@@ -220,9 +264,9 @@ def finetuned_fit(dataset, subject_idx, emg_idx, model,
 
     for i in range(n_reps):
 
-        indices = np.random.choice(len(y_train_full), budget, replace=False)
-        X_train = np.repeat(X_train_full, n_stims, axis=0)[indices]
-        y_train = y_train_full[indices]
+        indices = np.random.choice(len(y_flat), budget, replace=False)
+        X_train = X_flat[indices]
+        y_train = y_flat[indices]
 
         start = time.time()
 
@@ -233,10 +277,8 @@ def finetuned_fit(dataset, subject_idx, emg_idx, model,
         total_time += (time.time() - start)
 
         y_pred = np.asarray(y_pred)
-        og_shape = y_pred.shape
-        y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
-        r2 = r2_score(y_test, y_pred)
-        r2_scores.append(np.clip(r2, 0.0, 1.0))
+        r2 = r2_score(y_test, y_pred)            # both standardized
+        r2_scores.append(float(r2))
         y_preds_all.append(y_pred)
 
     y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
@@ -249,17 +291,23 @@ def finetuned_fit(dataset, subject_idx, emg_idx, model,
         'y_pred': y_pred_mean,
         'dataset': dataset,
         'subject': subject_idx,
-        'emg': emg_idx
+        'emg': emg_idx,
+        'ch2xy': data['ch2xy'][_valid_site_mask(data, emg_idx)],
+        'grid_shape': data.get('grid_shape'),
     }
 
 
 def finetuned_optimization(dataset, subject_idx, emg_idx, model,
-                            device='cpu', budget=100, n_reps=20):
+                            device='cpu', budget=100, n_reps=20,
+                            kappa_schedule: float = 0.0):
     """
     Evaluate optimization performance using a finetuned TabPFN model.
 
     Args:
         model: A TabPFNRegressor from extract_inference_model()
+        kappa_schedule: UCB exploration coefficient passed to
+            ``run_finetunedbo_loop``.  ``0.0`` (default) = auto cosine-annealed
+            schedule; any other value = fixed kappa throughout the BO loop.
     """
     data = load_data(dataset, subject_idx)
 
@@ -286,10 +334,11 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
 
     for i in range(n_reps):
 
-        traj, observed_values, real_values, times, y_pred, snap = run_finetunedbo_loop(
+        traj, observed_values, real_values, times, y_pred, snap, best_rec_indices_rep = run_finetunedbo_loop(
             X_train_full, y_train_full, X_test, y_test, bo_model,
             n_init=n_init, budget=budget, device=device,
             snapshot_iters=snap_iters if i == snapshot_rep else None,
+            kappa_schedule=kappa_schedule,
         )
 
         if snap is not None:
@@ -298,24 +347,25 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
         mean_times.append(times)
         values_all.append(real_values)
 
-        # Compute R2 from the final model predictions
-        og_shape = y_pred.shape
-        y_pred_unscaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(og_shape)
-        r2 = r2_score(y_test, y_pred_unscaled)
-        r2_scores.append(np.clip(r2, 0.0, 1.0))
-        y_preds_all.append(y_pred_unscaled)
+        # Compute R2 (both y_test and y_pred in standardized space)
+        r2 = r2_score(y_test, y_pred)
+        r2_scores.append(float(r2))
+        y_preds_all.append(y_pred)
 
     mean_times = np.mean(np.array(mean_times), axis=0)
     y_pred_mean = np.mean(np.array(y_preds_all), axis=0)
 
-    # Inverse-transform snapshot predictions and compute R2
     snapshot_results = None
     if collected_snapshots is not None:
         snapshot_results = {}
-        for it, s_pred in collected_snapshots.items():
-            s_pred_unscaled = scaler_y.inverse_transform(s_pred.reshape(-1, 1)).ravel()
-            s_r2 = float(np.clip(r2_score(y_test, s_pred_unscaled), 0.0, 1.0))
-            snapshot_results[it] = {'y_pred': s_pred_unscaled, 'r2': s_r2}
+        for it, s_data in collected_snapshots.items():
+            s_pred = np.asarray(s_data['y_pred']).ravel()
+            s_r2 = float(r2_score(y_test, s_pred))
+            snapshot_results[it] = {
+                'y_pred': s_pred,
+                'r2': s_r2,
+                'best_pred_val': s_data['best_pred_val'],
+            }
 
     return {
         'model_type': 'finetuned_tabpfn',
@@ -328,6 +378,8 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
         'subject': subject_idx,
         'emg': emg_idx,
         'snapshots': snapshot_results,
+        'ch2xy': data['ch2xy'][_valid_site_mask(data, emg_idx)],
+        'grid_shape': data.get('grid_shape'),
     }
 
 
@@ -386,7 +438,7 @@ def evaluate_optimization(
         RuntimeError: If NaN/Inf values appear in predictions.
     """
     data = load_data(dataset_type, subject_idx)
-
+ 
     X_pool, y_pool, X_test, y_test, scaler_y = preprocess_neural_data(
         data, emg_idx, normalization
     )
@@ -421,42 +473,31 @@ def evaluate_optimization(
         mean_times_all.append(loop_result['times'])
         values_all.append(loop_result['real_values'])
 
-        y_pred = loop_result['y_pred']  # [M] — already in normalised space
-        og_shape = y_pred.shape
-        y_pred_unscaled = scaler_y.inverse_transform(
-            y_pred.reshape(-1, 1)
-        ).reshape(og_shape)  # [M]
+        y_pred = np.asarray(loop_result['y_pred'])  # [M] — standardized
 
-        if np.isnan(y_pred_unscaled).any():
+        if np.isnan(y_pred).any():
             raise RuntimeError(
                 f"evaluate_optimization: NaN in final predictions for "
                 f"subject={subject_idx}, emg={emg_idx}, rep={i}."
             )
 
-        r2 = r2_score(y_test, y_pred_unscaled)
-        r2_scores.append(float(np.clip(r2, 0.0, 1.0)))
-        y_preds_all.append(y_pred_unscaled)
+        r2 = r2_score(y_test, y_pred)            # both standardized
+        r2_scores.append(float(r2))
+        y_preds_all.append(y_pred)
 
     mean_times = np.mean(np.array(mean_times_all), axis=0)  # [budget - n_init]
     y_pred_mean = np.mean(np.array(y_preds_all), axis=0)    # [M]
 
-    # Inverse-transform snapshot predictions and compute R²
     snapshot_results: dict | None = None
     if collected_snapshots is not None:
         snapshot_results = {}
         for it, snap_data in collected_snapshots.items():
-            s_pred = snap_data['y_pred']
-            s_pred_unscaled = scaler_y.inverse_transform(
-                s_pred.reshape(-1, 1)
-            ).ravel()  # [M]
-            s_r2 = float(np.clip(r2_score(y_test, s_pred_unscaled), 0.0, 1.0))
-            best_pred_unscaled = float(
-                scaler_y.inverse_transform([[snap_data['best_pred_val']]])[0, 0]
-            )
+            s_pred = np.asarray(snap_data['y_pred']).ravel()  # [M] — standardized
+            s_r2 = float(r2_score(y_test, s_pred))
             snapshot_results[it] = {
-                'y_pred': s_pred_unscaled,
+                'y_pred': s_pred,
                 'r2': s_r2,
-                'best_pred_val': best_pred_unscaled,
+                'best_pred_val': float(snap_data['best_pred_val']),
             }
 
     return {
@@ -470,6 +511,8 @@ def evaluate_optimization(
         'subject': subject_idx,
         'emg': emg_idx,
         'snapshots': snapshot_results,
+        'ch2xy': data['ch2xy'][_valid_site_mask(data, emg_idx)],
+        'grid_shape': data.get('grid_shape'),
     }
 
 
@@ -519,7 +562,7 @@ def finetuned_fit_budget(dataset_type, model, device='cpu',
                     plot_data.append({
                         'Budget': b,
                         'Model': 'TabPFN',
-                        'R2': np.clip(score, 0.0, 1.0),
+                        'R2': float(score),
                         'ID': f"{res_ft['subject']}_{res_ft['emg']}"
                     })
 
@@ -529,7 +572,7 @@ def finetuned_fit_budget(dataset_type, model, device='cpu',
                     plot_data.append({
                         'Budget': b,
                         'Model': 'GP',
-                        'R2': np.clip(score, 0.0, 1.0),
+                        'R2': float(score),
                         'ID': f"{res_gp['subject']}_{res_gp['emg']}"
                     })
 
@@ -544,7 +587,8 @@ def finetuned_fit_budget(dataset_type, model, device='cpu',
 def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
                                    device='cpu', budgets=[10, 50, 100, 150, 200],
                                    test_subjects=None, test_emg_indices=None,
-                                   split_type='', output_dir=None):
+                                   split_type='', output_dir=None,
+                                   kappa_schedule: float = 0.0):
     """
     Run optimization evaluation for varying budgets on held-out subjects.
 
@@ -584,7 +628,8 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
                     model,
                     device=device,
                     budget=b,
-                    n_reps=20
+                    n_reps=20,
+                    kappa_schedule=kappa_schedule,
                 )
                 budget_results_ft.append(res_ft)
                 optimal_ft = res_ft['y_test'].max()
@@ -598,7 +643,7 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
                         'Budget': b,
                         'Model': 'TabPFN',
                         'Regret': score,
-                        'R2': float(np.clip(r2, 0.0, 1.0)),
+                        'R2': float(r2),
                         'ID': f"{res_ft['subject']}_{res_ft['emg']}"
                     })
 
@@ -617,7 +662,7 @@ def finetuned_optimization_budget(dataset_type, model, regret_metric='abs',
                         'Budget': b,
                         'Model': 'GP',
                         'Regret': score,
-                        'R2': float(np.clip(r2, 0.0, 1.0)),
+                        'R2': float(r2),
                         'ID': f"{res_gp['subject']}_{res_gp['emg']}"
                     })
 
@@ -647,6 +692,7 @@ def finetuned_percentage(
     held_out_subj_idx=None,
     save=False,
     silence_diagnostics=True,
+    kappa_schedule: float = 0.0,
 ):
     """
     Ablation study: evaluate BO performance (R² + regret) across augmentation counts.
@@ -771,7 +817,7 @@ def finetuned_percentage(
             for r2, reg in zip(res['r2'], regrets):
                 plot_data.append({
                     'n_aug':  res['n_aug'],
-                    'R2':     float(np.clip(r2, 0.0, 1.0)),
+                    'R2':     float(r2),
                     'Regret': float(reg),
                     'ID':     f"{res['subject']}_{res['emg']}",
                 })
@@ -779,7 +825,7 @@ def finetuned_percentage(
             for r2 in res['r2']:
                 plot_data.append({
                     'n_aug': res['n_aug'],
-                    'R2':    float(np.clip(r2, 0.0, 1.0)),
+                    'R2':    float(r2),
                     'ID':    f"{res['subject']}_{res['emg']}",
                 })
 
@@ -793,7 +839,8 @@ def finetuned_percentage(
         print(f"  Vanilla: subject={subj_idx}, emg={emg_idx}")
         if mode == 'optimization':
             res = finetuned_optimization(dataset_type, subj_idx, emg_idx, vanilla_model,
-                                         device=device, budget=budget, n_reps=n_reps)
+                                         device=device, budget=budget, n_reps=n_reps,
+                                         kappa_schedule=kappa_schedule)
         else:
             res = finetuned_fit(dataset_type, subj_idx, emg_idx, vanilla_model,
                                 device=device, budget=budget, n_reps=n_reps)
@@ -868,7 +915,8 @@ def finetuned_percentage(
             print(f"  n_aug={n_aug}: subject={subj_idx}, emg={emg_idx}")
             if mode == 'optimization':
                 res = finetuned_optimization(dataset_type, subj_idx, emg_idx, ft_model,
-                                             device=device, budget=budget, n_reps=n_reps)
+                                             device=device, budget=budget, n_reps=n_reps,
+                                             kappa_schedule=kappa_schedule)
             else:
                 res = finetuned_fit(dataset_type, subj_idx, emg_idx, ft_model,
                                     device=device, budget=budget, n_reps=n_reps)

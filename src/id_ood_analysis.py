@@ -108,8 +108,8 @@ def main():
                         help='Device for TabPFN inference (default: cpu)')
     parser.add_argument('--n_synthetic', type=int, default=None,
                         help='Number of synthetic datasets for reference (default: 500)')
-    parser.add_argument('--n_context', type=int, default=None,
-                        help='Context size for entropy and Mahalanobis (default: 50)')
+    parser.add_argument('--n_context', type=float, default=None,
+                        help='Fraction of observations to use as context, 0.0–1.0 (default: 0.5)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed.  If not provided, a fresh seed is '
                              'drawn from system entropy and logged to '
@@ -152,7 +152,7 @@ def main():
         'prior_source': 'both',
         'device': 'cpu',
         'n_synthetic': 500,
-        'n_context': 50,
+        'n_context': 0.5,
         'proc_layer': 17,
         'proc_n_synthetic': 20,
     }

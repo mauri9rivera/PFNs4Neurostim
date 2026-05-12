@@ -150,8 +150,8 @@ class TestCreateRunDir:
     def test_with_tag_all_subdirs_created(self, tmp_dir):
         create_run_dir = _import_create_run_dir()
         run_dir = create_run_dir("legacy", base_dir=tmp_dir, tag="my-tag")
-        for sub in ("fitness", "fitness/emg_maps", "optimization",
-                     "optimization/emg_maps", "results", "diagnostics"):
+        for sub in ("optimization", "optimization/emg_maps",
+                     "results", "diagnostics"):
             assert os.path.isdir(os.path.join(run_dir, sub)), f"Missing subdir: {sub}"
 
     def test_without_tag_uses_exp_tag_prefix(self, tmp_dir):
@@ -169,7 +169,7 @@ class TestCreateRunDir:
     def test_without_tag_subdirs_created(self, tmp_dir):
         create_run_dir = _import_create_run_dir()
         run_dir = create_run_dir("legacy_exp", base_dir=tmp_dir, tag=None)
-        for sub in ("fitness", "optimization", "results", "diagnostics"):
+        for sub in ("optimization", "results", "diagnostics"):
             assert os.path.isdir(os.path.join(run_dir, sub))
 
     def test_idempotent_second_call_does_not_raise(self, tmp_dir):
@@ -206,9 +206,9 @@ class TestLoadYamlConfig:
     def test_nested_list_values_preserved(self, tmp_dir):
         path = os.path.join(tmp_dir, "nested.yaml")
         with open(path, "w") as f:
-            f.write("mode:\n  - optimization\n  - fit\n")
+            f.write("mode:\n  - optimization\n  - optimization_budget\n")
         result = _standalone_load_yaml_config(path)
-        assert result["mode"] == ["optimization", "fit"]
+        assert result["mode"] == ["optimization", "optimization_budget"]
 
     def test_float_scientific_notation(self, tmp_dir):
         path = os.path.join(tmp_dir, "lr.yaml")
@@ -236,9 +236,6 @@ _FINETUNING_CONFIGS = [
 _FINETUNING_REQUIRED_KEYS = {
     "dataset", "mode", "epochs", "lr", "n_augmentations", "budget", "n_reps",
 }
-
-# Pre-existing config with slightly different structure
-_PREEXISTING_CONFIGS = ["nhp_fit.yaml"]
 
 _ID_OOD_CONFIGS = [
     "id_ood_gp.yaml",

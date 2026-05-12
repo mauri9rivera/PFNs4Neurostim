@@ -7,7 +7,6 @@
 family: vanilla-benchmark
 dataset: nhp
 mode:
-  - fit
   - optimization
   - optimization_budget
 

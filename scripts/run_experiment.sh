@@ -68,20 +68,22 @@ USE_LORA=0
 if [ "$FAMILY" = "0" ]; then
     # Legacy single-run (backward compatible with original script)
     SPLIT=${SPLIT:-inter_subject}
-    MODE=${MODE:-fit}
+    MODE=${MODE:-optimization}
     BUDGET=${BUDGET:-100}
     N_AUG=${N_AUG:-25}
     HELD_OUT_EMG=${HELD_OUT_EMG:-}
     HELD_OUT_SUBJ=${HELD_OUT_SUBJ:-}
 
 elif [ "$FAMILY" = "1" ]; then
-    # Per held_out_subject — inter_subject, fit+optimization
+    # Per held_out_subject — inter_subject, optimization (R² reported as a
+    # secondary metric inside the optimization run; standalone fit removed
+    # 2026-04-27).
     # sbatch --array=0-3%2  FAMILY=1 DATASET=nhp N_AUG=25 BUDGET=100
     # sbatch --array=0-5%2  FAMILY=1 DATASET=rat N_AUG=25 BUDGET=100
     HELD_OUT_SUBJ=$TASK_ID
     HELD_OUT_EMG=
     SPLIT=inter_subject
-    MODE=fit,optimization
+    MODE=optimization
     N_AUG=${N_AUG:-25}
     BUDGET=${BUDGET:-100}
 
@@ -115,12 +117,12 @@ elif [ "$FAMILY" = "3" ]; then
     BUDGET=100  # unused — budget values passed via --budgets
 
 elif [ "$FAMILY" = "4" ]; then
-    # Per held_out_emg — intra_emg, fit+optimization
+    # Per held_out_emg — intra_emg, optimization (R² reported as secondary metric).
     # sbatch --array=0-5%2  FAMILY=4 DATASET=nhp N_AUG=25 BUDGET=100
     HELD_OUT_EMG=$TASK_ID
     HELD_OUT_SUBJ=
     SPLIT=intra_emg
-    MODE=fit,optimization
+    MODE=optimization
     N_AUG=${N_AUG:-25}
     BUDGET=${BUDGET:-100}
 
@@ -131,7 +133,7 @@ elif [ "$FAMILY" = "5" ]; then
     : # no finetuning variables needed; python call handled separately below
 
 elif [ "$FAMILY" = "6" ]; then
-    # LoRA per held_out_subject — inter_subject, fit+optimization (mirrors Family 1).
+    # LoRA per held_out_subject — inter_subject, optimization (mirrors Family 1).
     # Identical to Family 1 but with --lora added to the finetuning command.
     # sbatch --array=0,1,3%2  FAMILY=6 DATASET=nhp N_AUG=25 BUDGET=100
     # sbatch --array=0-5%2    FAMILY=6 DATASET=rat N_AUG=25 BUDGET=100
@@ -149,7 +151,7 @@ elif [ "$FAMILY" = "7" ]; then
     # NHP held-out subjects: [1]   → sbatch --array=1%1
     # Rat held-out subjects: [0,5] → sbatch --array=0,5%2
     HELD_OUT_SUBJ=$TASK_ID
-    MODE=${MODE:-fit,optimization,optimization_budget}
+    MODE=${MODE:-optimization,optimization_budget}
     BUDGET=${BUDGET:-100}
     VANILLA_CONFIG=${VANILLA_CONFIG:-}
 

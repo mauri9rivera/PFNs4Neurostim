@@ -7,6 +7,7 @@ comparing against synthetic reference distributions (GP and/or Prior Bag).
 """
 from __future__ import annotations
 
+import math
 import os
 import pickle
 import warnings
@@ -28,6 +29,20 @@ from utils.data_utils import load_data, ALL_SUBJECTS
 from analysis.synthetic_gp import generate_synthetic_gp_bank
 from analysis.synthetic_noise import generate_noise_bank
 from analysis.synthetic_tabpfn_prior import generate_tabpfn_prior_bank
+
+def _effective_n_ctx(n_context: float, n_total: int) -> int:
+    """Convert fractional context size to an absolute observation count.
+
+    Args:
+        n_context: Fraction of total observations to use as context (0.0–1.0).
+        n_total: Total number of observations available.
+
+    Returns:
+        Absolute count: ceil(n_total * n_context), capped at n_total - 1 so
+        at least one point is always reserved for evaluation.
+    """
+    return min(math.ceil(n_total * n_context), n_total - 1)
+
 
 # Phase-aligned layer indices for TabPFN v2 (18-layer model).
 # Maps the three-phase attention structure from Ye et al. (2025,
@@ -110,7 +125,7 @@ def compute_bar_distribution_entropy(model, X_train, y_train, X_test):
     return entropy.detach().cpu().numpy()
 
 
-def entropy_analysis(dataset_types, device='cpu', n_context=500,
+def entropy_analysis(dataset_types, device='cpu', n_context=0.5,
                      prior_source='tabpfn_prior', n_synthetic=500, seed=42):
     """Entropy across all datasets/subjects/EMGs + synthetic reference(s).
 
@@ -123,7 +138,7 @@ def entropy_analysis(dataset_types, device='cpu', n_context=500,
     Args:
         dataset_types: list of dataset names (e.g., ['rat', 'nhp'])
         device: 'cpu' or 'cuda'
-        n_context: number of context points for TabPFN
+        n_context: fraction of observations to use as context (0.0–1.0)
         prior_source: 'gp' | 'tabpfn_prior' | 'both'
         n_synthetic: number of synthetic datasets for reference
         seed: random seed
@@ -171,7 +186,7 @@ def entropy_analysis(dataset_types, device='cpu', n_context=500,
 
                 # --- In-context: n_ctx randomly sampled points as context,
                 #     remaining points as test (mirrors BO initialisation) ---
-                n_ctx = min(n_context, n_channels - 1)
+                n_ctx = _effective_n_ctx(n_context, n_channels)
                 all_idx = rng_ctx.permutation(n_channels)
                 ctx_idx = all_idx[:n_ctx]
                 tst_idx = all_idx[n_ctx:]
@@ -223,9 +238,9 @@ def entropy_analysis(dataset_types, device='cpu', n_context=500,
 def _entropy_from_bank(model, bank, n_context):
     """Compute entropy for a bank of synthetic datasets.
 
-    Uses exactly n_context training points so that all conditions are
-    evaluated under identical context size.  Datasets with fewer than
-    n_context + 1 points are skipped (too small to provide full context).
+    Uses ceil(len(X) * n_context) training points so all conditions share
+    the same fractional context size.  Datasets too small for at least one
+    test point are skipped.
     """
     all_entropies = []
     for X, y in bank:
@@ -233,11 +248,11 @@ def _entropy_from_bank(model, bank, n_context):
         if normed is None:
             continue
         X, y = normed
-        # Require exactly n_context context points + at least 1 test point
-        if len(X) <= n_context:
+        n_ctx = _effective_n_ctx(n_context, len(X))
+        if n_ctx < 2 or len(X) - n_ctx < 1:
             continue
-        X_ctx, y_ctx = X[:n_context], y[:n_context]
-        X_tst = X[n_context:]
+        X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
+        X_tst = X[n_ctx:]
         entropy = compute_bar_distribution_entropy(model, X_ctx, y_ctx, X_tst)
         all_entropies.append(entropy)
     return np.concatenate(all_entropies) if all_entropies else np.array([])
@@ -649,7 +664,7 @@ def compute_mahalanobis_distance(z, mu, sigma_inv):
 
 
 def mahalanobis_analysis(dataset_types, device='cpu', prior_source='both',
-                         n_synthetic=500, n_context=50, regularization=1e-2,
+                         n_synthetic=500, n_context=0.5, regularization=1e-2,
                          seed=42, layer: int = 17):
     """Full Mahalanobis pipeline.
 
@@ -665,7 +680,7 @@ def mahalanobis_analysis(dataset_types, device='cpu', prior_source='both',
         device: 'cpu' or 'cuda'.
         prior_source: 'gp' | 'tabpfn_prior' | 'both'.
         n_synthetic: number of synthetic datasets for reference.
-        n_context: context size for embedding extraction.
+        n_context: fraction of observations to use as context (0.0–1.0).
         regularization: Tikhonov regularization for covariance inversion.
         seed: random seed.
         layer: transformer layer index for embedding extraction.
@@ -793,7 +808,7 @@ def _mahalanobis_analysis_inner(
                     y_mean.reshape(-1, 1),
                 ).ravel().astype(np.float32)
 
-                n_ctx = min(n_context, len(X) - 1)
+                n_ctx = _effective_n_ctx(n_context, len(X))
                 X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
                 X_tst = X[n_ctx:]
 
@@ -875,7 +890,7 @@ def _embeddings_from_bank(model, bank, n_context,
             n_nonfinite_input += 1
             continue
         X, y = normed
-        n_ctx = min(n_context, len(X) - 1)
+        n_ctx = _effective_n_ctx(n_context, len(X))
         if n_ctx < 2 or len(X) - n_ctx < 1:
             continue
         X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
@@ -973,7 +988,7 @@ def _fit_reference(embeddings, regularization, max_pca_components=30):
 # ============================================================================
 
 def cka_analysis(dataset_types, device='cpu', prior_source='both',
-                 n_synthetic=500, n_context=50, n_bootstrap=10, seed=42,
+                 n_synthetic=500, n_context=0.5, n_bootstrap=10, seed=42,
                  layers=None):
     """Multi-layer CKA between neurostim and synthetic reference embeddings.
 
@@ -993,7 +1008,7 @@ def cka_analysis(dataset_types, device='cpu', prior_source='both',
         device: 'cpu' or 'cuda'.
         prior_source: 'gp' | 'tabpfn_prior' | 'both'.
         n_synthetic: number of synthetic datasets for reference.
-        n_context: context size for embedding extraction.
+        n_context: fraction of observations to use as context (0.0–1.0).
         n_bootstrap: subsampling rounds to align row counts for CKA.
         seed: random seed.
         layers: list of transformer layer indices to analyze.
@@ -1098,7 +1113,7 @@ def _cka_analysis_inner(dataset_types, device, prior_source, n_synthetic,
                     y_mean.reshape(-1, 1),
                 ).ravel().astype(np.float32)
 
-                n_ctx = min(n_context, len(X) - 1)
+                n_ctx = _effective_n_ctx(n_context, len(X))
                 X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
                 X_tst = X[n_ctx:]
 
@@ -1203,7 +1218,7 @@ def rsa_analysis(
     device: str = 'cpu',
     prior_source: str = 'both',
     n_synthetic: int = 500,
-    n_context: int = 50,
+    n_context: float = 0.5,
     n_subsample: int = 300,
     seed: int = 42,
     layers: list[int] | None = None,
@@ -1262,7 +1277,7 @@ def _rsa_analysis_inner(
     device: str,
     prior_source: str,
     n_synthetic: int,
-    n_context: int,
+    n_context: float,
     n_subsample: int,
     seed: int,
     layers: list[int],
@@ -1331,7 +1346,7 @@ def _rsa_analysis_inner(
                     y_mean.reshape(-1, 1),
                 ).ravel().astype(np.float32)
 
-                n_ctx = min(n_context, len(X) - 1)
+                n_ctx = _effective_n_ctx(n_context, len(X))
                 X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
                 X_tst = X[n_ctx:]
 
@@ -1732,7 +1747,7 @@ def _gradient_norm_from_bank(model, bank, n_context):
         if normed is None:
             continue
         X, y = normed
-        n_ctx = min(n_context, len(X) - 1)
+        n_ctx = _effective_n_ctx(n_context, len(X))
         if n_ctx < 2 or len(X) - n_ctx < 1:
             continue
         X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
@@ -1749,7 +1764,7 @@ def _gradient_norm_from_bank(model, bank, n_context):
 
 
 def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
-                           n_synthetic=500, n_context=50, seed=42):
+                           n_synthetic=500, n_context=0.5, seed=42):
     """Gradient L2-norm at step 0 for neurostim and synthetic data.
 
     Creates a fresh TabPFNRegressor to avoid corrupting state for other
@@ -1760,7 +1775,7 @@ def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
         device: 'cpu' or 'cuda'
         prior_source: 'gp' | 'tabpfn_prior' | 'both'
         n_synthetic: number of synthetic datasets for reference
-        n_context: context size
+        n_context: fraction of observations to use as context (0.0–1.0)
         seed: random seed
 
     Returns:
@@ -1792,7 +1807,7 @@ def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
                     y_mean.reshape(-1, 1),
                 ).ravel().astype(np.float32)
 
-                n_ctx = min(n_context, len(X) - 1)
+                n_ctx = _effective_n_ctx(n_context, len(X))
                 X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
                 X_tst, y_tst = X[n_ctx:], y[n_ctx:]
 
@@ -1844,7 +1859,7 @@ def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
 
 def run_id_ood_analysis(dataset_types=None, analyses=None,
                         prior_source='both', device='cpu',
-                        n_synthetic=500, n_context=100, seed=42,
+                        n_synthetic=500, n_context=0.5, seed=42,
                         save=False, output_dir=None,
                         cka_layers=None,
                         proc_budgets=None,
@@ -1862,7 +1877,7 @@ def run_id_ood_analysis(dataset_types=None, analyses=None,
         prior_source: 'gp' | 'tabpfn_prior' | 'both'
         device: 'cpu' or 'cuda'
         n_synthetic: number of synthetic datasets
-        n_context: context size for entropy/Mahalanobis
+        n_context: fraction of observations to use as context (0.0–1.0) for entropy/Mahalanobis
         seed: random seed
         save: whether to save results to disk
         output_dir: base output directory

@@ -20,57 +20,27 @@ import pandas as pd
 # ============================================
 
 
-def _topographic_reorder(sorted_resp, sorted_respMean, sorted_respSD,
-                         sorted_isvalid, ch2xy, maps):
-    """Reorder channel-indexed arrays to row-major grid order, padding grounds.
+def _topographic_metadata(ch2xy: np.ndarray, maps: np.ndarray) -> tuple:
+    """Return integer-cast ``ch2xy`` and grid shape — no array reordering.
 
-    The Utah microelectrode array has a scrambled pin-to-electrode mapping.
-    ch2xy[i] = [row, col] gives the physical grid position of channel i.
-    maps.shape gives the full grid dimensions (e.g. 10x10 for NHP).
+    Channel-indexed arrays (``sorted_resp``, ``sorted_respMean``,
+    ``sorted_isvalid``, …) stay at length ``nChan_real``.  Ground/empty grid
+    positions are *never* materialised, so they cannot pollute ``Y_test`` /
+    ``r2_score`` downstream.  ``ch2xy[i] = [row, col]`` keeps mapping the
+    *i-th real electrode* to its physical grid position; visualisation code
+    scatters values into a NaN-padded display grid using ``ch2xy`` +
+    ``grid_shape`` (see ``utils.visualization._to_grid``).
 
-    After reordering, channel k in the output corresponds to grid position
-    (k // n_cols, k % n_cols), so array.reshape(grid_shape) gives the correct
-    topographic map. Ground positions (grid cells with no electrode) are filled
-    with 0.
+    Args:
+        ch2xy: (nChan_real, 2) electrode → (row, col) coords, 0-indexed.
+        maps: Full grid layout from the .mat file, shape (n_rows, n_cols, …).
 
     Returns:
-        (sorted_resp, sorted_respMean, sorted_respSD, sorted_isvalid,
-         ch2xy, grid_shape) — all reordered/padded.
+        Tuple ``(ch2xy_int, grid_shape)``.
     """
-    grid_shape = maps.shape[:2]
-    n_rows, n_cols = grid_shape
-    n_grid = n_rows * n_cols
-
-    # Map grid position → original channel index
-    grid_to_chan = {}
-    for i in range(ch2xy.shape[0]):
-        r, c = int(round(ch2xy[i, 0])), int(round(ch2xy[i, 1]))
-        grid_to_chan[(r, c)] = i
-
-    # Row-major ordering: grid position 0 = (0,0), 1 = (0,1), ...
-    topo_order = []
-    topo_coords = []
-    for r in range(n_rows):
-        for c in range(n_cols):
-            topo_order.append(grid_to_chan.get((r, c), -1))
-            topo_coords.append([r, c])
-
-    def _reorder(arr):
-        """Reorder first axis from channel order to row-major grid order."""
-        out = np.zeros((n_grid,) + arr.shape[1:], dtype=arr.dtype)
-        for g, ch in enumerate(topo_order):
-            if ch >= 0:
-                out[g] = arr[ch]
-        return out
-
-    return (
-        _reorder(sorted_resp),
-        _reorder(sorted_respMean),
-        _reorder(sorted_respSD),
-        _reorder(sorted_isvalid),
-        np.array(topo_coords, dtype=ch2xy.dtype),
-        grid_shape,
-    )
+    grid_shape = (int(maps.shape[0]), int(maps.shape[1]))
+    ch2xy_int = np.rint(ch2xy).astype(np.int64)  # [nChan_real, 2]
+    return ch2xy_int, grid_shape
 
 
 def load_data(dataset_type, m_i):
@@ -172,16 +142,17 @@ def load_data(dataset_type, m_i):
 
         emgs = data[0][0]
 
-        # Topographic reorder: place channels at correct grid positions
-        sorted_resp, sorted_respMean, sorted_respSD, sorted_isvalid, ch2xy, grid_shape = \
-            _topographic_reorder(sorted_resp, sorted_respMean, sorted_respSD,
-                                 sorted_isvalid, ch2xy, maps)
+        # Channels remain in their native (real-electrode) order — no padding.
+        # grid_shape is exposed only so visualisation can place values into
+        # a NaN-padded display grid via ch2xy.
+        ch2xy, grid_shape = _topographic_metadata(ch2xy, maps)
+        n_real_channels = sorted_resp.shape[0]
 
         return {
         'correspondance': mapping,
         'emgs': emgs,
         'evoked_emg': evoked_emg,
-        'nChan': grid_shape[0] * grid_shape[1],
+        'nChan': n_real_channels,
         'sorted_isvalid': sorted_isvalid,
         'sorted_resp': sorted_resp,
         'sorted_respMean': sorted_respMean,
@@ -189,8 +160,9 @@ def load_data(dataset_type, m_i):
         'sorted_evoked': sorted_evoked,
         'sorted_filtered': sorted_filtered,
         'ch2xy': ch2xy,
+        'grid_shape': grid_shape,
         'parameters': parameters, 'n_muscles': n_muscles, 'maps': maps,
-        'DimSearchSpace': grid_shape[0] * grid_shape[1],
+        'DimSearchSpace': n_real_channels,
         }
 
     elif dataset_type=='rat':  # rat dataset has 6 subjects
@@ -264,20 +236,20 @@ def load_data(dataset_type, m_i):
 
         emgs = data[0][0]
 
-        # Topographic reorder: place channels at correct grid positions
-        sorted_resp, sorted_respMean, sorted_respSD, sorted_isvalid, ch2xy, grid_shape = \
-            _topographic_reorder(sorted_resp, sorted_respMean, sorted_respSD,
-                                 sorted_isvalid, ch2xy, maps)
+        # Channels remain in their native (real-electrode) order — no padding.
+        ch2xy, grid_shape = _topographic_metadata(ch2xy, maps)
+        n_real_channels = sorted_resp.shape[0]
 
         return {
         'emgs': emgs,
-        'nChan': grid_shape[0] * grid_shape[1],
+        'nChan': n_real_channels,
         'sorted_isvalid': sorted_isvalid,
         'sorted_resp': sorted_resp,
         'sorted_respMean': sorted_respMean,
         'sorted_respSD': sorted_respSD,
         'ch2xy': ch2xy,
-        'DimSearchSpace': grid_shape[0] * grid_shape[1],
+        'grid_shape': grid_shape,
+        'DimSearchSpace': n_real_channels,
         }
     elif dataset_type =='spinal':
 
@@ -346,18 +318,17 @@ def load_data(dataset_type, m_i):
         #mask sorted_isvalid by n_rep
         sorted_isvalid = sorted_isvalid[:, :, :n_rep]
 
-        # Topographic reorder: place channels at correct grid positions
-        sorted_resp, sorted_respMean, sorted_respSD, sorted_isvalid, ch2xy, grid_shape = \
-            _topographic_reorder(sorted_resp, sorted_respMean, sorted_respSD,
-                                 sorted_isvalid, ch2xy, maps)
-        n_grid = grid_shape[0] * grid_shape[1]
+        # Channels remain in their native (real-electrode) order — no padding.
+        ch2xy, grid_shape = _topographic_metadata(ch2xy, maps)
+        n_real_channels = sorted_resp.shape[0]
 
         subject = {
             'emgs': emgs,
-            'nChan': n_grid,
-            'DimSearchSpace': n_grid,
+            'nChan': n_real_channels,
+            'DimSearchSpace': n_real_channels,
             'sorted_respMean': sorted_respMean,
             'ch2xy': ch2xy,
+            'grid_shape': grid_shape,
             'evoked_emg': evoked_emg, 'filtered_emg':filtered_emg, 'sorted_resp': sorted_resp,
             'sorted_isvalid': sorted_isvalid, 'sorted_respSD': sorted_respSD,
             'sorted_filtered': sorted_filtered, 'stim_channel': stim_channel, 'fs': fs,
@@ -448,7 +419,7 @@ def create_run_dir(
     else:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         run_dir = os.path.join(base_dir, f'{exp_tag}_{timestamp}')
-    for sub in ('fitness', 'fitness/emg_maps', 'optimization', 'optimization/emg_maps', 'results', 'diagnostics'):
+    for sub in ('optimization', 'optimization/emg_maps', 'results', 'diagnostics'):
         os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
     return run_dir
 
@@ -488,9 +459,18 @@ def augment_maps(subject_data, emg_idx, n_augmentations=25, seed=42):
     mean_map = subject_data['sorted_respMean'][:, emg_idx]  # (nChan,)
     std_map = subject_data['sorted_respSD'][:, emg_idx]     # (nChan,)
 
+    # Drop sites with zero valid reps — their respMean is the np.ma.filled
+    # fill value (0.0), not a real measurement, and would bias the scaler.
+    if 'sorted_isvalid' in subject_data:
+        valid_site_mask = (
+            subject_data['sorted_isvalid'][:, emg_idx, :] != 0
+        ).any(axis=-1)
+        coords = coords[valid_site_mask]
+        mean_map = mean_map[valid_site_mask]
+        std_map = std_map[valid_site_mask]
+
     scaler_x = MinMaxScaler()
     X_scaled = scaler_x.fit_transform(coords)
-    n_channels = mean_map.shape
 
     scaler_y = StandardScaler()
     scaler_y.fit(mean_map.reshape(-1, 1))
@@ -523,16 +503,21 @@ def plot_augmented_maps(subject_data, emg_idx, dataset_type, subj_idx,
     """
 
 
-    mean_map = subject_data['sorted_respMean'][:, emg_idx]  # (nChan,)
-    nChan = len(mean_map)
-    if nChan == 100:
-        grid_shape = (10, 10)
-    elif nChan == 64:
-        grid_shape = (8, 8)
-    elif nChan == 32:
-        grid_shape = (4, 8)
+    from utils.visualization import _to_grid  # local import to avoid cycle
+
+    mean_map_full = subject_data['sorted_respMean'][:, emg_idx]   # (nChan,)
+    grid_shape = subject_data.get('grid_shape', (1, len(mean_map_full)))
+    ch2xy_full = subject_data['ch2xy']
+
+    if 'sorted_isvalid' in subject_data:
+        valid_site_mask = (
+            subject_data['sorted_isvalid'][:, emg_idx, :] != 0
+        ).any(axis=-1)
     else:
-        grid_shape = (1, nChan)
+        valid_site_mask = np.ones(len(mean_map_full), dtype=bool)
+
+    mean_map = mean_map_full[valid_site_mask]                    # (n_valid,)
+    ch2xy = ch2xy_full[valid_site_mask]
 
     # Generate augmented pairs and inverse-transform y back to response scale
     scaler_y = StandardScaler()
@@ -549,7 +534,9 @@ def plot_augmented_maps(subject_data, emg_idx, dataset_type, subj_idx,
     # Shared color scale across original + all augmented maps
     all_vals = np.concatenate([mean_map] + aug_maps)
     vmin, vmax = all_vals.min(), all_vals.max()
-    heatmap_kw = dict(cmap='viridis', vmin=vmin, vmax=vmax,
+    cmap = plt.get_cmap('viridis').copy()
+    cmap.set_bad('lightgrey')
+    heatmap_kw = dict(cmap=cmap, vmin=vmin, vmax=vmax,
                       cbar=False, xticklabels=False, yticklabels=False)
 
     n_total = 1 + n_show
@@ -562,13 +549,13 @@ def plot_augmented_maps(subject_data, emg_idx, dataset_type, subj_idx,
     axes_flat = axes.flatten()
 
     # Original map
-    sns.heatmap(mean_map.reshape(grid_shape), ax=axes_flat[0], **heatmap_kw)
+    sns.heatmap(_to_grid(mean_map, ch2xy, grid_shape), ax=axes_flat[0], **heatmap_kw)
     axes_flat[0].set_title(f'Original\n{dataset_type} S{subj_idx} EMG{emg_idx}',
                            fontsize=9)
 
     # Augmented maps
     for i, y_map in enumerate(aug_maps):
-        sns.heatmap(y_map.reshape(grid_shape), ax=axes_flat[i + 1], **heatmap_kw)
+        sns.heatmap(_to_grid(y_map, ch2xy, grid_shape), ax=axes_flat[i + 1], **heatmap_kw)
         axes_flat[i + 1].set_title(f'Aug {i + 1}\n{dataset_type} S{subj_idx} EMG{emg_idx}',
                                    fontsize=9)
 
@@ -635,41 +622,73 @@ def build_finetuning_dataset(dataset_type, subject_indices=None,
 
 def preprocess_neural_data(subject_data, emg_idx=0, normalization='pfn'):
     """
-    Ideally, you would preprocess neural data so that Y_test is the resp_mean,
-    but we train (Y_train) on a randomly selected sample of sorted_resp.
-    """
+    Build the per-EMG (X_pool, y_pool) tensors consumed by the BO loops.
 
-    coords = subject_data['ch2xy'] # Shape (96, 2)
-    resp_all = subject_data['sorted_resp'][:, emg_idx, :] # Shape (96, repetitions)
-    resp_flat = resp_all.reshape(-1, 1) # Shape (96*repetitions, )
+    Sites with zero valid reps at this EMG are dropped entirely — they would
+    otherwise enter ``Y_test`` as standardized-zero artefacts (from
+    ``np.ma.filled(..., 0.0)`` in :func:`load_data`) and pollute
+    ``r2_score(y_test, y_pred)``.  Combined with the no-padding policy in
+    :func:`_topographic_metadata`, this guarantees every row of the returned
+    tensors corresponds to a real, observable electrode-EMG pair.
+
+    y_pool exposes the full noisy single-trial response bank (one column per
+    repetition) so the BO loop can draw one stochastic observation per query,
+    matching the real neurostim experimental protocol.  Repetitions flagged
+    invalid by ``sorted_isvalid`` are masked to NaN in y_pool; downstream
+    samplers must skip NaN draws (see ``bo_loops._draw_valid_rep``).
+
+    Returns:
+        X_train: MinMax-scaled coordinates [N_valid, D].
+        Y_train: Per-trial responses [N_valid, n_reps], standardized; NaN at
+            invalid trials.  Used as ``y_pool``.
+        X_test: Same as X_train (passed through for API compatibility).
+        Y_test: Per-site ground-truth means [N_valid], standardized in the
+            *same* space as Y_train (so ``r2_score(y_test, y_pred)`` and
+            regret ``y_test.max() - max(real_values)`` are both unit-consistent).
+            To recover raw EMG units, apply ``scaler_y.inverse_transform``.
+        scaler_y: Fitted scaler used for Y_train (and Y_test).
+    """
+    coords = subject_data['ch2xy']                              # [N, 2]
+    resp_all = subject_data['sorted_resp'][:, emg_idx, :].astype(np.float32).copy()  # [N, n_reps]
+    resp_mean = subject_data['sorted_respMean'][:, emg_idx]     # [N]
+
+    # Mask invalid trials with NaN so the BO sampler can redraw past them.
+    if 'sorted_isvalid' in subject_data:
+        valid_trial_mask = subject_data['sorted_isvalid'][:, emg_idx, :]  # [N, n_reps]
+        resp_all[valid_trial_mask == 0] = np.nan
+        # A site is usable only if at least one rep is valid; otherwise
+        # ``sorted_respMean`` at that site is the np.ma.filled fill value
+        # (0.0) — never a real measurement.
+        valid_site_mask = (valid_trial_mask != 0).any(axis=-1)            # [N]
+    else:
+        valid_site_mask = np.ones(resp_all.shape[0], dtype=bool)
+
+    # Drop unobservable sites *before* anything else touches Y_test.
+    coords = coords[valid_site_mask]                            # [N_valid, D]
+    resp_all = resp_all[valid_site_mask]                        # [N_valid, n_reps]
+    resp_mean = resp_mean[valid_site_mask]                      # [N_valid]
     n_channels, n_reps = resp_all.shape
-    resp_mean = subject_data['sorted_respMean'][:, emg_idx] # Shape (96,)
+
+    # Fit y-scaler on valid trials only (NaN propagates through .fit otherwise).
+    valid_flat = resp_all[~np.isnan(resp_all)].reshape(-1, 1)
+    if valid_flat.size == 0:
+        raise RuntimeError(
+            f"preprocess_neural_data: no valid trials for emg_idx={emg_idx}."
+        )
 
     if normalization == 'pfn':
-    
         scaler_x = MinMaxScaler()
-        X_train = scaler_x.fit_transform(coords)
-        
+        X_train = scaler_x.fit_transform(coords)                # [N_valid, D]
         scaler_y = StandardScaler()
-        y_scaled_flat = scaler_y.fit_transform(resp_flat)
-        Y_train = y_scaled_flat.reshape(n_channels, n_reps) 
-        
-        Y_test_scaled = scaler_y.transform(resp_mean.reshape(-1, 1))
-        Y_test = Y_test_scaled.flatten()
-
     else:
-
-        X_train = coords
-
+        X_train = coords                                         # [N_valid, D]
         scaler_y = MinMaxScaler()
-        y_scaled_flat = scaler_y.fit_transform(resp_flat)
-        Y_train = y_scaled_flat.reshape(n_channels, n_reps)
 
-        Y_test_scaled = scaler_y.transform(resp_mean.reshape(-1,1))
-        Y_test = Y_test_scaled.flatten()
+    scaler_y.fit(valid_flat)
+    Y_train = scaler_y.transform(resp_all.reshape(-1, 1)).reshape(n_channels, n_reps)  # [N_valid, n_reps], NaN preserved
+    Y_test = scaler_y.transform(resp_mean.reshape(-1, 1)).flatten()                    # [N_valid], same space as Y_train
 
-
-    return X_train, Y_train, X_train, resp_mean, scaler_y
+    return X_train, Y_train, X_train, Y_test, scaler_y
 
 
 # ============================================
@@ -689,7 +708,8 @@ def save_results(
     Args:
         results_dict: dict[str, list[dict]] — model name -> list of result dicts
                       (as returned by run_experiment() or the evaluation loops).
-        evaluation_type: 'fit' or 'optimization'.
+        evaluation_type: 'optimization' (only supported value; kept as a
+            filename component for back-compat with existing pkl naming).
         output_dir: Directory to write into (created if absent).
         tag: Optional suffix for the filename (e.g. 'finetuned_vs_gp').
         metadata: Optional dict injected as ``_metadata`` key in the pickle.
@@ -776,7 +796,7 @@ def load_results(pickle_path: str) -> dict:
 
     Returns:
         The exact ``dict[str, list[dict]]`` for direct use with
-        ``r2_per_muscle``, ``regret_with_timing``, etc.
+        ``r2_by_subject``, ``regret_with_timing``, etc.
     """
     with open(pickle_path, 'rb') as f:
         return pickle.load(f)
@@ -801,8 +821,7 @@ def aggregate_results(
         dataset: Dataset type — ``'rat'``, ``'nhp'``, or ``'spinal'``.
         result_type: Which pkl type to load.  One of:
 
-            * ``'fit'`` — ``*_fit.pkl`` files (dict[str, list[dict]])
-            * ``'optimization'`` — ``*_optimization.pkl`` files (same schema)
+            * ``'optimization'`` — ``*_optimization.pkl`` files (dict[str, list[dict]])
             * ``'optimization_budget'`` — ``*_optimization_budget.pkl``
               (DataFrame pkl, columns: Budget|Model|Regret|R2|ID)
 
@@ -812,7 +831,7 @@ def aggregate_results(
             ``None`` means load all directories matching the family prefix.
 
     Returns:
-        Concatenated DataFrame.  Schema for ``fit`` / ``optimization``:
+        Concatenated DataFrame.  Schema for ``optimization``:
 
         .. code-block::
 
@@ -830,7 +849,7 @@ def aggregate_results(
     Raises:
         ValueError: If ``result_type`` is not one of the recognised values.
     """
-    valid_types = {'fit', 'optimization', 'optimization_budget'}
+    valid_types = {'optimization', 'optimization_budget'}
     if result_type not in valid_types:
         raise ValueError(
             f"result_type must be one of {sorted(valid_types)}, got {result_type!r}"
@@ -889,8 +908,8 @@ def aggregate_results(
                 all_frames.append(df)
 
             else:
-                # 'fit' or 'optimization': match files that contain
-                # f'_{result_type}_' (the evaluation_type component).
+                # 'optimization': match files that contain f'_{result_type}_'
+                # (the evaluation_type component).
                 # Exclude budget files (contain 'budget').
                 marker = f'_{result_type}_'
                 if 'budget' in fname:

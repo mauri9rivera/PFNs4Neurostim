@@ -17,6 +17,6 @@ analyses:
 prior_source: gp
 device: cpu
 n_synthetic: 500
-n_context: 100
+n_context: 0.5
 seed: 42
 save: true

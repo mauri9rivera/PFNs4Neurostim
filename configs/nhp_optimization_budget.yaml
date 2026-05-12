@@ -18,6 +18,12 @@ n_augmentations: 25
 # Evaluation
 budget: 100
 n_reps: 30
+
+# UCB kappa control:
+#   kappa_schedule: 0.0  →  auto cosine-annealed schedule (GP-UCB theory)
+#   kappa_schedule: 2.5  →  fixed kappa=2.5 throughout (no annealing)
+kappa_schedule: 0.0
+
 budgets:
   - 10
   - 30

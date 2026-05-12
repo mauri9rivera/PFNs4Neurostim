@@ -10,12 +10,12 @@
 #   for SUBJ in 0 1 3; do
 #     sbatch --wrap="conda run -n pfns4neurostim python src/vanilla_benchmark.py \
 #       --config configs/nhp_vanilla_benchmark_loo.yaml --held_out_subj $SUBJ \
-#       --mode fit,optimization --save"
+#       --mode optimization --save"
 #   done
 #
 # Aggregate:
 #   python src/aggregate.py --config configs/nhp_vanilla_benchmark_loo.yaml \
-#     --result_types fit optimization
+#     --result_types optimization
 
 family: vanilla-benchmark-loo
 dataset: nhp

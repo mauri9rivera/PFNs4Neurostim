@@ -21,6 +21,24 @@ from models.gaussians import ExactGP
 from utils.gpbo_utils import compute_ucb_kappa, _auto_kappa_max, _auto_kappa_min
 
 
+def _draw_valid_rep(y_pool: np.ndarray, idx: int, fallback: float) -> float:
+    """Draw one noisy trial from ``y_pool[idx]``, skipping NaN-masked invalid reps.
+
+    Models a real neurostim query: one trial drawn uniformly at random from
+    the *valid* repetitions at site ``idx``.  Invalid trials (flagged by
+    ``sorted_isvalid`` and masked to NaN in ``preprocess_neural_data``) are
+    excluded from the draw.  Falls back to ``fallback`` if every rep at this
+    site is invalid (defensive — should be rare in practice).
+    """
+    site_reps = y_pool[idx] if y_pool.ndim > 1 else np.atleast_1d(y_pool[idx])
+    valid_mask = ~np.isnan(site_reps)
+    if not valid_mask.any():
+        return float(fallback)
+    valid_idx = np.flatnonzero(valid_mask)
+    chosen = int(np.random.choice(valid_idx))
+    return float(site_reps[chosen])
+
+
 def _snapshot_iters(budget, n_init):
     """Compute log2-spaced iteration counts (total observations, 1-indexed) for snapshots."""
     iters = set()
@@ -56,8 +74,14 @@ def run_bo_loop(
       - ``model.predict_ucb(X, kappa, t, n_steps)`` — return UCB values
         (falls back to ``mean + kappa * std`` if not implemented)
 
-    Observations are drawn as the mean across all repetitions in ``y_pool``
-    (``y_pool[idx].mean()``), matching the protocol used in the legacy loops.
+    Observations model a real neurostim experiment: each query returns a
+    single noisy trial drawn uniformly at random from the *valid* reps in
+    ``y_pool[idx, :]`` (NaN-flagged invalid reps are skipped).  The agent
+    never sees the per-site mean; that is reserved as offline ground truth in
+    ``y_test`` for regret/R² evaluation.
+
+    Revisits are allowed: re-querying a previously observed site yields a
+    fresh independent trial and reduces variance at that site.
 
     Kappa schedule: controlled by ``kappa_schedule``.  ``0.0`` activates cosine
     annealing from an auto-computed upper bound (``_auto_kappa_max``) down to an
@@ -69,10 +93,11 @@ def run_bo_loop(
         model: Any object conforming to the ``SurrogateModel`` protocol.
         X_pool: Feature matrix for all candidate locations, shape [N, D].
         y_pool: Response matrix with repeated measurements, shape [N, n_reps].
-            Each row corresponds to one candidate location; the observation
-            returned for a queried location is the row mean.
+            Each row corresponds to one candidate location; each query draws
+            one noisy trial uniformly at random from ``y_pool[idx, :]``.
         X_test: Test feature matrix for final R² prediction, shape [M, D].
-        y_test: Test response vector (mean across repetitions), shape [M].
+        y_test: Ground-truth test responses (per-site mean across reps),
+            shape [M] — never observed by the agent; used only offline.
         n_init: Number of randomly selected initial observations before the
             optimisation loop starts.
         budget: Total number of observations (including ``n_init``).
@@ -89,8 +114,10 @@ def run_bo_loop(
     Returns:
         Dictionary with keys:
           - ``'observed_indices'``: list[int] — query indices into ``X_pool``
-          - ``'observed_values'``: list[float] — noisy (mean-rep) observations
-          - ``'real_values'``: list[float] — true test values at observed locs
+          - ``'observed_values'``: list[float] — noisy single-trial draws
+            from ``y_pool`` (what the agent actually sees during BO)
+          - ``'real_values'``: list[float] — ground-truth ``y_test`` values
+            at observed locations (offline reference, not seen by the agent)
           - ``'times'``: list[float] — per-step wall-clock time in seconds
           - ``'y_pred'``: np.ndarray shape [M] — final predictions on ``X_test``
           - ``'snapshots'``: dict[int, dict] | None — at each snapshot iteration:
@@ -116,8 +143,7 @@ def run_bo_loop(
         _kappa_min = _auto_kappa_min(d, n_steps)
 
     def _sample(idx: int) -> float:
-        """Return mean observation for pool index idx."""
-        return float(y_pool[idx].mean())
+        return _draw_valid_rep(y_pool, idx, fallback=float(y_test[idx]))
 
     # --- Initialisation: random seed queries ---
     pool_indices = np.arange(n_locs)
@@ -129,6 +155,9 @@ def run_bo_loop(
 
     times: list[float] = []
     snapshots: dict[int, np.ndarray] = {}
+    # Pure-exploitation recommendation at each BO step (argmax of posterior mean).
+    # Distinct from the UCB-selected query when kappa > 0.
+    best_rec_indices: list[int] = []
 
     # --- BO loop ---
     for t in range(n_steps):
@@ -146,17 +175,23 @@ def run_bo_loop(
         else:
             kappa = kappa_schedule
 
-        # Compute UCB acquisition values for all candidates
-        # Prefer native predict_ucb if available; fall back to mean + kappa*std
+        # Compute UCB acquisition values for all candidates.
+        # Also obtain pool_mean for the pure-exploitation recommendation (argmax of mean).
+        # Prefer native predict_ucb if available; fall back to mean + kappa*std.
         if hasattr(model, 'predict_ucb') and callable(model.predict_ucb):
             ucb_vals = model.predict_ucb(X_pool, kappa, t, n_steps)  # [N]
             # Convert torch tensors if necessary
             if hasattr(ucb_vals, 'numpy'):
                 ucb_vals = ucb_vals.numpy()
             ucb_vals = np.asarray(ucb_vals, dtype=np.float64)         # [N]
+            # Separate mean prediction for exploitation recommendation
+            pool_mean, _ = model.predict(X_pool)                      # [N]
         else:
-            mean, std = model.predict(X_pool)   # [N], [N]
-            ucb_vals = mean + kappa * std        # [N]
+            pool_mean, std = model.predict(X_pool)   # [N], [N]
+            ucb_vals = np.asarray(pool_mean, dtype=np.float64) + kappa * np.asarray(std, dtype=np.float64)  # [N]
+
+        pool_mean_arr = np.asarray(pool_mean, dtype=np.float64)       # [N]
+        best_rec_indices.append(int(np.argmax(pool_mean_arr)))        # pure-exploit recommendation
 
         if not np.isfinite(ucb_vals).any():
             raise RuntimeError(
@@ -164,10 +199,8 @@ def run_bo_loop(
                 "Check surrogate fit and input data for NaN/Inf."
             )
 
-        # Mask already-observed locations to prevent revisiting
-        for obs_idx in observed_indices:
-            ucb_vals[obs_idx] = -np.inf
-
+        # Revisits are allowed: the noise model means re-querying a site
+        # yields a fresh (independent) trial, providing variance reduction.
         next_idx = int(np.argmax(ucb_vals))
         observed_indices.append(next_idx)
         observed_values.append(_sample(next_idx))
@@ -207,6 +240,7 @@ def run_bo_loop(
         'times': times,
         'y_pred': y_pred,
         'snapshots': snapshots if snapshot_iters is not None else None,
+        'best_rec_indices': best_rec_indices,   # list[int], length = n_steps
     }
 
 
@@ -216,7 +250,8 @@ def run_bo_loop(
 
 
 def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
-                  n_init=5, budget=100, device='cpu', snapshot_iters=None):
+                  n_init=5, budget=100, device='cpu', snapshot_iters=None,
+                  kappa_schedule: float = 0.0):
     """
     .. deprecated::
         Use ``run_bo_loop(GPSurrogate(device=device), ...)`` instead.
@@ -227,17 +262,19 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
 
     Args:
         X_pool: Feature matrix for the candidate pool (n_locs, n_features).
-        y_pool: Response matrix (n_locs, n_reps) with noisy observations.
+        y_pool: Response matrix (n_locs, n_reps) with noisy single-trial
+            observations.  Each query draws one rep uniformly at random.
         x_test: Test feature matrix for final prediction.
-        y_test: Test response vector (mean across repetitions).
+        y_test: Ground-truth response vector (per-site mean across reps),
+            never observed by the agent.
         n_init: Number of random initial observations.
         budget: Total number of observations (including initial).
         device: 'cpu' or 'cuda'.
 
     Returns:
         - observed_indices: Indices of points chosen
-        - observed_values: Observed y values (with noise)
-        - real_values: True y values at observed indices
+        - observed_values: Noisy single-trial draws from y_pool
+        - real_values: Ground-truth y_test values at observed indices
         - times: Time taken at each step
         - y_pred: Final predictions on x_test
         - snapshots: dict or None
@@ -245,7 +282,7 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
     n_locs, n_reps = y_pool.shape
 
     def sample_from_pool(idx):
-        return float(y_pool[idx, :].mean())     
+        return _draw_valid_rep(y_pool, idx, fallback=float(y_test[idx]))
 
     # 1. Initialization (Random)
     pool_indices = np.arange(n_locs)
@@ -255,6 +292,7 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
 
     times = []
     snapshots = {}
+    best_rec_indices = []
     n_steps = budget - n_init
 
     # --- LOOP ---
@@ -282,8 +320,11 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
             loss.backward()
             optimizer.step()
 
-        # Select Next Point (UCB with cosine-annealed kappa)
-        kappa = compute_ucb_kappa(t, n_steps, kappa_max=5.0, kappa_min=1.0)
+        # Select Next Point (UCB with cosine-annealed or fixed kappa)
+        if kappa_schedule == 0.0:
+            kappa = compute_ucb_kappa(t, n_steps, kappa_max=5.0, kappa_min=1.0)
+        else:
+            kappa = kappa_schedule
         model.eval()
         likelihood.eval()
         with torch.no_grad():
@@ -291,9 +332,9 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
             mean = posterior.mean
             sigma = posterior.stddev
         acq_vals = mean + kappa * sigma
-        # Prevent revisiting already-observed locations
-        for obs_idx in observed_indices:
-            acq_vals[obs_idx] = -float('inf')
+        # Pure-exploitation recommendation = argmax of posterior mean
+        best_rec_indices.append(int(mean.argmax().item()))
+        # Revisits allowed (single-trial noise model — re-queries are informative).
         next_idx = acq_vals.argmax().item()
 
         observed_indices.append(next_idx)
@@ -322,7 +363,11 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
             _gp_snap.eval(); _lik_snap.eval()
             with torch.no_grad():
                 snap_post = _lik_snap(_gp_snap(torch.tensor(x_test, dtype=torch.float32, device=device)))
-                snapshots[len(observed_indices)] = snap_post.mean.cpu().numpy()
+                pool_post = _lik_snap(_gp_snap(torch.tensor(X_pool, dtype=torch.float32, device=device)))
+                snapshots[len(observed_indices)] = {
+                    'y_pred': snap_post.mean.cpu().numpy(),
+                    'best_pred_val': float(pool_post.mean.max().item()),
+                }
 
     # Final model fit on all observed data to predict on x_test
     X_train_final = torch.tensor(X_pool[observed_indices], dtype=torch.float32, device=device)
@@ -348,14 +393,20 @@ def run_gpbo_loop(X_pool, y_pool, x_test, y_test,
 
     # Capture final snapshot (budget) if not already captured in loop
     if snapshot_iters is not None and budget not in snapshots:
-        snapshots[budget] = y_pred.copy()
+        with torch.no_grad():
+            pool_posterior = likelihood(model(torch.tensor(X_pool, dtype=torch.float32, device=device)))
+        snapshots[budget] = {
+            'y_pred': y_pred.copy(),
+            'best_pred_val': float(pool_posterior.mean.max().item()),
+        }
 
     return observed_indices, observed_values, real_values, times, y_pred, \
-        (snapshots if snapshot_iters else None)
+        (snapshots if snapshot_iters else None), best_rec_indices
 
 
 def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
-                          n_init=5, budget=100, device='cpu', snapshot_iters=None):
+                          n_init=5, budget=100, device='cpu', snapshot_iters=None,
+                          kappa_schedule: float = 0.0):
     """
     .. deprecated::
         Use ``run_bo_loop(TabPFNSurrogate(model), ...)`` instead.
@@ -370,11 +421,14 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
 
     Args:
         model: A TabPFNRegressor from extract_inference_model()
+        kappa_schedule: UCB exploration coefficient.  ``0.0`` (default) =
+            auto cosine-annealed schedule (kappa_max=2.5, kappa_min=0.5);
+            any other value = fixed kappa throughout the BO loop.
 
     Returns:
         - observed_indices: Indices of points chosen
-        - observed_values: Observed y values (with noise)
-        - real_values: True y values at observed indices
+        - observed_values: Noisy single-trial draws from y_pool
+        - real_values: Ground-truth y_test values at observed indices
         - times: Time taken at each step
         - y_pred: Final predictions on x_test
         - snapshots: dict or None — {iter: y_pred_array} at snapshot iterations
@@ -382,7 +436,7 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
     n_locs, n_reps = y_pool.shape
 
     def sample_from_pool(idx):
-        return float(y_pool[idx, :].mean())
+        return _draw_valid_rep(y_pool, idx, fallback=float(y_test[idx]))
 
     # 1. Initialization (Random)
     pool_indices = np.arange(n_locs)
@@ -392,6 +446,7 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
 
     times = []
     snapshots = {}
+    best_rec_indices = []
     n_steps = budget - n_init
 
     # --- LOOP ---
@@ -406,16 +461,20 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
 
         # Compute UCB directly from the bar distribution (no Gaussian assumption)
         # kappa → rest_prob via: rest_prob = 0.5 * erfc(kappa / sqrt(2))
-        kappa = compute_ucb_kappa(t, n_steps, kappa_max=2.5, kappa_min=0.5)
+        if kappa_schedule == 0.0:
+            kappa = compute_ucb_kappa(t, n_steps, kappa_max=2.5, kappa_min=0.5)
+        else:
+            kappa = kappa_schedule
         rest_prob = 0.5 * math.erfc(kappa / math.sqrt(2))
         full_output = model.predict(X_pool, output_type="full")
         logits = full_output['logits']
         criterion = full_output['criterion']
         ucb_vals = criterion.ucb(logits, 0, rest_prob=rest_prob, maximize=True)
         ucb_vals = ucb_vals.clone()
-        # Prevent revisiting already-observed locations
-        for obs_idx in observed_indices:
-            ucb_vals[obs_idx] = -float('inf')
+        # Pure-exploitation recommendation = argmax of posterior mean
+        pool_mean = model.predict(X_pool)                            # [N]
+        best_rec_indices.append(int(np.argmax(np.asarray(pool_mean))))
+        # Revisits allowed (single-trial noise model — re-queries are informative).
         next_idx = int(ucb_vals.argmax().item())
 
         observed_indices.append(next_idx)
@@ -430,7 +489,11 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
         if snapshot_iters is not None and len(observed_indices) in snapshot_iters:
             model.fit(X_pool[observed_indices], np.array(observed_values))
             snap_pred = model.predict(x_test)
-            snapshots[len(observed_indices)] = np.asarray(snap_pred)
+            snap_pool_mean = model.predict(X_pool)
+            snapshots[len(observed_indices)] = {
+                'y_pred': np.asarray(snap_pred),
+                'best_pred_val': float(np.max(np.asarray(snap_pool_mean))),
+            }
 
     # Final prediction with all observed data as context
     X_obs_final = X_pool[observed_indices]
@@ -440,7 +503,11 @@ def run_finetunedbo_loop(X_pool, y_pool, x_test, y_test, model,
 
     # Capture final snapshot (budget) if not already captured in loop
     if snapshot_iters is not None and budget not in snapshots:
-        snapshots[budget] = np.asarray(y_pred).copy()
+        pool_mean_final = model.predict(X_pool)
+        snapshots[budget] = {
+            'y_pred': np.asarray(y_pred).copy(),
+            'best_pred_val': float(np.max(np.asarray(pool_mean_final))),
+        }
 
     return observed_indices, observed_values, real_values, times, np.asarray(y_pred), \
-        (snapshots if snapshot_iters else None)
+        (snapshots if snapshot_iters else None), best_rec_indices

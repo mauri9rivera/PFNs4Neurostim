@@ -4,13 +4,13 @@ Driven by a canonical YAML config from ``configs/``, this script locates all
 matching run directories under ``output/runs/``, merges their pkl files into
 family-level DataFrames, and produces three aggregation views (per-EMG,
 per-subject, family-level) saved as CSV.  Aggregate plots are also written for
-``fit`` and ``optimization`` result types.
+``optimization`` result types.
 
 Usage::
 
     python src/aggregate.py --config configs/nhp_vanilla_benchmark.yaml
     python src/aggregate.py --config configs/nhp_optimization.yaml \\
-        --result_types fit optimization
+        --result_types optimization
     python src/aggregate.py --config configs/nhp_vanilla_benchmark.yaml \\
         --runs_dir output/runs --output_dir output/aggregated
 
@@ -32,7 +32,6 @@ if _SRC_DIR not in sys.path:
 
 from utils.data_utils import aggregate_results, load_results
 from utils.visualization import (
-    r2_per_muscle,
     r2_by_subject,
     regret_with_timing,
     regret_curve,
@@ -40,12 +39,11 @@ from utils.visualization import (
 
 
 # Result types that can be loaded as dict[str, list[dict]] pkl files
-_DICT_RESULT_TYPES = frozenset({'fit', 'optimization'})
+_DICT_RESULT_TYPES = frozenset({'optimization'})
 # Result types that correspond to DataFrame pkl files
 _DF_RESULT_TYPES = frozenset({'optimization_budget'})
 # Result types that come from mode names in YAML
 _MODE_TO_RESULT_TYPE: Dict[str, str] = {
-    'fit': 'fit',
     'optimization': 'optimization',
     'optimization_budget': 'optimization_budget',
 }
@@ -137,8 +135,8 @@ def _compute_views(
 
     Args:
         df: Flat DataFrame produced by ``aggregate_results()``.
-        result_type: ``'fit'`` or ``'optimization'`` (determines which
-            metric columns are present).
+        result_type: ``'optimization'`` (determines which metric columns
+            are present).
 
     Returns:
         Dict with keys ``'per_emg'``, ``'per_subject'``, ``'family'``;
@@ -236,7 +234,7 @@ def _load_combined_results_dict(
     Args:
         family: Experiment family string.
         dataset: Dataset type.
-        result_type: ``'fit'`` or ``'optimization'``.
+        result_type: ``'optimization'``.
         runs_dir: Root directory for runs.
         tags: Optional list of 5-char hash suffixes to restrict loading.
             ``None`` loads all runs matching the family prefix.
@@ -382,16 +380,7 @@ def run_aggregation(
                 if combined is not None:
                     tag_label = f"{dataset}_{family}_aggregated"
                     try:
-                        if result_type == 'fit':
-                            r2_per_muscle(
-                                combined, mode=f'_{tag_label}',
-                                save=True, output_dir=out_subdir,
-                            )
-                            r2_by_subject(
-                                combined, split_type=tag_label,
-                                save=True, output_dir=out_subdir,
-                            )
-                        elif result_type == 'optimization':
+                        if result_type == 'optimization':
                             regret_with_timing(
                                 combined, split_type=tag_label,
                                 save=True, output_dir=out_subdir,
@@ -403,7 +392,6 @@ def run_aggregation(
                             r2_by_subject(
                                 combined, split_type=tag_label,
                                 save=True, output_dir=out_subdir,
-                                output_subdir='optimization',
                             )
                     except Exception as exc:
                         print(f"  [WARNING] Plot generation failed: {exc}")
@@ -443,7 +431,7 @@ def main() -> None:
     parser.add_argument(
         '--result_types', type=str, nargs='+', default=None,
         metavar='TYPE',
-        help='Result types to aggregate: fit, optimization, optimization_budget.\n'
+        help='Result types to aggregate: optimization, optimization_budget.\n'
              'Inferred from the YAML mode key when omitted.',
     )
     parser.add_argument(

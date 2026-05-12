@@ -18,9 +18,11 @@ The following files are imported, with these conditions:
 Gaussian Process Bayesian Optimization (GPBO) in neurostimulation applications, where GP's
 O(n³) complexity hinders real-time and large-scale use.
 
-**Two evaluation axes:**
-1. **Prediction quality** — R² score across subjects/channels (fit task)
-2. **Bayesian optimization** — cumulative regret vs query budget (optimization task)
+**Evaluation axis:**
+- **Bayesian optimization** — cumulative regret vs query budget (optimization
+  task). R² of the surrogate's final prediction (after the BO loop) is reported
+  as a secondary metric inside the same run; there is no standalone "fit task"
+  (random-subset R² evaluation was removed on 2026-04-27).
 
 **Animal modalities:** rat, non-human primate (NHP), spinal cord
 
@@ -150,12 +152,11 @@ PFNs4Neurostim/
 ├── CLAUDE.md                    ← This file
 ├── environment.yml              ← Conda environment (pfns4neurostim)
 ├── configs/                     ← Canonical YAML experiment configs
-│   ├── nhp_fit.yaml
 │   ├── nhp_optimization.yaml
 │   └── rat_optimization.yaml
 ├── src/
 │   ├── finetuning.py            ← CLI entry: finetune_tabpfn(), run_experiment()
-│   ├── evaluation.py            ← Core eval: gp_baseline, finetuned_fit/optimization, budget sweeps
+│   ├── evaluation.py            ← Core eval: gp_baseline + finetuned_optimization (+ budget sweeps)
 │   ├── vanilla_benchmark.py     ← Vanilla TabPFN v2 vs GP benchmark (Hypothesis A)
 │   ├── aggregate.py             ← Post-hoc aggregation CLI: --config <yaml> → output/aggregated/
 │   ├── id_ood_analysis.py       ← ID/OOD analysis CLI entry
@@ -181,7 +182,7 @@ PFNs4Neurostim/
 │   ├── rat/
 │   └── spinal/
 ├── output/
-│   ├── runs/<tag>/              ← diagnostics/, fitness/, optimization/, results/
+│   ├── runs/<tag>/              ← diagnostics/, optimization/, results/
 │   └── aggregated/<dataset>-<family>/  ← CSVs + plots from aggregate.py
 ├── libs/                        ← Git submodules — READ-ONLY, never modify
 │   ├── PFNs/
@@ -288,6 +289,9 @@ via function arguments, CLI flags, or YAML config keys.
 
 ## 10. Knowledge Transfer & Context Engineering
 
-**`[take-notes]` flag** — delegate to the **note-taker** subagent. The agent reads the conversation and updates the relevant documentation files independently.
+@.claude/skills/take-notes.md
+
+**`[take-notes]` flag** — invokes the note-taker skill inline (no subagent spawned).
+Claude reads the current conversation and updates the relevant documentation files directly.
 
 
