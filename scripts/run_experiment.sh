@@ -24,11 +24,12 @@
 #    # Family 4 — per held_out_emg (nhp has 6 EMGs → array 0-5)
 #    FAMILY=4 DATASET=nhp N_AUG=25 BUDGET=100 sbatch --array=0-5%2 scripts/run_experiment.sh
 #
-#    # Family 5 — ID/OOD B1–B7 full suite (entropy,mmd,wasserstein,mahalanobis,cka,rsa,procrustes)
-#    FAMILY=5 sbatch --mem=32G --cpus-per-task=4 --time=12:00:00 scripts/run_experiment.sh
+#    # Family 5 — ID/OOD B1–B7 full suite (nhp+rat+spinal, all analyses, cuda)
+#    FAMILY=5 sbatch --gres=gpu:rtx8000:1 --mem=16G --cpus-per-task=2 --time=12:00:00 scripts/run_experiment.sh
+#    # Override dataset subset: DATASETS="nhp rat" FAMILY=5 sbatch ...
 #
 #    # Family 9 — ID/OOD B4 dense CKA (10-layer sweep for layerwise heatmap, run separately)
-#    FAMILY=9 sbatch --mem=32G --cpus-per-task=4 --time=8:00:00 scripts/run_experiment.sh
+#    FAMILY=9 sbatch --gres=gpu:rtx8000:1 --mem=16G --cpus-per-task=2 --time=8:00:00 scripts/run_experiment.sh
 #
 #    # Family 6 — LoRA per held_out_subject (mirrors Family 1, adds --lora)
 #    FAMILY=6 DATASET=nhp N_AUG=25 BUDGET=100 sbatch --array=0,1,3%2 scripts/run_experiment.sh
@@ -198,18 +199,20 @@ _DIAG_FLAG=""
 [ "$CLUSTER_DIAG" = "1" ] && _DIAG_FLAG="--cluster-diag"
 
 if [ "$FAMILY" = "5" ]; then
-    echo "[$(date)] family=5 — ID/OOD B1-B7 full suite (nhp + rat)"
+    DATASETS=${DATASETS:-"nhp rat spinal"}
+    echo "[$(date)] family=5 — ID/OOD B1-B7 full suite (${DATASETS})"
     mkdir -p output/id_ood
 
-    python src/id_ood_analysis.py --datasets nhp rat --analyses entropy mmd wasserstein mahalanobis cka rsa procrustes --prior_source tabpfn_prior --n_synthetic 500 --n_context 50 --seed 42 --save ${_DIAG_FLAG}
+    python src/id_ood_analysis.py --datasets ${DATASETS} --analyses entropy mmd wasserstein mahalanobis cka rsa procrustes --prior_source all --device cuda --n_synthetic 500 --n_context 0.5 --cka_layers 0 2 4 6 8 10 12 14 16 17 --proc_budgets 2 10 30 50 100 --seed 42 --save ${_DIAG_FLAG}
 
     echo "[$(date)] Done. Results in output/id_ood/"
 
 elif [ "$FAMILY" = "9" ]; then
-    echo "[$(date)] family=9 — ID/OOD B4 dense CKA 10-layer sweep (nhp + rat)"
+    DATASETS=${DATASETS:-"nhp rat spinal"}
+    echo "[$(date)] family=9 — ID/OOD B4 dense CKA 10-layer sweep (${DATASETS})"
     mkdir -p output/id_ood
 
-    python src/id_ood_analysis.py --datasets nhp rat --analyses cka --cka_layers 0 2 4 6 8 10 12 14 16 17 --prior_source tabpfn_prior --n_synthetic 500 --n_context 50 --seed 42 --save ${_DIAG_FLAG}
+    python src/id_ood_analysis.py --datasets ${DATASETS} --analyses cka --cka_layers 0 2 4 6 8 10 12 14 16 17 --prior_source all --device cuda --n_synthetic 500 --n_context 0.5 --seed 42 --save ${_DIAG_FLAG}
 
     echo "[$(date)] Done. Results in output/id_ood/"
 
