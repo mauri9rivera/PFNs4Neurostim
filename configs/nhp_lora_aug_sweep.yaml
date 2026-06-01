@@ -1,0 +1,58 @@
+# Canonical hyperparameters for NHP LoRA augmentation sensitivity sweep.
+# Family: lora-aug-sweep-opt
+# Tests whether R2 and regret plateau after aug_pct ~ 2.5 (25 maps/EMG)
+# when using LoRA (decoder_dict only, rank=8) instead of full finetuning.
+# Direct LoRA counterpart of nhp_aug_sweep.yaml.
+# Usage:
+#   python src/finetuning.py --config configs/nhp_lora_aug_sweep.yaml
+
+family: lora-aug-sweep-opt
+dataset: nhp
+split: inter_subject
+mode:
+  - aug_sweep_optimization
+
+# Training — epochs/lr fixed; aug_pct is swept via aug_pct_sweep
+epochs: 100
+lr: 1.0e-4
+aug_pct: 2.5
+
+# GPU training stability: clamp per-param gradient norm to prevent explosion.
+# Shadow test showed decoder_dict grad/weight ratios of 3799-4030% (NaN at epoch 2)
+# without clipping. 1.0 is standard for transformer adapter finetuning.
+grad_clip: 1.0
+n_estimators: 4
+
+# LoRA settings (matches nhp_lora_ablation.yaml)
+lora: true
+lora_rank: 8
+lora_alpha: 16
+lora_target: decoder_dict
+
+# Augmentation sweep values (0 = vanilla TabPFN baseline included automatically)
+aug_pct_sweep:
+  - 0.1
+  - 0.2
+  - 0.5
+  - 0.7
+  - 1.0
+  - 2.5
+
+# Evaluation
+budget: 100
+n_reps: 30
+
+# UCB kappa control:
+#   kappa_schedule: 0.0  →  auto cosine-annealed schedule (GP-UCB theory)
+#   kappa_schedule: 4.0  →  fixed kappa=4.0 throughout (matches lora_ablation)
+kappa_schedule: 4.0
+
+# Acquisition function
+acq_fn: ucb
+ts_temperature: 1.0
+
+# Infrastructure
+subjects: all
+device: cuda
+save: true
+diagnostics: True

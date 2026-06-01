@@ -16,6 +16,7 @@ import numpy as np
 import yaml
 
 from analysis.id_ood import run_id_ood_analysis
+from analysis.id_ood import compute_procrustes_auc
 from analysis.id_ood_visualization import (
     plot_entropy_distribution, plot_entropy_heatmap,
     plot_mmd_heatmap, plot_mahalanobis_distribution,
@@ -23,6 +24,9 @@ from analysis.id_ood_visualization import (
     plot_gradient_norm_barplot,
     plot_rsa_layerwise,
     plot_procrustes_trajectory,
+    plot_procrustes_auc_bar,
+    plot_procrustes_per_subject,
+    plot_cross_distribution_disparity,
     plot_summary_dashboard,
 )
 
@@ -109,7 +113,8 @@ def main():
     parser.add_argument('--n_synthetic', type=int, default=None,
                         help='Number of synthetic datasets for reference (default: 500)')
     parser.add_argument('--n_context', type=float, default=None,
-                        help='Fraction of observations to use as context, 0.0–1.0 (default: 0.5)')
+                        help='Context size: fraction (0.0–1.0, e.g. 0.5) or absolute count '
+                             '(≥ 1, e.g. 50). Default: 0.5 (50%% of observations).')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed.  If not provided, a fresh seed is '
                              'drawn from system entropy and logged to '
@@ -117,6 +122,11 @@ def main():
                              'remain reproducible post-hoc.')
     parser.add_argument('--save', action='store_true',
                         help='Save results and plots to disk')
+    parser.add_argument('--cluster-diag', action='store_true', default=False,
+                        dest='cluster_diag',
+                        help='Print HPC efficiency summary at job end (GPU memory, walltime, '
+                             'utilisation, grade, warnings). Also activated by CLUSTER_DIAG=1 '
+                             'env var. Designed for SLURM .out log visibility.')
     parser.add_argument('--cka_layers', nargs='+', type=int, default=None,
                         help='Transformer layer indices for CKA analysis. '
                              'Default: ID_OOD_LAYERS=[4, 13, 17]. '
@@ -136,7 +146,7 @@ def main():
     # --- YAML config loading: load first, then let explicit CLI args override ---
     if args.config is not None:
         yaml_cfg = _load_yaml_config(args.config)
-        _bool_flags = {'save'}
+        _bool_flags = {'save', 'cluster_diag'}
         for key, value in yaml_cfg.items():
             if key in _bool_flags:
                 if not getattr(args, key, False):
@@ -176,22 +186,32 @@ def main():
     if args.save:
         write_id_ood_config(output_dir, args)
 
-    # Run analyses
-    all_results = run_id_ood_analysis(
-        dataset_types=args.datasets,
-        analyses=args.analyses,
-        prior_source=args.prior_source,
-        device=args.device,
-        n_synthetic=args.n_synthetic,
-        n_context=args.n_context,
-        seed=args.seed,
-        save=args.save,
-        output_dir=output_dir,
-        cka_layers=args.cka_layers,
-        proc_budgets=args.proc_budgets,
-        proc_layer=args.proc_layer,
-        proc_n_synthetic=args.proc_n_synthetic,
-    )
+    # Activate cluster diagnostics via env var even when flag not passed
+    if not getattr(args, 'cluster_diag', False) and os.environ.get('CLUSTER_DIAG', '0') == '1':
+        args.cluster_diag = True
+
+    from utils.cluster_diagnostics import ClusterDiagnostics as _CD
+    _n_planned = len(args.datasets) * len(args.analyses)
+    with _CD(tag=f"id-ood-{args.prior_source}", device=args.device,
+             n_planned=_n_planned,
+             enabled=getattr(args, 'cluster_diag', False)) as _diag:
+
+        all_results = run_id_ood_analysis(
+            dataset_types=args.datasets,
+            analyses=args.analyses,
+            prior_source=args.prior_source,
+            device=args.device,
+            n_synthetic=args.n_synthetic,
+            n_context=args.n_context,
+            seed=args.seed,
+            save=args.save,
+            output_dir=output_dir,
+            cka_layers=args.cka_layers,
+            proc_budgets=args.proc_budgets,
+            proc_layer=args.proc_layer,
+            proc_n_synthetic=args.proc_n_synthetic,
+        )
+        _diag.record_experiment(n_completed=_n_planned)
 
     # Generate visualizations
     if 'entropy' in all_results:
@@ -235,8 +255,13 @@ def main():
                            output_dir=output_dir)
 
     if 'procrustes' in all_results:
-        plot_procrustes_trajectory(all_results['procrustes'],
-                                   save=args.save, output_dir=output_dir)
+        proc = all_results['procrustes']
+        plot_procrustes_trajectory(proc, save=args.save, output_dir=output_dir)
+        plot_procrustes_per_subject(proc, save=args.save, output_dir=output_dir)
+        auc_results = compute_procrustes_auc(proc)
+        plot_procrustes_auc_bar(auc_results, save=args.save, output_dir=output_dir)
+        cross = proc.get('cross_distribution', {})
+        plot_cross_distribution_disparity(cross, save=args.save, output_dir=output_dir)
 
     # Summary dashboard — passes all result dicts; each is None if not run
     if any(k in all_results for k in

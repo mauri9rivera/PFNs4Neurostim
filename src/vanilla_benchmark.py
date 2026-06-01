@@ -31,7 +31,7 @@ import torch
 import yaml
 from tabpfn import TabPFNRegressor
 
-from evaluation import evaluate_optimization
+from evaluation import evaluate_optimization, _unpack_budget_trajectory
 from models.regressors import GPSurrogate, TabPFNSurrogate
 from utils.data_utils import (
     load_data,
@@ -41,15 +41,20 @@ from utils.data_utils import (
     save_results,
     create_run_dir,
     write_run_config,
+    load_subject_result,
+    save_subject_result,
 )
 from utils.visualization import (
     r2_by_subject,
     regret_with_timing,
     regret_by_subject,
     regret_by_emg,
+    exploration_by_subject,
+    exploration_by_emg,
     budget_sweep_plot,
     regret_curve,
     visualize_representation,
+    show_emg_map,
     kappa_regret_curves,
     kappa_auc_bar,
 )
@@ -181,12 +186,13 @@ def _vanilla_optimization(
     save: bool,
     save_tag: str,
     metadata: Optional[Dict[str, Any]] = None,
+    acq_fn: str = 'ucb',
+    ts_temperature: float = 1.0,
 ) -> Dict[str, list]:
     """Run BO optimization evaluation for vanilla TabPFN and GP.
 
-    Uses ``evaluate_optimization()`` (unified pipeline) for both models.
-    GP always uses the auto kappa schedule (``kappa_schedule=0.0``).
-    TabPFN uses the caller-supplied ``kappa_schedule``.
+    Uses ``evaluate_optimization()`` (unified pipeline) for both models with
+    the same ``kappa_schedule`` and acquisition function.
 
     Args:
         dataset_type: ``'rat'`` or ``'nhp'``.
@@ -194,12 +200,15 @@ def _vanilla_optimization(
         device: PyTorch device string.
         budget: Total BO query budget.
         n_reps: Repetitions per experiment.
-        kappa_schedule: UCB coefficient for TabPFN.  ``0.0`` = auto cosine-
-            annealed schedule; any other value = fixed kappa throughout.
+        kappa_schedule: UCB coefficient for both TabPFN and GP.  ``0.0`` = auto
+            cosine-annealed schedule; any other value = fixed kappa throughout.
         run_dir: Output directory.
         exp_tag: Tag suffix for plot filenames.
         save: If True, persist results.
         save_tag: Full experiment tag.
+        metadata: Optional provenance dict written into saved pkl files.
+        acq_fn: Acquisition function — ``'ucb'`` or ``'ts'`` (Thompson Sampling).
+        ts_temperature: Temperature for TabPFN bar-distribution TS sampling.
 
     Returns:
         ``{'GP': list[dict], 'TabPFN': list[dict]}``.
@@ -207,39 +216,77 @@ def _vanilla_optimization(
     results_tabpfn: List[dict] = []
     results_gp: List[dict] = []
 
+    _vanilla_cache_params = {
+        'model': 'vanilla_tabpfn',
+        'budget': budget,
+        'n_reps': n_reps,
+        'kappa_schedule': kappa_schedule,
+        'acq_fn': acq_fn,
+        'normalization': 'pfn',
+    }
+    _gp_cache_params = {
+        'model': 'gp',
+        'budget': budget,
+        'n_reps': n_reps,
+        'kappa_schedule': kappa_schedule,
+        'acq_fn': acq_fn,
+        'normalization': 'gp',
+    }
+
     for subj_idx, emg_idx in experiments:
         print(f"  Optimization: subject={subj_idx}, emg={emg_idx}")
 
-        # TabPFN: n_estimators=1 for BO speed
-        tabpfn_base = _build_vanilla_tabpfn(device, n_estimators=1)
-        tabpfn_surrogate = TabPFNSurrogate(model=tabpfn_base)
-        res_tabpfn = evaluate_optimization(
-            surrogate=tabpfn_surrogate,
-            dataset_type=dataset_type,
-            subject_idx=subj_idx,
-            emg_idx=emg_idx,
-            device=device,
-            budget=budget,
-            n_reps=n_reps,
-            kappa_schedule=kappa_schedule,
-            normalization='pfn',
+        res_tabpfn = load_subject_result(
+            dataset_type, subj_idx, emg_idx, 'vanilla_tabpfn', _vanilla_cache_params
         )
-        res_tabpfn['model_type'] = 'vanilla_tabpfn'
+        if res_tabpfn is not None:
+            print(f"    [CACHE HIT] vanilla_tabpfn subject={subj_idx}, emg={emg_idx}")
+        else:
+            tabpfn_base = _build_vanilla_tabpfn(device, n_estimators=1)
+            tabpfn_surrogate = TabPFNSurrogate(model=tabpfn_base)
+            res_tabpfn = evaluate_optimization(
+                surrogate=tabpfn_surrogate,
+                dataset_type=dataset_type,
+                subject_idx=subj_idx,
+                emg_idx=emg_idx,
+                device=device,
+                budget=budget,
+                n_reps=n_reps,
+                kappa_schedule=kappa_schedule,
+                normalization='pfn',
+                acq_fn=acq_fn,
+                ts_temperature=ts_temperature,
+            )
+            res_tabpfn['model_type'] = 'vanilla_tabpfn'
+            save_subject_result(
+                res_tabpfn, dataset_type, subj_idx, emg_idx,
+                'vanilla_tabpfn', _vanilla_cache_params
+            )
 
-        # GP: auto kappa schedule (GP-UCB theory scaling)
-        gp_surrogate = GPSurrogate(device=device)
-        res_gp = evaluate_optimization(
-            surrogate=gp_surrogate,
-            dataset_type=dataset_type,
-            subject_idx=subj_idx,
-            emg_idx=emg_idx,
-            device=device,
-            budget=budget,
-            n_reps=n_reps,
-            kappa_schedule=0.0,
-            normalization='gp',
+        res_gp = load_subject_result(
+            dataset_type, subj_idx, emg_idx, 'gp', _gp_cache_params
         )
-        res_gp['model_type'] = 'gp'
+        if res_gp is not None:
+            print(f"    [CACHE HIT] GP subject={subj_idx}, emg={emg_idx}")
+        else:
+            gp_surrogate = GPSurrogate(device=device)
+            res_gp = evaluate_optimization(
+                surrogate=gp_surrogate,
+                dataset_type=dataset_type,
+                subject_idx=subj_idx,
+                emg_idx=emg_idx,
+                device=device,
+                budget=budget,
+                n_reps=n_reps,
+                kappa_schedule=kappa_schedule,
+                normalization='gp',
+                acq_fn=acq_fn,
+                ts_temperature=ts_temperature,
+            )
+            res_gp['model_type'] = 'gp'
+            save_subject_result(
+                res_gp, dataset_type, subj_idx, emg_idx, 'gp', _gp_cache_params
+            )
 
         results_tabpfn.append(res_tabpfn)
         results_gp.append(res_gp)
@@ -256,8 +303,18 @@ def _vanilla_optimization(
                       output_dir=run_dir)
     regret_by_emg(results_dict, split_type=exp_tag, save=True,
                   output_dir=run_dir)
+    exploration_by_subject(results_dict, split_type=exp_tag, save=True,
+                           output_dir=run_dir)
+    exploration_by_emg(results_dict, split_type=exp_tag, save=True,
+                       output_dir=run_dir)
     visualize_representation(results_dict, mode=f'_vanilla_{exp_tag}',
                              save=True, output_dir=run_dir)
+    for _res in results_gp:
+        show_emg_map(_res, model_type='GP', mode=f'_vanilla_{exp_tag}',
+                     save=True, output_dir=run_dir)
+    for _res in results_tabpfn:
+        show_emg_map(_res, model_type='TabPFN', mode=f'_vanilla_{exp_tag}',
+                     save=True, output_dir=run_dir)
 
     all_r2 = [np.mean(r['r2']) for r in results_tabpfn]
     print(f"\nOptimization done. {len(results_tabpfn)} experiments.")
@@ -284,70 +341,85 @@ def _vanilla_optimization_budget(
     exp_tag: str,
     save: bool,
     save_tag: str,
+    acq_fn: str = 'ucb',
+    ts_temperature: float = 1.0,
 ) -> pd.DataFrame:
-    """Budget sweep: run optimization evaluation across multiple query budgets.
+    """Budget sweep: infer sub-budget performance from a single max-budget run.
 
-    For each budget in *budgets*, evaluates both vanilla TabPFN and GP using
-    ``evaluate_optimization()``.  Results are collected into a long-form
-    DataFrame suitable for ``budget_sweep_plot()``.
+    Runs ``evaluate_optimization`` once per (model, subject, emg) at
+    ``budget=max(budgets)`` with ``capture_all_snapshots=True`` and
+    ``snapshot_iters_override=budgets``.  Sub-budget regret is read from the
+    stored trajectory (``result['values'][:, :b]``) and per-rep R² from
+    ``result['r2_by_snapshot'][b]``.  This eliminates the N_budgets×n_reps
+    redundant BO runs of the old outer-loop approach.
+
+    Note: Because UCB and TS are myopic (each step is independently optimal
+    given the current posterior), early-step choices under the max-budget
+    trajectory are equivalent to re-running with the shorter budget.  This
+    single-trajectory inference is exact for both acquisition functions.
 
     Args:
         dataset_type: ``'rat'`` or ``'nhp'``.
         experiments: List of (subject_idx, emg_idx).
         device: PyTorch device string.
-        budgets: List of integer query budgets to evaluate.
-        n_reps: Repetitions per (subject, emg, budget) combination.
-        kappa_schedule: UCB coefficient for TabPFN.  ``0.0`` = auto cosine-
-            annealed schedule; any other value = fixed kappa throughout.
+        budgets: Sub-budget values to evaluate (also used as ``snapshot_iters``).
+        n_reps: Repetitions per (subject, emg) pair at the max budget.
+        kappa_schedule: UCB coefficient for both TabPFN and GP.  ``0.0`` = auto
+            cosine-annealed schedule; any other value = fixed kappa throughout.
         run_dir: Output directory.
         exp_tag: Tag suffix.
         save: If True, persist DataFrame as pkl.
         save_tag: Full experiment tag.
+        acq_fn: Acquisition function — ``'ucb'`` or ``'ts'`` (Thompson Sampling).
+        ts_temperature: Temperature for TabPFN bar-distribution TS sampling.
 
     Returns:
         Long-form DataFrame with columns: Budget, Model, Regret, R2, ID.
     """
     plot_data: List[dict] = []
+    max_b = max(budgets)
 
-    for b in budgets:
-        print(f"\n  Budget = {b}")
-        for subj_idx, emg_idx in experiments:
-            print(f"    subject={subj_idx}, emg={emg_idx}")
+    for subj_idx, emg_idx in experiments:
+        print(f"\n  Budget sweep: subject={subj_idx}, emg={emg_idx} (max_budget={max_b})")
 
-            # --- TabPFN ---
-            tabpfn_base = _build_vanilla_tabpfn(device, n_estimators=1)
-            tabpfn_surrogate = TabPFNSurrogate(model=tabpfn_base)
-            res_tabpfn = evaluate_optimization(
-                surrogate=tabpfn_surrogate,
-                dataset_type=dataset_type,
-                subject_idx=subj_idx,
-                emg_idx=emg_idx,
-                device=device,
-                budget=b,
-                n_reps=n_reps,
-                kappa_schedule=kappa_schedule,
-                normalization='pfn',
-            )
-            _collect_budget_rows(
-                plot_data, res_tabpfn, 'TabPFN', b, subj_idx, emg_idx,
-            )
+        # --- TabPFN: single run at max_budget with snapshots at all sub-budgets ---
+        tabpfn_base = _build_vanilla_tabpfn(device, n_estimators=1)
+        tabpfn_surrogate = TabPFNSurrogate(model=tabpfn_base)
+        res_tabpfn = evaluate_optimization(
+            surrogate=tabpfn_surrogate,
+            dataset_type=dataset_type,
+            subject_idx=subj_idx,
+            emg_idx=emg_idx,
+            device=device,
+            budget=max_b,
+            n_reps=n_reps,
+            kappa_schedule=kappa_schedule,
+            normalization='pfn',
+            acq_fn=acq_fn,
+            ts_temperature=ts_temperature,
+            capture_all_snapshots=True,
+            snapshot_iters_override=budgets,
+        )
+        _unpack_budget_trajectory(plot_data, res_tabpfn, 'TabPFN', budgets, subj_idx, emg_idx)
 
-            # --- GP: auto kappa schedule ---
-            gp_surrogate = GPSurrogate(device=device)
-            res_gp = evaluate_optimization(
-                surrogate=gp_surrogate,
-                dataset_type=dataset_type,
-                subject_idx=subj_idx,
-                emg_idx=emg_idx,
-                device=device,
-                budget=b,
-                n_reps=n_reps,
-                kappa_schedule=0.0,
-                normalization='gp',
-            )
-            _collect_budget_rows(
-                plot_data, res_gp, 'GP', b, subj_idx, emg_idx,
-            )
+        # --- GP: single run at max_budget with snapshots at all sub-budgets ---
+        gp_surrogate = GPSurrogate(device=device)
+        res_gp = evaluate_optimization(
+            surrogate=gp_surrogate,
+            dataset_type=dataset_type,
+            subject_idx=subj_idx,
+            emg_idx=emg_idx,
+            device=device,
+            budget=max_b,
+            n_reps=n_reps,
+            kappa_schedule=kappa_schedule,
+            normalization='gp',
+            acq_fn=acq_fn,
+            ts_temperature=ts_temperature,
+            capture_all_snapshots=True,
+            snapshot_iters_override=budgets,
+        )
+        _unpack_budget_trajectory(plot_data, res_gp, 'GP', budgets, subj_idx, emg_idx)
 
     df = pd.DataFrame(plot_data)
 
@@ -602,6 +674,8 @@ def run_vanilla_benchmark(
     subjects_mode: str = 'held_out',
     save: bool = False,
     seed: int = 42,
+    acq_fn: str = 'ucb',
+    ts_temperature: float = 1.0,
 ) -> Dict[str, Any]:
     """Orchestrate vanilla TabPFN vs GP benchmark for one or more modes.
 
@@ -748,6 +822,8 @@ def run_vanilla_benchmark(
                 kappa_schedule,
                 run_dir, exp_tag, save, save_tag,
                 metadata=_metadata,
+                acq_fn=acq_fn,
+                ts_temperature=ts_temperature,
             )
 
         elif m == 'optimization_budget':
@@ -755,6 +831,8 @@ def run_vanilla_benchmark(
                 dataset_type, experiments, device, budgets, n_reps,
                 kappa_schedule,
                 run_dir, exp_tag, save, save_tag,
+                acq_fn=acq_fn,
+                ts_temperature=ts_temperature,
             )
 
         elif m == 'kappa_search':
@@ -811,6 +889,14 @@ def run_benchmark() -> None:
                         help='UCB coefficient for TabPFN BO.\n'
                              '  0.0 (default) = auto cosine-annealed schedule (GP-UCB theory)\n'
                              '  any other value = fixed kappa throughout the BO loop')
+    parser.add_argument('--acq_fn', type=str, default=None,
+                        choices=['ucb', 'ts'],
+                        help="Acquisition function: 'ucb' (default, UCB with optional kappa schedule)\n"
+                             "  or 'ts' (Thompson Sampling from predictive posterior).")
+    parser.add_argument('--ts_temperature', type=float, default=None,
+                        help='Temperature for TabPFN bar-distribution sampling in TS mode.\n'
+                             '  1.0 (default) = exact predictive distribution;\n'
+                             '  <1.0 = sharper / greedier; >1.0 = more uniform / exploratory.')
     parser.add_argument('--kappa_values', type=float, nargs='+', default=None,
                         help='Fixed kappa values for kappa_search mode\n'
                              '(default: 0.5 1.0 2.0 3.0 5.0)')
@@ -826,6 +912,11 @@ def run_benchmark() -> None:
                              '(one job per subject).')
     parser.add_argument('--save', action='store_true', default=False,
                         help='Persist results to output/runs/<tag>/results/')
+    parser.add_argument('--cluster-diag', action='store_true', default=False,
+                        dest='cluster_diag',
+                        help='Print HPC efficiency summary at job end (GPU memory, walltime, '
+                             'utilisation, grade, warnings). Also activated by CLUSTER_DIAG=1 '
+                             'env var. Designed for SLURM .out log visibility.')
     parser.add_argument('--seed', type=int, default=None,
                         help='Master random seed (default: 42)')
 
@@ -834,7 +925,7 @@ def run_benchmark() -> None:
     # --- YAML config loading ---
     if args.config is not None:
         yaml_cfg = _load_yaml_config(args.config)
-        _bool_flags = {'save'}
+        _bool_flags = {'save', 'cluster_diag'}
         for key, value in yaml_cfg.items():
             if key in _bool_flags:
                 if not getattr(args, key, False):
@@ -855,6 +946,8 @@ def run_benchmark() -> None:
         'kappa_values': list(_DEFAULT_KAPPA_VALUES),
         'subjects_mode': 'held_out',
         'seed': 42,
+        'acq_fn': 'ucb',
+        'ts_temperature': 1.0,
     }
     for key, default in _defaults.items():
         if getattr(args, key, None) is None:
@@ -868,21 +961,38 @@ def run_benchmark() -> None:
             f"Valid: {', '.join(sorted(_VALID_MODES))}"
         )
 
+    # Activate cluster diagnostics via env var even when flag not passed
+    import os as _os
+    if not args.cluster_diag and _os.environ.get('CLUSTER_DIAG', '0') == '1':
+        args.cluster_diag = True
+
     # --- Run ---
-    run_vanilla_benchmark(
-        dataset_type=args.dataset,
-        mode=args.mode,
-        device=args.device,
-        budget=args.budget,
-        n_reps=args.n_reps,
-        budgets=args.budgets,
-        kappa_schedule=args.kappa_schedule,
-        kappa_values=args.kappa_values,
+    _experiments = _build_experiments(
+        args.dataset,
         held_out_subj_idx=args.held_out_subj,
         subjects_mode=args.subjects_mode,
-        save=args.save,
-        seed=args.seed,
     )
+    from utils.cluster_diagnostics import ClusterDiagnostics as _CD
+    with _CD(tag=f"{args.dataset}-vanilla-benchmark", device=args.device,
+             n_planned=len(_experiments) * len(args.mode),
+             enabled=args.cluster_diag) as _diag:
+        run_vanilla_benchmark(
+            dataset_type=args.dataset,
+            mode=args.mode,
+            device=args.device,
+            budget=args.budget,
+            n_reps=args.n_reps,
+            budgets=args.budgets,
+            kappa_schedule=args.kappa_schedule,
+            kappa_values=args.kappa_values,
+            held_out_subj_idx=args.held_out_subj,
+            subjects_mode=args.subjects_mode,
+            save=args.save,
+            seed=args.seed,
+            acq_fn=args.acq_fn,
+            ts_temperature=args.ts_temperature,
+        )
+        _diag.record_experiment(n_completed=len(_experiments) * len(args.mode))
 
 
 if __name__ == '__main__':

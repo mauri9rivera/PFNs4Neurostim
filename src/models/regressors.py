@@ -95,6 +95,26 @@ class SurrogateModel(Protocol):
         """
         ...
 
+    def predict_ts(self, X: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        """Return one Thompson Sample value for each candidate in X.
+
+        Draws a single function sample from the surrogate's predictive
+        distribution.  For GP, this is an exact draw from the joint posterior
+        MVN.  For TabPFN, this samples a bin from the temperature-scaled
+        bar distribution at each candidate independently.
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].
+            temperature: Softmax temperature for bar-distribution sampling
+                (TabPFN only).  ``1.0`` = exact predictive distribution;
+                ``<1.0`` = sharper / greedier; ``>1.0`` = more uniform.
+                Ignored for GP (posterior is uniquely determined by kernel).
+
+        Returns:
+            Thompson sample values, shape [M].
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # GPSurrogate — ExactGP wrapper conforming to SurrogateModel
@@ -213,6 +233,38 @@ class GPSurrogate:
         """
         mean, std = self.predict(X)  # [M], [M]
         return mean + kappa * std    # [M]
+
+    def predict_ts(self, X: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        """Draw one function sample from the joint GP posterior (Thompson Sampling).
+
+        Uses GPyTorch's ``posterior.rsample()`` to draw a single exact sample
+        from the joint MultivariateNormal posterior over all candidate locations.
+        This is theoretically correct Thompson Sampling for GP: the sampled
+        function preserves inter-point correlations dictated by the kernel.
+
+        The ``temperature`` argument is unused for GP — the posterior is fully
+        determined by kernel hyperparameters.  It is accepted for interface
+        compatibility with ``TabPFNSurrogate.predict_ts``.
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].  # [M, D]
+            temperature: Unused; included for SurrogateModel protocol compatibility.
+
+        Returns:
+            Thompson sample, shape [M].  # [M]
+
+        Raises:
+            RuntimeError: If ``fit`` has not been called yet.
+        """
+        if self._model is None or self._likelihood is None:
+            raise RuntimeError(
+                "GPSurrogate.predict_ts called before fit. Call fit() first."
+            )
+        query_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [M, D]
+        with torch.no_grad():
+            posterior = self._likelihood(self._model(query_x))  # MultivariateNormal [M]
+            sample = posterior.rsample()                         # [M] — joint function draw
+        return sample.cpu().numpy()                              # [M]
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +400,43 @@ class TabPFNSurrogate:
         ucb_vals = criterion.ucb(logits, 0, rest_prob=rest_prob, maximize=True)
         return ucb_vals.clone().cpu().numpy()  # [M]
 
+    def predict_ts(self, X: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        """Draw one Thompson sample from the TabPFN bar-distribution posterior.
+
+        For each candidate in X, samples a bin index from the temperature-scaled
+        bar distribution via multinomial sampling, then returns the bin-centre
+        value.  The logit cache is populated so that a subsequent ``predict(X)``
+        call with the same context can skip a second transformer forward pass.
+
+        Temperature controls sharpness of the distribution before sampling:
+          - ``temperature=1.0``: sample from the exact predicted distribution
+          - ``temperature<1.0``: sharper / more exploitative (greedier argmax)
+          - ``temperature>1.0``: flatter / more exploratory (more uniform)
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].  # [M, D]
+            temperature: Softmax temperature for bar distribution (default 1.0).
+
+        Returns:
+            Thompson sample values (bin centres), shape [M].  # [M]
+        """
+        full_output = self._model.predict(X, output_type="full")
+        logits = full_output['logits']        # [M, num_bars]
+        criterion = full_output['criterion']
+        self._logit_cache = (X.copy(), logits.detach(), criterion)
+
+        scaled_logits = logits / temperature                                  # [M, num_bars]
+        probs = torch.softmax(scaled_logits, dim=-1)                          # [M, num_bars]
+        bin_indices = torch.multinomial(probs, num_samples=1).squeeze(-1)    # [M]
+
+        # Map bin indices to bin-centre values using bar-distribution borders
+        borders = criterion.borders                # [num_bars + 1]
+        left = borders[bin_indices]                # [M]
+        right = borders[bin_indices + 1]           # [M]
+        samples = (left + right) / 2.0            # [M] — bin centres
+
+        return samples.detach().cpu().numpy()      # [M]
+
 
 def linear_cka(X, Y):
     """Linear CKA between activation matrices X, Y of shape [n, d]."""
@@ -373,7 +462,7 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
     All metrics are printed to stdout each epoch.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, grad_clip: Optional[float] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._diagnostics_ = []
         self._cka_ref_X_ = None
@@ -381,6 +470,7 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
         self._pretrained_acts_ = {}
         self._cka_hook_names_ = []
         self._cka_ref_inputs_ = None
+        self._grad_clip_val_ = grad_clip
 
     def fit(self, X, y, **kwargs):
         self._grad_log_ = []
@@ -432,7 +522,11 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
         def _make_hook(name):
             def hook_fn(module, input, output):
                 act = output if isinstance(output, torch.Tensor) else output[0]
-                # Flatten all dims except first → [n, d]
+                # PerFeatureTransformer outputs [batch, seq_len, n_features, hidden].
+                # Squeeze batch dim (always 1 here) so CKA sees seq_len samples,
+                # not 1. Without this, centering collapses everything to zeros.
+                if act.dim() >= 3 and act.shape[0] == 1:
+                    act = act[0]  # [seq_len, ...]
                 activations[name] = act.detach().cpu().reshape(act.shape[0], -1).float()
             return hook_fn
 
@@ -459,7 +553,13 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
         return activations
 
     def _compute_weight_metrics(self, model):
-        """Per-layer weight displacement and cosine similarity vs pretrained."""
+        """Per-layer weight displacement and cosine similarity vs pretrained.
+
+        Params with a zero-norm pretrained reference (e.g. lora_B, zero-init)
+        are excluded from cosine_sim — cosine(w, 0) is undefined and clamped to
+        ~0 by torch, which drags the layer average to a spuriously low constant.
+        They still contribute to displacement and update_ratio via |w - 0| = |w|.
+        """
         displacement = {}
         cosine_sim = {}
         update_ratio = {}
@@ -469,10 +569,13 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
             layer = name.split('.')[0]
             w = p.data.cpu().flatten()
             w0 = self._pretrained_params_[name].flatten()
+            w0_norm = w0.norm().item()
             diff = (w - w0).norm().item()
-            base = w0.norm().item() + 1e-8
             displacement.setdefault(layer, []).append(diff)
-            update_ratio.setdefault(layer, []).append(diff / base * 100)
+            update_ratio.setdefault(layer, []).append(diff / (w0_norm + 1e-8) * 100)
+            # Skip zero-reference params: cosine_similarity(w, 0) is undefined
+            if w0_norm < 1e-8:
+                continue
             cos = torch.nn.functional.cosine_similarity(
                 w.unsqueeze(0), w0.unsqueeze(0)
             ).item()
@@ -493,17 +596,38 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
                 for name, p in model.named_parameters()
             }
 
-            # Discover CKA hook layers — phase-aligned with TabPFN v2's
-            # three-phase attention structure (Ye et al., 2025, arXiv:2502.17361):
-            #   Early (0-4): label-token attention, attribute identity internalized
-            #   Middle (5-12): uniform mixing, cross-attribute information exchange
-            #   Deep (13-17): selective attention on predictive attributes
-            n_layers = len(model.transformer_encoder.layers)
-            phase_indices = [0, 4, 9, 13, n_layers - 1]  # [N, D]
-            self._cka_hook_names_ = [
-                f'transformer_encoder.layers.{i}'
-                for i in phase_indices if i < n_layers
-            ]
+            # Discover CKA hook layers based on which components have trainable params.
+            # Hooking frozen layers (e.g. encoder when LoRA targets decoder_dict)
+            # always yields CKA=1.0 — uninformative.
+            trainable_prefixes = {
+                name.split('.')[0]
+                for name, p in model.named_parameters() if p.requires_grad
+            }
+            hook_names = []
+            if 'decoder_dict' in trainable_prefixes or not trainable_prefixes:
+                # Hook decoder_dict output layers (where LoRA adapters live)
+                for cand in ('decoder_dict.standard.0',
+                             'decoder_dict.standard.2',
+                             'decoder_dict.standard'):
+                    try:
+                        m_ = model
+                        for a in cand.split('.'):
+                            m_ = m_[int(a)] if a.isdigit() else getattr(m_, a)
+                        hook_names.append(cand)
+                    except (AttributeError, IndexError, KeyError):
+                        pass
+            if 'transformer_encoder' in trainable_prefixes or not hook_names:
+                # Full finetuning (or fallback): phase-sampled encoder layers.
+                # Phase-aligned with TabPFN v2's three-phase attention structure
+                # (Ye et al., 2025, arXiv:2502.17361):
+                #   Early (0-4): label-token attention / attribute identity
+                #   Middle (5-12): uniform mixing / cross-attribute exchange
+                #   Deep (13-17): selective attention on predictive attributes
+                n_layers = len(model.transformer_encoder.layers)
+                for i in [0, 4, 9, 13, n_layers - 1]:
+                    if i < n_layers:
+                        hook_names.append(f'transformer_encoder.layers.{i}')
+            self._cka_hook_names_ = hook_names
 
             # Prepare CKA reference tensors
             device = next(model.parameters()).device
@@ -520,21 +644,70 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
             # Capture pretrained activations
             self._pretrained_acts_ = self._capture_activations(model)
 
+            # Register per-parameter gradient clipping hooks (opt-in via grad_clip arg)
+            if self._grad_clip_val_ is not None:
+                _clip = self._grad_clip_val_
+
+                def _make_clip_hook(max_norm: float):
+                    def _hook(grad: torch.Tensor) -> torch.Tensor:
+                        g_norm = grad.norm()
+                        return grad * (max_norm / (g_norm + 1e-8)) if g_norm > max_norm else grad
+                    return _hook
+
+                n_clipped = 0
+                for param in model.parameters():
+                    if param.requires_grad:
+                        param.register_hook(_make_clip_hook(_clip))
+                        n_clipped += 1
+                print(f"  [GradientMonitor] Per-parameter gradient clipping enabled: "
+                      f"max_norm={_clip} ({n_clipped} params registered).")
+
         else:
             # --- Gradient-based metrics ---
+            # Skip parameters whose weight norm is near-zero (e.g. LoRA B matrices
+            # initialised to 0) — dividing by ~0 produces astronomically large ratios
+            # that are uninformative and trigger false explosion warnings.
+            _MIN_WEIGHT_NORM = 1e-3
             grad_norm = {}
             grad_weight_ratio = {}
             for name, param in model.named_parameters():
                 if param.grad is None:
                     continue
+                w_norm = param.data.norm().item()
+                if w_norm < _MIN_WEIGHT_NORM:
+                    continue  # skip near-zero params (LoRA B at init)
                 layer = name.split('.')[0]
                 g_norm = param.grad.norm().item()
-                w_norm = param.data.norm().item() + 1e-8
                 grad_norm.setdefault(layer, []).append(g_norm)
-                grad_weight_ratio.setdefault(layer, []).append(g_norm / w_norm * 100)
+                grad_weight_ratio.setdefault(layer, []).append(g_norm / (w_norm + 1e-8) * 100)
 
             grad_norm_avg = {k: float(np.mean(v)) for k, v in grad_norm.items()}
             grad_ratio_avg = {k: float(np.mean(v)) for k, v in grad_weight_ratio.items()}
+
+            # Warn on genuine explosion (threshold: 1000%)
+            _EXPLOSION_THRESHOLD = 1000.0
+            for layer, ratio in grad_ratio_avg.items():
+                if ratio > _EXPLOSION_THRESHOLD:
+                    print(
+                        f"  [GradientMonitor] WARNING: '{layer}' grad/weight ratio "
+                        f"{ratio:.1f}% > {_EXPLOSION_THRESHOLD:.0f}% (explosion risk). "
+                        "Consider reducing lr or setting grad_clip."
+                    )
+
+            # Synchronize CUDA to flush async ops before inspecting tensor values
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            # Fail fast on NaN/Inf in model parameters before TabPFN's internal deepcopy
+            for name, param in model.named_parameters():
+                if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                    peak = max(grad_ratio_avg.values(), default=float('nan'))
+                    raise RuntimeError(
+                        f"[GradientMonitor] NaN/Inf detected in '{name}' after epoch "
+                        f"{epoch + 1}. Peak grad/weight ratio: {peak:.1f}%. "
+                        "Gradient explosion — reduce lr or pass grad_clip to "
+                        "_make_finetuned_regressor / finetune_tabpfn."
+                    )
 
             # --- Weight-based metrics ---
             w_disp, w_cos, w_update = self._compute_weight_metrics(model)
@@ -685,35 +858,71 @@ class LoRAFinetunedRegressor(GradientMonitoredRegressor):
         return result
 
     def _log_epoch_evaluation(self, epoch, eval_result, mean_train_loss):
-        """Capture LoRA state dict at every epoch (overwritten each time).
+        """Capture LoRA state dict and print adapter diagnostics each epoch.
 
-        The last captured state is the final pre-merge adapter weights.
+        Replaces the inherited CKA diagnostic (which is blind to LoRA's small
+        output perturbation) with adapter-specific metrics that directly reveal
+        whether the low-rank matrices are learning:
+
+        - lora_B_norm: L2 norm of B matrix (starts at 0, must grow for adaptation)
+        - delta_norm: ||A @ B||_F * scaling (actual weight-space perturbation)
+        - delta_pct: delta_norm as % of frozen base weight norm
         """
         if epoch >= 0:
-            from models.lora import get_lora_state_dict
-            self._lora_state_dict_ = get_lora_state_dict(
-                self.finetuned_estimator_.model_
-            )
+            from models.lora import get_lora_state_dict, LoRALinear
+            model = self.finetuned_estimator_.model_
+            self._lora_state_dict_ = get_lora_state_dict(model)
+
+            # LoRA adapter diagnostics (replaces CKA for LoRA runs)
+            lora_lines = []
+            for name, mod in model.named_modules():
+                if not isinstance(mod, LoRALinear):
+                    continue
+                with torch.no_grad():
+                    b_norm = mod.lora_B.norm().item()
+                    delta = (mod.lora_A @ mod.lora_B) * mod.scaling  # [in, out]
+                    delta_norm = delta.norm().item()
+                    base_norm = mod.base_linear.weight.norm().item() + 1e-8
+                    delta_pct = delta_norm / base_norm * 100
+                lora_lines.append(
+                    f"{name}: lora_B_norm={b_norm:.4f}, "
+                    f"delta_norm={delta_norm:.4f} ({delta_pct:.3f}% of base)"
+                )
+            if lora_lines:
+                print(f"  [LoRA adapters]")
+                for line in lora_lines:
+                    print(f"    {line}")
+
         super()._log_epoch_evaluation(epoch, eval_result, mean_train_loss)
 
 
 def _make_finetuned_regressor(silence_diagnostics=True, use_lora=False,
                                lora_rank=8, lora_alpha=16,
-                               lora_target='decoder_dict', **kwargs):
+                               lora_target='decoder_dict',
+                               grad_clip: Optional[float] = None, **kwargs):
     """Factory: returns the appropriate regressor class.
 
     - use_lora=True  → LoRAFinetunedRegressor (always includes diagnostics)
     - silence_diagnostics=False → GradientMonitoredRegressor
     - otherwise → plain FinetunedTabPFNRegressor
+
+    Early stopping is disabled by default: TabPFN's default patience=8 is too
+    aggressive for the low-data neurostim regime where validation splits are
+    tiny and noisy. The caller controls convergence via the epochs parameter.
+
+    Note: grad_clip is only applied when diagnostics are active (i.e., when
+    GradientMonitoredRegressor or LoRAFinetunedRegressor is used); it has no
+    effect when silence_diagnostics=True.
     """
+    kwargs.setdefault('early_stopping', False)
     if use_lora:
         return LoRAFinetunedRegressor(
             lora_rank=lora_rank, lora_alpha=lora_alpha,
-            lora_target=lora_target, **kwargs,
+            lora_target=lora_target, grad_clip=grad_clip, **kwargs,
         )
     if silence_diagnostics:
         return FinetunedTabPFNRegressor(**kwargs)
-    return GradientMonitoredRegressor(**kwargs)
+    return GradientMonitoredRegressor(grad_clip=grad_clip, **kwargs)
 
 
 def extract_inference_model(finetuned_regressor):

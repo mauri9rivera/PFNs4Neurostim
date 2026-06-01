@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import numpy as np
 import scipy.io
@@ -379,7 +381,7 @@ def generate_experiment_tag(
     Example:
         >>> tag = generate_experiment_tag(
         ...     'nhp', 'optimization',
-        ...     {'epochs': 50, 'lr': 1e-5, 'n_augmentations': 25},
+        ...     {'epochs': 100, 'lr': 1e-4, 'aug_pct': 2.5},
         ... )
         >>> assert len(tag.split('-')) == 3
     """
@@ -434,30 +436,230 @@ def write_run_config(run_dir: str, config: dict) -> str:
 
 
 # ============================================
+#         Subject-Oriented Result Cache
+# ============================================
+
+
+def _subject_cache_dir(
+    dataset: str,
+    subject_idx: int,
+    model_type: str,
+    emg_idx: int,
+    base_dir: str = './output/subjects',
+) -> str:
+    """Return the per-EMG cache directory for a (dataset, subject, model_type, emg) tuple."""
+    return os.path.join(
+        base_dir, dataset, f'subject_{subject_idx}', model_type, f'emg_{emg_idx}'
+    )
+
+
+def _cache_hash(cache_params: dict[str, Any]) -> str:
+    """Compute a 5-char alphanumeric content hash from ``cache_params``.
+
+    Uses the same MD5-based scheme as :func:`generate_experiment_tag` so the
+    hash is deterministic: identical params always produce the same key.
+
+    Args:
+        cache_params: Hyperparams dict to hash.  All values must be
+            JSON-serialisable.
+
+    Returns:
+        5-character hex digest string.
+    """
+    serialised = json.dumps(cache_params, sort_keys=True, default=str)
+    return hashlib.md5(serialised.encode()).hexdigest()[:5]
+
+
+def load_subject_result(
+    dataset: str,
+    subject_idx: int,
+    emg_idx: int,
+    model_type: str,
+    cache_params: dict[str, Any],
+    base_dir: str = './output/subjects',
+) -> Optional[dict]:
+    """Return cached result dict if a matching entry exists; else ``None``.
+
+    Layout: ``output/subjects/{dataset}/subject_{idx}/{model_type}/emg_{emg_idx}/``
+    contains one ``{hash}.pkl`` + ``{hash}.yaml`` pair per distinct ``cache_params``
+    combination.  The hash is a content-addressed key derived from ``cache_params``;
+    the YAML is the authoritative source of truth and is verified on load to guard
+    against the (astronomically rare) case of a hash collision.
+
+    Multiple ``cache_params`` combinations for the same (dataset, subject, emg,
+    model_type) coexist as separate hash-named file pairs — no overwriting occurs
+    unless the exact same params are re-saved.
+
+    Args:
+        dataset: Dataset identifier, e.g. ``'nhp'`` or ``'rat'``.
+        subject_idx: Integer subject index.
+        emg_idx: Integer EMG channel index.
+        model_type: Model identifier used as subdirectory name, e.g.
+            ``'gp'``, ``'vanilla_tabpfn'``, ``'finetuned_tabpfn'``.
+        cache_params: Dict of hyperparams that must match for a cache hit.
+        base_dir: Root of the subject cache tree.
+
+    Returns:
+        Loaded result dict on a cache hit, or ``None`` on a miss.
+    """
+    cache_dir = _subject_cache_dir(dataset, subject_idx, model_type, emg_idx, base_dir)
+    h = _cache_hash(cache_params)
+    pkl_path = os.path.join(cache_dir, f'{h}.pkl')
+    cfg_path = os.path.join(cache_dir, f'{h}.yaml')
+    if not os.path.exists(pkl_path) or not os.path.exists(cfg_path):
+        return None
+    with open(cfg_path) as f:
+        stored = yaml.safe_load(f)
+    if stored != cache_params:
+        return None
+    with open(pkl_path, 'rb') as f:
+        return pickle.load(f)
+
+
+def save_subject_result(
+    result: dict,
+    dataset: str,
+    subject_idx: int,
+    emg_idx: int,
+    model_type: str,
+    cache_params: dict[str, Any],
+    base_dir: str = './output/subjects',
+) -> None:
+    """Persist a result dict and its cache key config for future lookup.
+
+    Writes two files to the per-EMG cache directory:
+    ``{hash}.pkl`` (full result) and ``{hash}.yaml`` (``cache_params``).
+    The hash is derived from ``cache_params`` so different hyperparam
+    combinations produce distinct file pairs and never overwrite each other.
+
+    Args:
+        result: Result dict from any evaluation function.
+        dataset: Dataset identifier.
+        subject_idx: Integer subject index.
+        emg_idx: Integer EMG channel index.
+        model_type: Model identifier used as subdirectory name.
+        cache_params: Hyperparams dict written to the companion YAML and used
+            to derive the content-addressed filename.
+        base_dir: Root of the subject cache tree.
+    """
+    cache_dir = _subject_cache_dir(dataset, subject_idx, model_type, emg_idx, base_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    h = _cache_hash(cache_params)
+    with open(os.path.join(cache_dir, f'{h}.pkl'), 'wb') as f:
+        pickle.dump(result, f)
+    with open(os.path.join(cache_dir, f'{h}.yaml'), 'w') as f:
+        yaml.dump(cache_params, f, sort_keys=True)
+    print(
+        f"[SUBJECT CACHE] Saved {dataset}/subject_{subject_idx}"
+        f"/{model_type}/emg_{emg_idx}/{h}"
+    )
+
+
+# ============================================
 #      Data Augmentation for Fine-Tuning
 # ============================================
 
-def augment_maps(subject_data, emg_idx, n_augmentations=25, seed=42):
-    """
-    Generate augmented (X, y) training pairs by adding per-channel Gaussian noise.
+# Supported topology-preserving augmentation transforms.
+# Spatial transforms (h_flip, v_flip, d_flip) operate on MinMax-scaled [0,1]²
+# electrode coordinates; y_shift operates on the StandardScaler-normalised response.
+_AUG_TRANSFORMS: frozenset[str] = frozenset({'none', 'h_flip', 'v_flip', 'd_flip', 'y_shift'})
 
-    For each augmentation, sample noise ~ N(0, std_map[channel]) per channel
-    and add it to the mean map. Also perturb individual repetitions similarly.
+
+def _apply_aug_transform(
+    X: np.ndarray,
+    y: np.ndarray,
+    transform: str,
+    rng: np.random.RandomState,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply one topology-preserving augmentation to a (X, y) map pair.
+
+    All transforms preserve the spatial organisation of the EMG response map.
+    Coordinate transforms (h_flip, v_flip, d_flip) operate on MinMax-scaled
+    [0, 1]² coords and remain in-bounds for any grid shape.  The response
+    transform (y_shift) adds a global baseline shift to the standardized y,
+    simulating inter-session DC offset without altering electrode ordering.
 
     Args:
-        subject_data: dict returned by load_data
-        emg_idx: int, which EMG channel to augment
-        n_augmentations: int, number of augmented maps to produce
-        seed: int, random seed for reproducibility
+        X: MinMax-scaled electrode coordinates, shape [N, 2]
+            (column 0 = row, column 1 = col), values in [0, 1].
+        y: StandardScaler-normalised response values, shape [N].
+        transform: One of ``'none'``, ``'h_flip'``, ``'v_flip'``,
+            ``'d_flip'``, ``'y_shift'``.
+        rng: Random state used by stochastic transforms (``'y_shift'``).
+            Deterministic transforms ignore it.
 
     Returns:
-        List of (X, y) tuples where X = MinMax-scaled coords, y = perturbed response
+        Tuple ``(X_out, y_out)`` with the same shapes as the inputs.
+
+    Raises:
+        ValueError: If ``transform`` is not in :data:`_AUG_TRANSFORMS`.
     """
+    if transform == 'none':
+        return X, y
+    if transform == 'h_flip':                   # left-right mirror
+        X = X.copy(); X[:, 1] = 1.0 - X[:, 1]
+        return X, y
+    if transform == 'v_flip':                   # top-bottom mirror
+        X = X.copy(); X[:, 0] = 1.0 - X[:, 0]
+        return X, y
+    if transform == 'd_flip':                   # diagonal / transpose
+        return X[:, [1, 0]], y
+    if transform == 'y_shift':                  # global baseline shift
+        beta = rng.randn() * 0.15               # β ~ N(0, 0.15) in standardised space
+        return X, y + beta
+    raise ValueError(
+        f"Unknown aug transform {transform!r}. Valid: {sorted(_AUG_TRANSFORMS)}"
+    )
+
+
+def augment_maps(
+    subject_data: dict,
+    emg_idx: int,
+    n_augmentations: int = 10,
+    seed: int = 42,
+    aug_transforms: tuple[str, ...] | None = None,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Generate augmented (X, y) training pairs from one EMG channel.
+
+    For each augmentation:
+
+    1. Sample a noisy response map: ``noise ~ N(0, std_map)`` added to
+       ``mean_map`` per channel.
+    2. Uniformly draw one transform from ``aug_transforms`` and apply it.
+       Coordinate transforms flip the MinMax-scaled electrode layout; the
+       response transform (``'y_shift'``) adds a global baseline shift.
+
+    Args:
+        subject_data: Dict returned by :func:`load_data`.
+        emg_idx: Which EMG channel to augment.
+        n_augmentations: Number of augmented maps to produce.
+        seed: Random seed for reproducibility.
+        aug_transforms: Tuple of transform names to sample uniformly from.
+            Supported: ``'none'``, ``'h_flip'``, ``'v_flip'``, ``'d_flip'``,
+            ``'y_shift'``.  ``None`` → ``('none',)`` (noise-only, default).
+
+    Returns:
+        List of ``(X, y)`` tuples — MinMax-scaled (possibly transformed)
+        electrode coords and StandardScaler-normalised perturbed response.
+
+    Raises:
+        ValueError: If any value in ``aug_transforms`` is not in
+            :data:`_AUG_TRANSFORMS`.
+    """
+    if aug_transforms is None:
+        aug_transforms = ('none',)
+    unknown = set(aug_transforms) - _AUG_TRANSFORMS
+    if unknown:
+        raise ValueError(
+            f"Unknown aug transforms: {sorted(unknown)}. "
+            f"Valid: {sorted(_AUG_TRANSFORMS)}"
+        )
+
     rng = np.random.RandomState(seed)
 
-    coords = subject_data['ch2xy']
-    mean_map = subject_data['sorted_respMean'][:, emg_idx]  # (nChan,)
-    std_map = subject_data['sorted_respSD'][:, emg_idx]     # (nChan,)
+    coords = subject_data['ch2xy']                            # [nChan, 2]
+    mean_map = subject_data['sorted_respMean'][:, emg_idx]   # [nChan]
+    std_map = subject_data['sorted_respSD'][:, emg_idx]      # [nChan]
 
     # Drop sites with zero valid reps — their respMean is the np.ma.filled
     # fill value (0.0), not a real measurement, and would bias the scaler.
@@ -470,36 +672,49 @@ def augment_maps(subject_data, emg_idx, n_augmentations=25, seed=42):
         std_map = std_map[valid_site_mask]
 
     scaler_x = MinMaxScaler()
-    X_scaled = scaler_x.fit_transform(coords)
+    X_base = scaler_x.fit_transform(coords)                  # [N, 2]
 
     scaler_y = StandardScaler()
     scaler_y.fit(mean_map.reshape(-1, 1))
 
-    augmented_pairs = []
+    transforms_list = list(aug_transforms)
+    augmented_pairs: list[tuple[np.ndarray, np.ndarray]] = []
     for _ in range(n_augmentations):
         noise = rng.randn(len(mean_map)) * std_map
         y_aug = scaler_y.transform((mean_map + noise).reshape(-1, 1)).ravel()
-        augmented_pairs.append((X_scaled.copy(), y_aug))
+        chosen = transforms_list[rng.randint(len(transforms_list))]
+        X_aug, y_aug = _apply_aug_transform(X_base, y_aug, chosen, rng)
+        augmented_pairs.append((X_aug, y_aug))
 
     return augmented_pairs
 
 
-def plot_augmented_maps(subject_data, emg_idx, dataset_type, subj_idx,
-                        n_show=6, n_augmentations=25, seed=42):
-    """
-    Visualize the original EMG map alongside augmented versions (debug only).
+def plot_augmented_maps(
+    subject_data: dict,
+    emg_idx: int,
+    dataset_type: str,
+    subj_idx: int,
+    n_show: int = 6,
+    aug_pct: float = 2.5,
+    aug_transforms: tuple[str, ...] | None = None,
+    seed: int = 42,
+) -> None:
+    """Visualize the original EMG map alongside augmented versions (debug only).
 
     Inverse-transforms augmented y values back to the original response scale
     so all maps share the same colorbar for direct comparison.
 
     Args:
-        subject_data: dict returned by load_data
-        emg_idx: int, which EMG channel to visualize
-        dataset_type: str, e.g. 'nhp' or 'rat' (used in title only)
-        subj_idx: int, subject index (used in title only)
-        n_show: number of augmented maps to display (default 6)
-        n_augmentations: total augmentations to generate before selecting n_show
-        seed: random seed passed to augment_maps
+        subject_data: Dict returned by :func:`load_data`.
+        emg_idx: Which EMG channel to visualize.
+        dataset_type: E.g. ``'nhp'`` or ``'rat'`` (used in title only).
+        subj_idx: Subject index (used in title only).
+        n_show: Number of augmented maps to display (default 6).
+        aug_pct: Augmentation percentage; 1.0 = 100% = 10 maps/EMG.
+            Total maps generated = ``max(1, round(aug_pct * 10))``.
+        aug_transforms: Transforms to sample from (passed to
+            :func:`augment_maps`).  ``None`` → noise-only.
+        seed: Random seed passed to :func:`augment_maps`.
     """
 
 
@@ -523,8 +738,11 @@ def plot_augmented_maps(subject_data, emg_idx, dataset_type, subj_idx,
     scaler_y = StandardScaler()
     scaler_y.fit(mean_map.reshape(-1, 1))
 
+    n_augmentations = max(1, round(aug_pct * 10))
     pairs = augment_maps(subject_data, emg_idx,
-                         n_augmentations=n_augmentations, seed=seed)
+                         n_augmentations=n_augmentations,
+                         seed=seed,
+                         aug_transforms=aug_transforms)
     n_show = min(n_show, len(pairs))
     aug_maps = [
         scaler_y.inverse_transform(y.reshape(-1, 1)).ravel()
@@ -576,29 +794,59 @@ def plot_augmented_maps(subject_data, emg_idx, dataset_type, subj_idx,
     plt.show()
 
 
-def build_finetuning_dataset(dataset_type, subject_indices=None,
-                              held_out_emg_idx=None,
-                              n_augmentations=10, seed=42):
-    """
-    Build a large (X_all, y_all) dataset for fine-tuning TabPFN by augmenting
-    training subjects across all EMG channels.
+def build_finetuning_dataset(
+    dataset_type: str,
+    subject_indices: list[int] | None = None,
+    held_out_emg_idx: int | None = None,
+    aug_pct: float = 1.0,
+    seed: int = 42,
+    aug_transforms: tuple[str, ...] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a (X_all, y_all) dataset for fine-tuning TabPFN.
+
+    Iterates over all (subject, EMG) training pairs and generates augmented
+    maps via :func:`augment_maps`.  The number of maps per EMG is controlled
+    by ``aug_pct``, a percentage relative to a canonical reference of 10 maps
+    per EMG channel:
+
+        ``n_aug_per_emg = max(1, round(aug_pct * 10))``
+
+    Percentage → count mapping for common sweep values:
+
+    ============  ================
+    ``aug_pct``   maps per EMG
+    ============  ================
+    0.1  (10 %)   1
+    0.2  (20 %)   2
+    0.5  (50 %)   5
+    0.7  (70 %)   7
+    1.0 (100 %)  10
+    2.5 (250 %)  25
+    ============  ================
 
     Args:
-        dataset_type: 'rat' or 'nhp'
-        subject_indices: list of subject ints to use (defaults to TRAIN_SUBJECTS)
-        held_out_emg_idx: int or None. If set, this EMG index is skipped for all
-            subjects (intra-EMG holdout). Passing None preserves existing behavior.
-        n_augmentations: augmentations per subject-EMG pair
-        seed: random seed
+        dataset_type: ``'rat'``, ``'nhp'``, or ``'spinal'``.
+        subject_indices: Subject indices to include in training.  Defaults to
+            ``TRAIN_SUBJECTS[dataset_type]``.
+        held_out_emg_idx: If set, this EMG index is excluded from all subjects
+            (intra-EMG holdout).  ``None`` → include all EMGs.
+        aug_pct: Augmentation percentage.  1.0 = 100 % = 10 maps per EMG.
+        seed: Base random seed; per-EMG seeds are derived as
+            ``seed + subj_idx * 100 + emg_idx``.
+        aug_transforms: Tuple of transform names passed to
+            :func:`augment_maps`.  ``None`` → ``('none',)`` (noise-only).
 
     Returns:
-        X_all: np.ndarray of shape (N, 2), MinMax-scaled coordinates
-        y_all: np.ndarray of shape (N,), response values
+        ``(X_all, y_all)`` — concatenated MinMax-scaled coordinates
+        ``[N, 2]`` and StandardScaler-normalised responses ``[N]``.
     """
     if subject_indices is None:
         subject_indices = TRAIN_SUBJECTS[dataset_type]
 
-    X_parts, y_parts = [], []
+    n_aug_per_emg = max(1, round(aug_pct * 10))
+
+    X_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
 
     for subj_idx in subject_indices:
         data = load_data(dataset_type, subj_idx)
@@ -607,16 +855,18 @@ def build_finetuning_dataset(dataset_type, subject_indices=None,
         for emg_idx in range(n_emgs):
             if held_out_emg_idx is not None and emg_idx == held_out_emg_idx:
                 continue
-            pairs = augment_maps(data, emg_idx,
-                                 n_augmentations=n_augmentations,
-                                 seed=seed + subj_idx * 100 + emg_idx)
+            pairs = augment_maps(
+                data, emg_idx,
+                n_augmentations=n_aug_per_emg,
+                seed=seed + subj_idx * 100 + emg_idx,
+                aug_transforms=aug_transforms,
+            )
             for X, y in pairs:
                 X_parts.append(X)
                 y_parts.append(y)
 
-    X_all = np.concatenate(X_parts, axis=0)
-    y_all = np.concatenate(y_parts, axis=0)
-
+    X_all = np.concatenate(X_parts, axis=0)   # [N, 2]
+    y_all = np.concatenate(y_parts, axis=0)   # [N]
     return X_all, y_all
 
 

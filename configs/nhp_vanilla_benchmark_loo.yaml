@@ -33,6 +33,11 @@ n_reps: 30
 # Override with explicit values for fixed-kappa ablation:
 #   kappa_max: 2.5
 #   kappa_min: 2.5
+kappa_schedule: 4.0
+
+# Acquisition function
+acq_fn: ucb
+ts_temperature: 1.0
 
 # Infrastructure
 device: cuda

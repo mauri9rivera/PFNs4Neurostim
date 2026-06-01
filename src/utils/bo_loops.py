@@ -60,19 +60,23 @@ def run_bo_loop(
     budget: int = 100,
     kappa_schedule: float = 0.0,
     snapshot_iters: Optional[List[int]] = None,
+    acq_fn: str = 'ucb',
+    ts_temperature: float = 1.0,
 ) -> Dict[str, Any]:
-    """Unified model-agnostic Bayesian optimisation loop using UCB acquisition.
+    """Unified model-agnostic Bayesian optimisation loop.
 
     Performs a sequential active learning loop over a discrete candidate pool.
     At each step the surrogate is refitted on all observed data and the next
-    query is selected by the surrogate's UCB acquisition function.
+    query is selected via the chosen acquisition function.
 
     The ``model`` argument must conform to the ``SurrogateModel`` protocol
     (defined in ``models.regressors``):
       - ``model.fit(X, y)`` — update the surrogate on observed data
       - ``model.predict(X)`` — return ``(mean, std)`` for candidate points
-      - ``model.predict_ucb(X, kappa, t, n_steps)`` — return UCB values
-        (falls back to ``mean + kappa * std`` if not implemented)
+      - ``model.predict_ucb(X, kappa, t, n_steps)`` — UCB acquisition values
+        (used when ``acq_fn='ucb'``; falls back to ``mean + kappa * std``)
+      - ``model.predict_ts(X, temperature)`` — Thompson Sample values
+        (used when ``acq_fn='ts'``)
 
     Observations model a real neurostim experiment: each query returns a
     single noisy trial drawn uniformly at random from the *valid* reps in
@@ -83,11 +87,10 @@ def run_bo_loop(
     Revisits are allowed: re-querying a previously observed site yields a
     fresh independent trial and reduces variance at that site.
 
-    Kappa schedule: controlled by ``kappa_schedule``.  ``0.0`` activates cosine
-    annealing from an auto-computed upper bound (``_auto_kappa_max``) down to an
-    auto-computed lower bound (``_auto_kappa_min``), both derived from input
-    dimensionality and number of active steps via GP-UCB theory scaling.  Any
-    non-zero value fixes kappa at that constant throughout the loop.
+    UCB kappa schedule: controlled by ``kappa_schedule`` when ``acq_fn='ucb'``.
+    ``0.0`` activates cosine annealing from ``_auto_kappa_max`` down to
+    ``_auto_kappa_min``, derived from input dimensionality and number of active
+    steps via GP-UCB theory scaling.  Any non-zero value fixes kappa constant.
 
     Args:
         model: Any object conforming to the ``SurrogateModel`` protocol.
@@ -101,15 +104,17 @@ def run_bo_loop(
         n_init: Number of randomly selected initial observations before the
             optimisation loop starts.
         budget: Total number of observations (including ``n_init``).
-        kappa_schedule: UCB exploration coefficient control.
-            ``0.0`` (default) → cosine-annealed auto schedule:
-              kappa_max = 2.5 * sqrt(d * log(n_steps)), floor 3.0;
-              kappa_min = 0.2 * sqrt(d * log(n_steps)).
-            Any other value → fixed kappa throughout (no annealing).
-            Use fixed values for dataset-specific hyperparameter search.
+        kappa_schedule: UCB exploration coefficient control (used when
+            ``acq_fn='ucb'``).  ``0.0`` (default) → cosine-annealed auto
+            schedule; any other value → fixed kappa throughout.
         snapshot_iters: Optional list of observation counts at which to record
             a prediction snapshot on ``X_test`` (e.g. for R²-vs-budget plots).
             The final budget iteration is always included if provided.
+        acq_fn: Acquisition function choice.  ``'ucb'`` (default) uses
+            Upper Confidence Bound acquisition; ``'ts'`` uses Thompson Sampling.
+        ts_temperature: Temperature for TabPFN bar-distribution sampling when
+            ``acq_fn='ts'``.  ``1.0`` = exact predictive distribution;
+            ``<1.0`` = sharper / greedier; ``>1.0`` = more uniform.
 
     Returns:
         Dictionary with keys:
@@ -125,20 +130,24 @@ def run_bo_loop(
             space), or ``None`` if ``snapshot_iters`` is ``None``
 
     Raises:
-        ValueError: If ``budget <= n_init``.
-        RuntimeError: If NaN/Inf values appear in UCB acquisition values.
+        ValueError: If ``budget <= n_init`` or ``acq_fn`` is not recognised.
+        RuntimeError: If NaN/Inf values appear in acquisition values.
     """
     if budget <= n_init:
         raise ValueError(
             f"budget ({budget}) must be greater than n_init ({n_init})."
+        )
+    if acq_fn not in ('ucb', 'ts'):
+        raise ValueError(
+            f"Unknown acq_fn: {acq_fn!r}. Choose 'ucb' or 'ts'."
         )
 
     n_locs = X_pool.shape[0]   # [N, D]
     d = X_pool.shape[1]        # [N, D]
     n_steps = budget - n_init
 
-    # Pre-compute auto kappa bounds once (only used when kappa_schedule == 0.0)
-    if kappa_schedule == 0.0:
+    # Pre-compute auto kappa bounds once (only used when acq_fn='ucb' and kappa_schedule==0.0)
+    if acq_fn == 'ucb' and kappa_schedule == 0.0:
         _kappa_max = _auto_kappa_max(d, n_steps)
         _kappa_min = _auto_kappa_min(d, n_steps)
 
@@ -158,6 +167,10 @@ def run_bo_loop(
     # Pure-exploitation recommendation at each BO step (argmax of posterior mean).
     # Distinct from the UCB-selected query when kappa > 0.
     best_rec_indices: list[int] = []
+    # Exploitation score: ground-truth response at the recommended location / optimal.
+    # Stored at every BO step (not just snapshots) to enable dense trajectory plots.
+    optimal_y = float(y_test.max())
+    perf_explore: list[float] = []
 
     # --- BO loop ---
     for t in range(n_steps):
@@ -169,39 +182,50 @@ def run_bo_loop(
         # Refit surrogate on all observations so far
         model.fit(X_obs, y_obs)
 
-        # Compute kappa for this step
-        if kappa_schedule == 0.0:
-            kappa = compute_ucb_kappa(t, n_steps, kappa_max=_kappa_max, kappa_min=_kappa_min)
-        else:
-            kappa = kappa_schedule
+        # --- Acquisition: select next query ---
+        if acq_fn == 'ts':
+            # Thompson Sampling: draw one function sample from the posterior
+            acq_vals = np.asarray(
+                model.predict_ts(X_pool, temperature=ts_temperature), dtype=np.float64
+            )  # [N]
+            pool_mean, _ = model.predict(X_pool)  # [N] — for exploitation rec.
 
-        # Compute UCB acquisition values for all candidates.
-        # Also obtain pool_mean for the pure-exploitation recommendation (argmax of mean).
-        # Prefer native predict_ucb if available; fall back to mean + kappa*std.
-        if hasattr(model, 'predict_ucb') and callable(model.predict_ucb):
-            ucb_vals = model.predict_ucb(X_pool, kappa, t, n_steps)  # [N]
-            # Convert torch tensors if necessary
-            if hasattr(ucb_vals, 'numpy'):
-                ucb_vals = ucb_vals.numpy()
-            ucb_vals = np.asarray(ucb_vals, dtype=np.float64)         # [N]
-            # Separate mean prediction for exploitation recommendation
-            pool_mean, _ = model.predict(X_pool)                      # [N]
-        else:
-            pool_mean, std = model.predict(X_pool)   # [N], [N]
-            ucb_vals = np.asarray(pool_mean, dtype=np.float64) + kappa * np.asarray(std, dtype=np.float64)  # [N]
+        else:  # acq_fn == 'ucb'
+            # Compute UCB kappa for this step (cosine-annealed or fixed)
+            kappa = (
+                compute_ucb_kappa(t, n_steps, kappa_max=_kappa_max, kappa_min=_kappa_min)
+                if kappa_schedule == 0.0 else kappa_schedule
+            )
+            # Prefer native predict_ucb (bar-distribution UCB for TabPFN);
+            # fall back to mean + kappa*std for surrogates without predict_ucb.
+            if hasattr(model, 'predict_ucb') and callable(model.predict_ucb):
+                acq_vals = np.asarray(
+                    model.predict_ucb(X_pool, kappa, t, n_steps), dtype=np.float64
+                )  # [N]
+                pool_mean, _ = model.predict(X_pool)  # [N]
+            else:
+                pool_mean, std = model.predict(X_pool)  # [N], [N]
+                acq_vals = (
+                    np.asarray(pool_mean, dtype=np.float64)
+                    + kappa * np.asarray(std, dtype=np.float64)
+                )  # [N]
 
-        pool_mean_arr = np.asarray(pool_mean, dtype=np.float64)       # [N]
-        best_rec_indices.append(int(np.argmax(pool_mean_arr)))        # pure-exploit recommendation
+        pool_mean_arr = np.asarray(pool_mean, dtype=np.float64)        # [N]
+        best_rec_idx = int(np.argmax(pool_mean_arr))
+        best_rec_indices.append(best_rec_idx)                          # pure-exploit recommendation
+        perf_explore.append(
+            float(y_test[best_rec_idx]) / optimal_y if optimal_y > 1e-8 else 0.0
+        )
 
-        if not np.isfinite(ucb_vals).any():
+        if not np.isfinite(acq_vals).any():
             raise RuntimeError(
-                f"run_bo_loop: all UCB values are non-finite at step {t}. "
-                "Check surrogate fit and input data for NaN/Inf."
+                f"run_bo_loop: all {acq_fn.upper()} acquisition values are non-finite "
+                f"at step {t}. Check surrogate fit and input data for NaN/Inf."
             )
 
         # Revisits are allowed: the noise model means re-querying a site
         # yields a fresh (independent) trial, providing variance reduction.
-        next_idx = int(np.argmax(ucb_vals))
+        next_idx = int(np.argmax(acq_vals))
         observed_indices.append(next_idx)
         observed_values.append(_sample(next_idx))
         real_values.append(float(y_test[next_idx]))
@@ -241,6 +265,7 @@ def run_bo_loop(
         'y_pred': y_pred,
         'snapshots': snapshots if snapshot_iters is not None else None,
         'best_rec_indices': best_rec_indices,   # list[int], length = n_steps
+        'perf_explore': perf_explore,           # list[float], length = n_steps
     }
 
 

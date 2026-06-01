@@ -35,6 +35,10 @@ from utils.visualization import (
     r2_by_subject,
     regret_with_timing,
     regret_curve,
+    regret_by_subject,
+    regret_by_emg,
+    exploration_by_subject,
+    exploration_by_emg,
 )
 
 
@@ -393,6 +397,22 @@ def run_aggregation(
                                 combined, split_type=tag_label,
                                 save=True, output_dir=out_subdir,
                             )
+                            regret_by_subject(
+                                combined, split_type=tag_label,
+                                save=True, output_dir=out_subdir,
+                            )
+                            regret_by_emg(
+                                combined, split_type=tag_label,
+                                save=True, output_dir=out_subdir,
+                            )
+                            exploration_by_subject(
+                                combined, split_type=tag_label,
+                                save=True, output_dir=out_subdir,
+                            )
+                            exploration_by_emg(
+                                combined, split_type=tag_label,
+                                save=True, output_dir=out_subdir,
+                            )
                     except Exception as exc:
                         print(f"  [WARNING] Plot generation failed: {exc}")
 
@@ -449,16 +469,35 @@ def main() -> None:
              'Example: --tags 32c2b 15h5p\n'
              'Default: aggregate all runs matching the family prefix.',
     )
+    parser.add_argument(
+        '--cluster-diag', action='store_true', default=False,
+        dest='cluster_diag',
+        help='Print HPC efficiency summary at job end (walltime, RAM, grade, warnings). '
+             'Also activated by CLUSTER_DIAG=1 env var.',
+    )
 
     args = parser.parse_args()
 
-    run_aggregation(
-        config_path=args.config,
-        result_types=args.result_types,
-        runs_dir=args.runs_dir,
-        output_dir=args.output_dir,
-        tags=args.tags,
-    )
+    import os as _os
+    if not args.cluster_diag and _os.environ.get('CLUSTER_DIAG', '0') == '1':
+        args.cluster_diag = True
+
+    import sys as _sys
+    _src_dir = os.path.dirname(os.path.abspath(__file__))
+    if _src_dir not in _sys.path:
+        _sys.path.insert(0, _src_dir)
+    from utils.cluster_diagnostics import ClusterDiagnostics as _CD
+
+    with _CD(tag='aggregate', device='cpu', n_planned=1,
+             enabled=args.cluster_diag) as _diag:
+        run_aggregation(
+            config_path=args.config,
+            result_types=args.result_types,
+            runs_dir=args.runs_dir,
+            output_dir=args.output_dir,
+            tags=args.tags,
+        )
+        _diag.record_experiment(n_completed=1)
 
 
 if __name__ == '__main__':

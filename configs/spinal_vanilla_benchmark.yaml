@@ -26,6 +26,10 @@ budgets:
 #   kappa_schedule: 2.5  →  fixed kappa=2.5 throughout (no annealing)
 kappa_schedule: 0.0
 
+# Acquisition function
+acq_fn: ucb
+ts_temperature: 1.0
+
 # kappa values tested in kappa_search mode
 kappa_values:
   - 0.5

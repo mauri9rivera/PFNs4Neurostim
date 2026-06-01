@@ -24,8 +24,11 @@
 #    # Family 4 — per held_out_emg (nhp has 6 EMGs → array 0-5)
 #    FAMILY=4 DATASET=nhp N_AUG=25 BUDGET=100 sbatch --array=0-5%2 scripts/run_experiment.sh
 #
-#    # Family 5 — ID/OOD analysis (single job, no array — analyzes rat+nhp together)
-#    FAMILY=5 sbatch --time=8:00:00 --mem=16G --cpus-per-task=4 scripts/run_experiment.sh
+#    # Family 5 — ID/OOD B1–B7 full suite (entropy,mmd,wasserstein,mahalanobis,cka,rsa,procrustes)
+#    FAMILY=5 sbatch --mem=32G --cpus-per-task=4 --time=12:00:00 scripts/run_experiment.sh
+#
+#    # Family 9 — ID/OOD B4 dense CKA (10-layer sweep for layerwise heatmap, run separately)
+#    FAMILY=9 sbatch --mem=32G --cpus-per-task=4 --time=8:00:00 scripts/run_experiment.sh
 #
 #    # Family 6 — LoRA per held_out_subject (mirrors Family 1, adds --lora)
 #    FAMILY=6 DATASET=nhp N_AUG=25 BUDGET=100 sbatch --array=0,1,3%2 scripts/run_experiment.sh
@@ -127,9 +130,13 @@ elif [ "$FAMILY" = "4" ]; then
     BUDGET=${BUDGET:-100}
 
 elif [ "$FAMILY" = "5" ]; then
-    # ID/OOD analysis — single job, no array.
-    # Runs id_ood_analysis.py for rat+nhp with all three metrics and both priors.
-    # sbatch --time=8:00:00 --mem=16G --cpus-per-task=4 FAMILY=5 scripts/run_experiment.sh
+    # ID/OOD B1–B7 full suite — single job, no array.
+    # FAMILY=5 sbatch --mem=32G --cpus-per-task=4 --time=12:00:00 scripts/run_experiment.sh
+    : # no finetuning variables needed; python call handled separately below
+
+elif [ "$FAMILY" = "9" ]; then
+    # ID/OOD B4 dense CKA — 10-layer sweep for layerwise heatmap.
+    # FAMILY=9 sbatch --mem=32G --cpus-per-task=4 --time=8:00:00 scripts/run_experiment.sh
     : # no finetuning variables needed; python call handled separately below
 
 elif [ "$FAMILY" = "6" ]; then
@@ -161,7 +168,7 @@ elif [ "$FAMILY" = "8" ]; then
     : "${AGG_CONFIG:?AGG_CONFIG must be set for FAMILY=8 (e.g. configs/nhp_vanilla_benchmark.yaml)}"
 
 else
-    echo "Unknown FAMILY=$FAMILY. Must be 0-8." >&2
+    echo "Unknown FAMILY=$FAMILY. Must be 0-9." >&2
     exit 1
 fi
 
@@ -174,6 +181,11 @@ EXTRA_FLAGS=""
 [ "${DIAGNOSTICS:-0}" = "1" ] && EXTRA_FLAGS="$EXTRA_FLAGS --diagnostics"
 [ "$USE_LORA"          = "1" ] && EXTRA_FLAGS="$EXTRA_FLAGS --lora"
 
+# Cluster diagnostics: ON by default for all SLURM jobs.
+# Override with CLUSTER_DIAG=0 sbatch ... to suppress.
+CLUSTER_DIAG=${CLUSTER_DIAG:-1}
+[ "$CLUSTER_DIAG" = "1" ] && EXTRA_FLAGS="$EXTRA_FLAGS --cluster-diag"
+
 # ── Environment ───────────────────────────────────────────────────────────────
 module load miniconda/3
 conda activate pfns4neurostim
@@ -182,17 +194,22 @@ cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs output/runs
 
 # ── Run ───────────────────────────────────────────────────────────────────────
+_DIAG_FLAG=""
+[ "$CLUSTER_DIAG" = "1" ] && _DIAG_FLAG="--cluster-diag"
+
 if [ "$FAMILY" = "5" ]; then
-    echo "[$(date)] family=5 — ID/OOD analysis (rat + nhp)"
+    echo "[$(date)] family=5 — ID/OOD B1-B7 full suite (nhp + rat)"
     mkdir -p output/id_ood
 
-    python src/id_ood_analysis.py \
-        --datasets rat nhp \
-        --analyses entropy mmd mahalanobis \
-        --prior_source both \
-        --device cuda \
-        --n_synthetic 300 \
-        --save
+    python src/id_ood_analysis.py --datasets nhp rat --analyses entropy mmd wasserstein mahalanobis cka rsa procrustes --prior_source tabpfn_prior --n_synthetic 500 --n_context 50 --seed 42 --save ${_DIAG_FLAG}
+
+    echo "[$(date)] Done. Results in output/id_ood/"
+
+elif [ "$FAMILY" = "9" ]; then
+    echo "[$(date)] family=9 — ID/OOD B4 dense CKA 10-layer sweep (nhp + rat)"
+    mkdir -p output/id_ood
+
+    python src/id_ood_analysis.py --datasets nhp rat --analyses cka --cka_layers 0 2 4 6 8 10 12 14 16 17 --prior_source tabpfn_prior --n_synthetic 500 --n_context 50 --seed 42 --save ${_DIAG_FLAG}
 
     echo "[$(date)] Done. Results in output/id_ood/"
 
@@ -200,9 +217,7 @@ elif [ "$FAMILY" = "7" ]; then
     echo "[$(date)] family=7 task=$TASK_ID dataset=$DATASET mode=$MODE subj=$HELD_OUT_SUBJ"
     mkdir -p output/runs
 
-    VANILLA_FLAGS="--dataset $DATASET --mode $MODE --device cuda \
-                   --budget $BUDGET --n_reps $N_REPS \
-                   --held_out_subj $HELD_OUT_SUBJ --save"
+    VANILLA_FLAGS="--dataset $DATASET --mode $MODE --device cuda --budget $BUDGET --n_reps $N_REPS --held_out_subj $HELD_OUT_SUBJ --save ${_DIAG_FLAG}"
     [ -n "${VANILLA_CONFIG:-}" ] && VANILLA_FLAGS="$VANILLA_FLAGS --config $VANILLA_CONFIG"
 
     # shellcheck disable=SC2086
@@ -214,7 +229,7 @@ elif [ "$FAMILY" = "8" ]; then
     echo "[$(date)] family=8 — post-hoc aggregation config=$AGG_CONFIG"
     mkdir -p output/aggregated
 
-    python src/aggregate.py --config "$AGG_CONFIG"
+    python src/aggregate.py --config "$AGG_CONFIG" ${_DIAG_FLAG}
 
     echo "[$(date)] Done. Aggregated results in output/aggregated/"
 

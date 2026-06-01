@@ -25,7 +25,11 @@ budgets:
 #                           kappa_max = max(2.5 * sqrt(d * log(n_steps)), 3.0)
 #                           kappa_min = 0.2 * sqrt(d * log(n_steps))
 #   kappa_schedule: 2.5  →  fixed kappa=2.5 throughout (no annealing)
-kappa_schedule: 0.0
+kappa_schedule: 4.0
+
+# Acquisition function
+acq_fn: ucb
+ts_temperature: 1.0
 
 # kappa values tested in kappa_search mode
 kappa_values:

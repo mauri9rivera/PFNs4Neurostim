@@ -10,9 +10,9 @@ mode:
   - optimization
 
 # Training
-epochs: 50
-lr: 1.0e-5
-n_augmentations: 25
+epochs: 100
+lr: 1.0e-4
+aug_pct: 2.5
 
 # Evaluation — rat grid is 8x4=32 sites, so budget matches grid size
 budget: 32
@@ -23,7 +23,11 @@ n_reps: 30
 #   kappa_schedule: 2.5  →  fixed kappa=2.5 throughout (no annealing)
 kappa_schedule: 0.0
 
+# Acquisition function
+acq_fn: ucb
+ts_temperature: 1.0
+
 # Infrastructure
 device: cuda
 save: true
-diagnostics: false
+diagnostics: true

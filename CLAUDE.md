@@ -268,6 +268,7 @@ via function arguments, CLI flags, or YAML config keys.
 | Never modify `libs/` submodules | External dependencies pinned by git |
 | Never commit `data/` or `output/` | See `.gitignore` |
 | No backwards-compatibility shims | Remove or replace cleanly; don't wrap |
+| No multi-line CLI commands | All flags on one line; never use `\` continuations — breaks copy-paste on Windows |
 
 ---
 

@@ -939,7 +939,8 @@ def plot_rsa_layerwise(
                     for emg in rsa_results[dataset_type][subj]
                     if layer_idx in rsa_results[dataset_type][subj][emg]
                 ]
-                rho_per_layer.append(np.nanmean(rhos) if rhos else np.nan)
+                finite = [r for r in rhos if not np.isnan(r)]
+                rho_per_layer.append(np.mean(finite) if finite else np.nan)
 
             label = ref_labels[ref]
             ax.plot(layers, rho_per_layer,
@@ -1107,6 +1108,210 @@ def _panel_procrustes(ax: plt.Axes, trajectory_results: dict) -> None:
     ax.set_ylabel('Procrustes disp.')
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=6)
+
+
+def plot_procrustes_auc_bar(
+    auc_results: dict,
+    save: bool = False,
+    output_dir: str | None = None,
+) -> None:
+    """Bar chart of AUC (area under Procrustes disparity curve) per source.
+
+    Integrating each disparity curve collapses the temporal dimension into a
+    single scalar per trajectory.  Bars are sorted ascending so that ID
+    sources (low AUC, geometrically stable) appear on the left and OOD
+    sources (high AUC, erratic drift) appear on the right.
+
+    Args:
+        auc_results: dict from :func:`compute_procrustes_auc`.
+        save: Whether to save the figure.
+        output_dir: Base output directory.  Saves to
+            ``<output_dir>/trajectory/procrustes_auc_bar.svg``.
+    """
+    if not auc_results:
+        print("  [Procrustes AUC] No AUC results to plot")
+        return
+
+    labels = list(auc_results.keys())
+    means = np.array([auc_results[l]['mean'] for l in labels])
+    stds = np.array([auc_results[l]['std'] for l in labels])
+
+    order = np.argsort(means)
+    labels = [labels[i] for i in order]
+    means = means[order]
+    stds = stds[order]
+
+    colors = []
+    for lbl in labels:
+        if 'Noise' in lbl:
+            colors.append(PALETTE['Noise (OOD)'])
+        elif 'GP' in lbl and 'Neuro' not in lbl:
+            colors.append(PALETTE['Synthetic GP'])
+        elif 'Prior' in lbl:
+            colors.append(PALETTE['TabPFN Prior'])
+        else:
+            colors.append(PALETTE['Neurostim'])
+
+    fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.2), 4))
+    x = np.arange(len(labels))
+    ax.bar(x, means, yerr=stds, capsize=4, color=colors,
+           alpha=0.85, edgecolor='black', linewidth=0.7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha='right', fontsize=9)
+    ax.set_ylabel('AUC (Procrustes disparity × budget)')
+    ax.set_title('Procrustes Trajectory AUC — geometric drift per source')
+    ax.grid(True, axis='y', alpha=0.3)
+    fig.tight_layout()
+
+    if save:
+        base = _save_dir(output_dir, 'trajectory')
+        path = os.path.join(base, 'procrustes_auc_bar.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
+
+
+def plot_procrustes_per_subject(
+    trajectory_results: dict,
+    save: bool = False,
+    output_dir: str | None = None,
+) -> None:
+    """Procrustes disparity curves split by subject (neurostim datasets only).
+
+    Per-subject traces shown as faint lines (one per subject, averaged over
+    that subject's EMG channels).  Bold line = grand mean ± 1 std band across
+    subjects.  One subplot per dataset type.  Reveals inter-subject
+    heterogeneity in geometric drift rates.
+
+    Args:
+        trajectory_results: dict from :func:`embedding_trajectory_analysis`.
+        save: Whether to save the figure.
+        output_dir: Base output directory.  Saves to
+            ``<output_dir>/trajectory/procrustes_per_subject.svg``.
+    """
+    budgets = trajectory_results.get('budgets', [])
+    if not budgets:
+        print("  [Procrustes] No budgets in results, skipping per-subject plot")
+        return
+
+    meta_keys = {'budgets', 'layer', 'cross_distribution'}
+    synthetic_prefix = 'synthetic_'
+    dataset_types = [k for k in trajectory_results
+                     if k not in meta_keys and not k.startswith(synthetic_prefix)]
+
+    if not dataset_types:
+        print("  [Procrustes] No neurostim datasets found, skipping per-subject plot")
+        return
+
+    n_panels = len(dataset_types)
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5), squeeze=False)
+    layer = trajectory_results.get('layer', 17)
+
+    for col, dt in enumerate(dataset_types):
+        ax = axes[0, col]
+        subj_means: list[np.ndarray] = []
+
+        for subj_idx, subj_data in trajectory_results[dt].items():
+            emg_trajs = [
+                np.array(traj, dtype=float)
+                for traj in subj_data.values()
+                if np.all(np.isfinite(traj))
+            ]
+            if not emg_trajs:
+                continue
+            subj_mean = np.nanmean(np.array(emg_trajs), axis=0)  # [n_budgets]
+            subj_means.append(subj_mean)
+            ax.plot(budgets, subj_mean, color=PALETTE['Neurostim'],
+                    alpha=0.35, linewidth=1.0, label=f'S{subj_idx}')
+
+        if subj_means:
+            arr = np.array(subj_means)                    # [n_subj, n_budgets]
+            mean_all = np.nanmean(arr, axis=0)
+            std_all = np.nanstd(arr, axis=0)
+            ax.plot(budgets, mean_all, color=PALETTE['Neurostim'],
+                    linewidth=2.2,
+                    label=f'Mean (n={len(subj_means)} subjects)')
+            ax.fill_between(budgets,
+                            mean_all - std_all, mean_all + std_all,
+                            color=PALETTE['Neurostim'], alpha=0.18)
+
+        ax.set_xlabel('BO budget (# context observations)')
+        ax.set_ylabel('Procrustes disparity')
+        ax.set_title(f'{dt.upper()} — Subject-level Trajectory (layer {layer})')
+        ax.legend(fontsize=7, loc='best')
+        ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+
+    if save:
+        base = _save_dir(output_dir, 'trajectory')
+        path = os.path.join(base, 'procrustes_per_subject.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
+
+
+def plot_cross_distribution_disparity(
+    cross_results: dict,
+    save: bool = False,
+    output_dir: str | None = None,
+) -> None:
+    """Cross-distribution geometric distance vs BO budget.
+
+    Plots the absolute difference in mean Procrustes disparity between each
+    neurostim dataset and each synthetic reference (GP, Noise) at each budget
+    step.  A neurostim curve close to Synthetic GP (low Δ) indicates ID-like
+    geometric behaviour; a curve close to Noise (high Δ) indicates OOD-like
+    behaviour.
+
+    Args:
+        cross_results: dict from :func:`compute_cross_distribution_procrustes`,
+            with keys ``'budgets'`` and one entry per dataset_type.
+        save: Whether to save the figure.
+        output_dir: Base output directory.  Saves to
+            ``<output_dir>/trajectory/cross_distribution_disparity.svg``.
+    """
+    budgets = cross_results.get('budgets', [])
+    dataset_types = [k for k in cross_results if k != 'budgets']
+
+    if not budgets or not dataset_types:
+        print("  [Procrustes] Empty cross-distribution results, skipping plot")
+        return
+
+    ref_styles: dict[str, dict] = {
+        'Synthetic GP': {'color': PALETTE['Synthetic GP'], 'ls': '-'},
+        'Noise (OOD)':  {'color': PALETTE['Noise (OOD)'],  'ls': '--'},
+    }
+    dt_markers = {'nhp': 'o', 'rat': 's', 'spinal': '^'}
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for dt in dataset_types:
+        for ref_label, diffs in cross_results[dt].items():
+            style = ref_styles.get(ref_label, {'color': 'gray', 'ls': ':'})
+            marker = dt_markers.get(dt, 'D')
+            ax.plot(budgets, diffs,
+                    color=style['color'], linestyle=style['ls'],
+                    linewidth=1.8, marker=marker, markersize=5,
+                    label=f'{dt.upper()} vs {ref_label}')
+
+    ax.set_xlabel('BO budget (# context observations)')
+    ax.set_ylabel('|Δ mean Procrustes disparity|')
+    ax.set_title('Cross-Distribution Geometric Distance vs BO Budget')
+    ax.legend(fontsize=8, loc='best')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    if save:
+        base = _save_dir(output_dir, 'trajectory')
+        path = os.path.join(base, 'cross_distribution_disparity.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
 
 
 def _panel_rsa(ax: plt.Axes, rsa_results: dict) -> None:

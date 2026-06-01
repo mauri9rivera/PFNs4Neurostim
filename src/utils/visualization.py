@@ -13,7 +13,9 @@ import os
 PALETTE = {
     'GP': 'sandybrown',
     'PFN': 'royalblue',
-    'TabPFN': 'seagreen'
+    'TabPFN': 'seagreen',
+    'LoRA TabPFN': 'seagreen',
+    'Full FT': 'royalblue',
 }
 
 
@@ -36,6 +38,78 @@ def _grid_argmax(values: np.ndarray, ch2xy: np.ndarray) -> tuple:
     """Return ``(row, col)`` of the maximum value, looked up via ``ch2xy``."""
     flat_idx = int(np.argmax(np.asarray(values).ravel()))
     return int(ch2xy[flat_idx, 0]), int(ch2xy[flat_idx, 1])
+
+
+def show_emg_map(
+    result: dict,
+    model_type: str,
+    mode: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """Side-by-side heatmap: ground truth vs surrogate final prediction on the EMG grid.
+
+    Args:
+        result: Result dict from gp_baseline / finetuned_optimization /
+            evaluate_optimization.  Must contain ``'y_test'``, ``'y_pred'``,
+            ``'r2'``, ``'ch2xy'``, ``'grid_shape'``, ``'dataset'``,
+            ``'subject'``, ``'emg'``.
+        model_type: Label for the plot title and filename (e.g. ``'GP'``,
+            ``'TabPFN'``).
+        mode: Optional suffix appended to the output filename.
+        save: If True, write SVG under ``<output_dir>/optimization/emg_maps/``.
+        output_dir: Run directory root.
+    """
+    ch2xy = result.get('ch2xy')
+    grid_shape = result.get('grid_shape')
+    if ch2xy is None or grid_shape is None:
+        return
+
+    y_true = np.asarray(result['y_test'])
+    y_pred = np.asarray(result['y_pred'])
+    r2_val = float(np.mean(result['r2']))
+    dataset = result['dataset']
+    subject = result['subject']
+    emg = result['emg']
+
+    map_true = _to_grid(y_true, ch2xy, grid_shape)   # [R, C]
+    map_pred = _to_grid(y_pred, ch2xy, grid_shape)   # [R, C]
+
+    vmin = float(np.nanmin([map_true, map_pred]))
+    vmax = float(np.nanmax([map_true, map_pred]))
+
+    max_r_true, max_c_true = _grid_argmax(y_true, ch2xy)
+    max_r_pred, max_c_pred = _grid_argmax(y_pred, ch2xy)
+
+    cmap = plt.cm.viridis.copy()
+    cmap.set_bad(color='lightgray')
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle(f'{model_type} — {dataset} Subj {subject} EMG {emg}')
+
+    hm_kw = dict(cmap=cmap, vmin=vmin, vmax=vmax)
+    sns.heatmap(map_true, ax=axes[0], mask=np.isnan(map_true), **hm_kw)
+    axes[0].set_title('Ground Truth')
+    axes[0].plot(max_c_true + 0.5, max_r_true + 0.5, 'ro', markersize=8)
+
+    sns.heatmap(map_pred, ax=axes[1], mask=np.isnan(map_pred), **hm_kw)
+    axes[1].set_title(f'Prediction  R²={r2_val:.3f}')
+    axes[1].plot(max_c_pred + 0.5, max_r_pred + 0.5, 'ro', markersize=8)
+
+    fig.tight_layout()
+
+    if save:
+        base = (
+            os.path.join(output_dir, 'optimization', 'emg_maps')
+            if output_dir
+            else os.path.join('output', 'optimization', 'emg_maps')
+        )
+        os.makedirs(base, exist_ok=True)
+        fname = f'emg_map_{dataset}_s{subject}_emg{emg}_{model_type}{mode}.svg'
+        path = os.path.join(base, fname)
+        plt.savefig(path, format='svg')
+        print(f"Saved EMG map -> {path}")
+    plt.close()
 
 
 def _diag_save_dir(output_dir):
@@ -568,6 +642,193 @@ def regret_curve(results_dict, split_type='', save=False, output_dir=None):
     plt.close()
 
 
+def _exploration_curves_for(
+    results_dict: dict,
+    group_key: str,
+) -> dict:
+    """Extract exploitation score curves keyed by group (subject or emg).
+
+    Returns:
+        dict mapping group_value -> dict[model_name -> list[curve_dict]].
+        Each curve_dict has keys:
+          'dense' (bool), 'x' (np.ndarray), 'y' (np.ndarray), 'se' (np.ndarray|None).
+    """
+    from collections import defaultdict
+    by_group: dict = defaultdict(lambda: defaultdict(list))
+    for model_name, results_list in results_dict.items():
+        for res in results_list:
+            optimal = float(res['y_test'].max())
+            if optimal < 1e-8:
+                continue
+            n_init = res.get('n_init', 0)
+            perf = res.get('perf_explore')
+            if perf is not None:
+                # Dense path: perf shape [n_reps, n_steps]
+                perf_arr = np.asarray(perf)                              # [n_reps, n_steps]
+                curve = {
+                    'dense': True,
+                    'x': np.arange(n_init, n_init + perf_arr.shape[1]),
+                    'y': np.mean(perf_arr, axis=0),
+                    'se': np.std(perf_arr, axis=0) / np.sqrt(max(perf_arr.shape[0], 1)),
+                }
+            else:
+                snaps = res.get('snapshots')
+                if not snaps:
+                    continue
+                iters = sorted(snaps.keys())
+                curve = {
+                    'dense': False,
+                    'x': np.array(iters),
+                    'y': np.array([snaps[it]['best_pred_val'] / optimal for it in iters]),
+                    'se': None,
+                }
+            by_group[res[group_key]][model_name].append(curve)
+    return by_group
+
+
+def _plot_exploration_panel(
+    ax,
+    model_curves: dict,
+    col_idx: int,
+    title: str,
+) -> None:
+    """Render one exploitation-score subplot."""
+    for model_name, curves in model_curves.items():
+        color = PALETTE.get(model_name, 'gray')
+        dense = [c for c in curves if c['dense']]
+        sparse = [c for c in curves if not c['dense']]
+        if dense:
+            max_len = max(len(c['y']) for c in dense)
+            ys = np.array([np.pad(c['y'], (0, max_len - len(c['y'])), constant_values=np.nan)
+                           for c in dense])                              # [n_curves, n_steps]
+            x = dense[0]['x'][:max_len]
+            mean_c = np.nanmean(ys, axis=0)
+            se_c = np.nanstd(ys, axis=0) / np.sqrt(
+                np.sum(~np.isnan(ys), axis=0).clip(1)
+            )
+            ax.plot(x, mean_c, color=color, linewidth=2, label=model_name)
+            ax.fill_between(x, mean_c - 1.96 * se_c, mean_c + 1.96 * se_c,
+                            color=color, alpha=0.2)
+        elif sparse:
+            # Aggregate sparse curves at shared snapshot iterations
+            ref_x = sparse[0]['x']
+            stacked = np.array([c['y'] for c in sparse
+                                 if len(c['y']) == len(ref_x)])
+            if stacked.ndim == 2 and stacked.shape[0] > 1:
+                mean_c = np.nanmean(stacked, axis=0)
+                ax.plot(ref_x, mean_c, color=color, linewidth=2.5,
+                        marker='o', markersize=5, label=model_name)
+                for c in sparse:
+                    if len(c['y']) == len(ref_x):
+                        ax.plot(c['x'], c['y'], color=color, linewidth=1,
+                                marker='o', markersize=3, alpha=0.35,
+                                label='_nolegend_')
+            else:
+                for c in sparse:
+                    ax.plot(c['x'], c['y'], color=color, linewidth=2,
+                            marker='o', markersize=4, label=model_name)
+
+    ax.set_title(title)
+    ax.set_xlabel('BO Iteration')
+    ax.set_ylim(0, 1.05)
+    ax.axhline(1.0, color='gray', linewidth=0.8, linestyle=':')
+    ax.grid(True, alpha=0.3)
+    if col_idx == 0:
+        ax.set_ylabel('Exploitation Score\n(best recommendation / optimal)')
+    ax.legend(title='Model', fontsize=7)
+
+
+def exploration_by_subject(results_dict, split_type='', save=False, output_dir=None):
+    """Exploitation score trajectories faceted by subject.
+
+    Plots how well the surrogate's pure-exploitation recommendation tracks the
+    true optimum over BO iterations, aggregated over EMGs per subject.
+
+    Dense path (new runs): uses ``perf_explore`` stored at every step.
+    Sparse fallback (legacy pkl files): uses log-spaced snapshot ``best_pred_val``.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+        output_dir: run-level directory (saves under optimization/)
+    """
+    results_dict = _normalize_results_dict(results_dict)
+    by_subject = _exploration_curves_for(results_dict, 'subject')
+
+    subjects = sorted(by_subject.keys())
+    n_subj = len(subjects)
+    if n_subj == 0:
+        return
+
+    fig, axes = plt.subplots(1, n_subj, figsize=(5 * n_subj, 5), squeeze=False)
+    for col, subj in enumerate(subjects):
+        _plot_exploration_panel(axes[0, col], by_subject[subj], col, f'Subject {subj}')
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    fig.suptitle(f'Exploitation Score Trajectory by Subject ({dataset})')
+    fig.tight_layout()
+
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'exploration_by_subject{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg')
+        print(f'Saved plot to {plot_path}')
+    plt.close()
+
+
+def exploration_by_emg(results_dict, split_type='', save=False, output_dir=None):
+    """Exploitation score trajectories faceted by EMG channel.
+
+    Same as ``exploration_by_subject`` but grouped by EMG index.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts
+        split_type: string suffix for the output filename
+        save: whether to save the figure to disk
+        output_dir: run-level directory (saves under optimization/)
+    """
+    results_dict = _normalize_results_dict(results_dict)
+    by_emg = _exploration_curves_for(results_dict, 'emg')
+
+    emgs = sorted(by_emg.keys())
+    n_emgs = len(emgs)
+    if n_emgs == 0:
+        return
+
+    n_cols = min(n_emgs, 8)
+    n_rows = int(np.ceil(n_emgs / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(5 * n_cols, 4 * n_rows),
+                             squeeze=False)
+    ax_flat = axes.ravel()
+
+    for i, emg in enumerate(emgs):
+        _plot_exploration_panel(ax_flat[i], by_emg[emg], i % n_cols, f'EMG {emg}')
+
+    for j in range(n_emgs, len(ax_flat)):
+        ax_flat[j].set_visible(False)
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    fig.suptitle(f'Exploitation Score Trajectory by EMG Channel ({dataset})')
+    fig.tight_layout()
+
+    base = os.path.join(output_dir, 'optimization') if output_dir else \
+           os.path.join('output', 'optimization')
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'exploration_by_emg{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg')
+        print(f'Saved plot to {plot_path}')
+    plt.close()
+
+
 def kappa_regret_curves(
     kappa_results: dict,
     gp_results: list,
@@ -969,4 +1230,225 @@ def augmentation_sweep_plot(df, dataset='', split_type='', save=False, output_di
         plt.savefig(plot_path, format='svg')
         print(f"Saved plot to {plot_path}")
 
+    plt.close()
+
+
+def r2_barplot_by_subject(
+    results_dict: dict,
+    split_type: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """Grouped bar chart of mean R² per subject plus an aggregate Average group.
+
+    One bar per model per subject; an extra 'Avg' group shows the cross-subject
+    mean.  Error bars are the standard deviation pooled across all repetitions
+    and EMG channels for each (subject, model) pair.  Raw R² values are used
+    (no clipping) so negative values remain visible.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts.
+            Each result dict must contain 'r2' (list[float]), 'subject' (int),
+            and 'dataset' (str).
+        split_type: String suffix appended to the output filename.
+        save: If True, write SVG to disk under '<output_dir>/optimization/'.
+        output_dir: Run-level directory root.
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    records = []
+    for model_name, results_list in results_dict.items():
+        for res in results_list:
+            for score in res['r2']:
+                records.append({
+                    'Subject': f"S{res['subject']}",
+                    'R2': float(score),
+                    'Model': model_name,
+                })
+
+    df = pd.DataFrame(records)
+    subjects = sorted(df['Subject'].unique())
+    models = list(results_dict.keys())
+    x_labels = list(subjects) + ['Avg']
+
+    n_models = len(models)
+    bar_width = 0.7 / n_models
+    x_base = np.arange(len(x_labels))  # [n_subjects + 1]
+
+    fig, ax = plt.subplots(figsize=(max(6, 2.2 * len(x_labels)), 5))
+
+    all_means, all_stds = [], []
+    for i, model_name in enumerate(models):
+        color = PALETTE.get(model_name, f'C{i}')
+        mdf = df[df['Model'] == model_name]
+
+        means, stds = [], []
+        for lbl in subjects:
+            vals = mdf.loc[mdf['Subject'] == lbl, 'R2'].values  # [n_reps * n_emg]
+            means.append(float(np.mean(vals)) if len(vals) else 0.0)
+            stds.append(float(np.std(vals)) if len(vals) else 0.0)
+        # Avg bar: pool across all subjects
+        all_vals = mdf['R2'].values  # [n_reps * n_emg * n_subj]
+        means.append(float(np.mean(all_vals)) if len(all_vals) else 0.0)
+        stds.append(float(np.std(all_vals)) if len(all_vals) else 0.0)
+
+        all_means.extend(means)
+        all_stds.extend(stds)
+
+        offset = (i - (n_models - 1) / 2.0) * bar_width
+        ax.bar(
+            x_base + offset,
+            means,
+            width=bar_width,
+            yerr=stds,
+            capsize=4,
+            color=color,
+            label=model_name,
+            alpha=0.85,
+            error_kw={'elinewidth': 1.5, 'ecolor': 'black'},
+        )
+
+    # Dynamic y-axis bounds that accommodate negative values
+    y_lo = min(0.0, min(m - s for m, s in zip(all_means, all_stds))) - 0.05
+    y_hi = max(1.0, max(m + s for m, s in zip(all_means, all_stds))) + 0.05
+    ax.set_ylim(y_lo, y_hi)
+    ax.axhline(0, color='black', linewidth=0.6, linestyle='--', alpha=0.4)
+
+    ax.set_xticks(x_base)
+    ax.set_xticklabels(x_labels)
+    ax.set_xlabel('Subject')
+    ax.set_ylabel('R² Score')
+    ax.set_title('R² by Subject')
+    ax.legend(title='Model')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    fig.tight_layout()
+
+    base = (
+        os.path.join(output_dir, 'optimization')
+        if output_dir
+        else os.path.join('output', 'optimization', dataset)
+    )
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'r2_barplot_by_subject{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg', bbox_inches='tight')
+        print(f"Saved plot to {plot_path}")
+    plt.close()
+
+
+def regret_traces_by_subject(
+    results_dict: dict,
+    split_type: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """Regret curve traces per subject plus an Average panel.
+
+    For each subject panel:
+      - Faint thin lines: per-EMG mean regret curve (averaged across n_reps).
+      - Bold line: cross-EMG mean regret trajectory.
+      - Shaded band: +-1 std across EMGs.
+
+    A final 'Average' panel pools all subjects x EMGs with the same layout.
+
+    Args:
+        results_dict: dict[str, list[dict]] -- model name -> list of result dicts.
+            Each dict must have 'values' (list[list[float]], shape [n_reps, budget]),
+            'y_test' (np.ndarray), 'subject' (int), and 'emg' (int).
+        split_type: String suffix appended to the output filename.
+        save: If True, write SVG to disk under '<output_dir>/optimization/'.
+        output_dir: Run-level directory root.
+    """
+    results_dict = _normalize_results_dict(results_dict)
+
+    # by_subject[subj][model] = list of per-EMG mean regret curves, each [budget]
+    by_subject: dict = {}
+
+    for model_name, results_list in results_dict.items():
+        for res in results_list:
+            if 'values' not in res or 'y_test' not in res:
+                continue
+            y_range = float(res['y_test'].max() - res['y_test'].min())
+            if y_range < 1e-8:
+                continue
+            optimal = float(res['y_test'].max())
+            rb = np.maximum.accumulate(np.array(res['values']), axis=1)  # [n_reps, budget]
+            regret = (optimal - rb) / y_range                            # [n_reps, budget]
+            curve = np.mean(regret, axis=0)                              # [budget]
+            subj = res['subject']
+            if subj not in by_subject:
+                by_subject[subj] = {}
+            if model_name not in by_subject[subj]:
+                by_subject[subj][model_name] = []
+            by_subject[subj][model_name].append(curve)
+
+    subjects = sorted(by_subject.keys())
+    n_subj = len(subjects)
+    if n_subj == 0:
+        return
+
+    n_panels = n_subj + 1  # one per subject + Average
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5), squeeze=False)
+
+    def _panel(ax, model_curves, title, col_idx):
+        for model_name, curves in model_curves.items():
+            color = PALETTE.get(model_name, 'gray')
+            max_len = max(len(c) for c in curves)
+            padded = np.array([                                          # [n_emg, budget]
+                np.pad(c, (0, max_len - len(c)), constant_values=np.nan)
+                for c in curves
+            ])
+            mean_c = np.nanmean(padded, axis=0)                          # [budget]
+            std_c = np.nanstd(padded, axis=0)                            # [budget]
+            x = np.arange(len(mean_c))
+
+            # Faint per-EMG traces
+            for c in curves:
+                ax.plot(np.arange(len(c)), c,
+                        color=color, linewidth=0.8, alpha=0.3)
+            # Bold mean + +-1 std band
+            ax.plot(x, mean_c, color=color, linewidth=2.5, label=model_name)
+            ax.fill_between(x, mean_c - std_c, mean_c + std_c,
+                            color=color, alpha=0.15)
+
+        ax.set_title(title)
+        ax.set_xlabel('BO Iteration')
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.3)
+        if col_idx == 0:
+            ax.set_ylabel('Simple Regret\n(normalized by response range, lower is better)')
+        ax.legend(title='Model', fontsize=8)
+
+    for col, subj in enumerate(subjects):
+        _panel(axes[0, col], by_subject[subj], f'Subject {subj}', col)
+
+    # Average panel: pool all subject x EMG curves
+    all_curves: dict = {}
+    for subj in subjects:
+        for model_name, curves in by_subject[subj].items():
+            if model_name not in all_curves:
+                all_curves[model_name] = []
+            all_curves[model_name].extend(curves)
+    _panel(axes[0, n_subj], all_curves, 'Average', n_subj)
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    fig.suptitle(f'Regret Curves by Subject ({dataset})')
+    fig.tight_layout()
+
+    base = (
+        os.path.join(output_dir, 'optimization')
+        if output_dir
+        else os.path.join('output', 'optimization')
+    )
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'regret_traces_by_subject{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg', bbox_inches='tight')
+        print(f"Saved plot to {plot_path}")
     plt.close()

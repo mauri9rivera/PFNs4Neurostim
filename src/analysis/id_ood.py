@@ -31,16 +31,31 @@ from analysis.synthetic_noise import generate_noise_bank
 from analysis.synthetic_tabpfn_prior import generate_tabpfn_prior_bank
 
 def _effective_n_ctx(n_context: float, n_total: int) -> int:
-    """Convert fractional context size to an absolute observation count.
+    """Convert context size to an absolute observation count.
+
+    Supports two calling conventions:
+
+    - **Fraction** (0 < n_context < 1): ``n_ctx = ceil(n_total * n_context)``,
+      capped at ``n_total - 1`` so at least 1 test point is reserved.
+      E.g. n_context=0.5, n_total=96 → 48 context, 48 test.
+
+    - **Absolute count** (n_context >= 1): ``n_ctx = int(n_context)``, capped at
+      ``n_total // 2`` so the test set is always at least half the dataset.
+      This prevents degenerate embedding matrices (CKA, Mahalanobis, RSA) when
+      the requested count exceeds the dataset size.
+      E.g. n_context=50, n_total=96 → min(50, 48) = 48 context, 48 test.
+      E.g. n_context=50, n_total=32 → min(50, 16) = 16 context, 16 test.
 
     Args:
-        n_context: Fraction of total observations to use as context (0.0–1.0).
+        n_context: Context size as fraction (0.0, 1.0) or absolute count (≥ 1).
         n_total: Total number of observations available.
 
     Returns:
-        Absolute count: ceil(n_total * n_context), capped at n_total - 1 so
-        at least one point is always reserved for evaluation.
+        Absolute context count in [1, n_total - 1].
     """
+    if n_context >= 1:
+        # Cap at half of n_total to ensure enough test embeddings for matrix ops.
+        return min(int(n_context), max(1, n_total // 2))
     return min(math.ceil(n_total * n_context), n_total - 1)
 
 
@@ -1444,6 +1459,130 @@ def compute_procrustes_disparity(
     return float(disparity)
 
 
+def compute_procrustes_auc(trajectory_results: dict) -> dict:
+    """Compute AUC of each Procrustes disparity curve via the trapezoidal rule.
+
+    Integrates each per-trajectory disparity curve over the budget axis.
+    A high AUC indicates rapid or sustained geometric drift; a low AUC
+    indicates geometrically stable embeddings (ID-like behaviour).
+
+    Args:
+        trajectory_results: dict from :func:`embedding_trajectory_analysis`.
+
+    Returns:
+        dict mapping source label → ``{'mean': float, 'std': float, 'all': list[float]}``.
+        Trajectories containing non-finite values are silently skipped.
+    """
+    budgets = np.array(trajectory_results.get('budgets', []), dtype=float)
+    if len(budgets) < 2:
+        return {}
+
+    meta_keys = {'budgets', 'layer', 'cross_distribution'}
+    synthetic_prefix = 'synthetic_'
+    dataset_types = [k for k in trajectory_results
+                     if k not in meta_keys and not k.startswith(synthetic_prefix)]
+
+    auc_results: dict = {}
+
+    for dt in dataset_types:
+        aucs: list[float] = []
+        for subj_data in trajectory_results[dt].values():
+            for traj in subj_data.values():
+                arr = np.array(traj, dtype=float)
+                if np.all(np.isfinite(arr)):
+                    aucs.append(float(np.trapz(arr, budgets)))
+        if aucs:
+            auc_results[f'{dt.upper()} Neurostim'] = {
+                'mean': float(np.mean(aucs)),
+                'std': float(np.std(aucs)),
+                'all': aucs,
+            }
+
+    synth_labels = {
+        'synthetic_gp': 'Synthetic GP',
+        'synthetic_prior': 'TabPFN Prior',
+        'synthetic_noise': 'Noise (OOD)',
+    }
+    for key, label in synth_labels.items():
+        trajs = trajectory_results.get(key, [])
+        if not trajs:
+            continue
+        aucs = [
+            float(np.trapz(np.array(traj, dtype=float), budgets))
+            for traj in trajs
+            if np.all(np.isfinite(traj))
+        ]
+        if aucs:
+            auc_results[label] = {
+                'mean': float(np.mean(aucs)),
+                'std': float(np.std(aucs)),
+                'all': aucs,
+            }
+
+    return auc_results
+
+
+def compute_cross_distribution_procrustes(trajectory_results: dict) -> dict:
+    """Cross-distribution geometric distance vs BO budget.
+
+    For each budget step t, computes the absolute difference in mean
+    Procrustes disparity between each neurostim dataset and each synthetic
+    reference (GP, Noise).  A neurostim trace near Synthetic GP indicates
+    ID-like geometric drift; a trace near Noise indicates OOD-like drift.
+
+    This is derivable from the existing disparity curves in
+    ``trajectory_results`` without re-extracting embeddings.
+
+    Args:
+        trajectory_results: dict from :func:`embedding_trajectory_analysis`.
+
+    Returns:
+        dict with keys:
+          - ``'budgets'``: list of budget steps
+          - per dataset_type: ``{ref_label: [abs_diff_at_each_budget]}``
+    """
+    budgets = trajectory_results.get('budgets', [])
+    if not budgets:
+        return {'budgets': []}
+
+    meta_keys = {'budgets', 'layer', 'cross_distribution'}
+    synthetic_prefix = 'synthetic_'
+    dataset_types = [k for k in trajectory_results
+                     if k not in meta_keys and not k.startswith(synthetic_prefix)]
+
+    synth_refs = {
+        'synthetic_gp': 'Synthetic GP',
+        'synthetic_noise': 'Noise (OOD)',
+    }
+
+    # Mean disparity per reference at each budget
+    ref_means: dict[str, np.ndarray] = {}
+    for key, label in synth_refs.items():
+        trajs = trajectory_results.get(key, [])
+        if not trajs:
+            continue
+        arr = np.array(trajs, dtype=float)                     # [n_synth, n_budgets]
+        ref_means[label] = np.nanmean(arr, axis=0)             # [n_budgets]
+
+    cross: dict = {'budgets': list(budgets)}
+    for dt in dataset_types:
+        trajs_neuro = [
+            np.array(traj, dtype=float)
+            for subj_data in trajectory_results[dt].values()
+            for traj in subj_data.values()
+            if np.all(np.isfinite(traj))
+        ]
+        if not trajs_neuro:
+            continue
+        mean_neuro = np.nanmean(np.array(trajs_neuro), axis=0)  # [n_budgets]
+        dt_cross: dict = {}
+        for label, ref_mean in ref_means.items():
+            dt_cross[label] = np.abs(mean_neuro - ref_mean).tolist()
+        cross[dt] = dt_cross
+
+    return cross
+
+
 def _trajectory_disparities(
     model: TabPFNRegressor,
     X: np.ndarray,
@@ -1586,9 +1725,9 @@ def _embedding_trajectory_inner(
             X = scaler_x.fit_transform(coords).astype(np.float32)   # [n, 2]
             n_emgs = data['sorted_respMean'].shape[1]
 
-            if len(X) < max_budget + 1:
+            if len(X) < 3:
                 print(f"  [Procrustes] Skipping {dataset_type} S{subj_idx}: "
-                      f"grid size {len(X)} < max budget {max_budget}")
+                      f"grid size {len(X)} too small (need >= 3)")
                 continue
 
             subj_traj: dict = {}
@@ -1635,7 +1774,7 @@ def _embedding_trajectory_inner(
                 n_skipped += 1
                 continue
             X_n, y_n = normed
-            if len(X_n) < max_budget + 1:
+            if len(X_n) < 3:
                 n_skipped += 1
                 continue
             rng_pair = np.random.RandomState(seed + 100_000 + ds_idx)
@@ -1649,6 +1788,8 @@ def _embedding_trajectory_inner(
         print(f"  [Procrustes] synthetic_{src_name}: {len(src_trajs)} valid, "
               f"{n_skipped} skipped")
         results[f'synthetic_{src_name}'] = src_trajs
+
+    results['cross_distribution'] = compute_cross_distribution_procrustes(results)
 
     return results
 

@@ -1,6 +1,6 @@
 # Canonical hyperparameters for NHP augmentation sensitivity sweep.
 # Family: aug-sweep-opt
-# Tests whether R2 and regret plateau after n_augmentations ~ 25.
+# Tests whether R2 and regret plateau after aug_pct ~ 2.5 (25 maps/EMG).
 # Usage:
 #   python src/finetuning.py --config configs/nhp_aug_sweep.yaml
 
@@ -10,19 +10,19 @@ split: inter_subject
 mode:
   - aug_sweep_optimization
 
-# Training — epochs/lr fixed; n_augmentations is swept via aug_counts
-epochs: 50
-lr: 1.0e-5
-n_augmentations: 25
+# Training — epochs/lr fixed; aug_pct is swept via aug_pct_sweep
+epochs: 100
+lr: 1.0e-4
+aug_pct: 2.5
 
 # Augmentation sweep values (0 = vanilla TabPFN baseline included automatically)
-aug_counts:
-  - 1
-  - 2
-  - 5
-  - 7
-  - 10
-  - 25
+aug_pct_sweep:
+  - 0.1
+  - 0.2
+  - 0.5
+  - 0.7
+  - 1.0
+  - 2.5
 
 # Evaluation
 budget: 100
@@ -31,9 +31,14 @@ n_reps: 30
 # UCB kappa control:
 #   kappa_schedule: 0.0  →  auto cosine-annealed schedule (GP-UCB theory)
 #   kappa_schedule: 2.5  →  fixed kappa=2.5 throughout (no annealing)
-kappa_schedule: 0.0
+kappa_schedule: 4.0
+
+# Acquisition function
+acq_fn: ucb
+ts_temperature: 1.0
 
 # Infrastructure
+subjects: all
 device: cuda
 save: true
-diagnostics: false
+diagnostics: true
