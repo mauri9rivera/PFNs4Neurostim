@@ -1001,7 +1001,7 @@ def plot_procrustes_trajectory(
     # Group trajectories per labelled source
     curves: dict[str, np.ndarray] = {}
 
-    meta_keys = {'budgets', 'layer'}
+    meta_keys = {'budgets', 'layer', 'cross_distribution'}
     synthetic_prefix = 'synthetic_'
     dataset_types = [k for k in trajectory_results
                      if k not in meta_keys and not k.startswith(synthetic_prefix)]
@@ -1078,7 +1078,7 @@ def _panel_procrustes(ax: plt.Axes, trajectory_results: dict) -> None:
         ax.set_visible(False)
         return
 
-    meta_keys = {'budgets', 'layer'}
+    meta_keys = {'budgets', 'layer', 'cross_distribution'}
     synthetic_prefix = 'synthetic_'
     dataset_types = [k for k in trajectory_results
                      if k not in meta_keys and not k.startswith(synthetic_prefix)]
@@ -1308,6 +1308,459 @@ def plot_cross_distribution_disparity(
     if save:
         base = _save_dir(output_dir, 'trajectory')
         path = os.path.join(base, 'cross_distribution_disparity.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
+
+
+# ============================================================================
+#  Tier 1 Consensus Analyses — B8, B9, B10
+# ============================================================================
+
+# Metric display labels for consensus plots.
+_METRIC_LABELS = {
+    'entropy': 'Entropy',
+    'mmd': 'MMD²',
+    'wasserstein': 'Wasserstein',
+    'mahalanobis': 'Mahalanobis',
+    'cka': 'CKA',
+    'rsa': 'RSA',
+}
+
+# Metrics where higher = more ID (need inversion for [0=ID,1=OOD] normalization).
+_SIMILARITY_METRICS = {'cka', 'rsa'}
+
+
+def _extract_scalar_per_emg(
+    all_results: dict,
+) -> tuple[list[tuple[str, int, int]], dict[str, list[float]]]:
+    """Extract one scalar score per (dataset, subject, emg) for each metric.
+
+    Used by both B8 (consensus matrix) and B10 (heterogeneity heatmap).
+    All returned lists are co-indexed: ``labels[i]`` corresponds to
+    ``scores[metric][i]`` for every metric.
+
+    For CKA and RSA, uses the deepest available transformer layer.
+
+    Args:
+        all_results: dict from :func:`run_id_ood_analysis`.
+
+    Returns:
+        ``(labels, scores)`` where ``labels`` is a list of
+        ``(dataset_type, subj_idx, emg_idx)`` tuples and ``scores`` is a
+        dict mapping metric name → list of floats (same length as labels).
+        Entries where a metric is unavailable for a given (dataset,subj,emg)
+        are stored as NaN.
+    """
+    ref_skip = {'ref_stats', 'layers', 'synthetic_gp', 'synthetic_prior',
+                'noise', 'budgets', 'layer', 'cross_distribution'}
+
+    # Determine the union of (dataset, subj, emg) present in any metric.
+    # Use entropy or mmd as the primary key source; fall back to any available.
+    key_source = None
+    for candidate in ('entropy', 'mmd', 'wasserstein', 'mahalanobis', 'cka', 'rsa'):
+        if candidate in all_results:
+            key_source = candidate
+            break
+    if key_source is None:
+        return [], {}
+
+    primary = all_results[key_source]
+    labels: list[tuple[str, int, int]] = []
+    for ds_key, ds_data in primary.items():
+        if ds_key in ref_skip or not isinstance(ds_data, dict):
+            continue
+        for subj_idx, subj_data in ds_data.items():
+            if not isinstance(subj_data, dict):
+                continue
+            for emg_idx in subj_data:
+                labels.append((ds_key, subj_idx, emg_idx))
+
+    scores: dict[str, list[float]] = {m: [] for m in _METRIC_LABELS}
+
+    # ── Entropy ──────────────────────────────────────────────────────────
+    for ds, subj, emg in labels:
+        val = np.nan
+        if 'entropy' in all_results:
+            node = (all_results['entropy']
+                    .get(ds, {}).get(subj, {}).get(emg))
+            if node is not None:
+                arr = np.asarray(node, dtype=float)
+                valid = arr[np.isfinite(arr)]
+                val = float(np.mean(valid)) if len(valid) > 0 else np.nan
+        scores['entropy'].append(val)
+
+    # ── MMD ──────────────────────────────────────────────────────────────
+    for ds, subj, emg in labels:
+        val = np.nan
+        if 'mmd' in all_results:
+            node = (all_results['mmd']
+                    .get(ds, {}).get(subj, {}).get(emg, {}))
+            v = node.get('mmd2_gp')
+            if v is not None:
+                val = float(v)
+        scores['mmd'].append(val)
+
+    # ── Wasserstein ───────────────────────────────────────────────────────
+    for ds, subj, emg in labels:
+        val = np.nan
+        if 'wasserstein' in all_results:
+            node = (all_results['wasserstein']
+                    .get(ds, {}).get(subj, {}).get(emg, {}))
+            v = node.get('w2_gp')
+            if v is not None:
+                val = float(v)
+        scores['wasserstein'].append(val)
+
+    # ── Mahalanobis ───────────────────────────────────────────────────────
+    for ds, subj, emg in labels:
+        val = np.nan
+        if 'mahalanobis' in all_results:
+            node = (all_results['mahalanobis']
+                    .get(ds, {}).get(subj, {}).get(emg, {}))
+            v = node.get('mean_dist_gp')
+            if v is not None:
+                val = float(v)
+        scores['mahalanobis'].append(val)
+
+    # ── CKA (deepest layer) ───────────────────────────────────────────────
+    cka_layer = None
+    if 'cka' in all_results:
+        cka_layer = max(all_results['cka'].get('layers', [17]))
+    for ds, subj, emg in labels:
+        val = np.nan
+        if 'cka' in all_results and cka_layer is not None:
+            node = (all_results['cka']
+                    .get(ds, {}).get(subj, {}).get(emg, {}))
+            layer_node = node.get(cka_layer, {})
+            v = layer_node.get('cka_gp')
+            if v is not None:
+                val = float(v)
+        scores['cka'].append(val)
+
+    # ── RSA (deepest layer) ───────────────────────────────────────────────
+    rsa_layer = None
+    if 'rsa' in all_results:
+        rsa_layer = max(all_results['rsa'].get('layers', [17]))
+    for ds, subj, emg in labels:
+        val = np.nan
+        if 'rsa' in all_results and rsa_layer is not None:
+            node = (all_results['rsa']
+                    .get(ds, {}).get(subj, {}).get(emg, {}))
+            layer_node = node.get(rsa_layer, {})
+            v = layer_node.get('rsa_gp')
+            if v is not None:
+                val = float(v)
+        scores['rsa'].append(val)
+
+    # Drop metrics with no data at all.
+    scores = {m: v for m, v in scores.items() if any(np.isfinite(x) for x in v)}
+
+    return labels, scores
+
+
+def _normalize_scores(
+    scores: dict[str, list[float]],
+) -> dict[str, np.ndarray]:
+    """Min-max normalize each metric to [0=ID, 1=OOD].
+
+    Similarity metrics (CKA, RSA) are inverted so that 0 always means
+    most ID-like and 1 means most OOD-like.
+
+    Args:
+        scores: dict from :func:`_extract_scalar_per_emg`.
+
+    Returns:
+        dict mapping metric name → normalized float array.
+    """
+    norm: dict[str, np.ndarray] = {}
+    for metric, vals in scores.items():
+        arr = np.asarray(vals, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if len(finite) < 2:
+            norm[metric] = arr
+            continue
+        lo, hi = float(finite.min()), float(finite.max())
+        if hi == lo:
+            norm[metric] = np.zeros_like(arr)
+        else:
+            normalized = (arr - lo) / (hi - lo)
+            if metric in _SIMILARITY_METRICS:
+                normalized = 1.0 - normalized
+            norm[metric] = normalized
+    return norm
+
+
+def plot_metric_consensus(
+    all_results: dict,
+    save: bool = False,
+    output_dir: str | None = None,
+) -> None:
+    """B8 — Metric consensus heatmap + composite ID score bar chart.
+
+    Heatmap: 6×6 Spearman ρ between normalized per-(dataset,subj,emg)
+    metric scores.  ρ > 0.7 = redundant metrics; ρ < 0 = contradicting
+    evidence.
+
+    Bar chart: composite ID score (mean of normalized metrics) per
+    (dataset,subj,emg) sorted ascending; lower = more ID-like.
+
+    Args:
+        all_results: dict from :func:`run_id_ood_analysis`.
+        save: Whether to save figures.
+        output_dir: Base output directory.  Saves to
+            ``<output_dir>/consensus/``.
+    """
+    from scipy.stats import spearmanr
+
+    labels, scores = _extract_scalar_per_emg(all_results)
+    if len(scores) < 2:
+        print("  [B8] Need ≥2 metrics for consensus matrix — skipping.")
+        return
+
+    norm = _normalize_scores(scores)
+    metric_names = list(norm.keys())
+    n = len(metric_names)
+
+    # ── Heatmap ──────────────────────────────────────────────────────────
+    rho_matrix = np.full((n, n), np.nan)
+    for i, mi in enumerate(metric_names):
+        for j, mj in enumerate(metric_names):
+            vi = norm[mi]
+            vj = norm[mj]
+            both = np.isfinite(vi) & np.isfinite(vj)
+            if both.sum() >= 4:
+                rho_matrix[i, j] = float(spearmanr(vi[both], vj[both]).statistic)
+
+    disp_labels = [_METRIC_LABELS.get(m, m) for m in metric_names]
+    fig, ax = plt.subplots(figsize=(5 + 0.5 * n, 4 + 0.4 * n))
+    im = ax.imshow(rho_matrix, cmap='RdBu_r', vmin=-1, vmax=1,
+                   aspect='auto')
+    plt.colorbar(im, ax=ax, label='Spearman ρ')
+    ax.set_xticks(range(n)); ax.set_xticklabels(disp_labels, rotation=35, ha='right')
+    ax.set_yticks(range(n)); ax.set_yticklabels(disp_labels)
+    for i in range(n):
+        for j in range(n):
+            if np.isfinite(rho_matrix[i, j]):
+                ax.text(j, i, f'{rho_matrix[i, j]:.2f}',
+                        ha='center', va='center',
+                        fontsize=8,
+                        color='white' if abs(rho_matrix[i, j]) > 0.5 else 'black')
+    ax.set_title('B8 — Metric Consensus (Spearman ρ)')
+    fig.tight_layout()
+
+    if save:
+        base = _save_dir(output_dir, 'consensus')
+        path = os.path.join(base, 'metric_consensus_heatmap.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+    plt.close()
+
+    # ── Composite score bar chart ─────────────────────────────────────────
+    stacked = np.column_stack([norm[m] for m in metric_names])  # [N, n_metrics]
+    composite = np.nanmean(stacked, axis=1)                     # [N]
+
+    order = np.argsort(composite)
+    sorted_composite = composite[order]
+    sorted_labels = [labels[i] for i in order]
+
+    # Color by dataset type
+    ds_palette = {'nhp': PALETTE['Neurostim'],
+                  'rat': PALETTE['Neurostim GT'],
+                  'spinal': '#2f6fa0'}
+    colors = [ds_palette.get(lbl[0], 'gray') for lbl in sorted_labels]
+    x_ticks = [f"{lbl[0].upper()} S{lbl[1]} E{lbl[2]}" for lbl in sorted_labels]
+
+    fig2, ax2 = plt.subplots(figsize=(max(8, len(sorted_labels) * 0.35), 4))
+    ax2.bar(range(len(sorted_labels)), sorted_composite, color=colors, alpha=0.85)
+    ax2.set_xticks(range(len(sorted_labels)))
+    ax2.set_xticklabels(x_ticks, rotation=70, ha='right', fontsize=6)
+    ax2.set_ylabel('Composite ID Score (0=ID, 1=OOD)')
+    ax2.set_title('B8 — Composite ID Score per (Dataset, Subject, EMG)')
+    ax2.grid(True, axis='y', alpha=0.3)
+    fig2.tight_layout()
+
+    if save:
+        base = _save_dir(output_dir, 'consensus')
+        path2 = os.path.join(base, 'composite_score_bar.svg')
+        plt.savefig(path2, format='svg')
+        print(f"Saved plot -> {path2}")
+    plt.close()
+
+
+def plot_synthetic_validation(
+    cohens_d_results: dict,
+    save: bool = False,
+    output_dir: str | None = None,
+) -> None:
+    """B9 — Synthetic reference validation: Cohen's d per metric.
+
+    Two-panel figure:
+    - Left: violin plot of GP vs Noise score distributions per metric.
+    - Right: Cohen's d bar chart with 0.8 reference line (strong discriminator
+      threshold per Cohen 1988).
+
+    Also writes a CSV table: metric × {mean_gp, mean_noise, cohens_d, verdict}.
+
+    Args:
+        cohens_d_results: dict from :func:`compute_cohens_d_per_metric`.
+        save: Whether to save figures and CSV.
+        output_dir: Base output directory.  Saves to
+            ``<output_dir>/consensus/``.
+    """
+    if not cohens_d_results:
+        print("  [B9] No Cohen's d results to plot.")
+        return
+
+    metrics = list(cohens_d_results.keys())
+
+    # ── Violin plot ───────────────────────────────────────────────────────
+    violin_rows = []
+    for metric, info in cohens_d_results.items():
+        label = _METRIC_LABELS.get(metric, metric)
+        for v in info['gp_scores']:
+            violin_rows.append({'Metric': label, 'Group': 'GP (ID)', 'Score': float(v)})
+        for v in info['noise_scores']:
+            violin_rows.append({'Metric': label, 'Group': 'Noise (OOD)', 'Score': float(v)})
+
+    disp_labels = [_METRIC_LABELS.get(m, m) for m in metrics]
+    d_vals = [cohens_d_results[m]['cohens_d'] for m in metrics]
+    verdicts = [cohens_d_results[m]['verdict'] for m in metrics]
+
+    fig, axes = plt.subplots(1, 2, figsize=(4 + 2 * len(metrics), 5))
+
+    # Panel 1: violin
+    if violin_rows:
+        df_v = pd.DataFrame(violin_rows)
+        sns.violinplot(data=df_v, x='Metric', y='Score', hue='Group',
+                       order=disp_labels,
+                       palette={'GP (ID)': PALETTE['Synthetic GP'],
+                                'Noise (OOD)': PALETTE['Noise (OOD)']},
+                       ax=axes[0], inner='box', alpha=0.75, split=False)
+        axes[0].set_title('B9 — Score Distributions: GP vs Noise')
+        axes[0].set_xlabel('')
+        axes[0].tick_params(axis='x', rotation=30)
+        axes[0].grid(True, alpha=0.3, axis='y')
+
+    # Panel 2: Cohen's d bar
+    ax2 = axes[1]
+    bar_colors = [
+        'forestgreen' if v == 'strong' else ('goldenrod' if v == 'moderate' else 'firebrick')
+        for v in verdicts
+    ]
+    finite_d = [d if np.isfinite(d) else 0.0 for d in d_vals]
+    ax2.bar(disp_labels, finite_d, color=bar_colors, alpha=0.85, edgecolor='black', lw=0.6)
+    ax2.axhline(0.8, color='black', linestyle='--', linewidth=1.2,
+                label="Cohen's d = 0.8 (strong)")
+    ax2.axhline(0.5, color='gray', linestyle=':', linewidth=1.0,
+                label="Cohen's d = 0.5 (moderate)")
+    ax2.set_ylabel("Cohen's d")
+    ax2.set_title("B9 — Discriminability (Cohen's d)")
+    ax2.tick_params(axis='x', rotation=30)
+    ax2.legend(fontsize=8)
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    fig.tight_layout()
+
+    if save:
+        base = _save_dir(output_dir, 'consensus')
+        path = os.path.join(base, 'synthetic_validation.svg')
+        plt.savefig(path, format='svg')
+        print(f"Saved plot -> {path}")
+
+        # CSV table
+        rows = []
+        for metric in metrics:
+            info = cohens_d_results[metric]
+            rows.append({
+                'metric': metric,
+                'mean_gp': f"{info['mean_gp']:.4f}",
+                'mean_noise': f"{info['mean_noise']:.4f}",
+                'cohens_d': f"{info['cohens_d']:.4f}",
+                'verdict': info['verdict'],
+            })
+        csv_path = os.path.join(base, 'synthetic_validation.csv')
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+        print(f"Saved table -> {csv_path}")
+
+    plt.close()
+
+
+def plot_id_ood_heterogeneity_heatmap(
+    all_results: dict,
+    dataset_type: str,
+    save: bool = False,
+    output_dir: str | None = None,
+) -> None:
+    """B10 — EMG/Subject heterogeneity heatmap for one dataset.
+
+    Plots a Subject × EMG matrix colored by composite normalized ID score
+    (0 = most ID-like, 1 = most OOD-like).  Extends the
+    ``plot_entropy_heatmap()`` pattern to all available metrics.
+
+    Cells with no data are left blank (NaN → colormap bad color).
+
+    Args:
+        all_results: dict from :func:`run_id_ood_analysis`.
+        dataset_type: Which dataset to plot (e.g. ``'nhp'``).
+        save: Whether to save the figure.
+        output_dir: Base output directory.  Saves to
+            ``<output_dir>/consensus/heterogeneity_heatmap_{dataset_type}.svg``.
+    """
+    labels, scores = _extract_scalar_per_emg(all_results)
+    if not scores:
+        print(f"  [B10] No metric scores for {dataset_type} — skipping.")
+        return
+
+    norm = _normalize_scores(scores)
+
+    # Filter to this dataset type only.
+    ds_labels = [(ds, subj, emg)
+                 for ds, subj, emg in labels if ds == dataset_type]
+    if not ds_labels:
+        print(f"  [B10] No (subj,emg) pairs found for dataset '{dataset_type}'.")
+        return
+
+    idx_map = {lbl: i for i, lbl in enumerate(labels)}
+
+    subjects = sorted({subj for _, subj, _ in ds_labels})
+    emgs = sorted({emg for _, _, emg in ds_labels})
+
+    matrix = np.full((len(subjects), len(emgs)), np.nan)
+    n_metrics = len(norm)
+    for si, subj in enumerate(subjects):
+        for ei, emg in enumerate(emgs):
+            key = (dataset_type, subj, emg)
+            if key not in idx_map:
+                continue
+            idx = idx_map[key]
+            vals = [norm[m][idx] for m in norm if np.isfinite(norm[m][idx])]
+            if vals:
+                matrix[si, ei] = float(np.mean(vals))
+
+    fig, ax = plt.subplots(
+        figsize=(max(5, len(emgs) * 0.9), max(3, len(subjects) * 0.7)),
+    )
+    sns.heatmap(
+        matrix, ax=ax, cmap='YlOrRd',
+        vmin=0.0, vmax=1.0,
+        annot=True, fmt='.2f',
+        xticklabels=[f'EMG {e}' for e in emgs],
+        yticklabels=[f'S{s}' for s in subjects],
+        linewidths=0.4,
+    )
+    ax.set_title(
+        f'B10 — ID/OOD Heterogeneity | {dataset_type.upper()} '
+        f'(n_metrics={n_metrics}, 0=ID, 1=OOD)'
+    )
+    ax.set_xlabel('EMG Channel')
+    ax.set_ylabel('Subject')
+    fig.tight_layout()
+
+    if save:
+        base = _save_dir(output_dir, 'consensus')
+        path = os.path.join(base, f'heterogeneity_heatmap_{dataset_type}.svg')
         plt.savefig(path, format='svg')
         print(f"Saved plot -> {path}")
 

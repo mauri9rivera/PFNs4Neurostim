@@ -1,0 +1,37 @@
+# Bfull — ID/OOD full suite (B1–B7 combined dashboard run)
+# GPU job: all seven analyses in a single pass.
+# Usage:
+#   JOB=Bfull sbatch --gres=gpu:rtx8000:1 --cpus-per-task=4 --mem-per-gpu=24G --time=12:00:00 scripts/run_all_experiments.sh
+
+family: id-ood-bfull
+
+analyses:
+  - entropy
+  - mmd
+  - wasserstein
+  - mahalanobis
+  - cka
+  - rsa
+  - procrustes
+
+cka_layers:
+  - 4
+  - 13
+  - 17
+
+proc_budgets:
+  - 2
+  - 10
+  - 30
+  - 50
+  - 100
+
+proc_layer: 17
+proc_n_synthetic: 20
+
+prior_source: tabpfn_prior
+device: cuda
+n_synthetic: 500
+n_context: 0.5
+seed: 42
+save: true

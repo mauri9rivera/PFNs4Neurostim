@@ -1115,15 +1115,30 @@ def regret_with_timing(results_dict, split_type='', save=False, output_dir=None)
                 ax_time.plot(times_arr, color=color, linewidth=2, label=model_name)
 
             # --- exploitation score row ---
-            # Dense path: perf_explore[t] = cummax(y_test_raw[argmax(mean_pred)] / optimal)
+            # Dense path: perf_explore shape is [n_reps, n_steps] — must aggregate first.
             # Fallback: sparse best_pred_val from log-spaced snapshots (legacy pkl files).
             perf_explore = res.get('perf_explore')
             n_init_res = res.get('n_init', 0)
             if perf_explore is not None and optimal_val > 1e-8:
-                explore_arr = np.asarray(perf_explore)          # [n_steps]
-                x_explore = np.arange(n_init_res, n_init_res + len(explore_arr))
-                ax_ee.plot(x_explore, explore_arr, color=color, linewidth=2,
+                explore_arr = np.asarray(perf_explore)                          # [n_reps, n_steps]
+                if explore_arr.ndim == 1:
+                    explore_mean = explore_arr                                  # legacy scalar path
+                    explore_se = None
+                else:
+                    explore_mean = np.mean(explore_arr, axis=0)                 # [n_steps]
+                    explore_se = (
+                        np.std(explore_arr, axis=0) / np.sqrt(max(explore_arr.shape[0], 1))
+                    )                                                           # [n_steps]
+                x_explore = np.arange(n_init_res, n_init_res + len(explore_mean))
+                ax_ee.plot(x_explore, explore_mean, color=color, linewidth=2,
                            label=model_name)
+                if explore_se is not None:
+                    ax_ee.fill_between(
+                        x_explore,
+                        explore_mean - 1.96 * explore_se,
+                        explore_mean + 1.96 * explore_se,
+                        color=color, alpha=0.2,
+                    )
             else:
                 snaps = res.get('snapshots')
                 if snaps and optimal_val > 1e-8:
@@ -1451,4 +1466,154 @@ def regret_traces_by_subject(
     if save:
         plt.savefig(plot_path, format='svg', bbox_inches='tight')
         print(f"Saved plot to {plot_path}")
+
+
+# ============================================================================
+#  GFS Visualization (A5 — Prediction Surface Geometry)
+# ============================================================================
+
+def plot_gfs_profile(
+    results_list: list[dict],
+    dataset: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """Multi-scale GFS profile: mean GFS ± std vs smoothing scale sigma.
+
+    Reveals whether TabPFN preserves fine-grained gradient structure that
+    GP's kernel smoothing destroys.  Expected pattern: TabPFN GFS ≥ GP
+    across all σ; gap largest at σ = 0.5 (fine-scale features), both
+    converging at σ = 4.0 (coarse features accessible to both).
+
+    Args:
+        results_list: List of result dicts from evaluate_optimization() /
+            gp_baseline().  Each must contain keys ``'gfs'`` (dict[float,
+            float]), ``'model_type'``, ``'subject'``, ``'emg'``.
+            Entries where ``'gfs'`` is None are silently skipped.
+        dataset: Dataset label for figure title and filename suffix.
+        save: If True, write SVG to ``<output_dir>/optimization/gfs_profile.svg``.
+        output_dir: Run directory root.
+    """
+    rows = [
+        {'sigma': sigma, 'GFS': val, 'model_type': r['model_type']}
+        for r in results_list
+        if r.get('gfs') is not None
+        for sigma, val in r['gfs'].items()
+        if np.isfinite(val)
+    ]
+    if not rows:
+        print("[GFS] No finite GFS values to plot.")
+        return
+
+    df = pd.DataFrame(rows)
+    model_types = df['model_type'].unique().tolist()
+
+    palette = {m: PALETTE.get('GP' if 'GP' in m else 'PFN', 'steelblue')
+               for m in model_types}
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for mtype in model_types:
+        sub = df[df['model_type'] == mtype]
+        grp = sub.groupby('sigma')['GFS']
+        sigmas = sorted(grp.groups.keys())
+        means = [grp.get_group(s).mean() for s in sigmas]
+        stds = [grp.get_group(s).std() for s in sigmas]
+        color = palette.get(mtype, 'gray')
+        ax.plot(sigmas, means, marker='o', linewidth=1.8,
+                color=color, label=mtype)
+        ax.fill_between(sigmas,
+                        np.array(means) - np.array(stds),
+                        np.array(means) + np.array(stds),
+                        color=color, alpha=0.18)
+
+    ax.set_xlabel('Smoothing scale σ (grid-cell units)')
+    ax.set_ylabel('GFS — Gradient-Field Similarity')
+    ax.set_title(f'A5 — Multi-scale GFS Profile ({dataset})')
+    ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    if save:
+        base = (
+            os.path.join(output_dir, 'optimization')
+            if output_dir
+            else os.path.join('output', 'optimization')
+        )
+        os.makedirs(base, exist_ok=True)
+        suffix = f'_{dataset}' if dataset else ''
+        path = os.path.join(base, f'gfs_profile{suffix}.svg')
+        plt.savefig(path, format='svg', bbox_inches='tight')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
+
+
+def gfs_by_subject(
+    results_list: list[dict],
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """Box plot: GFS at σ=1.0 per held-out subject (mirrors r2_by_subject).
+
+    Reveals whether TabPFN's gradient-field advantage is consistent across
+    subjects or driven by a subset.
+
+    Args:
+        results_list: List of result dicts from evaluate_optimization() /
+            gp_baseline().  Must contain ``'gfs'``, ``'model_type'``,
+            ``'subject'``.
+        save: If True, write SVG to
+            ``<output_dir>/optimization/gfs_by_subject.svg``.
+        output_dir: Run directory root.
+    """
+    from utils.surface_geometry import GFS_SUMMARY_SIGMA
+
+    rows = [
+        {
+            'Subject': f"S{r['subject']}",
+            'GFS': r['gfs'].get(GFS_SUMMARY_SIGMA, float('nan')),
+            'Model': r['model_type'],
+        }
+        for r in results_list
+        if r.get('gfs') is not None
+    ]
+    rows = [row for row in rows if np.isfinite(row['GFS'])]
+    if not rows:
+        print("[GFS] No finite GFS@σ=1.0 values to plot.")
+        return
+
+    df = pd.DataFrame(rows)
+    model_types = df['Model'].unique().tolist()
+    palette = {m: PALETTE.get('GP' if 'GP' in m else 'PFN', 'steelblue')
+               for m in model_types}
+
+    subjects = sorted(df['Subject'].unique(),
+                      key=lambda s: int(s[1:]) if s[1:].isdigit() else 0)
+    fig, ax = plt.subplots(figsize=(max(5, len(subjects) * 1.2), 4))
+
+    sns.boxplot(data=df, x='Subject', y='GFS', hue='Model',
+                order=subjects, palette=palette,
+                ax=ax, fliersize=3)
+
+    ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+    ax.set_xlabel('Subject')
+    ax.set_ylabel(f'GFS at σ={GFS_SUMMARY_SIGMA}')
+    ax.set_title(f'A5 — GFS by Subject (σ={GFS_SUMMARY_SIGMA})')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+
+    if save:
+        base = (
+            os.path.join(output_dir, 'optimization')
+            if output_dir
+            else os.path.join('output', 'optimization')
+        )
+        os.makedirs(base, exist_ok=True)
+        path = os.path.join(base, 'gfs_by_subject.svg')
+        plt.savefig(path, format='svg', bbox_inches='tight')
+        print(f"Saved plot -> {path}")
+
+    plt.close()
     plt.close()

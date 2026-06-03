@@ -1,0 +1,20 @@
+# B4 — Layer-wise CKA (3-layer default: 4, 13, 17)
+# GPU job: forward hook repeated per analyzed layer.
+# Usage:
+#   JOB=B4 sbatch --gres=gpu:rtx8000:1 --cpus-per-task=4 --mem-per-gpu=16G --time=4:00:00 scripts/run_all_experiments.sh
+
+family: id-ood-b4
+
+analyses:
+  - cka
+
+cka_layers:
+  - 4
+  - 13
+  - 17
+
+prior_source: tabpfn_prior
+device: cuda
+n_synthetic: 500
+seed: 42
+save: true

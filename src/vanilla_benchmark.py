@@ -57,6 +57,8 @@ from utils.visualization import (
     show_emg_map,
     kappa_regret_curves,
     kappa_auc_bar,
+    plot_gfs_profile,
+    gfs_by_subject,
 )
 
 
@@ -222,6 +224,7 @@ def _vanilla_optimization(
         'n_reps': n_reps,
         'kappa_schedule': kappa_schedule,
         'acq_fn': acq_fn,
+        'ts_temperature': ts_temperature if acq_fn == 'ts' else None,
         'normalization': 'pfn',
     }
     _gp_cache_params = {
@@ -230,6 +233,7 @@ def _vanilla_optimization(
         'n_reps': n_reps,
         'kappa_schedule': kappa_schedule,
         'acq_fn': acq_fn,
+        'ts_temperature': ts_temperature if acq_fn == 'ts' else None,
         'normalization': 'gp',
     }
 
@@ -315,6 +319,12 @@ def _vanilla_optimization(
     for _res in results_tabpfn:
         show_emg_map(_res, model_type='TabPFN', mode=f'_vanilla_{exp_tag}',
                      save=True, output_dir=run_dir)
+
+    _all_results_flat = results_gp + results_tabpfn
+    if any(r.get('gfs') is not None for r in _all_results_flat):
+        plot_gfs_profile(_all_results_flat, dataset=dataset_type,
+                         save=True, output_dir=run_dir)
+        gfs_by_subject(_all_results_flat, save=True, output_dir=run_dir)
 
     all_r2 = [np.mean(r['r2']) for r in results_tabpfn]
     print(f"\nOptimization done. {len(results_tabpfn)} experiments.")

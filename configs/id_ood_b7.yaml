@@ -1,0 +1,25 @@
+# B7 — Procrustes BO-Trajectory (embedding geometry vs BO budget)
+# GPU job: budget sweep extracts embeddings at each (budget × dataset).
+# Usage:
+#   JOB=B7 sbatch --gres=gpu:rtx8000:1 --cpus-per-task=4 --mem-per-gpu=16G --time=8:00:00 scripts/run_all_experiments.sh
+
+family: id-ood-b7
+
+analyses:
+  - procrustes
+
+proc_budgets:
+  - 2
+  - 10
+  - 30
+  - 50
+  - 100
+
+proc_layer: 17
+proc_n_synthetic: 20
+
+prior_source: tabpfn_prior
+device: cuda
+n_synthetic: 500
+seed: 42
+save: true

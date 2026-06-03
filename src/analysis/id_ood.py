@@ -227,14 +227,14 @@ def entropy_analysis(dataset_types, device='cpu', n_context=0.5,
     # --- Synthetic references ---
     rng = np.random.RandomState(seed)
 
-    if prior_source in ('gp', 'both'):
+    if prior_source in ('gp', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
         gp_entropies = _entropy_from_bank(model, gp_bank, n_context)
         results['synthetic_gp'] = gp_entropies
 
-    if prior_source in ('tabpfn_prior', 'both'):
+    if prior_source in ('tabpfn_prior', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
@@ -365,13 +365,13 @@ def mmd_analysis(dataset_types, prior_source='both', n_synthetic=500,
     # Build synthetic reference feature matrix
     ref_features = {}
 
-    if prior_source in ('gp', 'both'):
+    if prior_source in ('gp', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
         ref_features['gp'] = _bank_to_features(gp_bank)
 
-    if prior_source in ('tabpfn_prior', 'both'):
+    if prior_source in ('tabpfn_prior', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
@@ -522,13 +522,13 @@ def wasserstein_analysis(dataset_types, prior_source='both',
     # Build synthetic reference feature matrices (reuse _bank_to_features)
     ref_features = {}
 
-    if prior_source in ('gp', 'both'):
+    if prior_source in ('gp', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
         ref_features['gp'] = _bank_to_features(gp_bank)
 
-    if prior_source in ('tabpfn_prior', 'both'):
+    if prior_source in ('tabpfn_prior', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
@@ -737,14 +737,14 @@ def _mahalanobis_analysis_inner(
 
     _LAST_LAYER = _layer_name(layer)
 
-    if prior_source in ('gp', 'both'):
+    if prior_source in ('gp', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
         gp_embeds = _embeddings_from_bank(model, gp_bank, n_context, _LAST_LAYER)
         ref_stats['gp'] = _fit_reference(gp_embeds, regularization)
 
-    if prior_source in ('tabpfn_prior', 'both'):
+    if prior_source in ('tabpfn_prior', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
@@ -1078,7 +1078,7 @@ def _cka_analysis_inner(dataset_types, device, prior_source, n_synthetic,
         lname = _layer_name(layer_idx)
         layer_refs: dict[str, np.ndarray] = {}
 
-        if prior_source in ('gp', 'both'):
+        if prior_source in ('gp', 'both', 'all'):
             gp_bank = generate_synthetic_gp_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
             )
@@ -1086,7 +1086,7 @@ def _cka_analysis_inner(dataset_types, device, prior_source, n_synthetic,
                 model, gp_bank, n_context, lname,
             )
 
-        if prior_source in ('tabpfn_prior', 'both'):
+        if prior_source in ('tabpfn_prior', 'both', 'all'):
             prior_bank = generate_tabpfn_prior_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
             )
@@ -1312,7 +1312,7 @@ def _rsa_analysis_inner(
         lname = _layer_name(layer_idx)
         layer_refs: dict[str, np.ndarray] = {}
 
-        if prior_source in ('gp', 'both'):
+        if prior_source in ('gp', 'both', 'all'):
             gp_bank = generate_synthetic_gp_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
             )
@@ -1320,7 +1320,7 @@ def _rsa_analysis_inner(
                 model, gp_bank, n_context, lname,
             )
 
-        if prior_source in ('tabpfn_prior', 'both'):
+        if prior_source in ('tabpfn_prior', 'both', 'all'):
             prior_bank = generate_tabpfn_prior_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
             )
@@ -1725,9 +1725,9 @@ def _embedding_trajectory_inner(
             X = scaler_x.fit_transform(coords).astype(np.float32)   # [n, 2]
             n_emgs = data['sorted_respMean'].shape[1]
 
-            if len(X) < 3:
+            if len(X) < 3 or len(X) <= max_budget:
                 print(f"  [Procrustes] Skipping {dataset_type} S{subj_idx}: "
-                      f"grid size {len(X)} too small (need >= 3)")
+                      f"grid size {len(X)} < max budget {max_budget}")
                 continue
 
             subj_traj: dict = {}
@@ -1753,11 +1753,11 @@ def _embedding_trajectory_inner(
 
     # ── Synthetic reference trajectories ──────────────────────────────────
     synthetic_banks: dict[str, list] = {}
-    if prior_source in ('gp', 'both'):
+    if prior_source in ('gp', 'both', 'all'):
         synthetic_banks['gp'] = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
-    if prior_source in ('tabpfn_prior', 'both'):
+    if prior_source in ('tabpfn_prior', 'both', 'all'):
         synthetic_banks['prior'] = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
@@ -1792,6 +1792,220 @@ def _embedding_trajectory_inner(
     results['cross_distribution'] = compute_cross_distribution_procrustes(results)
 
     return results
+
+
+# ============================================================================
+#  3d-iv. Metric Consensus — Cohen's d (B9)
+# ============================================================================
+
+def _cohens_d(a: np.ndarray, b: np.ndarray) -> float:
+    """Pooled Cohen's d: |mean_a - mean_b| / sqrt((var_a + var_b) / 2).
+
+    Args:
+        a: First distribution (1-D array of floats).
+        b: Second distribution (1-D array of floats).
+
+    Returns:
+        Cohen's d ≥ 0.  Returns NaN if either array is empty or has zero
+        variance.
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    if len(a) < 2 or len(b) < 2:
+        return float('nan')
+    pooled_std = float(np.sqrt((np.var(a, ddof=1) + np.var(b, ddof=1)) / 2.0))
+    if pooled_std == 0.0:
+        return float('nan')
+    return float(abs(np.mean(a) - np.mean(b)) / pooled_std)
+
+
+def _collect_emg_scores(
+    metric_results: dict,
+    key_gp: str,
+    key_noise: str,
+    layer_key: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Collect per-(dataset, subj, emg) scalar scores for GP and Noise references.
+
+    Iterates over ``metric_results[dataset][subj][emg][key_gp]`` (or
+    ``metric_results[dataset][subj][emg][layer][key_gp]`` when
+    ``layer_key`` is given) and returns two aligned flat arrays.
+
+    Args:
+        metric_results: Nested dict from any analysis function.
+        key_gp: Score key for the GP reference (e.g. ``'mmd2_gp'``).
+        key_noise: Score key for the Noise reference (e.g. ``'mmd2_noise'``).
+        layer_key: If not None, descend one extra level (for CKA/RSA per-layer
+            results).
+
+    Returns:
+        ``(gp_scores, noise_scores)`` as 1-D float arrays of equal length.
+    """
+    gp_vals: list[float] = []
+    noise_vals: list[float] = []
+    ref_keys = {'ref_stats', 'layers'}
+    for ds_key, ds_data in metric_results.items():
+        if ds_key in ref_keys or not isinstance(ds_data, dict):
+            continue
+        for subj_data in ds_data.values():
+            if not isinstance(subj_data, dict):
+                continue
+            for emg_data in subj_data.values():
+                if not isinstance(emg_data, dict):
+                    continue
+                node = emg_data[layer_key] if layer_key is not None else emg_data
+                if not isinstance(node, dict):
+                    continue
+                v_gp = node.get(key_gp)
+                v_noise = node.get(key_noise)
+                if v_gp is not None and v_noise is not None:
+                    gp_vals.append(float(v_gp))
+                    noise_vals.append(float(v_noise))
+    return np.array(gp_vals), np.array(noise_vals)
+
+
+def compute_cohens_d_per_metric(all_results: dict) -> dict[str, dict]:
+    """Cohen's d separating GP-like from Noise-like distributions per metric.
+
+    Tests whether each available metric correctly discriminates ID (GP-like)
+    data from OOD (Noise-like) data.
+
+    For ``entropy``: compares ``synthetic_gp`` vs ``noise`` entropy arrays
+    directly — the cleanest discrimination test.
+
+    For all other metrics: collects per-(dataset, subj, emg) scores
+    ``vs GP`` and ``vs Noise`` across all neurostim samples and computes
+    Cohen's d between these paired distributions.  This tests the metric's
+    *directionality* on real data — whether it consistently ranks GP-like
+    similarity above Noise-like similarity for actual recordings.
+
+    Verdict thresholds follow Cohen (1988): d > 0.8 = strong, 0.5–0.8 =
+    moderate, ≤ 0.5 = weak (flag as unreliable discriminator).
+
+    Args:
+        all_results: dict from :func:`run_id_ood_analysis` with metric-keyed
+            sub-dicts.
+
+    Returns:
+        dict mapping metric_name →
+        ``{'mean_gp', 'mean_noise', 'cohens_d', 'verdict',
+           'gp_scores', 'noise_scores'}``.
+        Only metrics present in ``all_results`` are included.
+    """
+    out: dict[str, dict] = {}
+
+    # ── Entropy ───────────────────────────────────────────────────────────
+    if 'entropy' in all_results:
+        er = all_results['entropy']
+        gp_arr = np.asarray(er.get('synthetic_gp', []), dtype=float)
+        noise_arr = np.asarray(er.get('noise', []), dtype=float)
+        gp_arr = gp_arr[np.isfinite(gp_arr)]
+        noise_arr = noise_arr[np.isfinite(noise_arr)]
+        if len(gp_arr) >= 2 and len(noise_arr) >= 2:
+            d = _cohens_d(gp_arr, noise_arr)
+            out['entropy'] = {
+                'mean_gp': float(np.mean(gp_arr)),
+                'mean_noise': float(np.mean(noise_arr)),
+                'cohens_d': d,
+                'verdict': 'strong' if d > 0.8 else ('moderate' if d > 0.5 else 'weak'),
+                'gp_scores': gp_arr,
+                'noise_scores': noise_arr,
+            }
+
+    # ── MMD ───────────────────────────────────────────────────────────────
+    if 'mmd' in all_results:
+        gp_s, noise_s = _collect_emg_scores(
+            all_results['mmd'], 'mmd2_gp', 'mmd2_noise',
+        )
+        if len(gp_s) >= 2:
+            d = _cohens_d(noise_s, gp_s)  # noise > gp → distance metric
+            out['mmd'] = {
+                'mean_gp': float(np.mean(gp_s)),
+                'mean_noise': float(np.mean(noise_s)),
+                'cohens_d': d,
+                'verdict': 'strong' if d > 0.8 else ('moderate' if d > 0.5 else 'weak'),
+                'gp_scores': gp_s,
+                'noise_scores': noise_s,
+            }
+
+    # ── Wasserstein ───────────────────────────────────────────────────────
+    if 'wasserstein' in all_results:
+        gp_s, noise_s = _collect_emg_scores(
+            all_results['wasserstein'], 'w2_gp', 'w2_noise',
+        )
+        if len(gp_s) >= 2:
+            d = _cohens_d(noise_s, gp_s)
+            out['wasserstein'] = {
+                'mean_gp': float(np.mean(gp_s)),
+                'mean_noise': float(np.mean(noise_s)),
+                'cohens_d': d,
+                'verdict': 'strong' if d > 0.8 else ('moderate' if d > 0.5 else 'weak'),
+                'gp_scores': gp_s,
+                'noise_scores': noise_s,
+            }
+
+    # ── Mahalanobis ───────────────────────────────────────────────────────
+    if 'mahalanobis' in all_results:
+        gp_s, noise_s = _collect_emg_scores(
+            all_results['mahalanobis'], 'mean_dist_gp', 'mean_dist_noise',
+        )
+        if len(gp_s) >= 2:
+            d = _cohens_d(noise_s, gp_s)
+            out['mahalanobis'] = {
+                'mean_gp': float(np.mean(gp_s)),
+                'mean_noise': float(np.mean(noise_s)),
+                'cohens_d': d,
+                'verdict': 'strong' if d > 0.8 else ('moderate' if d > 0.5 else 'weak'),
+                'gp_scores': gp_s,
+                'noise_scores': noise_s,
+            }
+
+    # ── CKA (deepest available layer; higher = ID, invert d direction) ────
+    if 'cka' in all_results:
+        layers = _get_cka_layers_from_results(all_results['cka'])
+        if layers:
+            layer = max(layers)
+            gp_s, noise_s = _collect_emg_scores(
+                all_results['cka'], 'cka_gp', 'cka_noise', layer_key=layer,
+            )
+            if len(gp_s) >= 2:
+                d = _cohens_d(gp_s, noise_s)  # gp > noise → similarity metric
+                out['cka'] = {
+                    'mean_gp': float(np.mean(gp_s)),
+                    'mean_noise': float(np.mean(noise_s)),
+                    'cohens_d': d,
+                    'verdict': 'strong' if d > 0.8 else ('moderate' if d > 0.5 else 'weak'),
+                    'gp_scores': gp_s,
+                    'noise_scores': noise_s,
+                }
+
+    # ── RSA (deepest layer; higher = ID, invert d direction) ──────────────
+    if 'rsa' in all_results:
+        layers = list(all_results['rsa'].get('layers', []))
+        if layers:
+            layer = max(layers)
+            gp_s, noise_s = _collect_emg_scores(
+                all_results['rsa'], 'rsa_gp', 'rsa_noise', layer_key=layer,
+            )
+            if len(gp_s) >= 2:
+                d = _cohens_d(gp_s, noise_s)
+                out['rsa'] = {
+                    'mean_gp': float(np.mean(gp_s)),
+                    'mean_noise': float(np.mean(noise_s)),
+                    'cohens_d': d,
+                    'verdict': 'strong' if d > 0.8 else ('moderate' if d > 0.5 else 'weak'),
+                    'gp_scores': gp_s,
+                    'noise_scores': noise_s,
+                }
+
+    return out
+
+
+def _get_cka_layers_from_results(cka_results: dict) -> list[int]:
+    """Extract layer list from CKA result dict (checks 'layers' metadata key)."""
+    return cka_results.get('layers', [17])
 
 
 # ============================================================================
@@ -1970,7 +2184,7 @@ def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
         results[dataset_type] = dataset_results
 
     # --- Synthetic references ---
-    if prior_source in ('gp', 'both'):
+    if prior_source in ('gp', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
@@ -1978,7 +2192,7 @@ def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
             model, gp_bank, n_context,
         )
 
-    if prior_source in ('tabpfn_prior', 'both'):
+    if prior_source in ('tabpfn_prior', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )

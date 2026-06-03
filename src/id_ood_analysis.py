@@ -15,8 +15,8 @@ from typing import Any
 import numpy as np
 import yaml
 
-from analysis.id_ood import run_id_ood_analysis
-from analysis.id_ood import compute_procrustes_auc
+from analysis.id_ood import run_id_ood_analysis, compute_procrustes_auc
+from analysis.id_ood import compute_cohens_d_per_metric
 from analysis.id_ood_visualization import (
     plot_entropy_distribution, plot_entropy_heatmap,
     plot_mmd_heatmap, plot_mahalanobis_distribution,
@@ -28,6 +28,9 @@ from analysis.id_ood_visualization import (
     plot_procrustes_per_subject,
     plot_cross_distribution_disparity,
     plot_summary_dashboard,
+    plot_metric_consensus,
+    plot_synthetic_validation,
+    plot_id_ood_heterogeneity_heatmap,
 )
 
 
@@ -278,6 +281,21 @@ def main():
             procrustes_results=all_results.get('procrustes'),
             save=args.save, output_dir=output_dir,
         )
+
+    # B8/B9/B10 — Tier 1 consensus analyses (require ≥2 scalar metrics)
+    _tier1_metrics = [k for k in all_results
+                      if k in ('entropy', 'mmd', 'wasserstein',
+                               'mahalanobis', 'cka', 'rsa')]
+    if len(_tier1_metrics) >= 2:
+        plot_metric_consensus(all_results, save=args.save, output_dir=output_dir)
+        cohens_d = compute_cohens_d_per_metric(all_results)
+        if cohens_d:
+            plot_synthetic_validation(cohens_d, save=args.save,
+                                      output_dir=output_dir)
+        for dt in args.datasets:
+            plot_id_ood_heterogeneity_heatmap(
+                all_results, dt, save=args.save, output_dir=output_dir,
+            )
 
     print(f"\n[ID/OOD] Analysis complete. Tag: {exp_tag}")
 

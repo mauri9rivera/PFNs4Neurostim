@@ -35,6 +35,7 @@ from utils.data_utils import (
     create_run_dir, write_run_config,
     load_subject_result, save_subject_result,
 )
+from utils.surface_geometry import compute_gfs
 from utils.visualization import (
     r2_by_subject,
     regret_with_timing, regret_by_subject, regret_by_emg,
@@ -533,6 +534,12 @@ def evaluate_optimization(
                 'best_pred_val': float(snap_data['best_pred_val']),
             }
 
+    _valid_ch2xy = data['ch2xy'][_valid_site_mask(data, emg_idx)]
+    _grid_shape = data.get('grid_shape')
+    gfs_result: dict[float, float] | None = None
+    if _grid_shape is not None:
+        gfs_result = compute_gfs(y_pred_mean, y_test, _valid_ch2xy, _grid_shape)
+
     return {
         'model_type': type(surrogate).__name__,
         'times': mean_times,
@@ -540,6 +547,7 @@ def evaluate_optimization(
         'y_test': y_test,
         'r2': r2_scores,
         'y_pred': y_pred_mean,
+        'gfs': gfs_result,                        # dict[sigma→GFS] or None (A5)
         'dataset': dataset_type,
         'subject': subject_idx,
         'emg': emg_idx,
@@ -547,8 +555,8 @@ def evaluate_optimization(
         'perf_explore': perf_explore_arr,         # [n_reps, n_steps] or None
         'r2_by_snapshot': r2_by_snapshot or None, # dict[int, list[float]] or None
         'n_init': n_init,
-        'ch2xy': data['ch2xy'][_valid_site_mask(data, emg_idx)],
-        'grid_shape': data.get('grid_shape'),
+        'ch2xy': _valid_ch2xy,
+        'grid_shape': _grid_shape,
     }
 
 

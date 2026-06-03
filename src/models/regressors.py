@@ -262,9 +262,12 @@ class GPSurrogate:
             )
         query_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [M, D]
         with torch.no_grad():
-            posterior = self._likelihood(self._model(query_x))  # MultivariateNormal [M]
-            sample = posterior.rsample()                         # [M] — joint function draw
-        return sample.cpu().numpy()                              # [M]
+            # Sample from latent function posterior, not the noisy predictive distribution.
+            # self._likelihood(...) would add independent ε_i per point, breaking the
+            # inter-point correlations dictated by the kernel.
+            f_posterior = self._model(query_x)   # latent posterior N(μ, K) — [M]
+            sample = f_posterior.rsample()       # [M] — joint draw preserving kernel correlations
+        return sample.cpu().numpy()              # [M]
 
 
 # ---------------------------------------------------------------------------

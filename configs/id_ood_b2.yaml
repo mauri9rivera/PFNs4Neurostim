@@ -1,0 +1,16 @@
+# B2+B5 — MMD² + sliced Wasserstein-2
+# CPU job: pure-NumPy distance metrics on (X, y) feature vectors — no TabPFN inference.
+# Usage:
+#   JOB=B2 sbatch --gres='' --cpus-per-task=4 --mem=16G --time=4:00:00 scripts/run_all_experiments.sh
+
+family: id-ood-b2
+
+analyses:
+  - mmd
+  - wasserstein
+
+prior_source: tabpfn_prior
+device: cpu
+n_synthetic: 500
+seed: 42
+save: true
