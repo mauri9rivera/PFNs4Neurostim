@@ -33,12 +33,19 @@ if _SRC_DIR not in sys.path:
 from utils.data_utils import aggregate_results, load_results
 from utils.visualization import (
     r2_by_subject,
+    spearman_by_subject,
+    spearman_by_emg,
     regret_with_timing,
     regret_curve,
-    regret_by_subject,
+    regret_traces_by_subject,
     regret_by_emg,
     exploration_by_subject,
     exploration_by_emg,
+    plot_tost_forest,
+)
+from utils.stats import (
+    compute_equivalence_margin,
+    run_tost_on_results,
 )
 
 
@@ -293,12 +300,81 @@ def _load_combined_results_dict(
 # ============================================
 
 
+def _run_tost_analysis(
+    combined: Dict[str, list],
+    tost_margin: Optional[float],
+    dataset: str,
+    family: str,
+    out_subdir: str,
+) -> None:
+    """Compute and save TOST equivalence results for optimization runs.
+
+    If ``tost_margin`` is None, calibrates the margin from GP rep-to-rep
+    variance and prints it so the user can pre-register it in the YAML config.
+
+    Args:
+        combined: ``{'GP': [...], 'TabPFN': [...], ...}`` results_dict.
+        tost_margin: Pre-registered Δ or None (auto-calibrate from GP).
+        dataset: Dataset label for plot titles and filenames.
+        family: Experiment family label.
+        out_subdir: Output directory for CSVs and SVGs.
+    """
+    gp_key = 'GP'
+    if gp_key not in combined:
+        print("  [TOST] No 'GP' key in combined results — skipping TOST.")
+        return
+
+    tabpfn_keys = [k for k in combined if k != gp_key]
+    if not tabpfn_keys:
+        print("  [TOST] No TabPFN key found — skipping TOST.")
+        return
+
+    if tost_margin is None:
+        try:
+            tost_margin = compute_equivalence_margin(
+                combined[gp_key], metric='final_regret'
+            )
+            print(
+                f"  [TOST] Auto-calibrated margin from GP variance: Δ = {tost_margin:.4f}. "
+                f"Add 'tost_margin: {tost_margin:.4f}' to your YAML config to pre-register."
+            )
+        except ValueError as exc:
+            print(f"  [TOST] Could not calibrate margin: {exc}")
+            return
+
+    tag_label = f"{dataset}_{family}_aggregated"
+    try:
+        tost_df = run_tost_on_results(
+            combined, margin=tost_margin, gp_key=gp_key
+        )
+        if tost_df.empty:
+            print("  [TOST] No matched experiments found.")
+            return
+
+        csv_path = os.path.join(out_subdir, f'tost_{tag_label}.csv')
+        tost_df.to_csv(csv_path, index=False)
+        print(f"  [TOST] Saved table -> {csv_path} ({len(tost_df)} rows)")
+
+        plot_tost_forest(
+            tost_df,
+            margin=tost_margin,
+            dataset=dataset,
+            split_type=f"{family}_aggregated",
+            save=True,
+            output_dir=out_subdir,
+        )
+    except Exception as exc:
+        print(f"  [TOST] Analysis failed: {exc}")
+
+
 def run_aggregation(
     config_path: str,
     result_types: Optional[List[str]] = None,
     runs_dir: str = './output/runs',
     output_dir: str = './output/aggregated',
     tags: Optional[List[str]] = None,
+    tost_margin: Optional[float] = None,
+    run_tost: bool = False,
 ) -> None:
     """Run full aggregation pipeline for a canonical YAML config.
 
@@ -308,6 +384,11 @@ def run_aggregation(
             key when ``None``.
         runs_dir: Root directory containing per-run subdirectories.
         output_dir: Root directory for aggregated output.
+        tags: Optional list of 5-char hash suffixes to restrict loading.
+        tost_margin: Pre-registered equivalence margin Δ for TOST.  Overrides
+            any ``tost_margin`` key in the YAML config.  If both are None and
+            ``run_tost`` is True, margin is auto-calibrated from GP variance.
+        run_tost: If True, run TOST equivalence analysis on optimization runs.
     """
     cfg = _load_yaml_config(config_path)
 
@@ -319,6 +400,12 @@ def run_aggregation(
         )
 
     datasets = _extract_datasets(cfg)
+
+    # Read tost_margin from YAML if not overridden by caller
+    if tost_margin is None:
+        tost_margin = cfg.get('tost_margin', None)
+        if tost_margin is not None:
+            tost_margin = float(tost_margin)
 
     if result_types is None:
         result_types = _infer_result_types(cfg)
@@ -397,7 +484,15 @@ def run_aggregation(
                                 combined, split_type=tag_label,
                                 save=True, output_dir=out_subdir,
                             )
-                            regret_by_subject(
+                            spearman_by_subject(
+                                combined, split_type=tag_label,
+                                save=True, output_dir=out_subdir,
+                            )
+                            spearman_by_emg(
+                                combined, split_type=tag_label,
+                                save=True, output_dir=out_subdir,
+                            )
+                            regret_traces_by_subject(
                                 combined, split_type=tag_label,
                                 save=True, output_dir=out_subdir,
                             )
@@ -413,6 +508,14 @@ def run_aggregation(
                                 combined, split_type=tag_label,
                                 save=True, output_dir=out_subdir,
                             )
+                            if run_tost:
+                                _run_tost_analysis(
+                                    combined,
+                                    tost_margin=tost_margin,
+                                    dataset=dataset,
+                                    family=family,
+                                    out_subdir=out_subdir,
+                                )
                     except Exception as exc:
                         print(f"  [WARNING] Plot generation failed: {exc}")
 
@@ -470,6 +573,17 @@ def main() -> None:
              'Default: aggregate all runs matching the family prefix.',
     )
     parser.add_argument(
+        '--tost', action='store_true', default=False,
+        help='Run TOST equivalence analysis on optimization runs (A6).\n'
+             'Requires GP and TabPFN results. Margin from --tost_margin or YAML\n'
+             "tost_margin key; auto-calibrated from GP variance when both are null.",
+    )
+    parser.add_argument(
+        '--tost_margin', type=float, default=None,
+        metavar='DELTA',
+        help='Pre-registered equivalence margin Δ for TOST. Overrides YAML tost_margin.',
+    )
+    parser.add_argument(
         '--cluster-diag', action='store_true', default=False,
         dest='cluster_diag',
         help='Print HPC efficiency summary at job end (walltime, RAM, grade, warnings). '
@@ -496,6 +610,8 @@ def main() -> None:
             runs_dir=args.runs_dir,
             output_dir=args.output_dir,
             tags=args.tags,
+            tost_margin=args.tost_margin,
+            run_tost=args.tost,
         )
         _diag.record_experiment(n_completed=1)
 

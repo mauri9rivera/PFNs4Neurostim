@@ -44,11 +44,13 @@ from utils.data_utils import (
 )
 from utils.visualization import (
     r2_by_subject,
-    regret_with_timing, regret_by_subject, regret_by_emg,
+    spearman_by_subject, spearman_by_emg,
+    regret_with_timing, regret_traces_by_subject, regret_by_emg,
     exploration_by_subject, exploration_by_emg,
     augmentation_sweep_plot,
     visualize_representation, show_emg_map,
     plot_gradient_metrics, plot_weight_metrics, plot_cka_similarity,
+    plot_gradient_share,
 )
 
 
@@ -59,7 +61,8 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=100, lr=1e-4,
                     use_lora=False, lora_rank=8, lora_alpha=16,
                     lora_target='decoder_dict', grad_clip=None,
                     n_estimators_finetune=8,
-                    aug_transforms: tuple | None = None):
+                    aug_transforms: tuple | None = None,
+                    loss_weights: dict[str, float] | None = None):
     """
     Fine-tune a TabPFNRegressor on augmented neurostimulation data.
 
@@ -88,6 +91,15 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=100, lr=1e-4,
             prevents the deepcopy-triggered CUDA illegal memory access.
         aug_transforms: tuple of transform names to sample from per augmented map;
             None defaults to ('none',) — noise only, no spatial transforms.
+        loss_weights: optional dict overriding the TabPFN finetuning objective
+            term weights. Recognised keys: ``ce_loss_weight`` (bar-distribution
+            NLL), ``crps_loss_weight`` (CRPS), ``crls_loss_weight`` (CRLS),
+            ``mse_loss_weight`` / ``mae_loss_weight`` (auxiliary point losses on
+            the decoded mean). ``None`` (default) keeps TabPFN's built-in defaults
+            (CRPS + auxiliary MSE, both weight 1.0). E.g. ``{'crps_loss_weight':
+            1.0, 'mse_loss_weight': 0.0}`` finetunes on pure CRPS;
+            ``{'ce_loss_weight': 1.0, 'crps_loss_weight': 0.0, 'mse_loss_weight':
+            0.0}`` finetunes on pure bar-distribution NLL.
 
     Returns:
         (ft_model_raw, ft_model) tuple:
@@ -121,7 +133,10 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=100, lr=1e-4,
         n_estimators_finetune=n_estimators_finetune,
         n_estimators_validation=n_estimators_finetune,
         n_estimators_final_inference=n_estimators_finetune,
+        **(loss_weights or {}),
     )
+    if loss_weights:
+        print(f"  [loss] objective overrides: {loss_weights}")
 
     print("Fine-tuning ...")
     ft_model_raw.fit(X_train, y_train)
@@ -159,6 +174,7 @@ def finetune_tabpfn(dataset_type, device='cuda', epochs=100, lr=1e-4,
         plot_gradient_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
         plot_weight_metrics(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
         plot_cka_similarity(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
+        plot_gradient_share(ft_model_raw._diagnostics_, save=True, output_dir=diag_dir)
         if diag_dir:
             with open(os.path.join(diag_dir, "diagnostics.pkl"), "wb") as _f:
                 pickle.dump(ft_model_raw._diagnostics_, _f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -235,6 +251,7 @@ def run_experiment(
     aug_transforms: tuple | None = None,
     acq_fn: str = 'ucb',
     ts_temperature: float = 1.0,
+    loss_weights: dict[str, float] | None = None,
 ):
     """
     Unified entry point for transfer learning evaluation.
@@ -275,6 +292,10 @@ def run_experiment(
         ts_temperature: Temperature for TabPFN bar-distribution TS sampling.
             ``1.0`` (default) = exact distribution; ``<1.0`` = sharper/greedier;
             ``>1.0`` = more uniform/exploratory.  Only used when ``acq_fn='ts'``.
+        loss_weights: optional dict of TabPFN finetuning objective weights
+            (``ce_loss_weight`` / ``crps_loss_weight`` / ``crls_loss_weight`` /
+            ``mse_loss_weight`` / ``mae_loss_weight``). Forwarded to
+            :func:`finetune_tabpfn`; ``None`` keeps TabPFN's CRPS+MSE default.
 
     Returns:
         dict keyed by mode name, each value being the result of that mode
@@ -441,6 +462,7 @@ def run_experiment(
             grad_clip=grad_clip,
             n_estimators_finetune=n_estimators_finetune,
             aug_transforms=aug_transforms,
+            loss_weights=loss_weights,
         )
 
     # --- Run each requested mode ---
@@ -517,8 +539,10 @@ def run_experiment(
 
             results_dict = {'GP': results_gp, 'TabPFN': results_ft}
             r2_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
+            spearman_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
+            spearman_by_emg(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_with_timing(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
-            regret_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
+            regret_traces_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             regret_by_emg(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             exploration_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
             exploration_by_emg(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
@@ -600,7 +624,7 @@ def run_finetuning():
     parser.add_argument('--config', type=str, default=None, metavar='PATH',
                         help='Path to a YAML config file.  All keys are used as defaults; '
                              'any CLI flag that is explicitly provided overrides the YAML value.')
-    parser.add_argument('--dataset', type=str, default=None, choices=['rat', 'nhp', 'spinal'],
+    parser.add_argument('--dataset', type=str, default=None, choices=['rat', 'nhp', 'spinal', '5d_rat'],
                         help='Dataset type (default: nhp)')
     parser.add_argument('--split', type=str, default='inter_subject',
                         choices=['inter_subject', 'intra_emg'],
@@ -665,6 +689,18 @@ def run_finetuning():
                         help='Temperature for TabPFN bar-distribution sampling in TS mode.\n'
                              '  1.0 (default) = exact predictive distribution;\n'
                              '  <1.0 = sharper/greedier; >1.0 = more uniform/exploratory.')
+    parser.add_argument('--ce_loss_weight', type=float, default=None,
+                        help='Finetuning objective: weight on the bar-distribution NLL term. '
+                             'TabPFN default 0.0. E.g. set 1.0 (with others 0) for pure NLL.')
+    parser.add_argument('--crps_loss_weight', type=float, default=None,
+                        help='Finetuning objective: weight on the CRPS term. TabPFN default 1.0.')
+    parser.add_argument('--crls_loss_weight', type=float, default=None,
+                        help='Finetuning objective: weight on the CRLS term. TabPFN default 0.0.')
+    parser.add_argument('--mse_loss_weight', type=float, default=None,
+                        help='Finetuning objective: weight on the auxiliary MSE term (decoded '
+                             'mean). TabPFN default 1.0. Set 0.0 to finetune without MSE.')
+    parser.add_argument('--mae_loss_weight', type=float, default=None,
+                        help='Finetuning objective: weight on the auxiliary MAE term. TabPFN default 0.0.')
     parser.add_argument('--diagnostics', action='store_true', default=False,
                         help='Enable gradient/CKA monitoring via GradientMonitoredRegressor '
                              '(slower finetuning, higher memory). Off by default.')
@@ -745,6 +781,18 @@ def run_finetuning():
         if getattr(args, key, None) is None:
             setattr(args, key, default)
 
+    # Assemble finetuning loss-objective overrides. Only flags the user set (or
+    # the YAML provided) are kept; absent entries are dropped so TabPFN keeps
+    # its built-in defaults (CRPS + auxiliary MSE, both weight 1.0).
+    _loss_weight_keys = (
+        'ce_loss_weight', 'crps_loss_weight', 'crls_loss_weight',
+        'mse_loss_weight', 'mae_loss_weight',
+    )
+    loss_weights = {
+        k: float(getattr(args, k)) for k in _loss_weight_keys
+        if getattr(args, k, None) is not None
+    } or None
+
     # Activate cluster diagnostics via env var even when flag not passed
     import os as _os
     if not args.cluster_diag and _os.environ.get('CLUSTER_DIAG', '0') == '1':
@@ -807,6 +855,7 @@ def run_finetuning():
                     aug_transforms=tuple(args.aug_transforms) if args.aug_transforms else None,
                     acq_fn=args.acq_fn,
                     ts_temperature=args.ts_temperature,
+                    loss_weights=loss_weights,
                 )
                 _diag.record_experiment(n_completed=1)
 
@@ -833,6 +882,7 @@ def run_finetuning():
             lora_target=args.lora_target,
             grad_clip=args.grad_clip,
             n_estimators_finetune=args.n_estimators if args.n_estimators is not None else 8,
+            loss_weights=loss_weights,
         )
 
 

@@ -61,7 +61,7 @@ def _standalone_load_yaml_config(path: str) -> dict:
 
 @pytest.fixture
 def base_config() -> dict:
-    return {"epochs": 50, "lr": 1e-5, "n_augmentations": 25}
+    return {"epochs": 100, "lr": 1e-4, "aug_pct": 2.5}
 
 
 @pytest.fixture
@@ -234,7 +234,7 @@ _FINETUNING_CONFIGS = [
 ]
 
 _FINETUNING_REQUIRED_KEYS = {
-    "dataset", "mode", "epochs", "lr", "n_augmentations", "budget", "n_reps",
+    "dataset", "mode", "epochs", "lr", "aug_pct", "budget", "n_reps",
 }
 
 _ID_OOD_CONFIGS = [

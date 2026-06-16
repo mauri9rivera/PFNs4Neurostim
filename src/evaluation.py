@@ -34,11 +34,12 @@ from utils.data_utils import (
     generate_experiment_tag, save_results,
     create_run_dir, write_run_config,
     load_subject_result, save_subject_result,
+    _safe_spearman,
 )
 from utils.surface_geometry import compute_gfs
 from utils.visualization import (
     r2_by_subject,
-    regret_with_timing, regret_by_subject, regret_by_emg,
+    regret_with_timing, regret_by_emg,
     budget_sweep_plot, augmentation_sweep_plot,
     visualize_representation, show_emg_map,
     plot_gradient_metrics, plot_weight_metrics, plot_cka_similarity,
@@ -317,6 +318,7 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
     mean_times_all: list[list[float]] = []
     values_all: list[list[float]] = []
     r2_scores: list[float] = []
+    spearman_scores: list[float] = []
     y_preds_all: list[np.ndarray] = []
     perf_explore_all: list[list[float]] = []
 
@@ -346,6 +348,7 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
         y_pred = np.asarray(loop_result['y_pred'])  # [M]
         r2 = r2_score(y_test, y_pred)
         r2_scores.append(float(r2))
+        spearman_scores.append(_safe_spearman(y_test, y_pred))
         y_preds_all.append(y_pred)
 
     mean_times = np.mean(np.array(mean_times_all), axis=0)  # [budget - n_init]
@@ -370,6 +373,7 @@ def finetuned_optimization(dataset, subject_idx, emg_idx, model,
         'values': values_all,
         'y_test': y_test,
         'r2': r2_scores,
+        'spearman': spearman_scores,             # per-rep rank-correlation fit
         'y_pred': y_pred_mean,
         'dataset': dataset,
         'subject': subject_idx,
@@ -471,6 +475,7 @@ def evaluate_optimization(
     mean_times_all: list[list[float]] = []
     values_all: list[list[float]] = []
     r2_scores: list[float] = []
+    spearman_scores: list[float] = []
     y_preds_all: list[np.ndarray] = []
     perf_explore_all: list[list[float]] = []
     collected_snapshots: dict | None = None
@@ -516,6 +521,7 @@ def evaluate_optimization(
 
         r2 = r2_score(y_test, y_pred)            # both standardized
         r2_scores.append(float(r2))
+        spearman_scores.append(_safe_spearman(y_test, y_pred))
         y_preds_all.append(y_pred)
 
     mean_times = np.mean(np.array(mean_times_all), axis=0)  # [budget - n_init]
@@ -546,6 +552,7 @@ def evaluate_optimization(
         'values': values_all,
         'y_test': y_test,
         'r2': r2_scores,
+        'spearman': spearman_scores,              # per-rep rank-correlation fit
         'y_pred': y_pred_mean,
         'gfs': gfs_result,                        # dict[sigma→GFS] or None (A5)
         'dataset': dataset_type,
@@ -808,6 +815,7 @@ def finetuned_percentage(
     lora_target: str = 'decoder_dict',
     grad_clip: float | None = None,
     n_estimators_finetune: int = 8,
+    loss_weights: dict[str, float] | None = None,
 ):
     """
     Ablation study: evaluate BO performance (R² + regret) across augmentation percentages.
@@ -849,6 +857,10 @@ def finetuned_percentage(
         lora_rank: rank of LoRA low-rank matrices (default 8).
         lora_alpha: LoRA scaling factor (default 16).
         lora_target: which layers to apply LoRA to (default 'decoder_dict').
+        loss_weights: optional dict overriding the TabPFN finetuning objective
+            term weights (``ce_loss_weight`` / ``crps_loss_weight`` /
+            ``crls_loss_weight`` / ``mse_loss_weight`` / ``mae_loss_weight``).
+            Forwarded to ``_make_finetuned_regressor`` at every sweep point.
 
     Returns:
         DataFrame with columns: aug_pct, R2, Regret, ID, Subject
@@ -862,6 +874,9 @@ def finetuned_percentage(
 
     if subjects_mode not in ('held_out', 'all'):
         raise ValueError(f"subjects_mode must be 'held_out' or 'all', got {subjects_mode!r}")
+
+    if loss_weights:
+        print(f"  [loss] objective overrides: {loss_weights}")
 
     if split_type == 'intra_emg' and held_out_emg_idx is None:
         raise ValueError("held_out_emg_idx must be set when split_type='intra_emg'")
@@ -1134,6 +1149,7 @@ def finetuned_percentage(
                     n_estimators_finetune=n_estimators_finetune,
                     n_estimators_validation=n_estimators_finetune,
                     n_estimators_final_inference=n_estimators_finetune,
+                    **(loss_weights or {}),
                 )
                 ft_model_raw.fit(X_ft, y_ft)
                 if hasattr(ft_model_raw, '_diagnostics_') and ft_model_raw._diagnostics_:

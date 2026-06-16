@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import numpy as np
 import scipy.io
+from scipy.stats import spearmanr
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import pickle
 import os
@@ -15,6 +16,28 @@ import seaborn as sns
 import math
 from typing import Any, Dict, List, Optional
 import pandas as pd
+
+
+def _safe_spearman(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Rank-correlation fit metric, robust to near-flat targets.
+
+    Spearman's ρ measures monotonic agreement between predicted and true
+    responses by rank, so unlike R² it does not blow up when the response
+    variance (and thus the R² denominator) collapses on non-responsive EMG
+    channels — exactly the case that makes spinal R² explode to large
+    negatives. Bounded in ``[-1, 1]`` and aligned with what the EMG-map
+    argmax/ranking actually shows.
+
+    Args:
+        y_true: Ground-truth responses, shape ``[M]``.
+        y_pred: Predicted responses, shape ``[M]``.
+
+    Returns:
+        Spearman ρ as a float, or ``nan`` if it is undefined (e.g. a constant
+        input, where rank correlation has zero variance).
+    """
+    rho = spearmanr(y_true, y_pred).statistic
+    return float(rho) if np.isfinite(rho) else float('nan')
 
 
 # ============================================
@@ -43,6 +66,36 @@ def _topographic_metadata(ch2xy: np.ndarray, maps: np.ndarray) -> tuple:
     grid_shape = (int(maps.shape[0]), int(maps.shape[1]))
     ch2xy_int = np.rint(ch2xy).astype(np.int64)  # [nChan_real, 2]
     return ch2xy_int, grid_shape
+
+
+def _sort_valid_5drat_reps(resp: np.ndarray) -> np.ndarray:
+    """Flag outlier repetitions for the 5-D rat dataset.
+
+    For each (condition, EMG) pair, a repetition is valid if it is finite and
+    within 2 standard deviations of the per-pair mean across repetitions.
+    Mathematically equivalent to the reference ``sort_valid_5drats`` helper —
+    that implementation re-buckets responses through a ``dim_sizes``-derived
+    grid before applying the same per-condition threshold, but since each row
+    of ``stim_combinations`` is unique, the bucketing is an identity remap and
+    can be skipped entirely.
+
+    Args:
+        resp: Per-repetition responses, shape ``[n_cond, n_emgs, n_reps]``.
+
+    Returns:
+        Binary validity mask, shape ``[n_cond, n_emgs, n_reps]``, dtype int64.
+    """
+    mean = np.nanmean(resp, axis=-1, keepdims=True)  # [n_cond, n_emgs, 1]
+    std = np.nanstd(resp, axis=-1, keepdims=True)  # [n_cond, n_emgs, 1]
+    valid = (~np.isnan(resp)) & (np.abs(resp - mean) <= 2 * std)  # [n_cond, n_emgs, n_reps]
+    sorted_isvalid = valid.astype(np.int64)
+
+    all_invalid = ~sorted_isvalid.any(axis=-1)  # [n_cond, n_emgs]
+    n_all_invalid = int(all_invalid.sum())
+    if n_all_invalid > 0:
+        print(f"[_sort_valid_5drat_reps] {n_all_invalid} (condition, EMG) pairs have all repetitions flagged invalid.")
+
+    return sorted_isvalid
 
 
 def load_data(dataset_type, m_i):
@@ -339,6 +392,63 @@ def load_data(dataset_type, m_i):
         }
 
         return subject
+    elif dataset_type == '5d_rat':
+        # 5-D rat motor-cortex stimulation: search space is
+        # (pulse-width, frequency, duration, x-channel, y-channel) — no 2D
+        # electrode grid, so ch2xy holds raw physical coordinates and
+        # grid_shape is None.
+        # Each entry: (filename, emgs_raw, valid_emg_idx). `emgs_raw` lists EMG
+        # channels in the order documented by each subject's README (rCer1.12/
+        # 1.14/1.15: ECR, FCU, Biceps, Triceps, Deltoid). `valid_emg_idx` selects
+        # the channels to keep — excludes channels flagged as artifact-prone in
+        # the README (e.g. rCer1.15 drops Triceps/Deltoid) or undocumented
+        # (BCI00's 5th "unknown" channel). rCer1.14 keeps all 5 despite the
+        # README's blanket recommendation, per user override.
+        subject_map = {
+            0: ('rData03_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left triceps', 'left pectoralis'], [1]),
+            1: ('rCer1.5_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left triceps', 'left biceps'], [0]),
+            2: ('BCI00_5D.mat', ['left extensor carpi radialis', 'biceps', 'triceps', 'left flexor carpi ulnaris', 'unknown'], [0, 1, 2, 3]),
+            3: ('rCer1.12_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left biceps', 'left triceps', 'deltoid'], [0, 1, 3, 4]),
+            4: ('rCer1.14_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left biceps', 'left triceps', 'deltoid'], [0, 1, 2, 3, 4]),
+            5: ('rCer1.15_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left biceps', 'left triceps', 'deltoid'], [0, 1, 2]),
+            # Subject 6: placeholder, intentionally excluded from ALL_SUBJECTS.
+            6: ('5D_step4_noartrej.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left biceps', 'left triceps', 'deltoid'], [0, 1, 2, 3, 4]),
+        }
+        filename, emgs_raw, valid_emg_idx = subject_map[m_i]
+        data = scipy.io.loadmat(f'{path_to_dataset}/5d_rat/{filename}')
+
+        resp = data['emg_response']  # [8 reps, n_emgs_raw, n_cond, 4 metrics]
+        resp = resp[:, valid_emg_idx, :, :]  # [8 reps, n_emgs, n_cond, 4 metrics]
+        emgs = [emgs_raw[i] for i in valid_emg_idx]
+        param = data['stim_combinations']  # [n_cond, 7] = [PW, freq, dur, count, chan, x_ch, y_ch]
+
+        # [PW, freq, duration, x_ch, y_ch] in raw physical units.
+        ch2xy = param[:, [0, 1, 2, 5, 6]].astype(np.float64)  # [n_cond, 5]
+
+        peak_resp = resp[:, :, :, 0]  # [8 reps, n_emgs, n_cond] — peak-EMG metric
+        sorted_resp = peak_resp.transpose(2, 1, 0)  # [n_cond, n_emgs, n_reps]
+
+        sorted_isvalid = _sort_valid_5drat_reps(sorted_resp)
+
+        masked_resp = np.ma.masked_where(sorted_isvalid == 0, sorted_resp)
+        sorted_respMean = masked_resp.mean(axis=-1)
+        sorted_respSD = masked_resp.std(axis=-1)
+        sorted_respSD = np.ma.filled(sorted_respSD, fill_value=0.0)
+        sorted_respMean = np.ma.filled(sorted_respMean, fill_value=0.0)
+
+        n_cond = sorted_resp.shape[0]
+
+        return {
+            'emgs': emgs,
+            'nChan': n_cond,
+            'sorted_isvalid': sorted_isvalid,
+            'sorted_resp': sorted_resp,
+            'sorted_respMean': sorted_respMean,
+            'sorted_respSD': sorted_respSD,
+            'ch2xy': ch2xy,
+            'grid_shape': None,
+            'DimSearchSpace': n_cond,
+        }
     else:
         raise ValueError('The dataset type should be 5d_rat, nhp, rat or spinal' )
 
@@ -347,9 +457,11 @@ def load_data(dataset_type, m_i):
 #      Held-Out / Train Subject Splits
 # ============================================
 
-HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [1], 'spinal': [0, 2, 5, 9]}
-TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 3], 'spinal': [1, 3, 4, 6, 7, 8, 10]}
-ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 3], 'spinal': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}
+# 5d_rat: TRAIN = rData03, BCI00, rCer1.12 (0, 2, 3); HELD_OUT = rCer1.5, rCer1.14,
+# rCer1.15 (1, 4, 5). Subject 6 (5D_step4_noartrej) remains a placeholder, excluded.
+HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [1], 'spinal': [0, 2, 5, 9], '5d_rat': [1, 4, 5]}
+TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 3], 'spinal': [1, 3, 4, 6, 7, 8, 10], '5d_rat': [0, 2, 3]}
+ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 3], 'spinal': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], '5d_rat': [0, 1, 2, 3, 4, 5]}
 
 
 def generate_experiment_tag(
@@ -580,7 +692,8 @@ def _apply_aug_transform(
     simulating inter-session DC offset without altering electrode ordering.
 
     Args:
-        X: MinMax-scaled electrode coordinates, shape [N, 2]
+        X: MinMax-scaled coordinates, shape [N, D]. For the 2D coordinate
+            transforms (``h_flip``, ``v_flip``, ``d_flip``), D must be 2
             (column 0 = row, column 1 = col), values in [0, 1].
         y: StandardScaler-normalised response values, shape [N].
         transform: One of ``'none'``, ``'h_flip'``, ``'v_flip'``,
@@ -592,18 +705,26 @@ def _apply_aug_transform(
         Tuple ``(X_out, y_out)`` with the same shapes as the inputs.
 
     Raises:
-        ValueError: If ``transform`` is not in :data:`_AUG_TRANSFORMS`.
+        ValueError: If ``transform`` is not in :data:`_AUG_TRANSFORMS`, or if
+            a 2D-only coordinate transform (``h_flip``, ``v_flip``,
+            ``d_flip``) is requested for a non-2D search space (e.g. the
+            5-D rat dataset).
     """
     if transform == 'none':
         return X, y
-    if transform == 'h_flip':                   # left-right mirror
-        X = X.copy(); X[:, 1] = 1.0 - X[:, 1]
-        return X, y
-    if transform == 'v_flip':                   # top-bottom mirror
-        X = X.copy(); X[:, 0] = 1.0 - X[:, 0]
-        return X, y
-    if transform == 'd_flip':                   # diagonal / transpose
-        return X[:, [1, 0]], y
+    if transform in ('h_flip', 'v_flip', 'd_flip'):
+        if X.shape[1] != 2:
+            raise ValueError(
+                f"Aug transform {transform!r} is 2D-only (assumes a 2D "
+                f"electrode grid), but X has {X.shape[1]} dimensions."
+            )
+        if transform == 'h_flip':                   # left-right mirror
+            X = X.copy(); X[:, 1] = 1.0 - X[:, 1]
+            return X, y
+        if transform == 'v_flip':                   # top-bottom mirror
+            X = X.copy(); X[:, 0] = 1.0 - X[:, 0]
+            return X, y
+        return X[:, [1, 0]], y                       # d_flip: diagonal / transpose
     if transform == 'y_shift':                  # global baseline shift
         beta = rng.randn() * 0.15               # β ~ N(0, 0.15) in standardised space
         return X, y + beta
@@ -657,7 +778,7 @@ def augment_maps(
 
     rng = np.random.RandomState(seed)
 
-    coords = subject_data['ch2xy']                            # [nChan, 2]
+    coords = subject_data['ch2xy']                            # [nChan, D]
     mean_map = subject_data['sorted_respMean'][:, emg_idx]   # [nChan]
     std_map = subject_data['sorted_respSD'][:, emg_idx]      # [nChan]
 
@@ -672,7 +793,7 @@ def augment_maps(
         std_map = std_map[valid_site_mask]
 
     scaler_x = MinMaxScaler()
-    X_base = scaler_x.fit_transform(coords)                  # [N, 2]
+    X_base = scaler_x.fit_transform(coords)                  # [N_valid, D]
 
     scaler_y = StandardScaler()
     scaler_y.fit(mean_map.reshape(-1, 1))
@@ -707,7 +828,7 @@ def plot_augmented_maps(
     Args:
         subject_data: Dict returned by :func:`load_data`.
         emg_idx: Which EMG channel to visualize.
-        dataset_type: E.g. ``'nhp'`` or ``'rat'`` (used in title only).
+        dataset_type: E.g. ``'nhp'``, ``'rat'``, or ``'5d_rat'`` (used in title only).
         subj_idx: Subject index (used in title only).
         n_show: Number of augmented maps to display (default 6).
         aug_pct: Augmentation percentage; 1.0 = 100% = 10 maps/EMG.
@@ -720,8 +841,12 @@ def plot_augmented_maps(
 
     from utils.visualization import _to_grid  # local import to avoid cycle
 
+    if subject_data.get('grid_shape') is None:
+        print(f"[plot_augmented_maps] No 2D grid_shape for {dataset_type} (e.g. 5D dataset) — skipping.")
+        return
+
     mean_map_full = subject_data['sorted_respMean'][:, emg_idx]   # (nChan,)
-    grid_shape = subject_data.get('grid_shape', (1, len(mean_map_full)))
+    grid_shape = subject_data['grid_shape']
     ch2xy_full = subject_data['ch2xy']
 
     if 'sorted_isvalid' in subject_data:
@@ -825,7 +950,7 @@ def build_finetuning_dataset(
     ============  ================
 
     Args:
-        dataset_type: ``'rat'``, ``'nhp'``, or ``'spinal'``.
+        dataset_type: ``'rat'``, ``'nhp'``, ``'spinal'``, or ``'5d_rat'``.
         subject_indices: Subject indices to include in training.  Defaults to
             ``TRAIN_SUBJECTS[dataset_type]``.
         held_out_emg_idx: If set, this EMG index is excluded from all subjects
@@ -838,7 +963,7 @@ def build_finetuning_dataset(
 
     Returns:
         ``(X_all, y_all)`` — concatenated MinMax-scaled coordinates
-        ``[N, 2]`` and StandardScaler-normalised responses ``[N]``.
+        ``[N, D]`` and StandardScaler-normalised responses ``[N]``.
     """
     if subject_indices is None:
         subject_indices = TRAIN_SUBJECTS[dataset_type]
@@ -865,7 +990,7 @@ def build_finetuning_dataset(
                 X_parts.append(X)
                 y_parts.append(y)
 
-    X_all = np.concatenate(X_parts, axis=0)   # [N, 2]
+    X_all = np.concatenate(X_parts, axis=0)   # [N, D]
     y_all = np.concatenate(y_parts, axis=0)   # [N]
     return X_all, y_all
 
@@ -898,7 +1023,7 @@ def preprocess_neural_data(subject_data, emg_idx=0, normalization='pfn'):
             To recover raw EMG units, apply ``scaler_y.inverse_transform``.
         scaler_y: Fitted scaler used for Y_train (and Y_test).
     """
-    coords = subject_data['ch2xy']                              # [N, 2]
+    coords = subject_data['ch2xy']                              # [N, D]
     resp_all = subject_data['sorted_resp'][:, emg_idx, :].astype(np.float32).copy()  # [N, n_reps]
     resp_mean = subject_data['sorted_respMean'][:, emg_idx]     # [N]
 
@@ -1004,10 +1129,19 @@ def save_results(
                 'subject': res.get('subject', ''),
                 'emg': res.get('emg', ''),
                 'mean_r2': float(np.mean(r2_arr)),
+                'median_r2': float(np.median(r2_arr)),
                 'std_r2': float(np.std(r2_arr)),
                 'n_reps': len(r2_arr),
                 'mean_time_s': float(np.mean(res['times'])),
             }
+
+            # Rank-correlation fit metric (robust to flat/non-responsive
+            # channels where R² explodes). May be absent in legacy pkls.
+            spearman = res.get('spearman')
+            if spearman is not None:
+                sp_arr = np.asarray(spearman, dtype=float)
+                row['mean_spearman'] = float(np.nanmean(sp_arr))
+                row['median_spearman'] = float(np.nanmedian(sp_arr))
 
             if evaluation_type == 'optimization' and 'values' in res:
                 values = np.asarray(res['values'])
@@ -1068,7 +1202,7 @@ def aggregate_results(
     Args:
         family: Experiment family string, e.g. ``'vanilla-benchmark'`` or
             ``'optimization'``.
-        dataset: Dataset type — ``'rat'``, ``'nhp'``, or ``'spinal'``.
+        dataset: Dataset type — ``'rat'``, ``'nhp'``, ``'spinal'``, or ``'5d_rat'``.
         result_type: Which pkl type to load.  One of:
 
             * ``'optimization'`` — ``*_optimization.pkl`` files (dict[str, list[dict]])

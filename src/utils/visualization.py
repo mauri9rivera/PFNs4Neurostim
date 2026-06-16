@@ -6,6 +6,8 @@ import seaborn as sns
 import numpy as np
 import os
 
+from utils.data_utils import _safe_spearman
+
 # ============================================
 #           Visualization
 # ============================================
@@ -17,6 +19,23 @@ PALETTE = {
     'LoRA TabPFN': 'seagreen',
     'Full FT': 'royalblue',
 }
+
+
+def _canonical_model_label(model_type: str) -> str:
+    """Map a raw ``model_type`` to a canonical PALETTE key / display label.
+
+    Result dicts store lowercase model identifiers (e.g. ``'gp'``,
+    ``'vanilla_tabpfn'``, ``'finetuned_tabpfn'``). This maps any GP-derived
+    type to ``'GP'`` (orange) and everything else to ``'TabPFN'`` (green) so
+    GFS plots match the colour legend used by the rest of the figures.
+
+    Args:
+        model_type: Raw model identifier from a result dict.
+
+    Returns:
+        ``'GP'`` if the identifier denotes a Gaussian Process, else ``'TabPFN'``.
+    """
+    return 'GP' if 'gp' in model_type.lower() else 'TabPFN'
 
 
 def _to_grid(values: np.ndarray, ch2xy: np.ndarray, grid_shape: tuple) -> np.ndarray:
@@ -309,6 +328,9 @@ def visualize_representation(results_dict, mode='', save=False, output_dir=None)
     y_test = np.asarray(ref_res['y_test'])
     ch2xy = ref_res['ch2xy']
     grid_shape = ref_res['grid_shape']
+    if grid_shape is None:
+        print("[visualize_representation] No 2D grid_shape (e.g. 5D dataset) — skipping.")
+        return
     v_min, v_max = float(y_test.min()), float(y_test.max())
 
     model_names = list(results_dict.keys())
@@ -428,6 +450,125 @@ def r2_by_subject(results_dict, split_type='', save=False, output_dir=None):
     plt.close()
 
 
+def _spearman_long_df(results_dict: dict, group_key: str, group_label: str) -> pd.DataFrame:
+    """Build a long-form Spearman ρ dataframe grouped by subject or EMG.
+
+    Prefers the per-rep ``res['spearman']`` list (gives a real 95% CI across
+    repetitions); falls back to a single ``_safe_spearman(y_test, y_pred)``
+    row when the key is absent (e.g. legacy runs predating per-rep storage).
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts.
+        group_key: result dict key to group by (``'subject'`` or ``'emg'``).
+        group_label: column name / label prefix for the group (``'S'`` or ``'EMG '``).
+
+    Returns:
+        Long-form DataFrame with columns matching ``group_label``'s stripped
+        name (``'Subject'`` or ``'EMG'``), ``'Spearman'``, and ``'Model'``.
+    """
+    column = 'Subject' if group_key == 'subject' else 'EMG'
+    data = []
+    for model_name, results_list in results_dict.items():
+        for res in results_list:
+            label = f"{group_label}{res[group_key]}"
+            spearman_list = res.get('spearman')
+            if spearman_list:
+                for rho in spearman_list:
+                    data.append({column: label, 'Spearman': float(rho), 'Model': model_name})
+            else:
+                rho = _safe_spearman(res['y_test'], res['y_pred'])
+                data.append({column: label, 'Spearman': float(rho), 'Model': model_name})
+    return pd.DataFrame(data)
+
+
+def _spearman_bar_plot(df: pd.DataFrame, x: str, title: str, plot_path: str, save: bool) -> None:
+    """Shared bar-plot renderer for :func:`spearman_by_subject` / :func:`spearman_by_emg`.
+
+    Args:
+        df: Long-form DataFrame with columns ``x``, ``'Spearman'``, ``'Model'``.
+        x: Column name to group by on the x-axis (``'Subject'`` or ``'EMG'``).
+        title: Plot title.
+        plot_path: Destination path for the saved SVG.
+        save: Whether to write the figure to disk.
+    """
+    n_groups = df[x].nunique()
+    plt.figure(figsize=(max(6, 1.8 * n_groups), 5))
+    sns.barplot(data=df, x=x, y='Spearman', hue='Model', palette=PALETTE,
+                errorbar=('ci', 95), capsize=0.1)
+    plt.ylim(min(-0.05, df['Spearman'].min()), 1.0)
+    plt.axhline(0, color='gray', linewidth=1, alpha=0.5)
+    plt.title(title)
+    plt.xlabel(x)
+    plt.ylabel("Spearman ρ (rank-fit, higher is better)")
+    plt.legend(title='Model')
+    plt.grid(True, alpha=0.3, axis='y')
+
+    if save:
+        plt.savefig(plot_path, format='svg')
+        print(f"Saved plot to {plot_path}")
+
+    plt.close()
+
+
+def spearman_by_subject(results_dict, split_type='', save=False, output_dir=None):
+    """Bar plot (mean ± 95% CI) of Spearman ρ grouped by subject, one bar per model.
+
+    Mirrors :func:`r2_by_subject` but for rank-correlation fit quality, which
+    stays well-behaved on near-flat (non-responsive) channels where R² blows
+    up to large negatives.
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts.
+        split_type: string suffix for the output filename.
+        save: whether to save the figure to disk.
+        output_dir: run directory (saves under optimization/).
+    """
+    output_subdir = 'optimization'
+    results_dict = _normalize_results_dict(results_dict)
+    df = _spearman_long_df(results_dict, group_key='subject', group_label='S')
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    base = os.path.join(output_dir, output_subdir) if output_dir else \
+           os.path.join('output', output_subdir, dataset)
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'spearman_by_subject{suffix}.svg')
+
+    _spearman_bar_plot(df, x='Subject', title="Spearman ρ by Subject",
+                       plot_path=plot_path, save=save)
+
+
+def spearman_by_emg(results_dict, split_type='', save=False, output_dir=None):
+    """Bar plot (mean ± 95% CI) of Spearman ρ grouped by EMG channel, one bar per model.
+
+    Mirrors :func:`r2_by_subject` but for rank-correlation fit quality, which
+    stays well-behaved on near-flat (non-responsive) channels where R² blows
+    up to large negatives — the relevant regime for identifying dead EMG
+    channels (e.g. spinal subjects).
+
+    Args:
+        results_dict: dict[str, list[dict]] — model name -> list of result dicts.
+        split_type: string suffix for the output filename.
+        save: whether to save the figure to disk.
+        output_dir: run directory (saves under optimization/).
+    """
+    output_subdir = 'optimization'
+    results_dict = _normalize_results_dict(results_dict)
+    df = _spearman_long_df(results_dict, group_key='emg', group_label='EMG ')
+
+    first_results = next(iter(results_dict.values()))
+    dataset = first_results[0].get('dataset', '')
+    base = os.path.join(output_dir, output_subdir) if output_dir else \
+           os.path.join('output', output_subdir, dataset)
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
+    plot_path = os.path.join(base, f'spearman_by_emg{suffix}.svg')
+
+    _spearman_bar_plot(df, x='EMG', title="Spearman ρ by EMG Channel",
+                       plot_path=plot_path, save=save)
+
+
 def _final_normalized_regret(res: dict) -> np.ndarray:
     """Compute per-rep final simple regret normalized by the response range.
 
@@ -450,7 +591,12 @@ def _final_normalized_regret(res: dict) -> np.ndarray:
 
 
 def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
-    """Box plot of final simple regret grouped by EMG index.
+    """Two-row figure of final simple regret grouped by EMG index.
+
+    Top row: box plot (outlier fliers retained — each hollow dot is one
+    repetition's final regret beyond the 1.5×IQR whiskers). Bottom row:
+    grouped bar chart of the mean with 95% bootstrap CI, mirroring the
+    multi-row layout of :func:`regret_with_timing`.
 
     Regret is normalized by the response range so values are comparable across
     EMG channels with different absolute magnitudes.
@@ -481,14 +627,35 @@ def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
 
     df = pd.DataFrame(data)
     n_emgs = df['EMG'].nunique()
-    plt.figure(figsize=(max(6, 1.8 * n_emgs), 5))
-    sns.boxplot(data=df, x='EMG', y='Normalized Regret', hue='Model', palette=PALETTE)
-    plt.ylim(bottom=0)
-    plt.title("Final Simple Regret by EMG Channel")
-    plt.xlabel("EMG")
-    plt.ylabel("Final Simple Regret\n(normalized by response range, lower is better)")
-    plt.legend(title='Model')
-    plt.grid(True, alpha=0.3, axis='y')
+    fig, axes = plt.subplots(
+        2, 1, figsize=(max(6, 1.8 * n_emgs), 9), sharex=True,
+    )
+    y_label = ("Final Simple Regret\n"
+               "(normalized by response range, lower is better)")
+
+    # Top: box plot (keep outlier fliers).
+    sns.boxplot(data=df, x='EMG', y='Normalized Regret', hue='Model',
+                palette=PALETTE, ax=axes[0])
+    axes[0].set_ylim(bottom=0)
+    axes[0].set_title("Final Simple Regret by EMG Channel")
+    axes[0].set_xlabel("")
+    axes[0].set_ylabel(y_label)
+    axes[0].legend(title='Model')
+    axes[0].grid(True, alpha=0.3, axis='y')
+
+    # Bottom: grouped bar (mean ± 95% bootstrap CI).
+    sns.barplot(data=df, x='EMG', y='Normalized Regret', hue='Model',
+                palette=PALETTE, errorbar=('ci', 95), capsize=0.1,
+                err_kws={'linewidth': 1.5}, ax=axes[1])
+    axes[1].set_ylim(bottom=0)
+    axes[1].set_title("Mean Final Simple Regret ± 95% CI")
+    axes[1].set_xlabel("EMG")
+    axes[1].set_ylabel(y_label)
+    if axes[1].get_legend() is not None:
+        axes[1].get_legend().remove()
+    axes[1].grid(True, alpha=0.3, axis='y')
+
+    fig.tight_layout()
 
     first_results = next(iter(results_dict.values()))
     dataset = first_results[0].get('dataset', '')
@@ -500,62 +667,6 @@ def regret_by_emg(results_dict, split_type='', save=False, output_dir=None):
     if save:
         plt.savefig(plot_path, format="svg")
         print(f"Saved plot to {plot_path}")
-
-    plt.close()
-
-
-def regret_by_subject(results_dict, split_type='', save=False, output_dir=None):
-    """Box plot of final simple regret grouped by subject index.
-
-    Regret is normalized by the response range so values are comparable across
-    subjects with different absolute magnitudes.
-
-    Args:
-        results_dict: dict[str, list[dict]] — model name -> list of result dicts
-                      (optimization mode; each result must have 'values' and 'y_test')
-        split_type: string suffix for the output filename
-        save: whether to save the figure to disk
-        output_dir: run-level directory (saves under optimization/)
-    """
-    results_dict = _normalize_results_dict(results_dict)
-
-    data = []
-    for model_name, results_list in results_dict.items():
-        for res in results_list:
-            if 'values' not in res:
-                continue
-            final_regrets = _final_normalized_regret(res)
-            for regret in final_regrets:
-                data.append({
-                    'Subject': f"S{res['subject']}",
-                    'Normalized Regret': float(regret),
-                    'Model': model_name,
-                })
-
-    if not data:
-        return
-
-    df = pd.DataFrame(data)
-    n_subjects = df['Subject'].nunique()
-    plt.figure(figsize=(max(6, 1.8 * n_subjects), 5))
-    sns.boxplot(data=df, x='Subject', y='Normalized Regret', hue='Model', palette=PALETTE)
-    plt.ylim(bottom=0)
-    plt.title('Final Simple Regret by Subject')
-    plt.xlabel('Subject')
-    plt.ylabel('Final Simple Regret\n(normalized by response range, lower is better)')
-    plt.legend(title='Model')
-    plt.grid(True, alpha=0.3, axis='y')
-
-    first_results = next(iter(results_dict.values()))
-    dataset = first_results[0].get('dataset', '')
-    base = os.path.join(output_dir, 'optimization') if output_dir else \
-           os.path.join('output', 'optimization')
-    os.makedirs(base, exist_ok=True)
-    suffix = f'_{dataset}_{split_type}' if split_type else f'_{dataset}'
-    plot_path = os.path.join(base, f'regret_by_subject{suffix}.svg')
-    if save:
-        plt.savefig(plot_path, format='svg')
-        print(f'Saved plot to {plot_path}')
 
     plt.close()
 
@@ -1467,6 +1578,8 @@ def regret_traces_by_subject(
         plt.savefig(plot_path, format='svg', bbox_inches='tight')
         print(f"Saved plot to {plot_path}")
 
+    plt.close()
+
 
 # ============================================================================
 #  GFS Visualization (A5 — Prediction Surface Geometry)
@@ -1508,8 +1621,7 @@ def plot_gfs_profile(
     df = pd.DataFrame(rows)
     model_types = df['model_type'].unique().tolist()
 
-    palette = {m: PALETTE.get('GP' if 'GP' in m else 'PFN', 'steelblue')
-               for m in model_types}
+    palette = {m: PALETTE[_canonical_model_label(m)] for m in model_types}
 
     fig, ax = plt.subplots(figsize=(7, 4))
     for mtype in model_types:
@@ -1520,7 +1632,7 @@ def plot_gfs_profile(
         stds = [grp.get_group(s).std() for s in sigmas]
         color = palette.get(mtype, 'gray')
         ax.plot(sigmas, means, marker='o', linewidth=1.8,
-                color=color, label=mtype)
+                color=color, label=_canonical_model_label(mtype))
         ax.fill_between(sigmas,
                         np.array(means) - np.array(stds),
                         np.array(means) + np.array(stds),
@@ -1549,6 +1661,309 @@ def plot_gfs_profile(
     plt.close()
 
 
+def plot_gradient_share(
+    diagnostics: list[dict],
+    save: bool = True,
+    output_dir: Optional[str] = None,
+) -> None:
+    """D1 — Gradient-share stacked bar chart: decoder vs attention vs other.
+
+    Shows what fraction of total gradient L2 norm each layer group absorbs at
+    each epoch.  The expected finding for decoder-targeted LoRA: ``decoder_dict``
+    accounts for the dominant share, validating the layer-targeting choice.
+
+    Derives entirely from the ``grad_norm`` key already stored in
+    ``_diagnostics_`` by :class:`GradientMonitoredRegressor` — no new forward/
+    backward pass required.  A text annotation on the final bar reports the
+    ``decoder_dict`` share at convergence.
+
+    Args:
+        diagnostics: Per-epoch diagnostic dicts from
+            ``GradientMonitoredRegressor._diagnostics_`` (or loaded via
+            ``finetuning.load_diagnostics()``).  Each entry must contain
+            ``'epoch'`` (int) and ``'grad_norm'`` (dict[str, float]).
+        save: If True, write ``gradient_share.svg`` to the diagnostics dir.
+        output_dir: Diagnostics directory (or project root fallback).
+    """
+    if not diagnostics:
+        return
+
+    epochs, layer_values = _extract_metric(diagnostics, 'grad_norm')
+    if not epochs or not layer_values:
+        return
+
+    # --- group layer names -------------------------------------------
+    def _group(name: str) -> str:
+        n = name.lower()
+        if 'decoder' in n:
+            return 'decoder_dict'
+        if 'transformer' in n or 'attention' in n or 'encoder' in n:
+            return 'transformer_encoder'
+        return 'other'
+
+    # Aggregate per-group per-epoch
+    group_epochs: list[int] = epochs
+    groups_per_epoch: list[dict[str, float]] = []
+    for ep_idx in range(len(epochs)):
+        grp: dict[str, float] = {}
+        for layer_name, values in layer_values.items():
+            if ep_idx >= len(values):
+                continue
+            g = _group(layer_name)
+            grp[g] = grp.get(g, 0.0) + values[ep_idx]
+        groups_per_epoch.append(grp)
+
+    if not groups_per_epoch:
+        return
+
+    all_groups = sorted({g for ep in groups_per_epoch for g in ep})
+    totals = [sum(ep.values()) for ep in groups_per_epoch]
+
+    # Convert to percentage shares
+    shares: dict[str, list[float]] = {g: [] for g in all_groups}
+    for ep_idx, ep in enumerate(groups_per_epoch):
+        tot = totals[ep_idx] if totals[ep_idx] > 0 else 1.0
+        for g in all_groups:
+            shares[g].append(ep.get(g, 0.0) / tot * 100.0)
+
+    # --- plot --------------------------------------------------------
+    group_colors = {
+        'decoder_dict': '#e07b39',         # orange
+        'transformer_encoder': '#4c8cbf',  # blue
+        'other': '#999999',                # gray
+    }
+
+    x = np.arange(len(group_epochs))
+    fig, ax = plt.subplots(figsize=(max(6, len(x) * 0.4 + 2), 4))
+
+    bottom = np.zeros(len(x))
+    for g in all_groups:
+        arr = np.array(shares[g])
+        color = group_colors.get(g, '#888888')
+        ax.bar(x, arr, bottom=bottom, color=color, label=g, alpha=0.88, width=0.75)
+        bottom += arr
+
+    # Annotate final epoch with decoder_dict share
+    final_dec = shares.get('decoder_dict', [0.0])[-1]
+    ax.text(
+        x[-1], 101.5,
+        f"decoder: {final_dec:.0f}%",
+        ha='center', va='bottom', fontsize=8,
+        color=group_colors['decoder_dict'],
+    )
+
+    ax.set_xlim(-0.6, len(x) - 0.4)
+    ax.set_ylim(0, 115)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(e) for e in group_epochs], fontsize=7)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Gradient Share (%)')
+    ax.set_title('D1 — Gradient Share per Layer Group')
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(True, alpha=0.25, axis='y')
+    fig.tight_layout()
+
+    base = _diag_save_dir(output_dir)
+    if save:
+        path = os.path.join(base, 'gradient_share.svg')
+        plt.savefig(path, format='svg', bbox_inches='tight')
+        print(f"Saved gradient share plot -> {path}")
+    plt.close()
+
+
+def plot_tost_forest(
+    tost_df: "pd.DataFrame",
+    margin: float,
+    dataset: str = '',
+    split_type: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """A6 — Forest plot of TOST 90% CIs vs the pre-registered equivalence bounds.
+
+    One row per (metric, label) in ``tost_df``.  The ``'All'`` aggregate row
+    is bolded.  A vertical dashed line at zero and two shaded bands at
+    ±margin mark the equivalence region.  Rows are colored green (equivalent)
+    or red (not equivalent) according to the TOST verdict.
+
+    Args:
+        tost_df: DataFrame from :func:`~utils.stats.run_tost_on_results`,
+            columns ``metric``, ``label``, ``mean_diff``, ``ci_lo``,
+            ``ci_hi``, ``equivalent``, ``margin``.
+        margin: Pre-registered equivalence margin Δ (same units as mean_diff).
+        dataset: Dataset label for the figure title and filename.
+        split_type: String suffix appended to the output filename.
+        save: If True, write SVG to ``<output_dir>/optimization/``.
+        output_dir: Run-level directory root.
+    """
+    if tost_df.empty:
+        print("[TOST] Empty DataFrame — skipping forest plot.")
+        return
+
+    metrics = tost_df['metric'].unique().tolist()
+    n_metrics = len(metrics)
+
+    fig, axes = plt.subplots(
+        1, n_metrics,
+        figsize=(6 * n_metrics, max(4, 0.45 * len(tost_df) // n_metrics + 2)),
+        squeeze=False,
+    )
+
+    for col, metric in enumerate(metrics):
+        ax = axes[0, col]
+        sub = tost_df[tost_df['metric'] == metric].copy()
+
+        # 'All' aggregate at top; alphabetical order for per-experiment rows
+        non_all = sub[sub['label'] != 'All'].sort_values('label', ascending=False)
+        all_row = sub[sub['label'] == 'All']
+        sub_ordered = pd.concat([all_row, non_all], ignore_index=True)
+
+        y_pos = np.arange(len(sub_ordered))
+
+        for i, row in sub_ordered.iterrows():
+            is_all = row['label'] == 'All'
+            color = '#2ca02c' if row['equivalent'] else '#d62728'
+            lw = 2.5 if is_all else 1.2
+            ms = 9 if is_all else 5
+
+            ci_lo = float(row['ci_lo'])
+            ci_hi = float(row['ci_hi'])
+            mean_d = float(row['mean_diff'])
+            y = float(y_pos[list(sub_ordered.index).index(i)])
+
+            ax.plot([ci_lo, ci_hi], [y, y], color=color, linewidth=lw)
+            ax.plot(mean_d, y, 'o', color=color, markersize=ms, zorder=5)
+
+            verdict = 'equiv.' if row['equivalent'] else 'n.e.'
+            label_text = f"{row['label']}  [{ci_lo:+.3f}, {ci_hi:+.3f}]  {verdict}"
+            ax.text(
+                margin * 2.2, y, label_text,
+                va='center', ha='left', fontsize=7,
+                fontweight='bold' if is_all else 'normal',
+            )
+
+        # Equivalence region shading
+        ax.axvspan(-margin, margin, alpha=0.10, color='green', label=f'±Δ = ±{margin:.3f}')
+        ax.axvline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.6)
+        ax.axvline(-margin, color='green', linewidth=1.0, linestyle=':')
+        ax.axvline(margin, color='green', linewidth=1.0, linestyle=':')
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([])
+        ax.set_xlabel(f'Mean diff (TabPFN − GP)\n90% CI of paired difference')
+        ax.set_title(f'A6 TOST — {metric} ({dataset})')
+        ax.legend(fontsize=8, loc='lower right')
+        ax.grid(True, alpha=0.25, axis='x')
+
+    fig.tight_layout()
+
+    base = (
+        os.path.join(output_dir, 'optimization')
+        if output_dir
+        else os.path.join('output', 'optimization')
+    )
+    os.makedirs(base, exist_ok=True)
+    suffix = f'_{dataset}_{split_type}' if split_type else (f'_{dataset}' if dataset else '')
+    plot_path = os.path.join(base, f'tost_forest{suffix}.svg')
+    if save:
+        plt.savefig(plot_path, format='svg', bbox_inches='tight')
+        print(f"Saved TOST forest plot -> {plot_path}")
+    plt.close()
+
+
+def plot_scaling_timing(
+    df: "pd.DataFrame",
+    save: bool = False,
+    output_dir: Optional[str] = None,
+    anchor_n: Optional[int] = None,
+    anchor_label: str = 'Paper scale (NHP 10×10)',
+) -> None:
+    """A7 — Log-log scaling plot: per-query wall-clock vs synthetic grid size.
+
+    Plots median time + IQR band for GP and TabPFN across grid sizes ``n``,
+    with an overlaid fitted power law for each model.  The measured exponents
+    (≈3 for GP, ≈2 for TabPFN) substantiate the O(n³) vs O(n²) scalability
+    claim in the paper.
+
+    Args:
+        df: DataFrame with columns ``['model', 'n', 'rep', 'time_s']``.
+            One row per timing repetition, produced by
+            ``scaling_timing.run_scaling_benchmark()``.
+        save: If True, write ``scaling_timing.svg`` to ``output_dir``.
+        output_dir: Directory for output file.  Defaults to
+            ``'output/scaling'``.
+        anchor_n: Grid size to annotate as the paper's real-data scale
+            (e.g. ``100`` for NHP 10×10).  Shown as a vertical dotted line.
+        anchor_label: Text label for the ``anchor_n`` annotation.
+    """
+    if df.empty:
+        print("[scaling_timing] Empty DataFrame — skipping plot.")
+        return
+
+    models = sorted(df['model'].unique().tolist())
+    grid_sizes = sorted(df['n'].unique().tolist())
+
+    _model_colors = {**PALETTE, 'GP': PALETTE['GP'], 'TabPFN': PALETTE['TabPFN']}
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    for model in models:
+        color = _model_colors.get(model, '#888888')
+        sub = df[df['model'] == model]
+
+        ns = np.array(grid_sizes)
+        medians = np.array([sub[sub['n'] == n]['time_s'].median() for n in grid_sizes])
+        q25s = np.array([np.percentile(sub[sub['n'] == n]['time_s'], 25) for n in grid_sizes])
+        q75s = np.array([np.percentile(sub[sub['n'] == n]['time_s'], 75) for n in grid_sizes])
+
+        # Empirical median + IQR band
+        ax.plot(ns, medians, 'o-', color=color, linewidth=2, markersize=5,
+                label=model, zorder=3)
+        ax.fill_between(ns, q25s, q75s, color=color, alpha=0.18, zorder=2)
+
+        # Fit power law in log-log space: log(t) = b*log(n) + log(a)
+        valid = (medians > 0) & np.isfinite(medians)
+        if valid.sum() >= 3:
+            b, log_a = np.polyfit(np.log(ns[valid]), np.log(medians[valid]), 1)
+            a = np.exp(log_a)
+            ns_fit = np.geomspace(ns[0], ns[-1], 120)
+            ax.plot(
+                ns_fit, a * ns_fit ** b,
+                '--', color=color, alpha=0.55, linewidth=1.3,
+                label=f'{model} fit: O(n^{b:.1f})',
+                zorder=2,
+            )
+
+    # Anchor marker for real-data scale
+    if anchor_n is not None:
+        ax.axvline(anchor_n, color='gray', linestyle=':', linewidth=1.3, alpha=0.75,
+                   zorder=1)
+        ax.text(
+            anchor_n, 0.03, anchor_label,
+            transform=ax.get_xaxis_transform(),
+            fontsize=7, color='gray',
+            rotation=90, ha='right', va='bottom',
+        )
+
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('Grid size n (electrode pool)')
+    ax.set_ylabel('Per-query wall-clock time (s)')
+    ax.set_title('A7 — Scaling: GP O(n³) vs TabPFN O(n²)')
+    ax.legend(fontsize=8, loc='upper left')
+    ax.grid(True, alpha=0.25, which='both')
+    fig.tight_layout()
+
+    if save:
+        base = output_dir if output_dir else os.path.join('output', 'scaling')
+        os.makedirs(base, exist_ok=True)
+        path = os.path.join(base, 'scaling_timing.svg')
+        plt.savefig(path, format='svg', bbox_inches='tight')
+        print(f"Saved scaling timing plot -> {path}")
+
+    plt.close()
+
+
 def gfs_by_subject(
     results_list: list[dict],
     save: bool = False,
@@ -1573,7 +1988,7 @@ def gfs_by_subject(
         {
             'Subject': f"S{r['subject']}",
             'GFS': r['gfs'].get(GFS_SUMMARY_SIGMA, float('nan')),
-            'Model': r['model_type'],
+            'Model': _canonical_model_label(r['model_type']),
         }
         for r in results_list
         if r.get('gfs') is not None
@@ -1585,8 +2000,7 @@ def gfs_by_subject(
 
     df = pd.DataFrame(rows)
     model_types = df['Model'].unique().tolist()
-    palette = {m: PALETTE.get('GP' if 'GP' in m else 'PFN', 'steelblue')
-               for m in model_types}
+    palette = {m: PALETTE[_canonical_model_label(m)] for m in model_types}
 
     subjects = sorted(df['Subject'].unique(),
                       key=lambda s: int(s[1:]) if s[1:].isdigit() else 0)
@@ -1615,5 +2029,4 @@ def gfs_by_subject(
         plt.savefig(path, format='svg', bbox_inches='tight')
         print(f"Saved plot -> {path}")
 
-    plt.close()
     plt.close()

@@ -152,6 +152,9 @@ class GPSurrogate:
             X: Feature matrix of observed points, shape [N, D].  # [N, D]
             y: Response vector of observed targets, shape [N].   # [N]
         """
+        if self._model is not None:
+            del self._model, self._likelihood
+
         train_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [N, D]
         train_y = torch.tensor(y, dtype=torch.float32, device=self._device)  # [N]
 

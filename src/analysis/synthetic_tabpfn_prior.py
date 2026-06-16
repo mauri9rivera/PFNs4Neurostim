@@ -27,16 +27,20 @@ if _PRIOR_LIB not in sys.path:
 from tabpfn_prior import build_tabpfn_prior  # noqa: E402
 
 
-def generate_tabpfn_prior_dataset(n_features=2, n_samples=100, seed=0):
-    """Single (X, y) from TabPFN's Prior Bag.
+def generate_tabpfn_prior_dataset(n_features=2, n_samples=100, seed=0,
+                                  prior_type='prior_bag'):
+    """Single (X, y) from a TabPFN v1 prior component.
 
-    Uses the official tabpfn-v1-prior implementation with the prior_bag
-    prior type (GP + MLP mixture, matching pretraining distribution).
+    Uses the official tabpfn-v1-prior implementation. ``prior_type`` selects the
+    component: ``'prior_bag'`` (GP + MLP mixture, the full pretraining
+    distribution), ``'gp'`` (pure GP component), ``'mlp'`` (SCM/MLP component),
+    or ``'gp_mix'`` (GP mixture).
 
     Args:
         n_features: input dimensionality
         n_samples: number of data points
         seed: random seed
+        prior_type: one of {'prior_bag', 'gp', 'mlp', 'gp_mix'}
 
     Returns:
         (X, y) tuple — X float32, y StandardScaler-normalized float32.
@@ -46,7 +50,7 @@ def generate_tabpfn_prior_dataset(n_features=2, n_samples=100, seed=0):
     np.random.seed(seed)
 
     prior = build_tabpfn_prior(
-        prior_type='prior_bag',
+        prior_type=prior_type,
         num_steps=1,
         batch_size=1,
         num_datapoints_max=n_samples,
@@ -74,11 +78,13 @@ def generate_tabpfn_prior_dataset(n_features=2, n_samples=100, seed=0):
 
 
 def generate_tabpfn_prior_bank(n_datasets=500, n_features=2,
-                                n_samples=100, seed=None):
-    """Bank of Prior Bag datasets.
+                                n_samples=100, seed=None, prior_type='prior_bag'):
+    """Bank of datasets from a TabPFN v1 prior component.
 
-    Each dataset independently samples the GP vs MLP component and all
-    hyperparameters from the v1 prior's internal distributions.
+    For ``prior_type='prior_bag'`` each dataset independently samples the GP vs
+    MLP component and all hyperparameters from the v1 prior's internal
+    distributions. For ``'gp'`` / ``'mlp'`` / ``'gp_mix'`` every dataset is drawn
+    from that single component (GP-bag / SCM-bag references).
 
     Args:
         n_datasets: number of datasets to generate
@@ -86,6 +92,7 @@ def generate_tabpfn_prior_bank(n_datasets=500, n_features=2,
         n_samples: number of data points per dataset
         seed: optional integer seed.  When None (default), draws from system
             entropy so consecutive calls produce independent realizations.
+        prior_type: one of {'prior_bag', 'gp', 'mlp', 'gp_mix'}
 
     Returns:
         List of (X, y) tuples.
@@ -96,6 +103,7 @@ def generate_tabpfn_prior_bank(n_datasets=500, n_features=2,
     for i in range(n_datasets):
         X, y = generate_tabpfn_prior_dataset(
             n_features=n_features, n_samples=n_samples, seed=seed + i,
+            prior_type=prior_type,
         )
         bank.append((X, y))
     return bank

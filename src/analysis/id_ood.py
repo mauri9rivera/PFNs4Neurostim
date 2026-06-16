@@ -26,9 +26,34 @@ from models.regressors import linear_cka
 
 from utils.data_utils import load_data, ALL_SUBJECTS
 
-from analysis.synthetic_gp import generate_synthetic_gp_bank
 from analysis.synthetic_noise import generate_noise_bank
 from analysis.synthetic_tabpfn_prior import generate_tabpfn_prior_bank
+
+
+def generate_synthetic_gp_bank(n_datasets=500, n_features=2,
+                               n_samples=100, seed=None):
+    """GP reference bank from the authentic tabpfn-v1-prior submodule.
+
+    Samples the submodule's pure-GP prior component (``prior_type='gp'``) — the
+    ``gp_bag`` reference. (The former internal gpytorch GP generator was removed
+    2026-06-08; this wrapper keeps that signature so every reference site uses the
+    authentic v1 GP prior with no call-site changes.)
+    """
+    return generate_tabpfn_prior_bank(
+        n_datasets=n_datasets, n_features=n_features,
+        n_samples=n_samples, seed=seed, prior_type='gp',
+    )
+
+
+def _slot2_prior_type(prior_source: str) -> str:
+    """Submodule ``prior_type`` for the second ('prior') reference slot.
+
+    ``scm_bag`` → the pure SCM/MLP component (``'mlp'``); every other prior_source
+    that fills this slot (``tabpfn_prior``/``prior_bag``/``both``/``all``) → the full
+    GP+MLP mixture (``'prior_bag'``).
+    """
+    return 'mlp' if prior_source == 'scm_bag' else 'prior_bag'
+
 
 def _effective_n_ctx(n_context: float, n_total: int) -> int:
     """Convert context size to an absolute observation count.
@@ -227,16 +252,17 @@ def entropy_analysis(dataset_types, device='cpu', n_context=0.5,
     # --- Synthetic references ---
     rng = np.random.RandomState(seed)
 
-    if prior_source in ('gp', 'both', 'all'):
+    if prior_source in ('gp_bag', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
         gp_entropies = _entropy_from_bank(model, gp_bank, n_context)
         results['synthetic_gp'] = gp_entropies
 
-    if prior_source in ('tabpfn_prior', 'both', 'all'):
+    if prior_source in ('tabpfn_prior', 'prior_bag', 'scm_bag', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
+            prior_type=_slot2_prior_type(prior_source),
         )
         prior_entropies = _entropy_from_bank(model, prior_bank, n_context)
         results['synthetic_prior'] = prior_entropies
@@ -365,15 +391,16 @@ def mmd_analysis(dataset_types, prior_source='both', n_synthetic=500,
     # Build synthetic reference feature matrix
     ref_features = {}
 
-    if prior_source in ('gp', 'both', 'all'):
+    if prior_source in ('gp_bag', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
         ref_features['gp'] = _bank_to_features(gp_bank)
 
-    if prior_source in ('tabpfn_prior', 'both', 'all'):
+    if prior_source in ('tabpfn_prior', 'prior_bag', 'scm_bag', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
+            prior_type=_slot2_prior_type(prior_source),
         )
         ref_features['prior'] = _bank_to_features(prior_bank)
 
@@ -522,15 +549,16 @@ def wasserstein_analysis(dataset_types, prior_source='both',
     # Build synthetic reference feature matrices (reuse _bank_to_features)
     ref_features = {}
 
-    if prior_source in ('gp', 'both', 'all'):
+    if prior_source in ('gp_bag', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
         ref_features['gp'] = _bank_to_features(gp_bank)
 
-    if prior_source in ('tabpfn_prior', 'both', 'all'):
+    if prior_source in ('tabpfn_prior', 'prior_bag', 'scm_bag', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
+            prior_type=_slot2_prior_type(prior_source),
         )
         ref_features['prior'] = _bank_to_features(prior_bank)
 
@@ -737,16 +765,17 @@ def _mahalanobis_analysis_inner(
 
     _LAST_LAYER = _layer_name(layer)
 
-    if prior_source in ('gp', 'both', 'all'):
+    if prior_source in ('gp_bag', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
         gp_embeds = _embeddings_from_bank(model, gp_bank, n_context, _LAST_LAYER)
         ref_stats['gp'] = _fit_reference(gp_embeds, regularization)
 
-    if prior_source in ('tabpfn_prior', 'both', 'all'):
+    if prior_source in ('tabpfn_prior', 'prior_bag', 'scm_bag', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
+            prior_type=_slot2_prior_type(prior_source),
         )
         prior_embeds = _embeddings_from_bank(model, prior_bank, n_context, _LAST_LAYER)
         ref_stats['prior'] = _fit_reference(prior_embeds, regularization)
@@ -1078,7 +1107,7 @@ def _cka_analysis_inner(dataset_types, device, prior_source, n_synthetic,
         lname = _layer_name(layer_idx)
         layer_refs: dict[str, np.ndarray] = {}
 
-        if prior_source in ('gp', 'both', 'all'):
+        if prior_source in ('gp_bag', 'both', 'all'):
             gp_bank = generate_synthetic_gp_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
             )
@@ -1086,9 +1115,10 @@ def _cka_analysis_inner(dataset_types, device, prior_source, n_synthetic,
                 model, gp_bank, n_context, lname,
             )
 
-        if prior_source in ('tabpfn_prior', 'both', 'all'):
+        if prior_source in ('tabpfn_prior', 'prior_bag', 'scm_bag', 'both', 'all'):
             prior_bank = generate_tabpfn_prior_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
+                prior_type=_slot2_prior_type(prior_source),
             )
             layer_refs['prior'] = _embeddings_from_bank(
                 model, prior_bank, n_context, lname,
@@ -1312,7 +1342,7 @@ def _rsa_analysis_inner(
         lname = _layer_name(layer_idx)
         layer_refs: dict[str, np.ndarray] = {}
 
-        if prior_source in ('gp', 'both', 'all'):
+        if prior_source in ('gp_bag', 'both', 'all'):
             gp_bank = generate_synthetic_gp_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
             )
@@ -1320,9 +1350,10 @@ def _rsa_analysis_inner(
                 model, gp_bank, n_context, lname,
             )
 
-        if prior_source in ('tabpfn_prior', 'both', 'all'):
+        if prior_source in ('tabpfn_prior', 'prior_bag', 'scm_bag', 'both', 'all'):
             prior_bank = generate_tabpfn_prior_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
+                prior_type=_slot2_prior_type(prior_source),
             )
             layer_refs['prior'] = _embeddings_from_bank(
                 model, prior_bank, n_context, lname,
@@ -1753,13 +1784,14 @@ def _embedding_trajectory_inner(
 
     # ── Synthetic reference trajectories ──────────────────────────────────
     synthetic_banks: dict[str, list] = {}
-    if prior_source in ('gp', 'both', 'all'):
+    if prior_source in ('gp_bag', 'both', 'all'):
         synthetic_banks['gp'] = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
-    if prior_source in ('tabpfn_prior', 'both', 'all'):
+    if prior_source in ('tabpfn_prior', 'prior_bag', 'scm_bag', 'both', 'all'):
         synthetic_banks['prior'] = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
+            prior_type=_slot2_prior_type(prior_source),
         )
     synthetic_banks['noise'] = generate_noise_bank(
         n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
@@ -2184,7 +2216,7 @@ def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
         results[dataset_type] = dataset_results
 
     # --- Synthetic references ---
-    if prior_source in ('gp', 'both', 'all'):
+    if prior_source in ('gp_bag', 'both', 'all'):
         gp_bank = generate_synthetic_gp_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
         )
@@ -2192,9 +2224,10 @@ def gradient_norm_analysis(dataset_types, device='cpu', prior_source='both',
             model, gp_bank, n_context,
         )
 
-    if prior_source in ('tabpfn_prior', 'both', 'all'):
+    if prior_source in ('tabpfn_prior', 'prior_bag', 'scm_bag', 'both', 'all'):
         prior_bank = generate_tabpfn_prior_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed,
+            prior_type=_slot2_prior_type(prior_source),
         )
         results['synthetic_prior'] = _gradient_norm_from_bank(
             model, prior_bank, n_context,

@@ -100,7 +100,7 @@ def main():
                         help='Path to a YAML config file.  All keys are used as defaults; '
                              'any CLI flag that is explicitly provided overrides the YAML value.')
     parser.add_argument('--datasets', nargs='+', default=None,
-                        choices=['rat', 'nhp', 'spinal'],
+                        choices=['rat', 'nhp', 'spinal', '5d_rat'],
                         help='Dataset types to analyze (default: rat nhp)')
     parser.add_argument('--analyses', nargs='+',
                         default=None,
@@ -109,8 +109,13 @@ def main():
                                  'rsa', 'procrustes'],
                         help='Which analyses to run (default: entropy mmd mahalanobis)')
     parser.add_argument('--prior_source', default=None,
-                        choices=['gp', 'tabpfn_prior', 'noise', 'both', 'all'],
-                        help='Synthetic reference distribution(s) (default: both)')
+                        choices=['noise', 'gp_bag', 'scm_bag', 'prior_bag',
+                                 'tabpfn_prior', 'both', 'all'],
+                        help='Reference distribution(s) (default: noise). All non-noise '
+                             'references come from the libs/tabpfn-v1-prior submodule: '
+                             'gp_bag (prior_type=gp), scm_bag (prior_type=mlp, SCM/MLP '
+                             'component), prior_bag/tabpfn_prior (GP+MLP mixture), '
+                             'both/all (gp_bag + prior_bag).')
     parser.add_argument('--device', default=None,
                         help='Device for TabPFN inference (default: cpu)')
     parser.add_argument('--n_synthetic', type=int, default=None,
@@ -162,7 +167,7 @@ def main():
     _defaults: dict[str, Any] = {
         'datasets': ['rat', 'nhp'],
         'analyses': ['entropy', 'mmd', 'mahalanobis'],
-        'prior_source': 'both',
+        'prior_source': 'noise',
         'device': 'cpu',
         'n_synthetic': 500,
         'n_context': 0.5,
@@ -172,6 +177,13 @@ def main():
     for key, default in _defaults.items():
         if getattr(args, key, None) is None:
             setattr(args, key, default)
+
+    # --- Hyp B reference policy (2026-06-08 reorientation) ---
+    # All non-noise references come from the libs/tabpfn-v1-prior submodule via
+    # prior_type: gp_bag→'gp', scm_bag→'mlp', prior_bag/tabpfn_prior→'prior_bag',
+    # both/all→gp + mixture. The former internal gpytorch GP generator was removed.
+    # `synthetic_tabpfn_prior.py` is the admissible submodule wrapper. Default is
+    # Noise-only (the main-story anchor).
 
     # Seed: when unspecified, draw a fresh int so priors differ across runs.
     # The drawn value is logged to config.json for reproducibility.

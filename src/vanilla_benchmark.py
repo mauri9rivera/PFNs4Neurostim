@@ -46,8 +46,10 @@ from utils.data_utils import (
 )
 from utils.visualization import (
     r2_by_subject,
+    spearman_by_subject,
+    spearman_by_emg,
     regret_with_timing,
-    regret_by_subject,
+    regret_traces_by_subject,
     regret_by_emg,
     exploration_by_subject,
     exploration_by_emg,
@@ -190,6 +192,7 @@ def _vanilla_optimization(
     metadata: Optional[Dict[str, Any]] = None,
     acq_fn: str = 'ucb',
     ts_temperature: float = 1.0,
+    cache_version: int = 1,
 ) -> Dict[str, list]:
     """Run BO optimization evaluation for vanilla TabPFN and GP.
 
@@ -211,6 +214,10 @@ def _vanilla_optimization(
         metadata: Optional provenance dict written into saved pkl files.
         acq_fn: Acquisition function — ``'ucb'`` or ``'ts'`` (Thompson Sampling).
         ts_temperature: Temperature for TabPFN bar-distribution TS sampling.
+        cache_version: Integer version stamp included in the cache hash.
+            Bump this (via the YAML ``cache_version`` key or ``--cache-version``
+            CLI flag) to invalidate all existing cached results and force a
+            fresh computation for every subject.
 
     Returns:
         ``{'GP': list[dict], 'TabPFN': list[dict]}``.
@@ -226,6 +233,7 @@ def _vanilla_optimization(
         'acq_fn': acq_fn,
         'ts_temperature': ts_temperature if acq_fn == 'ts' else None,
         'normalization': 'pfn',
+        'cache_version': cache_version,
     }
     _gp_cache_params = {
         'model': 'gp',
@@ -235,6 +243,7 @@ def _vanilla_optimization(
         'acq_fn': acq_fn,
         'ts_temperature': ts_temperature if acq_fn == 'ts' else None,
         'normalization': 'gp',
+        'cache_version': cache_version,
     }
 
     for subj_idx, emg_idx in experiments:
@@ -266,6 +275,7 @@ def _vanilla_optimization(
                 res_tabpfn, dataset_type, subj_idx, emg_idx,
                 'vanilla_tabpfn', _vanilla_cache_params
             )
+            del tabpfn_base, tabpfn_surrogate
 
         res_gp = load_subject_result(
             dataset_type, subj_idx, emg_idx, 'gp', _gp_cache_params
@@ -291,20 +301,24 @@ def _vanilla_optimization(
             save_subject_result(
                 res_gp, dataset_type, subj_idx, emg_idx, 'gp', _gp_cache_params
             )
+            del gp_surrogate
 
         results_tabpfn.append(res_tabpfn)
         results_gp.append(res_gp)
         print(f"    TabPFN R2={np.mean(res_tabpfn['r2']):.3f}  |  "
               f"GP R2={np.mean(res_gp['r2']):.3f}")
+        torch.cuda.empty_cache()
 
     results_dict = {'GP': results_gp, 'TabPFN': results_tabpfn}
 
     # --- Plots ---
     r2_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
+    spearman_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
+    spearman_by_emg(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
     regret_with_timing(results_dict, split_type=exp_tag, save=True,
                        output_dir=run_dir)
-    regret_by_subject(results_dict, split_type=exp_tag, save=True,
-                      output_dir=run_dir)
+    regret_traces_by_subject(results_dict, split_type=exp_tag, save=True,
+                             output_dir=run_dir)
     regret_by_emg(results_dict, split_type=exp_tag, save=True,
                   output_dir=run_dir)
     exploration_by_subject(results_dict, split_type=exp_tag, save=True,
@@ -327,8 +341,18 @@ def _vanilla_optimization(
         gfs_by_subject(_all_results_flat, save=True, output_dir=run_dir)
 
     all_r2 = [np.mean(r['r2']) for r in results_tabpfn]
+    all_spearman = [
+        float(np.nanmean(r['spearman'])) for r in results_tabpfn
+        if r.get('spearman') is not None
+    ]
     print(f"\nOptimization done. {len(results_tabpfn)} experiments.")
-    print(f"Vanilla TabPFN mean R2: {np.mean(all_r2):.3f} +/- {np.std(all_r2):.3f}")
+    # Median is the robust headline: a few non-responsive (near-flat) channels
+    # drive R2 to large negatives and wreck the mean, but not the median.
+    print(f"Vanilla TabPFN R2: mean={np.mean(all_r2):.3f} "
+          f"median={np.median(all_r2):.3f} (median is robust to flat channels)")
+    if all_spearman:
+        print(f"Vanilla TabPFN Spearman rho: mean={np.mean(all_spearman):.3f} "
+              f"median={np.median(all_spearman):.3f}")
 
     if save:
         save_results(
@@ -411,6 +435,7 @@ def _vanilla_optimization_budget(
             snapshot_iters_override=budgets,
         )
         _unpack_budget_trajectory(plot_data, res_tabpfn, 'TabPFN', budgets, subj_idx, emg_idx)
+        del tabpfn_base, tabpfn_surrogate
 
         # --- GP: single run at max_budget with snapshots at all sub-budgets ---
         gp_surrogate = GPSurrogate(device=device)
@@ -430,6 +455,8 @@ def _vanilla_optimization_budget(
             snapshot_iters_override=budgets,
         )
         _unpack_budget_trajectory(plot_data, res_gp, 'GP', budgets, subj_idx, emg_idx)
+        del gp_surrogate
+        torch.cuda.empty_cache()
 
     df = pd.DataFrame(plot_data)
 
@@ -686,6 +713,7 @@ def run_vanilla_benchmark(
     seed: int = 42,
     acq_fn: str = 'ucb',
     ts_temperature: float = 1.0,
+    cache_version: int = 1,
 ) -> Dict[str, Any]:
     """Orchestrate vanilla TabPFN vs GP benchmark for one or more modes.
 
@@ -718,6 +746,9 @@ def run_vanilla_benchmark(
         subjects_mode: ``'held_out'`` (default) or ``'all'`` for LOO.
         save: If True, persist results (pkl + CSV).
         seed: Master random seed.
+        cache_version: Integer version stamp passed into the subject-level cache
+            hash.  Bump via the YAML ``cache_version`` key or ``--cache-version``
+            flag to invalidate all cached results and force a full rerun.
 
     Returns:
         Dict keyed by mode name.  Values are either
@@ -729,9 +760,9 @@ def run_vanilla_benchmark(
         ValueError: If mode contains invalid values or dataset_type is unknown.
     """
     # --- Validate ---
-    if dataset_type not in ('rat', 'nhp', 'spinal'):
+    if dataset_type not in ('rat', 'nhp', 'spinal', '5d_rat'):
         raise ValueError(
-            f"Unknown dataset_type={dataset_type!r}. Use 'rat', 'nhp', or 'spinal'."
+            f"Unknown dataset_type={dataset_type!r}. Use 'rat', 'nhp', 'spinal', or '5d_rat'."
         )
     invalid = set(mode) - _VALID_MODES
     if invalid:
@@ -834,6 +865,7 @@ def run_vanilla_benchmark(
                 metadata=_metadata,
                 acq_fn=acq_fn,
                 ts_temperature=ts_temperature,
+                cache_version=cache_version,
             )
 
         elif m == 'optimization_budget':
@@ -880,7 +912,7 @@ def run_benchmark() -> None:
                         help='Path to a YAML config file.  All keys are used as defaults;\n'
                              'any CLI flag that is explicitly provided overrides the YAML value.')
     parser.add_argument('--dataset', type=str, default=None,
-                        choices=['rat', 'nhp', 'spinal'],
+                        choices=['rat', 'nhp', 'spinal', '5d_rat'],
                         help='Dataset type (default: nhp)')
     parser.add_argument('--mode', type=lambda s: s.split(','), default=None,
                         metavar='MODE[,MODE,...]',
@@ -929,6 +961,10 @@ def run_benchmark() -> None:
                              'env var. Designed for SLURM .out log visibility.')
     parser.add_argument('--seed', type=int, default=None,
                         help='Master random seed (default: 42)')
+    parser.add_argument('--cache-version', type=int, default=None,
+                        dest='cache_version',
+                        help='Integer cache version stamp (default: 1).\n'
+                             'Bump to invalidate all cached subject results and force a fresh run.')
 
     args = parser.parse_args()
 
@@ -958,6 +994,7 @@ def run_benchmark() -> None:
         'seed': 42,
         'acq_fn': 'ucb',
         'ts_temperature': 1.0,
+        'cache_version': 1,
     }
     for key, default in _defaults.items():
         if getattr(args, key, None) is None:
@@ -1001,6 +1038,7 @@ def run_benchmark() -> None:
             seed=args.seed,
             acq_fn=args.acq_fn,
             ts_temperature=args.ts_temperature,
+            cache_version=args.cache_version,
         )
         _diag.record_experiment(n_completed=len(_experiments) * len(args.mode))
 
