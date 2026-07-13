@@ -2,13 +2,11 @@
 
 ## Session Start Protocol
 
-The following files are imported, with these conditions:
+@.claude/task_plan.md
 
-@.claude/task_plan.md, automatically:
-
-@.claude/roadmap.md, only when you are specified to ultrathink
-
-@.claude/research_design.md, when the user explicitely specifies it.
+The following files are loaded on demand:
+- `.claude/roadmap.md` — load when ultrathink is specified
+- `.claude/research_design.md` — load when the user explicitly requests it
 
 ---
 
@@ -23,6 +21,13 @@ O(n³) complexity hinders real-time and large-scale use.
   task). R² of the surrogate's final prediction (after the BO loop) is reported
   as a secondary metric inside the same run; there is no standalone "fit task"
   (random-subset R² evaluation was removed on 2026-04-27).
+- **Default acquisition function is Thompson Sampling (`acq_fn: ts`)** as of 2026-07-13
+  (Hyp A is TS-primary). UCB/kappa remains available (`acq_fn: ucb`); the `kappa_*`
+  config keys are inert unless `acq_fn: ucb` is set.
+
+**ID/OOD reference policy:** the in-distribution reference is the TabPFN prior *bag*
+(`prior_source: prior_bag`/`tabpfn_prior` — the GP+MLP mixture the network is pretrained
+on), NOT the GP-only `gp_bag`. Noise is always retained as the OOD anchor.
 
 **Animal modalities:** rat, non-human primate (NHP), spinal cord
 

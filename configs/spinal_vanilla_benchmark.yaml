@@ -26,8 +26,8 @@ budgets:
 #   kappa_schedule: 2.5  →  fixed kappa=2.5 throughout (no annealing)
 kappa_schedule: 0.0
 
-# Acquisition function
-acq_fn: ucb
+# Acquisition function (TS is the project default; kappa_* below only apply when acq_fn: ucb)
+acq_fn: ts
 ts_temperature: 1.0
 
 # kappa values tested in kappa_search mode
@@ -37,6 +37,9 @@ kappa_values:
   - 2.0
   - 3.0
   - 5.0
+
+# TOST equivalence margin (A6): calibrated from GP rep-to-rep variance on spinal-vanilla-benchmark-28844.
+tost_margin: 0.0262
 
 # Infrastructure
 device: cuda

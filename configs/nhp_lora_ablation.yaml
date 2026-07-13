@@ -16,6 +16,16 @@ epochs: 100
 lr: 1.0e-4
 aug_pct: 1.0
 
+# Finetuning objective (uncomment to override TabPFN defaults of
+# crps_loss_weight=1.0 + mse_loss_weight=1.0).
+#   pure CRPS:  crps_loss_weight: 1.0  /  mse_loss_weight: 0.0
+#   pure NLL:   ce_loss_weight: 1.0  /  crps_loss_weight: 0.0  /  mse_loss_weight: 0.0
+# ce_loss_weight: 0.0
+# crps_loss_weight: 1.0
+# crls_loss_weight: 0.0
+# mse_loss_weight: 1.0
+# mae_loss_weight: 0.0
+
 # LoRA settings
 lora: true
 lora_rank: 8

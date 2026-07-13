@@ -37,6 +37,17 @@ kappa_schedule: 4.0
 acq_fn: ucb
 ts_temperature: 1.0
 
+# Finetuning objective (uncomment to override TabPFN defaults of
+# crps_loss_weight=1.0 + mse_loss_weight=1.0). Each key maps to a weighted term
+# in TabPFN's regression loss; leave commented to keep the default CRPS+MSE blend.
+#   pure CRPS:  crps_loss_weight: 1.0  /  mse_loss_weight: 0.0
+#   pure NLL:   ce_loss_weight: 1.0  /  crps_loss_weight: 0.0  /  mse_loss_weight: 0.0
+# ce_loss_weight: 0.0
+# crps_loss_weight: 1.0
+# crls_loss_weight: 0.0
+# mse_loss_weight: 1.0
+# mae_loss_weight: 0.0
+
 # Infrastructure
 subjects: all
 device: cuda

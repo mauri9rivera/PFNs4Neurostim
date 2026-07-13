@@ -64,7 +64,12 @@ def _effective_n_ctx(n_context: float, n_total: int) -> int:
       capped at ``n_total - 1`` so at least 1 test point is reserved.
       E.g. n_context=0.5, n_total=96 → 48 context, 48 test.
 
-    - **Absolute count** (n_context >= 1): ``n_ctx = int(n_context)``, capped at
+    - **Full context** (n_context == 1.0): ``n_ctx = n_total`` — use every
+      observation (100%), not an absolute count of 1. Intended for probe-grid
+      RSA, which queries a fixed grid rather than held-out points; metrics that
+      reserve a test split (entropy/CKA/Mahalanobis) skip when none remain.
+
+    - **Absolute count** (n_context > 1): ``n_ctx = int(n_context)``, capped at
       ``n_total // 2`` so the test set is always at least half the dataset.
       This prevents degenerate embedding matrices (CKA, Mahalanobis, RSA) when
       the requested count exceeds the dataset size.
@@ -78,7 +83,12 @@ def _effective_n_ctx(n_context: float, n_total: int) -> int:
     Returns:
         Absolute context count in [1, n_total - 1].
     """
-    if n_context >= 1:
+    if n_context == 1.0:
+        # Full-context: 1.0 means "use every observation" (100%), not absolute 1.
+        # Valid for probe-grid RSA (queries a fixed grid, not held-out points);
+        # test-reserving metrics skip when no test points remain.
+        return n_total
+    if n_context > 1:
         # Cap at half of n_total to ensure enough test embeddings for matrix ops.
         return min(int(n_context), max(1, n_total // 2))
     return min(math.ceil(n_total * n_context), n_total - 1)
@@ -1215,47 +1225,126 @@ def _cka_analysis_inner(dataset_types, device, prior_source, n_synthetic,
 #  3d-ii. RSA (Representational Similarity Analysis)
 # ============================================================================
 
-def compute_rsa(
-    Z1: np.ndarray,
-    Z2: np.ndarray,
-    n_subsample: int = 300,
-    seed: int = 42,
-) -> float:
-    """Compute RSA Spearman rho between two embedding clouds.
+def _make_probe_grid(m: int = 12, d: int = 2) -> np.ndarray:
+    """Build a regular probe grid over the unit hypercube ``[0, 1]^d``.
 
-    Subsamples both Z1 and Z2 to n_subsample rows, computes pairwise
-    Euclidean RDMs, vectorizes the upper triangle (k=1), and returns the
-    Spearman rank correlation between the two RDM vectors.
+    The grid provides a *shared, ordered* set of query points so RSA compares
+    representational geometry over identical items: row ``i`` is probe point
+    ``i`` in a fixed order, independent of any dataset. This is what makes the
+    two RDMs correspond, unlike independently subsampled clouds.
 
     Args:
-        Z1: First embedding matrix, shape (n1, D).
-        Z2: Second embedding matrix, shape (n2, D).
-        n_subsample: Max rows to draw from each matrix. Capped to
-            min(n1, n2, n_subsample) automatically.
-        seed: Random seed for subsampling reproducibility.
+        m: Points per axis. Total probe count is ``m ** d``.
+        d: Input dimensionality (2 for all neurostim/synthetic data here).
 
     Returns:
-        Spearman rho in [-1, 1]. Returns 0.0 if either RDM vector has
-        zero variance (degenerate case).
+        Probe grid of shape ``(m ** d, d)``, dtype float32.
     """
-    rng = np.random.RandomState(seed)
-    n = min(len(Z1), len(Z2), n_subsample)
-    idx1 = rng.choice(len(Z1), n, replace=False)
-    idx2 = rng.choice(len(Z2), n, replace=False)
-    Z1s = Z1[idx1]   # [n, D]
-    Z2s = Z2[idx2]   # [n, D]
+    axes = [np.linspace(0.0, 1.0, m, dtype=np.float32) for _ in range(d)]
+    grid = np.stack([g.ravel() for g in np.meshgrid(*axes, indexing='ij')],
+                    axis=-1)                                   # [m**d, d]
+    return grid.astype(np.float32)
 
-    rdm1 = cdist(Z1s, Z1s, metric='euclidean')  # [n, n]
-    rdm2 = cdist(Z2s, Z2s, metric='euclidean')  # [n, n]
 
-    triu_idx = np.triu_indices(n, k=1)
-    v1 = rdm1[triu_idx]
-    v2 = rdm2[triu_idx]
+def _rdm_triu_at_probe(
+    model: TabPFNRegressor,
+    X_ctx: np.ndarray,
+    y_ctx: np.ndarray,
+    P: np.ndarray,
+    layer_name: str,
+) -> np.ndarray | None:
+    """Upper triangle of the RDM of probe-point embeddings under a context.
 
-    if v1.std() == 0.0 or v2.std() == 0.0:
-        return 0.0
+    Conditions the frozen model on ``(X_ctx, y_ctx)`` and extracts embeddings
+    for the *shared* probe grid ``P``; row ``i`` of the embedding matrix is
+    always probe point ``i``, so RDMs built here are directly comparable across
+    contexts (proper RSA item correspondence).
 
-    return float(spearmanr(v1, v2).statistic)
+    Args:
+        model: Frozen ``TabPFNRegressor`` used as feature extractor.
+        X_ctx: Context features, shape ``(n_ctx, d)``.
+        y_ctx: Context targets, shape ``(n_ctx,)``.
+        P: Shared probe grid, shape ``(n_probe, d)``.
+        layer_name: Transformer module path to hook.
+
+    Returns:
+        Flattened upper triangle (``k=1``) of the Euclidean RDM, shape
+        ``(n_probe * (n_probe - 1) // 2,)``, or ``None`` if the embeddings are
+        non-finite.
+    """
+    emb = extract_embeddings_frozen(
+        model, X_ctx, y_ctx, P, layer_name=layer_name,
+    )                                                          # [n_probe, D]
+    if not np.all(np.isfinite(emb)):
+        return None
+    rdm = cdist(emb, emb, metric='euclidean')                 # [n_probe, n_probe]
+    return rdm[np.triu_indices(len(P), k=1)]                  # [n_probe*(n_probe-1)/2]
+
+
+def _reference_rdm_triu(
+    model: TabPFNRegressor,
+    bank: list,
+    n_context: float,
+    P: np.ndarray,
+    layer_name: str,
+) -> np.ndarray | None:
+    """Mean probe-grid RDM (upper triangle) across a bank of reference datasets.
+
+    Each synthetic dataset is normalised with :func:`_normalize_for_tabpfn`
+    (X -> ``[0, 1]^d`` so the shared probe grid ``P`` is in-support, y z-scored),
+    its first ``_effective_n_ctx`` points used as context, and its probe-grid
+    RDM computed via :func:`_rdm_triu_at_probe`. Averaging over the bank yields
+    the reference distribution's *typical* representational geometry over ``P``.
+
+    Args:
+        model: Frozen ``TabPFNRegressor``.
+        bank: Iterable of ``(X, y)`` synthetic datasets.
+        n_context: Context size (fraction or absolute) per dataset.
+        P: Shared probe grid, shape ``(n_probe, d)``.
+        layer_name: Transformer module path to hook.
+
+    Returns:
+        Mean upper-triangle RDM vector, or ``None`` if no dataset yielded a
+        finite RDM.
+    """
+    acc: np.ndarray | None = None
+    count = 0
+    for X, y in bank:
+        normed = _normalize_for_tabpfn(X, y)
+        if normed is None:
+            continue
+        X_n, y_n = normed
+        n_ctx = _effective_n_ctx(n_context, len(X_n))
+        if n_ctx < 2:
+            continue
+        v = _rdm_triu_at_probe(model, X_n[:n_ctx], y_n[:n_ctx], P, layer_name)
+        if v is None:
+            continue
+        acc = v if acc is None else acc + v
+        count += 1
+    return None if count == 0 else acc / count
+
+
+def compute_rsa(v_neuro: np.ndarray, v_ref: np.ndarray) -> float:
+    """Spearman RSA between two probe-grid RDM upper-triangle vectors.
+
+    Both vectors must index the *same* probe pairs in the same order (produced
+    by :func:`_rdm_triu_at_probe` / :func:`_reference_rdm_triu` over a shared
+    :func:`_make_probe_grid`). Returns the rank correlation of the two RDMs.
+
+    Args:
+        v_neuro: Neurostim RDM upper triangle, shape ``(n_pairs,)``.
+        v_ref: Reference RDM upper triangle, shape ``(n_pairs,)``.
+
+    Returns:
+        Spearman rho in ``[-1, 1]``; ``np.nan`` if inputs are None/misaligned
+        or either vector has zero variance (degenerate case).
+    """
+    if v_neuro is None or v_ref is None or v_neuro.shape != v_ref.shape:
+        return float('nan')
+    if v_neuro.std() == 0.0 or v_ref.std() == 0.0:
+        return float('nan')
+    return float(spearmanr(v_neuro, v_ref).statistic)
 
 
 def rsa_analysis(
@@ -1264,25 +1353,29 @@ def rsa_analysis(
     prior_source: str = 'both',
     n_synthetic: int = 500,
     n_context: float = 0.5,
-    n_subsample: int = 300,
+    probe_m: int = 12,
     seed: int = 42,
     layers: list[int] | None = None,
 ) -> dict:
-    """Multi-layer RSA between neurostim and synthetic reference embeddings.
+    """Multi-layer probe-grid RSA between neurostim and reference embeddings.
 
     Computes RSA Spearman rho at each transformer layer, revealing where
     neurostim geometry tracks the prior's geometry vs. the noise baseline.
-    High rho (->1) at a given layer means the pairwise distance structure
-    of neurostim embeddings matches the reference; near-zero or negative
-    rho means geometric dissimilarity.
+    Both RDMs index a *shared* probe grid (:func:`_make_probe_grid`), so the
+    correlation is over identical items — high rho (->1) means the neurostim
+    representational geometry over the grid matches the reference; near-zero or
+    negative rho means geometric dissimilarity. (The previous implementation
+    correlated two *independently* subsampled clouds with no item
+    correspondence, forcing rho ~ 0 for every reference.)
 
     Args:
         dataset_types: List of dataset names.
         device: 'cpu' or 'cuda'.
         prior_source: 'gp' | 'tabpfn_prior' | 'both'.
-        n_synthetic: Number of synthetic datasets for reference embeddings.
+        n_synthetic: Number of synthetic datasets for reference RDMs.
         n_context: Context size for embedding extraction.
-        n_subsample: Points to subsample per cloud for RDM computation.
+        probe_m: Points per axis of the shared probe grid (``probe_m ** 2``
+            total probe items in the 2-D input space).
         seed: Random seed.
         layers: Transformer layer indices to analyze.
             Defaults to ID_OOD_LAYERS ([4, 13, 17]).
@@ -1302,7 +1395,7 @@ def rsa_analysis(
         return _rsa_analysis_inner(
             dataset_types, device=device, prior_source=prior_source,
             n_synthetic=n_synthetic, n_context=n_context,
-            n_subsample=n_subsample, seed=seed, layers=layers,
+            probe_m=probe_m, seed=seed, layers=layers,
         )
     except _CudaError:
         if device == 'cpu':
@@ -1313,7 +1406,7 @@ def rsa_analysis(
         return _rsa_analysis_inner(
             dataset_types, device='cpu', prior_source=prior_source,
             n_synthetic=n_synthetic, n_context=n_context,
-            n_subsample=n_subsample, seed=seed, layers=layers,
+            probe_m=probe_m, seed=seed, layers=layers,
         )
 
 
@@ -1323,21 +1416,24 @@ def _rsa_analysis_inner(
     prior_source: str,
     n_synthetic: int,
     n_context: float,
-    n_subsample: int,
+    probe_m: int,
     seed: int,
     layers: list[int],
 ) -> dict:
-    """Core multi-layer RSA implementation.
+    """Core multi-layer probe-grid RSA implementation.
 
-    Mirrors _cka_analysis_inner() but calls compute_rsa() instead of
-    linear_cka(), omitting the bootstrap loop (RSA subsamples internally).
+    Builds a shared probe grid, computes a mean reference RDM per (layer,
+    reference) over the synthetic bank, then correlates each neurostim
+    (subject, EMG) probe-grid RDM against those references. Row correspondence
+    is guaranteed because every RDM is over the same probe items.
     """
     model = TabPFNRegressor(device=device)
     model.n_estimators = 1
 
-    # Phase 1: Build reference embeddings per layer
-    ref_embeddings: dict[int, dict[str, np.ndarray]] = {}
+    P = _make_probe_grid(m=probe_m, d=2)                       # [probe_m**2, 2]
 
+    # Phase 1: mean reference RDM (upper triangle) per layer and reference.
+    ref_rdms: dict[int, dict[str, np.ndarray]] = {}
     for layer_idx in layers:
         lname = _layer_name(layer_idx)
         layer_refs: dict[str, np.ndarray] = {}
@@ -1346,31 +1442,30 @@ def _rsa_analysis_inner(
             gp_bank = generate_synthetic_gp_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
             )
-            layer_refs['gp'] = _embeddings_from_bank(
-                model, gp_bank, n_context, lname,
-            )
+            v = _reference_rdm_triu(model, gp_bank, n_context, P, lname)
+            if v is not None:
+                layer_refs['gp'] = v
 
         if prior_source in ('tabpfn_prior', 'prior_bag', 'scm_bag', 'both', 'all'):
             prior_bank = generate_tabpfn_prior_bank(
                 n_datasets=n_synthetic, n_features=2, seed=seed,
                 prior_type=_slot2_prior_type(prior_source),
             )
-            layer_refs['prior'] = _embeddings_from_bank(
-                model, prior_bank, n_context, lname,
-            )
+            v = _reference_rdm_triu(model, prior_bank, n_context, P, lname)
+            if v is not None:
+                layer_refs['prior'] = v
 
         noise_bank = generate_noise_bank(
             n_datasets=n_synthetic, n_features=2, seed=seed + 10000,
         )
-        layer_refs['noise'] = _embeddings_from_bank(
-            model, noise_bank, n_context, lname,
-        )
+        v = _reference_rdm_triu(model, noise_bank, n_context, P, lname)
+        if v is not None:
+            layer_refs['noise'] = v
 
-        ref_embeddings[layer_idx] = layer_refs
+        ref_rdms[layer_idx] = layer_refs
 
-    # Phase 2: Compute RSA for neurostim data at each layer
+    # Phase 2: correlate each neurostim probe-grid RDM against the references.
     results: dict = {}
-
     for dataset_type in dataset_types:
         subjects = ALL_SUBJECTS[dataset_type]
         dataset_results: dict = {}
@@ -1379,7 +1474,7 @@ def _rsa_analysis_inner(
             data = load_data(dataset_type, subj_idx)
             coords = data['ch2xy']
             scaler_x = MinMaxScaler()
-            X = scaler_x.fit_transform(coords).astype(np.float32)
+            X = scaler_x.fit_transform(coords).astype(np.float32)   # [n, 2] in [0,1]
             n_emgs = data['sorted_respMean'].shape[1]
 
             subj_results: dict = {}
@@ -1393,30 +1488,22 @@ def _rsa_analysis_inner(
                 ).ravel().astype(np.float32)
 
                 n_ctx = _effective_n_ctx(n_context, len(X))
-                X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
-                X_tst = X[n_ctx:]
-
-                if len(X_tst) == 0:
+                if n_ctx < 2:
                     continue
+                X_ctx, y_ctx = X[:n_ctx], y[:n_ctx]
 
                 emg_result: dict[int, dict[str, float]] = {}
-
                 for layer_idx in layers:
                     lname = _layer_name(layer_idx)
-                    embeddings = extract_embeddings_frozen(
-                        model, X_ctx, y_ctx, X_tst,
-                        layer_name=lname,
-                    )
+                    v_neuro = _rdm_triu_at_probe(
+                        model, X_ctx, y_ctx, P, lname,
+                    )                                             # [n_pairs] or None
 
                     layer_scores: dict[str, float] = {}
-                    for ref_name, ref_emb in ref_embeddings[layer_idx].items():
-                        rho = compute_rsa(
-                            embeddings, ref_emb,
-                            n_subsample=n_subsample,
-                            seed=seed,
+                    for ref_name, v_ref in ref_rdms[layer_idx].items():
+                        layer_scores[f'rsa_{ref_name}'] = compute_rsa(
+                            v_neuro, v_ref,
                         )
-                        layer_scores[f'rsa_{ref_name}'] = rho
-
                     emg_result[layer_idx] = layer_scores
 
                 subj_results[emg_idx] = emg_result

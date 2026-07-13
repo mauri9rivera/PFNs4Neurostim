@@ -178,6 +178,153 @@ def compute_equivalence_margin(
 
 
 # ---------------------------------------------------------------------------
+# §17 — Predictive-interval calibration
+# ---------------------------------------------------------------------------
+
+def compute_calibration(
+    y_true: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    quantiles: Optional[np.ndarray] = None,
+) -> dict[str, np.ndarray | float]:
+    """Reliability of a surrogate's predictive intervals under a Gaussian model.
+
+    For each nominal central-interval level ``q`` the empirical coverage is the
+    fraction of test points whose true value falls inside the model's ``q``
+    predictive interval ``mean ± z * std`` (``z = Φ⁻¹((1+q)/2)``). A perfectly
+    calibrated model traces the diagonal (empirical = nominal). The expected
+    calibration error (ECE) summarises the mean absolute deviation from it.
+
+    Acquisition validity (UCB/TS) hinges on this: an over-confident surrogate
+    under-explores and an under-confident one wastes budget, so §17 tests it
+    directly on neurostim rather than assuming it. Applies equally to a GP
+    posterior and to TabPFN's ``(mean, std)`` derived from bar-distribution
+    quantiles (see :func:`utils.gpbo_utils.std_from_quantiles`).
+
+    Args:
+        y_true: Ground-truth responses, shape [M].
+        mean: Predictive means, shape [M].
+        std: Predictive standard deviations, shape [M]; floored internally.
+        quantiles: Nominal central-interval levels in (0, 1). Defaults to
+            ``[0.1, 0.2, …, 0.9]``.
+
+    Returns:
+        Dict with keys:
+          nominal (np.ndarray): the requested levels.
+          empirical (np.ndarray): observed coverage at each level.
+          ece (float): mean absolute (empirical − nominal).
+          overconfidence (float): mean signed (nominal − empirical); >0 means
+                                  intervals are too narrow (over-confident).
+          n (int): number of test points.
+
+    Raises:
+        ValueError: If array lengths differ or fewer than 2 points are given.
+    """
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    mean = np.asarray(mean, dtype=float).ravel()
+    std = np.maximum(np.asarray(std, dtype=float).ravel(), 1e-12)
+
+    if not (len(y_true) == len(mean) == len(std)):
+        raise ValueError(
+            f"y_true, mean, std must share length; got "
+            f"{len(y_true)}, {len(mean)}, {len(std)}."
+        )
+    if len(y_true) < 2:
+        raise ValueError(f"Need at least 2 points for calibration, got {len(y_true)}.")
+
+    if quantiles is None:
+        quantiles = np.arange(0.1, 0.91, 0.1)
+    quantiles = np.asarray(quantiles, dtype=float).ravel()
+
+    z_scores = np.abs(y_true - mean) / std  # [M] — standardized abs residuals
+    empirical = np.array([
+        float(np.mean(z_scores <= stats.norm.ppf((1.0 + q) / 2.0)))
+        for q in quantiles
+    ])
+
+    ece = float(np.mean(np.abs(empirical - quantiles)))
+    overconfidence = float(np.mean(quantiles - empirical))
+
+    return {
+        'nominal': quantiles,
+        'empirical': empirical,
+        'ece': ece,
+        'overconfidence': overconfidence,
+        'n': int(len(y_true)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# §17 — OOD placement → BO regret predictive link
+# ---------------------------------------------------------------------------
+
+def ood_regret_correlation(
+    ood_scores: np.ndarray,
+    regrets: np.ndarray,
+    n_boot: int = 10000,
+    seed: int = 42,
+) -> dict[str, float | int]:
+    """Spearman correlation between per-experiment OOD score and final regret.
+
+    Tests whether a Hypothesis-B distributional OOD score (MMD / Wasserstein /
+    Mahalanobis) for a (subject, EMG) pair predicts that pair's downstream BO
+    regret — converting Hyp B from descriptive to *predictive*: a usable
+    "when will TabPFN struggle?" diagnostic. A positive ρ means more-OOD
+    channels incur higher regret.
+
+    A percentile bootstrap over paired observations gives a 95% CI on ρ that
+    is honest about the small number of channels.
+
+    Args:
+        ood_scores: Per-experiment OOD scores, shape [K].
+        regrets: Per-experiment final BO regret (same ordering), shape [K].
+        n_boot: Bootstrap resamples for the CI.
+        seed: RNG seed for the bootstrap.
+
+    Returns:
+        Dict with keys ``spearman_rho``, ``p_value``, ``ci_lo``, ``ci_hi``,
+        ``n`` (number of paired experiments).
+
+    Raises:
+        ValueError: If the arrays differ in length or fewer than 3 pairs exist.
+    """
+    a = np.asarray(ood_scores, dtype=float).ravel()
+    b = np.asarray(regrets, dtype=float).ravel()
+    if len(a) != len(b):
+        raise ValueError(f"ood_scores and regrets must match; got {len(a)} vs {len(b)}.")
+    if len(a) < 3:
+        raise ValueError(f"Need at least 3 paired experiments, got {len(a)}.")
+
+    res = stats.spearmanr(a, b)
+    rho = float(res.statistic)
+    p_value = float(res.pvalue)
+
+    rng = np.random.default_rng(seed)
+    n = len(a)
+    boot_rhos: list[float] = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        if np.ptp(a[idx]) < 1e-12 or np.ptp(b[idx]) < 1e-12:
+            continue  # degenerate resample — Spearman undefined
+        r = stats.spearmanr(a[idx], b[idx]).statistic
+        if np.isfinite(r):
+            boot_rhos.append(float(r))
+
+    if boot_rhos:
+        ci_lo, ci_hi = np.percentile(boot_rhos, [2.5, 97.5])
+    else:
+        ci_lo, ci_hi = float('nan'), float('nan')
+
+    return {
+        'spearman_rho': rho,
+        'p_value': p_value,
+        'ci_lo': float(ci_lo),
+        'ci_hi': float(ci_hi),
+        'n': int(n),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Batch TOST over a combined results_dict
 # ---------------------------------------------------------------------------
 

@@ -995,6 +995,59 @@ def build_finetuning_dataset(
     return X_all, y_all
 
 
+def shuffle_response_pairing(
+    y_pool: np.ndarray,
+    y_test: np.ndarray,
+    frac: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Break coordinate↔response pairing for a controlled fraction of sites (§18).
+
+    Permutes the responses of a random fraction ``frac`` of electrode sites
+    while leaving their coordinates (``X_pool`` rows) fixed. This destroys the
+    exact property Hypothesis A depends on — smooth spatial autocorrelation
+    between electrode position and EMG response — in a graded way: at ``frac=0``
+    the map is intact, at ``frac=1`` position carries no information about
+    response and TabPFN's advantage should collapse toward a GP with the wrong
+    kernel. Sweeping ``frac`` yields a causal dose-response curve.
+
+    The *same* permutation is applied to ``y_pool`` (per-trial bank) and
+    ``y_test`` (per-site mean) so a site's full response distribution moves
+    together to its new coordinate — only the position↔response binding is
+    scrambled, not the marginal response statistics.
+
+    Args:
+        y_pool: Per-trial responses, shape [N, n_reps] (may contain NaN).
+        y_test: Per-site ground-truth means, shape [N].
+        frac: Fraction of sites to re-pair, in [0, 1].
+        rng: NumPy random generator for reproducible shuffling.
+
+    Returns:
+        Tuple ``(y_pool_shuffled, y_test_shuffled)`` with the same shapes.
+
+    Raises:
+        ValueError: If ``frac`` is outside [0, 1].
+    """
+    if not 0.0 <= frac <= 1.0:
+        raise ValueError(f"frac must be in [0, 1], got {frac}.")
+    n = y_test.shape[0]
+    k = int(round(frac * n))
+    if k < 2:
+        return y_pool.copy(), y_test.copy()
+
+    sel = rng.choice(n, size=k, replace=False)   # sites to re-pair
+    perm = rng.permutation(k)                     # new ordering among selected
+    # Guard against an identity permutation leaving pairing intact at frac>0.
+    if k > 1 and np.all(perm == np.arange(k)):
+        perm = np.roll(perm, 1)
+
+    y_pool_out = y_pool.copy()
+    y_test_out = y_test.copy()
+    y_pool_out[sel] = y_pool[sel][perm]
+    y_test_out[sel] = y_test[sel][perm]
+    return y_pool_out, y_test_out
+
+
 def preprocess_neural_data(subject_data, emg_idx=0, normalization='pfn'):
     """
     Build the per-EMG (X_pool, y_pool) tensors consumed by the BO loops.

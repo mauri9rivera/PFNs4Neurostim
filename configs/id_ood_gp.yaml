@@ -1,6 +1,8 @@
-# Canonical config for ID/OOD analysis using the GP synthetic reference only.
+# Canonical config for ID/OOD analysis using the submodule GP-bag reference only.
 # Family: gp
-# GP synthetic data serves as the ID lower-bound calibration anchor.
+# Sampled from the libs/tabpfn-v1-prior submodule (prior_type='gp'); the internal
+# gpytorch generator is retired (2026-06-08). Per Hyp B, Noise is the main-story
+# anchor — gp_bag is used for the B9 expressiveness diagnosis.
 # Usage:
 #   python src/id_ood_analysis.py --config configs/id_ood_gp.yaml
 
@@ -14,7 +16,7 @@ analyses:
   - mmd
   - mahalanobis
 
-prior_source: gp
+prior_source: gp_bag
 device: cpu
 n_synthetic: 500
 n_context: 0.5

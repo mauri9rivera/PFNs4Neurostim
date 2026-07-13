@@ -27,8 +27,8 @@ budgets:
 #   kappa_schedule: 2.5  →  fixed kappa=2.5 throughout (no annealing)
 kappa_schedule: 4.0
 
-# Acquisition function
-acq_fn: ucb
+# Acquisition function (TS is the project default; kappa_* below only apply when acq_fn: ucb)
+acq_fn: ts
 ts_temperature: 1.0
 
 # kappa values tested in kappa_search mode
@@ -39,7 +39,13 @@ kappa_values:
   - 3.0
   - 5.0
 
+# TOST equivalence margin (A6): calibrate with --tost before setting to a float.
+# Set to a float (e.g. 0.05) after running: python src/aggregate.py --config ... --tost
+# to pre-register the margin before making claims.
+tost_margin: 0.0653
+
 # Infrastructure
 device: cuda
 save: true
 seed: 42
+cache_version: 1  # bump to force cache invalidation across all subjects

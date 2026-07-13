@@ -32,7 +32,10 @@ import yaml
 from tabpfn import TabPFNRegressor
 
 from evaluation import evaluate_optimization, _unpack_budget_trajectory
-from models.regressors import GPSurrogate, TabPFNSurrogate
+from models.regressors import (
+    GPSurrogate, TabPFNSurrogate,
+    DeepKernelGPSurrogate, NaiveGPSurrogate, RandomSearchSurrogate,
+)
 from utils.data_utils import (
     load_data,
     HELD_OUT_SUBJECTS,
@@ -68,6 +71,16 @@ _VALID_MODES: frozenset = frozenset({'optimization', 'optimization_budget', 'kap
 
 # Default kappa values for kappa hyperparameter search
 _DEFAULT_KAPPA_VALUES: List[float] = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0]
+
+
+# §16 — expanded baseline ladder for the optimization mode.  Each entry maps a
+# CLI/config baseline name to (display_label, normalization, surrogate_factory).
+# ``GP`` (tuned stationary) and ``TabPFN`` are always run; these are additive.
+_EXTRA_BASELINES: Dict[str, tuple] = {
+    'deep_kernel_gp': ('Deep-Kernel GP', 'gp', lambda device: DeepKernelGPSurrogate(device=device)),
+    'naive_gp':       ('Naive GP',       'gp', lambda device: NaiveGPSurrogate(device=device)),
+    'random':         ('Random',         'gp', lambda device: RandomSearchSurrogate()),
+}
 
 
 # ============================================
@@ -193,11 +206,16 @@ def _vanilla_optimization(
     acq_fn: str = 'ucb',
     ts_temperature: float = 1.0,
     cache_version: int = 1,
+    baselines: Optional[List[str]] = None,
 ) -> Dict[str, list]:
     """Run BO optimization evaluation for vanilla TabPFN and GP.
 
     Uses ``evaluate_optimization()`` (unified pipeline) for both models with
-    the same ``kappa_schedule`` and acquisition function.
+    the same ``kappa_schedule`` and acquisition function.  When ``baselines``
+    is supplied (§16), each named surrogate in :data:`_EXTRA_BASELINES` is run
+    with the identical loop/acquisition settings and folded into the returned
+    ``results_dict`` under its display label — turning the thin GP-vs-TabPFN
+    result into "matches best-tuned GP, beats naive/random, with zero tuning."
 
     Args:
         dataset_type: ``'rat'`` or ``'nhp'``.
@@ -224,6 +242,17 @@ def _vanilla_optimization(
     """
     results_tabpfn: List[dict] = []
     results_gp: List[dict] = []
+    # §16 extra baselines: display_label -> list[result dict] (one per experiment)
+    baselines = baselines or []
+    unknown_baselines = set(baselines) - set(_EXTRA_BASELINES)
+    if unknown_baselines:
+        raise ValueError(
+            f"Unknown baseline(s): {sorted(unknown_baselines)}. "
+            f"Valid: {sorted(_EXTRA_BASELINES)}"
+        )
+    extra_results: Dict[str, List[dict]] = {
+        _EXTRA_BASELINES[b][0]: [] for b in baselines
+    }
 
     _vanilla_cache_params = {
         'model': 'vanilla_tabpfn',
@@ -307,9 +336,51 @@ def _vanilla_optimization(
         results_gp.append(res_gp)
         print(f"    TabPFN R2={np.mean(res_tabpfn['r2']):.3f}  |  "
               f"GP R2={np.mean(res_gp['r2']):.3f}")
+
+        # --- §16 extra baselines (deep-kernel GP, naive GP, random search) ---
+        for b in baselines:
+            label, normalization, factory = _EXTRA_BASELINES[b]
+            _b_cache_params = {
+                'model': b,
+                'budget': budget,
+                'n_reps': n_reps,
+                'kappa_schedule': kappa_schedule,
+                'acq_fn': acq_fn,
+                'ts_temperature': ts_temperature if acq_fn == 'ts' else None,
+                'normalization': normalization,
+                'cache_version': cache_version,
+            }
+            res_b = load_subject_result(
+                dataset_type, subj_idx, emg_idx, b, _b_cache_params
+            )
+            if res_b is not None:
+                print(f"    [CACHE HIT] {label} subject={subj_idx}, emg={emg_idx}")
+            else:
+                res_b = evaluate_optimization(
+                    surrogate=factory(device),
+                    dataset_type=dataset_type,
+                    subject_idx=subj_idx,
+                    emg_idx=emg_idx,
+                    device=device,
+                    budget=budget,
+                    n_reps=n_reps,
+                    kappa_schedule=kappa_schedule,
+                    normalization=normalization,
+                    acq_fn=acq_fn,
+                    ts_temperature=ts_temperature,
+                )
+                res_b['model_type'] = b
+                save_subject_result(
+                    res_b, dataset_type, subj_idx, emg_idx, b, _b_cache_params
+                )
+            extra_results[label].append(res_b)
+            print(f"    {label} R2={np.mean(res_b['r2']):.3f}")
+
         torch.cuda.empty_cache()
 
     results_dict = {'GP': results_gp, 'TabPFN': results_tabpfn}
+    # Fold §16 baselines in after the primary pair so PALETTE order stays stable.
+    results_dict.update(extra_results)
 
     # --- Plots ---
     r2_by_subject(results_dict, split_type=exp_tag, save=True, output_dir=run_dir)
@@ -714,6 +785,7 @@ def run_vanilla_benchmark(
     acq_fn: str = 'ucb',
     ts_temperature: float = 1.0,
     cache_version: int = 1,
+    baselines: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Orchestrate vanilla TabPFN vs GP benchmark for one or more modes.
 
@@ -866,6 +938,7 @@ def run_vanilla_benchmark(
                 acq_fn=acq_fn,
                 ts_temperature=ts_temperature,
                 cache_version=cache_version,
+                baselines=baselines,
             )
 
         elif m == 'optimization_budget':
@@ -933,8 +1006,8 @@ def run_benchmark() -> None:
                              '  any other value = fixed kappa throughout the BO loop')
     parser.add_argument('--acq_fn', type=str, default=None,
                         choices=['ucb', 'ts'],
-                        help="Acquisition function: 'ucb' (default, UCB with optional kappa schedule)\n"
-                             "  or 'ts' (Thompson Sampling from predictive posterior).")
+                        help="Acquisition function: 'ts' (default, Thompson Sampling from the\n"
+                             "  predictive posterior) or 'ucb' (UCB with optional kappa schedule).")
     parser.add_argument('--ts_temperature', type=float, default=None,
                         help='Temperature for TabPFN bar-distribution sampling in TS mode.\n'
                              '  1.0 (default) = exact predictive distribution;\n'
@@ -942,6 +1015,12 @@ def run_benchmark() -> None:
     parser.add_argument('--kappa_values', type=float, nargs='+', default=None,
                         help='Fixed kappa values for kappa_search mode\n'
                              '(default: 0.5 1.0 2.0 3.0 5.0)')
+    parser.add_argument('--baselines', type=str, nargs='+', default=None,
+                        choices=sorted(_EXTRA_BASELINES),
+                        help='§16 extra baselines to run alongside GP + TabPFN in\n'
+                             'optimization mode: deep_kernel_gp (non-stationary GP),\n'
+                             'naive_gp (fixed RBF, no tuning), random (random search).\n'
+                             'Default: none (GP + TabPFN only).')
     parser.add_argument('--subjects', type=str, default=None,
                         choices=['held_out', 'all'],
                         dest='subjects_mode',
@@ -992,9 +1071,10 @@ def run_benchmark() -> None:
         'kappa_values': list(_DEFAULT_KAPPA_VALUES),
         'subjects_mode': 'held_out',
         'seed': 42,
-        'acq_fn': 'ucb',
+        'acq_fn': 'ts',
         'ts_temperature': 1.0,
         'cache_version': 1,
+        'baselines': [],
     }
     for key, default in _defaults.items():
         if getattr(args, key, None) is None:
@@ -1039,6 +1119,7 @@ def run_benchmark() -> None:
             acq_fn=args.acq_fn,
             ts_temperature=args.ts_temperature,
             cache_version=args.cache_version,
+            baselines=args.baselines,
         )
         _diag.record_experiment(n_completed=len(_experiments) * len(args.mode))
 

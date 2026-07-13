@@ -18,6 +18,10 @@ PALETTE = {
     'TabPFN': 'seagreen',
     'LoRA TabPFN': 'seagreen',
     'Full FT': 'royalblue',
+    # §16 expanded baseline ladder
+    'Deep-Kernel GP': 'firebrick',
+    'Naive GP': 'goldenrod',
+    'Random': 'gray',
 }
 
 
@@ -2029,4 +2033,268 @@ def gfs_by_subject(
         plt.savefig(path, format='svg', bbox_inches='tight')
         print(f"Saved plot -> {path}")
 
+    plt.close()
+
+
+def plot_calibration_reliability(
+    calib_by_model: dict,
+    dataset: str = '',
+    split_type: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """§17 — Reliability diagram: empirical vs nominal predictive-interval coverage.
+
+    One line per model.  Points on the diagonal are perfectly calibrated;
+    below the diagonal means over-confident (intervals too narrow), above
+    means under-confident.  The legend reports each model's ECE.
+
+    Args:
+        calib_by_model: ``{model_label: calibration_dict}`` where each dict is a
+            return value of :func:`utils.stats.compute_calibration` (keys
+            ``nominal``, ``empirical``, ``ece``).
+        dataset: Dataset label for the title and filename.
+        split_type: Suffix appended to the output filename.
+        save: If True, write SVG under ``<output_dir>/optimization/``.
+        output_dir: Run-level output directory root.
+    """
+    if not calib_by_model:
+        print("[calibration] No calibration data — skipping reliability diagram.")
+        return
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot([0, 1], [0, 1], color='black', linestyle='--', linewidth=1.0,
+            label='Perfect calibration')
+
+    for model_label, calib in calib_by_model.items():
+        color = PALETTE.get(model_label, PALETTE.get(_canonical_model_label(model_label), 'gray'))
+        nominal = np.asarray(calib['nominal'], dtype=float)
+        empirical = np.asarray(calib['empirical'], dtype=float)
+        ax.plot(nominal, empirical, marker='o', color=color, linewidth=2,
+                label=f"{model_label} (ECE={calib['ece']:.3f})")
+
+    ax.set_xlabel('Nominal coverage')
+    ax.set_ylabel('Empirical coverage')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect('equal')
+    ax.set_title(f'§17 Calibration reliability ({dataset})' if dataset else '§17 Calibration reliability')
+    ax.legend(fontsize=8, loc='upper left')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    if save:
+        base = (
+            os.path.join(output_dir, 'optimization')
+            if output_dir
+            else os.path.join('output', 'optimization')
+        )
+        os.makedirs(base, exist_ok=True)
+        suffix = f'_{dataset}_{split_type}' if split_type else (f'_{dataset}' if dataset else '')
+        path = os.path.join(base, f'calibration_reliability{suffix}.svg')
+        plt.savefig(path, format='svg', bbox_inches='tight')
+        print(f"Saved calibration plot -> {path}")
+    plt.close()
+
+
+def plot_ood_regret_scatter(
+    ood_scores: np.ndarray,
+    regrets: np.ndarray,
+    corr: dict,
+    ood_metric: str = 'MMD',
+    labels: Optional[list] = None,
+    dataset: str = '',
+    split_type: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """§17 — Scatter of per-experiment OOD score vs final BO regret.
+
+    Each point is one (subject, EMG) channel.  A least-squares fit line and the
+    Spearman ρ with its bootstrap 95% CI (from
+    :func:`utils.stats.ood_regret_correlation`) are annotated, testing whether
+    OOD placement predicts BO performance.
+
+    Args:
+        ood_scores: Per-experiment OOD scores, shape [K].
+        regrets: Per-experiment final regret, same ordering, shape [K].
+        corr: Return dict of :func:`utils.stats.ood_regret_correlation`.
+        ood_metric: Name of the OOD metric (axis label / filename).
+        labels: Optional per-point text labels (e.g. ``'S1_EMG0'``).
+        dataset: Dataset label for the title and filename.
+        split_type: Suffix appended to the output filename.
+        save: If True, write SVG under ``<output_dir>/optimization/``.
+        output_dir: Run-level output directory root.
+    """
+    a = np.asarray(ood_scores, dtype=float).ravel()
+    b = np.asarray(regrets, dtype=float).ravel()
+    if len(a) == 0:
+        print("[ood-regret] No data — skipping scatter.")
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(a, b, s=40, color='seagreen', alpha=0.8, edgecolor='k', linewidth=0.5)
+
+    if labels is not None:
+        for x, y, lab in zip(a, b, labels):
+            ax.annotate(str(lab), (x, y), fontsize=6, alpha=0.6,
+                        xytext=(3, 3), textcoords='offset points')
+
+    # Least-squares trend line (visual aid; inference is the Spearman ρ).
+    if np.ptp(a) > 1e-12:
+        coeffs = np.polyfit(a, b, 1)
+        xs = np.linspace(a.min(), a.max(), 100)
+        ax.plot(xs, np.polyval(coeffs, xs), color='firebrick', linewidth=1.5, linestyle='--')
+
+    rho = corr.get('spearman_rho', float('nan'))
+    ci_lo = corr.get('ci_lo', float('nan'))
+    ci_hi = corr.get('ci_hi', float('nan'))
+    p_val = corr.get('p_value', float('nan'))
+    ax.set_title(
+        f'§17 OOD→regret ({dataset})\n'
+        f'Spearman ρ={rho:.3f} [95% CI {ci_lo:.3f}, {ci_hi:.3f}], p={p_val:.3g}'
+    )
+    ax.set_xlabel(f'{ood_metric} OOD score')
+    ax.set_ylabel('Final BO regret (normalised)')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    if save:
+        base = (
+            os.path.join(output_dir, 'optimization')
+            if output_dir
+            else os.path.join('output', 'optimization')
+        )
+        os.makedirs(base, exist_ok=True)
+        suffix = f'_{dataset}_{split_type}' if split_type else (f'_{dataset}' if dataset else '')
+        path = os.path.join(base, f'ood_regret_{ood_metric.lower()}{suffix}.svg')
+        plt.savefig(path, format='svg', bbox_inches='tight')
+        print(f"Saved OOD-regret scatter -> {path}")
+    plt.close()
+
+
+def plot_shuffle_ablation(
+    df: "pd.DataFrame",
+    dataset: str = '',
+    split_type: str = '',
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """§18 — Spatial-autocorrelation dose-response: regret vs shuffle fraction.
+
+    Mean final regret (95% CI over per-(subject,EMG,rep) values) for each model
+    as the coordinate↔response pairing is progressively scrambled.  A monotone
+    rise for TabPFN that converges toward GP as ``frac→1`` is the causal
+    signature that TabPFN's advantage comes from exploiting smooth spatial
+    autocorrelation.
+
+    Args:
+        df: Long-form DataFrame with columns ``['shuffle_frac', 'Model',
+            'Regret']`` (one row per rep), from ``mechanistic_ablation``.
+        dataset: Dataset label for title and filename.
+        split_type: Suffix appended to the output filename.
+        save: If True, write SVG under ``<output_dir>/optimization/``.
+        output_dir: Run-level output directory root.
+    """
+    if df.empty:
+        print("[shuffle-ablation] Empty DataFrame — skipping dose-response plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for model_name, sub in df.groupby('Model'):
+        color = PALETTE.get(model_name, PALETTE.get(_canonical_model_label(model_name), 'gray'))
+        grp = sub.groupby('shuffle_frac')['Regret']
+        fracs = np.array(sorted(sub['shuffle_frac'].unique()))
+        means = grp.mean().reindex(fracs).to_numpy()
+        counts = grp.count().reindex(fracs).to_numpy()
+        ses = (grp.std(ddof=1).reindex(fracs).to_numpy() / np.sqrt(np.maximum(counts, 1)))
+        ax.plot(fracs, means, marker='o', color=color, linewidth=2, label=model_name)
+        ax.fill_between(fracs, means - 1.96 * ses, means + 1.96 * ses,
+                        color=color, alpha=0.2)
+
+    ax.set_xlabel('Coordinate↔response shuffle fraction  $f$')
+    ax.set_ylabel('Final BO regret (normalised)')
+    ax.set_title(f'§18 Spatial-autocorrelation ablation ({dataset})' if dataset
+                 else '§18 Spatial-autocorrelation ablation')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    if save:
+        base = (
+            os.path.join(output_dir, 'optimization')
+            if output_dir
+            else os.path.join('output', 'optimization')
+        )
+        os.makedirs(base, exist_ok=True)
+        suffix = f'_{dataset}_{split_type}' if split_type else (f'_{dataset}' if dataset else '')
+        path = os.path.join(base, f'shuffle_ablation{suffix}.svg')
+        plt.savefig(path, format='svg', bbox_inches='tight')
+        print(f"Saved shuffle-ablation plot -> {path}")
+    plt.close()
+
+
+def plot_latency_vs_isi(
+    df: "pd.DataFrame",
+    isi_refs: Optional[dict] = None,
+    save: bool = False,
+    output_dir: Optional[str] = None,
+) -> None:
+    """§19 — Per-query latency vs biological inter-stimulus intervals.
+
+    Grouped bars of median per-query end-to-end latency (fit-context +
+    acquisition + prediction) for each model at each real dataset scale, with
+    horizontal reference lines at typical biological inter-stimulus intervals.
+    Making the "real-time" motivation concrete: a model whose per-query latency
+    sits well below the ISI is feasible for closed-loop stimulation.
+
+    Args:
+        df: DataFrame with columns ``['scale', 'model', 'latency_s']`` (one row
+            per timing rep), from ``latency_benchmark``.
+        isi_refs: ``{label: seconds}`` reference inter-stimulus intervals drawn
+            as horizontal lines.  Defaults to a cortical-microstimulation set.
+        save: If True, write ``latency_vs_isi.svg`` to ``output_dir``.
+        output_dir: Directory for the output file.  Defaults to
+            ``'output/latency'``.
+    """
+    if df.empty:
+        print("[latency] Empty DataFrame — skipping latency plot.")
+        return
+    if isi_refs is None:
+        isi_refs = {'Fast ISI (0.5 s)': 0.5, 'Typical ISI (1 s)': 1.0, 'Slow ISI (2 s)': 2.0}
+
+    scales = list(dict.fromkeys(df['scale'].tolist()))  # preserve first-seen order
+    models = sorted(df['model'].unique().tolist())
+    x = np.arange(len(scales))
+    width = 0.8 / max(len(models), 1)
+
+    fig, ax = plt.subplots(figsize=(max(6, 1.5 * len(scales)), 5))
+    for i, model in enumerate(models):
+        med = [
+            float(df[(df['scale'] == s) & (df['model'] == model)]['latency_s'].median())
+            for s in scales
+        ]
+        color = PALETTE.get(model, PALETTE.get(_canonical_model_label(model), 'gray'))
+        ax.bar(x + i * width, med, width, label=model, color=color)
+
+    for label, isi in isi_refs.items():
+        ax.axhline(isi, linestyle='--', linewidth=1.0, alpha=0.7, color='black')
+        ax.text(len(scales) - 0.5, isi, f' {label}', va='bottom', ha='right', fontsize=7)
+
+    ax.set_yscale('log')
+    ax.set_xticks(x + width * (len(models) - 1) / 2)
+    ax.set_xticklabels(scales, rotation=20, ha='right')
+    ax.set_ylabel('Per-query latency (s, log scale)')
+    ax.set_xlabel('Dataset scale')
+    ax.set_title('§19 Per-query latency vs biological inter-stimulus intervals')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, axis='y', which='both')
+    fig.tight_layout()
+
+    if save:
+        base = output_dir if output_dir else os.path.join('output', 'latency')
+        os.makedirs(base, exist_ok=True)
+        path = os.path.join(base, 'latency_vs_isi.svg')
+        plt.savefig(path, format='svg', bbox_inches='tight')
+        print(f"Saved latency plot -> {path}")
     plt.close()

@@ -23,6 +23,18 @@ PALETTE = {
     'Correlated OOD': 'mediumorchid',
 }
 
+# Shared reference-comparison legend for dashboard panels. Passing a dict keyed
+# by the hue label (not a positional list) keeps each reference on its semantic
+# color regardless of which references are present in a given run — e.g. with
+# prior_source=prior_bag the 'vs GP' level is absent, but 'vs Prior'/'vs Noise'
+# still map to seagreen/firebrick instead of shifting to the missing GP slot.
+REF_HUE_ORDER = ['vs GP', 'vs Prior', 'vs Noise']
+REF_PALETTE = {
+    'vs GP': PALETTE['Synthetic GP'],
+    'vs Prior': PALETTE['TabPFN Prior'],
+    'vs Noise': PALETTE['Noise (OOD)'],
+}
+
 
 def _save_dir(output_dir, subdir):
     """Return output directory, creating if needed."""
@@ -762,8 +774,7 @@ def _panel_mmd(ax, mmd_results):
     if mmd_data:
         df = pd.DataFrame(mmd_data)
         sns.barplot(data=df, x='Dataset', y='MMD²', hue='Reference',
-                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
-                             PALETTE['Noise (OOD)']],
+                    palette=REF_PALETTE, hue_order=REF_HUE_ORDER,
                     ax=ax, capsize=0.1, errorbar=('ci', 95))
     ax.grid(True, alpha=0.3, axis='y')
 
@@ -788,8 +799,7 @@ def _panel_mahalanobis(ax, mahalanobis_results):
     if mah_data:
         df = pd.DataFrame(mah_data)
         sns.boxplot(data=df, x='Dataset', y='D_M', hue='Reference',
-                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
-                             PALETTE['Noise (OOD)']],
+                    palette=REF_PALETTE, hue_order=REF_HUE_ORDER,
                     ax=ax, fliersize=2)
     ax.grid(True, alpha=0.3, axis='y')
 
@@ -800,8 +810,7 @@ def _panel_cka(ax, cka_results):
     layer = max(layers)
 
     cka_data = []
-    ref_label_map = {'gp': 'Synthetic GP', 'prior': 'TabPFN Prior',
-                     'noise': 'Noise (OOD)'}
+    ref_label_map = {'gp': 'vs GP', 'prior': 'vs Prior', 'noise': 'vs Noise'}
     for dt in _get_cka_dataset_types(cka_results):
         ds_data = cka_results[dt]
         for subj_data in ds_data.values():
@@ -820,8 +829,7 @@ def _panel_cka(ax, cka_results):
     if cka_data:
         df = pd.DataFrame(cka_data)
         sns.barplot(data=df, x='Dataset', y='CKA', hue='Reference',
-                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
-                             PALETTE['Noise (OOD)']],
+                    palette=REF_PALETTE, hue_order=REF_HUE_ORDER,
                     ax=ax, capsize=0.1, errorbar=('ci', 95))
         ax.set_ylim(0, 1)
     ax.set_title(f'CKA (Layer {layer})')
@@ -846,8 +854,7 @@ def _panel_wasserstein(ax, wasserstein_results):
     if w_data:
         df = pd.DataFrame(w_data)
         sns.barplot(data=df, x='Dataset', y='W2', hue='Reference',
-                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
-                             PALETTE['Noise (OOD)']],
+                    palette=REF_PALETTE, hue_order=REF_HUE_ORDER,
                     ax=ax, capsize=0.1, errorbar=('ci', 95))
     ax.grid(True, alpha=0.3, axis='y')
 
@@ -1778,11 +1785,7 @@ def _panel_rsa(ax: plt.Axes, rsa_results: dict) -> None:
     layer = max(layers)
     dataset_types = [k for k in rsa_results if k != 'layers']
     refs = ['gp', 'prior', 'noise']
-    ref_labels = {
-        'gp': 'Synthetic GP',
-        'prior': 'TabPFN Prior',
-        'noise': 'Noise (OOD)',
-    }
+    ref_labels = {'gp': 'vs GP', 'prior': 'vs Prior', 'noise': 'vs Noise'}
 
     rsa_data = []
     for dt in dataset_types:
@@ -1802,8 +1805,7 @@ def _panel_rsa(ax: plt.Axes, rsa_results: dict) -> None:
     if rsa_data:
         df = pd.DataFrame(rsa_data)
         sns.barplot(data=df, x='Dataset', y='RSA ρ', hue='Reference',
-                    palette=[PALETTE['Synthetic GP'], PALETTE['TabPFN Prior'],
-                             PALETTE['Noise (OOD)']],
+                    palette=REF_PALETTE, hue_order=REF_HUE_ORDER,
                     ax=ax, capsize=0.1, errorbar=('ci', 95))
 
     ax.set_ylim(-1, 1)

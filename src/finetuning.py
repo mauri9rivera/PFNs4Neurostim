@@ -770,7 +770,7 @@ def run_finetuning():
         'aug_transforms': None,
         'subjects': 'held_out',
         'kappa_schedule': 0.0,
-        'acq_fn': 'ucb',
+        'acq_fn': 'ts',
         'ts_temperature': 1.0,
         'lora_rank': 8,
         'lora_alpha': 16,

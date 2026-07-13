@@ -1,23 +1,27 @@
-# Canonical hyperparameters for NHP budget sweep (optimization mode).
-# Family: optimization-budget
-# Sweeps BO query budgets to test TabPFN robustness at small training sizes.
+# Canonical hyperparameters for 5d_rat inter-subject optimization experiment.
+# Family: optimization
 # Usage:
-#   python src/finetuning.py --config configs/nhp_optimization_budget.yaml
+#   python src/finetuning.py --config configs/5d_rat_optimization.yaml
 
-family: optimization-budget
-dataset: nhp
+family: optimization
+dataset: 5d_rat
 split: inter_subject
 mode:
-  - optimization_budget
+  - optimization
 
 # Training
 epochs: 100
 lr: 1.0e-4
 aug_pct: 2.5
+# 5D search space (PW, freq, duration, x_ch, y_ch) has no 2D electrode grid,
+# so the 2D-only spatial flips (h_flip/v_flip/d_flip) are unavailable.
+aug_transforms:
+  - none
+  - y_shift
 
 # Evaluation
-budget: 100
-n_reps: 30
+budget: 200
+n_reps: 20
 
 # UCB kappa control:
 #   kappa_schedule: 0.0  →  auto cosine-annealed schedule (GP-UCB theory)
@@ -27,13 +31,6 @@ kappa_schedule: 0.0
 # Acquisition function (TS is the project default; kappa_* only apply when acq_fn: ucb)
 acq_fn: ts
 ts_temperature: 1.0
-
-budgets:
-  - 10
-  - 30
-  - 50
-  - 100
-  - 200
 
 # Infrastructure
 device: cuda

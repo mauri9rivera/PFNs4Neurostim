@@ -30,6 +30,7 @@ from models.regressors import (
 from utils.bo_loops import run_bo_loop, _snapshot_iters
 from utils.data_utils import (
     build_finetuning_dataset, load_data, preprocess_neural_data,
+    shuffle_response_pairing,
     HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS,
     generate_experiment_tag, save_results,
     create_run_dir, write_run_config,
@@ -400,6 +401,7 @@ def evaluate_optimization(
     ts_temperature: float = 1.0,
     capture_all_snapshots: bool = False,
     snapshot_iters_override: Optional[List[int]] = None,
+    shuffle_frac: float = 0.0,
 ) -> dict:
     """Evaluate Bayesian optimisation performance using any surrogate model.
 
@@ -438,6 +440,11 @@ def evaluate_optimization(
         snapshot_iters_override: When provided, replaces the auto-computed
             log2-spaced ``snap_iters`` with this explicit list.  Used by the
             budget-sweep refactor to force snapshots at the exact budget values.
+        shuffle_frac: §18 spatial-autocorrelation ablation.  Fraction of
+            electrode sites whose coordinate↔response pairing is scrambled
+            (via :func:`utils.data_utils.shuffle_response_pairing`) before the
+            BO loop.  ``0.0`` (default) leaves the map intact; ``1.0`` fully
+            destroys spatial autocorrelation.
 
     Returns:
         Dictionary with keys matching ``gp_baseline`` / ``finetuned_optimization``:
@@ -463,6 +470,13 @@ def evaluate_optimization(
         data, emg_idx, normalization
     )
     # X_pool: [N, D], y_pool: [N, n_stims], X_test: [M, D], y_test: [M]
+
+    # §18 — scramble coordinate↔response pairing to ablate spatial autocorrelation.
+    if shuffle_frac > 0.0:
+        _shuf_rng = np.random.default_rng(
+            abs(hash((dataset_type, subject_idx, emg_idx, round(shuffle_frac, 4)))) % (2**32)
+        )
+        y_pool, y_test = shuffle_response_pairing(y_pool, y_test, shuffle_frac, _shuf_rng)
 
     n_init = max(3, int(0.05 * budget))
     snap_iters = (

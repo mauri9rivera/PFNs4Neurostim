@@ -22,7 +22,7 @@ from tabpfn import TabPFNRegressor
 from tabpfn.base import RegressorModelSpecs
 from tabpfn.finetuning.finetuned_regressor import FinetunedTabPFNRegressor
 
-from models.gaussians import ExactGP
+from models.gaussians import ExactGP, DeepKernelGP
 from models.lora import (
     apply_lora, merge_lora, count_params, save_lora_checkpoint,
     load_lora_checkpoint,
@@ -145,6 +145,24 @@ class GPSurrogate:
         self._model: ExactGP | None = None
         self._likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
 
+    def _build_model(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: "gpytorch.likelihoods.GaussianLikelihood",
+    ) -> ExactGP:
+        """Construct the GP model for this surrogate (override point for subclasses).
+
+        Args:
+            train_x: Training inputs, shape [N, D].
+            train_y: Training targets, shape [N].
+            likelihood: The Gaussian likelihood instance.
+
+        Returns:
+            An initialised gpytorch ExactGP-derived model on the surrogate device.
+        """
+        return ExactGP(train_x, train_y, likelihood).to(self._device)
+
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         """Train GP hyperparameters via marginal likelihood on observed data.
 
@@ -166,7 +184,7 @@ class GPSurrogate:
             )
 
         self._likelihood = gpytorch.likelihoods.GaussianLikelihood().to(self._device)
-        self._model = ExactGP(train_x, train_y, self._likelihood).to(self._device)
+        self._model = self._build_model(train_x, train_y, self._likelihood)
 
         self._model.train()
         self._likelihood.train()
@@ -271,6 +289,194 @@ class GPSurrogate:
             f_posterior = self._model(query_x)   # latent posterior N(μ, K) — [M]
             sample = f_posterior.rsample()       # [M] — joint draw preserving kernel correlations
         return sample.cpu().numpy()              # [M]
+
+
+# ---------------------------------------------------------------------------
+# DeepKernelGPSurrogate — non-stationary GP baseline (§16, limitation L2/L9)
+# ---------------------------------------------------------------------------
+
+class DeepKernelGPSurrogate(GPSurrogate):
+    """Deep-kernel (non-stationary) GP surrogate conforming to ``SurrogateModel``.
+
+    Reuses the full :class:`GPSurrogate` fit/predict/acquisition machinery but
+    swaps the stationary :class:`ExactGP` for a :class:`DeepKernelGP` whose MLP
+    feature extractor is trained jointly with the GP hyperparameters. Serves as
+    the "best-tuned, expressive GP" baseline: if TabPFN still matches or beats
+    it, the on-par-but-cheaper claim is not an artefact of a weak (stationary)
+    GP, and the GFS over-smoothing story (A5) is causal rather than a
+    weak-baseline artefact.
+
+    A higher default ``n_opt_steps`` and ``lr`` are used than the stationary GP
+    because the extra MLP parameters need more optimisation to converge.
+
+    Args:
+        device: PyTorch device string ('cpu' or 'cuda').
+        n_opt_steps: Adam steps for joint MLP + GP hyperparameter training.
+        lr: Adam learning rate.
+        feature_dim: Output dimensionality of the learned feature space.
+        hidden: Hidden width of the feature-extractor MLP.
+    """
+
+    def __init__(
+        self,
+        device: str = 'cpu',
+        n_opt_steps: int = 120,
+        lr: float = 0.02,
+        feature_dim: int = 2,
+        hidden: int = 32,
+    ) -> None:
+        super().__init__(device=device, n_opt_steps=n_opt_steps, lr=lr)
+        self._feature_dim = feature_dim
+        self._hidden = hidden
+
+    def _build_model(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: "gpytorch.likelihoods.GaussianLikelihood",
+    ) -> DeepKernelGP:
+        """Construct a :class:`DeepKernelGP` on the surrogate device."""
+        return DeepKernelGP(
+            train_x, train_y, likelihood,
+            feature_dim=self._feature_dim, hidden=self._hidden,
+        ).to(self._device)
+
+
+# ---------------------------------------------------------------------------
+# NaiveGPSurrogate — fixed-hyperparameter RBF GP lower-bound baseline (§16, L2)
+# ---------------------------------------------------------------------------
+
+class NaiveGPSurrogate(GPSurrogate):
+    """Naive-default GP: fixed RBF kernel, *no* marginal-likelihood tuning.
+
+    Sets ``n_opt_steps=0`` so kernel hyperparameters keep their default
+    initialisation (a fixed lengthscale/outputscale/noise) and are never fit to
+    the data. This is the "no tuning at all" lower bound: it isolates how much
+    of a tuned GP's performance comes from hyperparameter optimisation, and
+    quantifies the tuning that TabPFN avoids entirely.
+
+    Args:
+        device: PyTorch device string ('cpu' or 'cuda').
+        lengthscale: Fixed RBF lengthscale applied to every input dimension.
+        outputscale: Fixed signal variance (scale-kernel output scale).
+        noise: Fixed Gaussian observation noise variance.
+    """
+
+    def __init__(
+        self,
+        device: str = 'cpu',
+        lengthscale: float = 0.2,
+        outputscale: float = 1.0,
+        noise: float = 1e-2,
+    ) -> None:
+        # n_opt_steps=0 → fit() skips the optimisation loop entirely.
+        super().__init__(device=device, n_opt_steps=0)
+        self._lengthscale = lengthscale
+        self._outputscale = outputscale
+        self._noise = noise
+
+    def _build_model(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: "gpytorch.likelihoods.GaussianLikelihood",
+    ) -> ExactGP:
+        """Construct an :class:`ExactGP` with fixed (unoptimised) hyperparameters."""
+        model = ExactGP(train_x, train_y, likelihood).to(self._device)
+        # Pin hyperparameters to the naive defaults; fit() runs 0 opt steps so
+        # these values persist through prediction.
+        with torch.no_grad():
+            model.covar_module.base_kernel.lengthscale = self._lengthscale
+            model.covar_module.outputscale = self._outputscale
+            likelihood.noise = self._noise
+        return model
+
+
+# ---------------------------------------------------------------------------
+# RandomSearchSurrogate — random-acquisition lower bound (§16, L2)
+# ---------------------------------------------------------------------------
+
+class RandomSearchSurrogate:
+    """Random-search baseline conforming to the ``SurrogateModel`` protocol.
+
+    Acquisition is uniformly random: ``predict_ucb`` / ``predict_ts`` return
+    i.i.d. noise so ``argmax`` selects a random candidate each step. The
+    ``predict`` readout used for the exploitation recommendation and the final
+    R² is a 1-nearest-neighbour lookup over the points observed so far — the
+    honest "best you can do with random queries and no model" reference.
+
+    This is the true lower bound for the §16 baseline ladder: matching random
+    search would falsify any claim that either surrogate is learning structure.
+
+    Args:
+        seed: Optional seed for the internal RNG (independent of global seeds
+            so the acquisition stream is reproducible per surrogate instance).
+    """
+
+    def __init__(self, seed: Optional[int] = None) -> None:
+        self._rng = np.random.default_rng(seed)
+        self._X: Optional[np.ndarray] = None  # [N, D] observed
+        self._y: Optional[np.ndarray] = None  # [N]    observed
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Store observed points for the nearest-neighbour readout.
+
+        Args:
+            X: Observed feature matrix, shape [N, D].
+            y: Observed targets, shape [N].
+        """
+        if np.isnan(X).any() or np.isnan(y).any():
+            raise RuntimeError("RandomSearchSurrogate.fit received NaN inputs.")
+        self._X = np.asarray(X, dtype=np.float64)
+        self._y = np.asarray(y, dtype=np.float64)
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return a 1-NN readout over observed points and zero std.
+
+        Args:
+            X: Query feature matrix, shape [M, D].
+
+        Returns:
+            Tuple of (mean, std), each shape [M].  ``mean[j]`` is the observed
+            target of the nearest observed point to ``X[j]``; ``std`` is all
+            zeros (random search carries no calibrated uncertainty).
+        """
+        if self._X is None or self._y is None:
+            raise RuntimeError("RandomSearchSurrogate.predict called before fit.")
+        Xq = np.asarray(X, dtype=np.float64)                     # [M, D]
+        # Pairwise squared distances query→observed, take nearest observed.
+        d2 = ((Xq[:, None, :] - self._X[None, :, :]) ** 2).sum(-1)  # [M, N]
+        nn = np.argmin(d2, axis=1)                                # [M]
+        mean = self._y[nn]                                        # [M]
+        return mean, np.zeros_like(mean)                         # [M], [M]
+
+    def predict_ucb(
+        self, X: np.ndarray, kappa: float, t: int, n_steps: int,
+    ) -> np.ndarray:
+        """Return i.i.d. random acquisition values (uniform random selection).
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].
+            kappa: Unused (random search ignores exploration coefficients).
+            t: Unused.
+            n_steps: Unused.
+
+        Returns:
+            Random values, shape [M].
+        """
+        return self._rng.standard_normal(X.shape[0])  # [M]
+
+    def predict_ts(self, X: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        """Return i.i.d. random acquisition values (uniform random selection).
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].
+            temperature: Unused.
+
+        Returns:
+            Random values, shape [M].
+        """
+        return self._rng.standard_normal(X.shape[0])  # [M]
 
 
 # ---------------------------------------------------------------------------

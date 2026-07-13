@@ -35,8 +35,8 @@ n_reps: 30
 #   kappa_min: 2.5
 kappa_schedule: 4.0
 
-# Acquisition function
-acq_fn: ucb
+# Acquisition function (TS is the project default; kappa_* only apply when acq_fn: ucb)
+acq_fn: ts
 ts_temperature: 1.0
 
 # Infrastructure
