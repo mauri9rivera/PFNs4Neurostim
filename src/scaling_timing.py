@@ -181,7 +181,8 @@ def run_scaling_benchmark(
     n_reps: int = 15,
     d: int = 2,
     tabpfn_device: str = 'cpu',
-    gp_n_opt_steps: int = 50,
+    tabpfn_n_estimators: int = 1,
+    gp_n_opt_steps: int = 100,
     acq_fn: str = 'ts',
     ts_temperature: float = 1.0,
     kappa: float = 2.0,
@@ -207,6 +208,10 @@ def run_scaling_benchmark(
         n_reps: Timing repetitions per (model, n).
         d: Feature dimensionality (2 for 2D electrode coordinates).
         tabpfn_device: Inference device for TabPFN (``'cpu'`` or ``'cuda'``).
+        tabpfn_n_estimators: TabPFN ensemble members per fit.  Default ``1``
+            matches ``run_bo_loop`` (one transformer call per BO step); the
+            TabPFN default of 8 would time a different, 3–5× slower
+            configuration than the one the BO experiments run (audit P0.13).
         gp_n_opt_steps: GP marginal-likelihood optimisation steps per fit call.
         acq_fn: Acquisition function to benchmark (``'ts'`` or ``'ucb'``).
             ``'ts'`` (default) is the primary acquisition used in the paper.
@@ -229,7 +234,7 @@ def run_scaling_benchmark(
     set_seed(seed)
     rng = np.random.default_rng(seed)
 
-    tabpfn_base = TabPFNRegressor(device=tabpfn_device)
+    tabpfn_base = TabPFNRegressor(device=tabpfn_device, n_estimators=tabpfn_n_estimators)
 
     records: list[dict] = []
     for n in grid_sizes:
@@ -325,7 +330,11 @@ def main() -> None:
         help='Device for TabPFN inference.  GP always runs on CPU.',
     )
     parser.add_argument(
-        '--gp_n_opt_steps', type=int, default=50,
+        '--tabpfn_n_estimators', type=int, default=1,
+        help='TabPFN ensemble members per fit (1 = the BO loop configuration; audit P0.13).',
+    )
+    parser.add_argument(
+        '--gp_n_opt_steps', type=int, default=100,
         help='GP marginal-likelihood optimisation steps per fit call.',
     )
     parser.add_argument(
@@ -378,6 +387,7 @@ def main() -> None:
         n_reps=args.n_reps,
         d=args.d,
         tabpfn_device=args.device,
+        tabpfn_n_estimators=args.tabpfn_n_estimators,
         gp_n_opt_steps=args.gp_n_opt_steps,
         acq_fn=args.acq_fn,
         ts_temperature=args.ts_temperature,

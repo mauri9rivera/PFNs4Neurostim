@@ -18,7 +18,9 @@ import torch
 import gpytorch
 
 from models.gaussians import ExactGP
-from utils.gpbo_utils import compute_ucb_kappa, _auto_kappa_max, _auto_kappa_min
+from utils.gpbo_utils import (
+    compute_ucb_kappa, expected_improvement_numpy, _auto_kappa_max, _auto_kappa_min,
+)
 
 
 def _draw_valid_rep(y_pool: np.ndarray, idx: int, fallback: float) -> float:
@@ -110,8 +112,11 @@ def run_bo_loop(
         snapshot_iters: Optional list of observation counts at which to record
             a prediction snapshot on ``X_test`` (e.g. for R²-vs-budget plots).
             The final budget iteration is always included if provided.
-        acq_fn: Acquisition function choice.  ``'ucb'`` (default) uses
-            Upper Confidence Bound acquisition; ``'ts'`` uses Thompson Sampling.
+        acq_fn: Acquisition function choice.  ``'ei'`` = Expected Improvement over
+            the best observed value (same closed form for every surrogate);
+            ``'ucb'`` = Upper Confidence Bound; ``'ts'`` = Thompson Sampling
+            (per-site draws; see the 2026-09-17 TS decision in
+            ``.claude/research_design.md``).
         ts_temperature: Temperature for TabPFN bar-distribution sampling when
             ``acq_fn='ts'``.  ``1.0`` = exact predictive distribution;
             ``<1.0`` = sharper / greedier; ``>1.0`` = more uniform.
@@ -137,9 +142,9 @@ def run_bo_loop(
         raise ValueError(
             f"budget ({budget}) must be greater than n_init ({n_init})."
         )
-    if acq_fn not in ('ucb', 'ts'):
+    if acq_fn not in ('ucb', 'ts', 'ei'):
         raise ValueError(
-            f"Unknown acq_fn: {acq_fn!r}. Choose 'ucb' or 'ts'."
+            f"Unknown acq_fn: {acq_fn!r}. Choose 'ei', 'ucb' or 'ts'."
         )
 
     n_locs = X_pool.shape[0]   # [N, D]
@@ -189,6 +194,20 @@ def run_bo_loop(
                 model.predict_ts(X_pool, temperature=ts_temperature), dtype=np.float64
             )  # [N]
             pool_mean, _ = model.predict(X_pool)  # [N] — for exploitation rec.
+
+        elif acq_fn == 'ei':
+            # Expected Improvement over the best *observed* value, computed from
+            # each surrogate's predictive mean and std — identical formula for GP
+            # and TabPFN, so no model gets a structurally different rule.
+            pool_mean, std = model.predict(X_pool)                     # [N], [N]
+            pool_mean = np.asarray(pool_mean, dtype=np.float64)        # [N]
+            # Incumbent = best *predicted* value among queried sites, not the best
+            # noisy observation: with trial-to-trial noise the running max of raw
+            # observations is upward-biased, which makes EI far too conservative.
+            incumbent = float(np.max(pool_mean[np.asarray(observed_indices, dtype=int)]))
+            acq_vals = expected_improvement_numpy(
+                pool_mean, np.asarray(std, dtype=np.float64), incumbent,
+            )  # [N]
 
         else:  # acq_fn == 'ucb'
             # Compute UCB kappa for this step (cosine-annealed or fixed)

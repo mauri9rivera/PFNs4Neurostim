@@ -151,7 +151,8 @@ class TestGPSurrogateConstructor:
         GP = self._import()
         s = GP()
         assert s._device == "cpu"
-        assert s._n_opt_steps == 50
+        assert s._n_opt_steps == 100
+        assert abs(s._lr - 0.1) < 1e-9
         assert s._model is None
 
     def test_custom_construction(self):

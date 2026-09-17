@@ -103,6 +103,57 @@ def expected_improvement(model, likelihood, X_candidates, y_best, device):
         
     return ei
 
+def moments_from_quantiles(
+    quantiles: "np.ndarray",
+    levels: "np.ndarray",
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Estimate predictive mean and std by integrating a quantile function.
+
+    Makes no normality assumption: for a random variable Y with quantile
+    function q(p), E[Y] = ∫₀¹ q(p) dp and E[Y²] = ∫₀¹ q(p)² dp, both evaluated
+    here by the trapezoid rule over the supplied levels.  This is the
+    distribution-faithful replacement for reading the median as the mean
+    (audit D7 / P0.11): for a skewed bar distribution the median and mean differ.
+
+    The integral is truncated at the outermost supplied levels, so pass a dense,
+    wide grid (e.g. ``np.linspace(0.005, 0.995, 199)``); the residual tail mass
+    biases the variance slightly downward.
+
+    Args:
+        quantiles: Predicted quantile values, shape [L, M] — one row per level.
+        levels: Quantile levels in (0, 1), shape [L], strictly increasing.
+
+    Returns:
+        Tuple of (mean, std), each shape [M], with std floored at 1e-9.
+
+    Raises:
+        ValueError: If shapes disagree, fewer than three levels are given, or
+            levels are not strictly increasing within (0, 1).
+        RuntimeError: If any predicted quantile is not finite.
+    """
+    q = np.asarray(quantiles, dtype=np.float64)      # [L, M]
+    p = np.asarray(levels, dtype=np.float64)         # [L]
+    if q.ndim != 2 or p.ndim != 1 or q.shape[0] != p.shape[0]:
+        raise ValueError(
+            f"quantiles must be [L, M] and levels [L]; got {q.shape} and {p.shape}."
+        )
+    if p.shape[0] < 3:
+        raise ValueError(f"Need at least 3 quantile levels, got {p.shape[0]}.")
+    if not (np.all(np.diff(p) > 0) and p[0] > 0.0 and p[-1] < 1.0):
+        raise ValueError("levels must be strictly increasing and lie inside (0, 1).")
+    if not np.isfinite(q).all():
+        raise RuntimeError(
+            f"moments_from_quantiles received {(~np.isfinite(q)).sum()} non-finite "
+            "quantile values."
+        )
+
+    width = p[-1] - p[0]                              # mass covered by the grid
+    mean = np.trapz(q, p, axis=0) / width             # [M]
+    mean_sq = np.trapz(q ** 2, p, axis=0) / width     # [M]
+    var = np.maximum(mean_sq - mean ** 2, 0.0)        # [M] — clip integration noise
+    return mean, np.maximum(np.sqrt(var), 1e-9)       # [M], [M]
+
+
 def std_from_quantiles(quantiles):
     """
     Estimate mean and std from quantile predictions.
@@ -124,7 +175,8 @@ def std_from_quantiles(quantiles):
     # Symmetric pairs: (low_index, high_index, divisor)
     # Divisor = 2 * Φ⁻¹(upper_quantile) for the standard normal distribution.
     std_pairs = [
-        (0, 6, 4.390),  # q025 / q975
+        (0, 6, 3.290),  # q05 / q95  — 2 * Φ⁻¹(0.95) = 3.290 (was 4.390, the q025/q975
+                        # constant, which underestimated this pair's sigma by 25%)
         (1, 5, 2.564),  # q10 / q90
         (2, 4, 1.349),  # q25 / q75
     ]

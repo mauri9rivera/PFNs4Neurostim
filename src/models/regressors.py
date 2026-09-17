@@ -29,6 +29,22 @@ from models.lora import (
 )
 
 
+# Quantile grid used to summarise the TabPFN bar distribution: mean/std come from
+# integrating the predicted quantile function rather than from a normal
+# approximation around the median (audit D7 / P0.11).  Levels are placed at equal
+# steps on the probit scale over ±4 SD, which concentrates points in the tails where
+# a uniform grid loses variance mass; on reference distributions this recovers the
+# true std to <1% (normal 1.0006 vs 1; lognormal 1.296 vs 1.304).
+_PROBIT_GRID_Z = 4.0
+_N_QUANTILE_LEVELS = 99
+QUANTILE_LEVELS = np.round(
+    0.5 * (1.0 + torch.erf(
+        torch.linspace(-_PROBIT_GRID_Z, _PROBIT_GRID_Z, _N_QUANTILE_LEVELS) / math.sqrt(2.0)
+    ).numpy()),
+    6,
+).clip(1e-6, 1.0 - 1e-6)  # [99]
+
+
 # ---------------------------------------------------------------------------
 # SurrogateModel protocol — unified interface for all BO surrogate models
 # ---------------------------------------------------------------------------
@@ -136,8 +152,8 @@ class GPSurrogate:
     def __init__(
         self,
         device: str = 'cpu',
-        n_opt_steps: int = 50,
-        lr: float = 0.01,
+        n_opt_steps: int = 100,
+        lr: float = 0.1,
     ) -> None:
         self._device = device
         self._n_opt_steps = n_opt_steps
@@ -255,40 +271,149 @@ class GPSurrogate:
         mean, std = self.predict(X)  # [M], [M]
         return mean + kappa * std    # [M]
 
-    def predict_ts(self, X: np.ndarray, temperature: float = 1.0) -> np.ndarray:
-        """Draw one function sample from the joint GP posterior (Thompson Sampling).
+    def predict_ts(
+        self,
+        X: np.ndarray,
+        temperature: float = 1.0,
+        generator: "torch.Generator | None" = None,
+        include_noise: bool = False,
+    ) -> np.ndarray:
+        """Draw one joint Thompson sample from the GP posterior.
 
-        Uses GPyTorch's ``posterior.rsample()`` to draw a single exact sample
-        from the joint MultivariateNormal posterior over all candidate locations.
-        This is theoretically correct Thompson Sampling for GP: the sampled
-        function preserves inter-point correlations dictated by the kernel.
+        Default (``include_noise=False``) is textbook GP Thompson sampling: one
+        draw from the joint latent posterior N(μ, Σ) over all candidates, so the
+        sampled values keep the inter-point correlations dictated by the kernel.
+        With ``include_noise=True`` the observation noise is added
+        (N(μ, Σ + σ²_n I)); this is diagnostic only, because homoscedastic noise
+        σ²_n swamps the posterior covariance once the surface is well observed
+        and the "joint" draw then behaves like independent per-site draws.
 
-        The ``temperature`` argument is unused for GP — the posterior is fully
-        determined by kernel hyperparameters.  It is accepted for interface
-        compatibility with ``TabPFNSurrogate.predict_ts``.
+        This is the GP-only reference row of the 2026-09-17 TS design decision
+        (see ``.claude/research_design_log.md``): PFN surrogates expose per-site
+        marginals only, so the symmetric GP-vs-PFN headline acquisition is
+        ``predict_ts_marginal``.
+
+        Only the GP supports this: PFN surrogates expose per-site marginals
+        only, so the symmetric GP-vs-PFN headline acquisition is
+        ``predict_ts_marginal``.
 
         Args:
             X: Candidate feature matrix, shape [M, D].  # [M, D]
-            temperature: Unused; included for SurrogateModel protocol compatibility.
+            temperature: Variance scaling of the sampled distribution.  ``1.0``
+                (default) samples the exact predictive posterior; ``>1`` inflates
+                and ``<1`` shrinks its spread, matching the effect of the
+                bar-distribution temperature in ``TabPFNSurrogate``.
+            generator: Optional torch RNG for reproducible draws.  ``None`` uses
+                the global torch RNG.
+            include_noise: Sample the noisy predictive posterior instead of the
+                latent one (diagnostic; see above).
 
         Returns:
             Thompson sample, shape [M].  # [M]
 
         Raises:
-            RuntimeError: If ``fit`` has not been called yet.
+            RuntimeError: If ``fit`` has not been called yet, or the sample is
+                not finite.
+            ValueError: If ``temperature`` is not strictly positive.
         """
         if self._model is None or self._likelihood is None:
             raise RuntimeError(
                 "GPSurrogate.predict_ts called before fit. Call fit() first."
             )
+        if temperature <= 0.0:
+            raise ValueError(f"temperature must be > 0, got {temperature}.")
+
         query_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [M, D]
         with torch.no_grad():
-            # Sample from latent function posterior, not the noisy predictive distribution.
-            # self._likelihood(...) would add independent ε_i per point, breaking the
-            # inter-point correlations dictated by the kernel.
-            f_posterior = self._model(query_x)   # latent posterior N(μ, K) — [M]
-            sample = f_posterior.rsample()       # [M] — joint draw preserving kernel correlations
-        return sample.cpu().numpy()              # [M]
+            latent = self._model(query_x)                        # N(μ, Σ) — [M]
+            posterior = self._likelihood(latent) if include_noise else latent
+            mean = posterior.mean                                # [M]
+            # rsample() has no generator argument: draw standard normals explicitly
+            # and push them through the Cholesky factor of the covariance.
+            # float64 + escalating jitter: the latent covariance of a well-fitted GP
+            # over a dense grid is near-singular in float32, where Cholesky fails.
+            cov = posterior.covariance_matrix.double()           # [M, M]
+            eye = torch.eye(cov.shape[0], dtype=cov.dtype, device=cov.device)
+            scale = float(torch.diagonal(cov).mean())
+            chol = None
+            for exponent in range(-8, -2):                       # 1e-8 … 1e-3 × mean variance
+                try:
+                    chol = torch.linalg.cholesky(cov + scale * (10.0 ** exponent) * eye)
+                    break
+                except RuntimeError:
+                    continue
+            if chol is None:
+                raise RuntimeError(
+                    "GPSurrogate.predict_ts: latent covariance not positive definite "
+                    f"even with 1e-3 relative jitter (M={cov.shape[0]})."
+                )
+            eps = torch.randn(
+                cov.shape[0], dtype=cov.dtype, device=cov.device, generator=generator
+            )                                                    # [M]
+            sample = mean.double() + np.sqrt(temperature) * (chol @ eps)  # [M]
+
+        out = sample.cpu().numpy()                               # [M]
+        if not np.isfinite(out).all():
+            raise RuntimeError(
+                f"GPSurrogate.predict_ts produced {(~np.isfinite(out)).sum()} "
+                "non-finite sample values."
+            )
+        return out                                               # [M]
+
+    def predict_ts_marginal(
+        self,
+        X: np.ndarray,
+        temperature: float = 1.0,
+        generator: "torch.Generator | None" = None,
+    ) -> np.ndarray:
+        """Draw independent per-site Thompson samples from the GP predictive marginals.
+
+        Samples each candidate independently from its own predictive marginal
+        N(μ_i, temperature · (σ²_i + σ²_n)), discarding cross-site correlations.
+        This is the symmetric counterpart of ``TabPFNSurrogate.predict_ts``,
+        which can only sample per-site because PFN query rows do not attend to
+        each other; it is the headline TS for both model families as of the
+        2026-09-17 TS design decision.
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].  # [M, D]
+            temperature: Variance scaling of the per-site draws (``1.0`` = exact
+                predictive marginals).
+            generator: Optional torch RNG for reproducible draws.  ``None`` uses
+                the global torch RNG.
+
+        Returns:
+            Thompson sample values, shape [M].  # [M]
+
+        Raises:
+            RuntimeError: If ``fit`` has not been called yet, or the sample is
+                not finite.
+            ValueError: If ``temperature`` is not strictly positive.
+        """
+        if self._model is None or self._likelihood is None:
+            raise RuntimeError(
+                "GPSurrogate.predict_ts_marginal called before fit. Call fit() first."
+            )
+        if temperature <= 0.0:
+            raise ValueError(f"temperature must be > 0, got {temperature}.")
+
+        query_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [M, D]
+        with torch.no_grad():
+            posterior = self._likelihood(self._model(query_x))   # [M]
+            mean = posterior.mean                                # [M]
+            std = posterior.stddev                               # [M]
+            eps = torch.randn(
+                mean.shape[0], dtype=mean.dtype, device=mean.device, generator=generator
+            )                                                    # [M]
+            sample = mean + np.sqrt(temperature) * std * eps     # [M]
+
+        out = sample.cpu().numpy()                               # [M]
+        if not np.isfinite(out).all():
+            raise RuntimeError(
+                f"GPSurrogate.predict_ts_marginal produced "
+                f"{(~np.isfinite(out)).sum()} non-finite sample values."
+            )
+        return out                                               # [M]
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +654,12 @@ class TabPFNSurrogate:
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Return predictive mean and standard deviation from the bar distribution.
 
+        Mean and standard deviation are obtained by integrating the predicted
+        quantile function over ``QUANTILE_LEVELS`` (see
+        ``gpbo_utils.moments_from_quantiles``), so the reported mean is the
+        distribution mean rather than the median, and the spread makes no
+        normality assumption (audit D7 / P0.11).
+
         If a logit cache is valid for this X (populated by a preceding
         ``predict_ucb(X)`` call with the same context), derives quantiles
         directly from the cached logits via ``criterion.icdf`` — avoiding a
@@ -540,33 +671,34 @@ class TabPFNSurrogate:
 
         Returns:
             Tuple of (mean, std), each shape [M].   # [M], [M]
-        """
-        from utils.gpbo_utils import std_from_quantiles  # avoid circular import
 
-        quantile_levels = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+        Raises:
+            RuntimeError: If the predictive summaries are not finite.
+        """
+        from utils.gpbo_utils import moments_from_quantiles  # avoid circular import
+
+        quantile_levels = QUANTILE_LEVELS
 
         # --- Try logit cache ---
         if self._logit_cache is not None:
             X_ref, cached_logits, cached_criterion = self._logit_cache
             if X.shape == X_ref.shape and np.array_equal(X, X_ref):
-                try:
-                    q_rows = [
-                        cached_criterion.icdf(cached_logits, float(q))
-                        .detach().cpu().numpy()
-                        for q in quantile_levels
-                    ]  # each [M]
-                    quantiles = np.stack(q_rows, axis=0)  # [7, M]
-                    mean, std = std_from_quantiles(quantiles)  # [M], [M]
-                    if not (np.isnan(mean).any() or np.isnan(std).any()):
-                        return mean, std
-                except Exception:
-                    pass  # cache unusable — fall through to forward pass
+                # No blanket except here: a failing cache is a bug, not a fallback
+                # path to swallow (audit D7 / P0.11).
+                q_rows = [
+                    cached_criterion.icdf(cached_logits, float(q))
+                    .detach().cpu().numpy()
+                    for q in quantile_levels
+                ]  # each [M]
+                quantiles = np.stack(q_rows, axis=0)          # [L, M]
+                return moments_from_quantiles(quantiles, quantile_levels)  # [M], [M]
 
         # --- Full forward pass ---
+        # TabPFN validates that quantile levels are built-in floats, not np.float64.
         preds = self._model.predict(X, output_type="quantiles",
-                                     quantiles=quantile_levels)
-        quantiles = np.array(preds)  # [7, M]
-        mean, std = std_from_quantiles(quantiles)  # [M], [M]
+                                     quantiles=[float(q) for q in quantile_levels])
+        quantiles = np.array(preds)  # [L, M]
+        mean, std = moments_from_quantiles(quantiles, quantile_levels)  # [M], [M]
 
         if np.isnan(mean).any() or np.isnan(std).any():
             raise RuntimeError(

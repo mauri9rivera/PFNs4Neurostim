@@ -219,7 +219,7 @@ def test_run_bo_loop_invalid_acq_fn(synthetic_data):
             y_test=y_test,
             n_init=3,
             budget=8,
-            acq_fn='ei',
+            acq_fn='not_an_acquisition',   # 'ei' became a supported type on 2026-09-17
         )
 
 
