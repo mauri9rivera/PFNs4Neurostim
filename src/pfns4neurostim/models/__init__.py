@@ -6,7 +6,16 @@ logged in every result row (P0.1).
 """
 from __future__ import annotations
 
-from . import registry
+from . import protocol, registry
+from .protocol import SurrogateAdapter, SurrogateModel
 from .registry import MODEL_REGISTRY, build_surrogate, model_version
 
-__all__ = ["registry", "MODEL_REGISTRY", "build_surrogate", "model_version"]
+__all__ = [
+    "protocol",
+    "registry",
+    "MODEL_REGISTRY",
+    "SurrogateAdapter",
+    "SurrogateModel",
+    "build_surrogate",
+    "model_version",
+]

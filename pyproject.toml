@@ -10,6 +10,17 @@ requires-python = ">=3.9,<3.10"
 readme = "README.md"
 license = { file = "LICENSE" }
 
+[project.optional-dependencies]
+# Hyp 0 benchmark models (task #8). Each is optional because these backends are
+# heavy and some conflict with the pinned Python 3.9 / torch 2.5.1 stack:
+# tabpfn-v1 in particular cannot coexist with the tabpfn 6.3.2 used for v2.5,
+# so it needs its own environment rather than a co-installed extra.
+pfns4bo = ["pfns4bo==0.1.5"]
+tabpfn-v1 = ["tabpfn<2"]
+tabfm = ["tabfm"]
+mitra = ["autogluon.tabular>=1.4"]
+tabflex = ["ticl"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 # Restricted to the new package: the legacy flat tree (src/analysis, src/utils,

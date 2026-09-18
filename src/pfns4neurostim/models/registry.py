@@ -46,6 +46,10 @@ class ModelSpec:
             ``SurrogateModel`` protocol (``fit``, ``predict``, ``predict_ucb``,
             ``predict_ts``).
         supports: Acquisition names this surrogate can serve.
+        has_predictive_distribution: Whether the surrogate exposes a genuine
+            predictive distribution. False for random search, whose "std" is a
+            placeholder: calibration metrics are then reported as not computed
+            rather than as a meaningless zero-variance posterior.
         notes: Short provenance note for tables and captions.
     """
 
@@ -54,6 +58,7 @@ class ModelSpec:
     family: str
     factory: Callable[..., Any]
     supports: tuple[str, ...] = ("ei", "ucb", "ts_marginal")
+    has_predictive_distribution: bool = True
     notes: str = ""
 
 
@@ -132,6 +137,34 @@ def _build_random(device: str = "cpu", **kwargs: Any) -> Any:
     return RandomSearchSurrogate()
 
 
+def _build_external(key: str) -> Callable[..., Any]:
+    """Build a factory for one external Hyp 0 surrogate (task #8).
+
+    Args:
+        key: External model key (``pfns4bo``, ``tabpfn_v1``, ``tabfm``,
+            ``mitra``, ``tabflex``).
+
+    Returns:
+        A factory with the standard ``(device, **params)`` signature. Calling it
+        raises ``ImportError`` naming the extra to install when the backend is
+        absent, and ``NotImplementedError`` while the wrapper body is pending.
+    """
+
+    def factory(device: str = "cpu", **params: Any) -> Any:
+        from .pfn import wrappers  # noqa: PLC0415 - optional backends, load lazily
+
+        classes = {
+            "pfns4bo": wrappers.PFNs4BOSurrogate,
+            "tabpfn_v1": wrappers.TabPFNv1Surrogate,
+            "tabfm": wrappers.TabFMSurrogate,
+            "mitra": wrappers.MitraSurrogate,
+            "tabflex": wrappers.TabFlexSurrogate,
+        }
+        return classes[key](device=device, **params)
+
+    return factory
+
+
 def _build_gp_oracle(device: str = "cpu", **kwargs: Any) -> Any:
     """Oracle GP (hyperparameters from the dense noiseless map). **Not implemented.**
 
@@ -181,12 +214,57 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         supports=("ei", "ucb", "ts_marginal", "ts_joint"),
         notes="Declared (roadmap S8); not implemented.",
     ),
+    # --- Hyp 0 external amortized surrogates (task #8) -----------------------
+    # Registered so configs, tables and contract tests can name them; each raises
+    # with the specific remaining work when constructed. "classification-head
+    # adaptation" must appear in every table row for the two bucketized models.
+    "pfns4bo": ModelSpec(
+        key="pfns4bo",
+        version="PFNs4BO (HEBO prior, vendored checkpoint)",
+        family="pfn",
+        factory=_build_external("pfns4bo"),
+        supports=("ei", "ucb", "ts_marginal"),
+        notes="Native BO-specific bar distribution; backend installed, wrapper pending.",
+    ),
+    "tabpfn_v1": ModelSpec(
+        key="tabpfn_v1",
+        version="TabPFN v1 (classification-head adaptation)",
+        family="pfn",
+        factory=_build_external("tabpfn_v1"),
+        supports=("ei", "ucb", "ts_marginal"),
+        notes="Classifier binned into a bar distribution; needs an isolated tabpfn<2 env.",
+    ),
+    "tabfm": ModelSpec(
+        key="tabfm",
+        version="Google TabFM",
+        family="pfn",
+        factory=_build_external("tabfm"),
+        supports=("ei", "ucb", "ts_marginal"),
+        notes="Native regression; Python/JAX compatibility to be verified.",
+    ),
+    "mitra": ModelSpec(
+        key="mitra",
+        version="Mitra (AutoGluon >= 1.4)",
+        family="pfn",
+        factory=_build_external("mitra"),
+        supports=("ei", "ucb", "ts_marginal"),
+        notes="Native regressor; predictive-distribution access to be confirmed.",
+    ),
+    "tabflex": ModelSpec(
+        key="tabflex",
+        version="TabFlex (classification-head adaptation)",
+        family="pfn",
+        factory=_build_external("tabflex"),
+        supports=("ei", "ucb", "ts_marginal"),
+        notes="Classifier binned into a bar distribution; needs libs/ticl.",
+    ),
     "random": ModelSpec(
         key="random",
         version="uniform random acquisition",
         family="baseline",
         factory=_build_random,
         supports=("random",),
+        has_predictive_distribution=False,
         notes="Lower bound: queries uniformly at random.",
     ),
 }
@@ -196,7 +274,7 @@ STRESS_COMPARATORS: tuple[str, ...] = ("tabpfn_v2_5", "gp_mll", "gp_naive")
 
 
 def build_surrogate(name: str, device: str = "cpu", **params: Any) -> Any:
-    """Construct a registered surrogate.
+    """Construct a registered surrogate, wrapped in the package's surrogate interface.
 
     Args:
         name: Canonical model key.
@@ -204,14 +282,19 @@ def build_surrogate(name: str, device: str = "cpu", **params: Any) -> Any:
         **params: Model-specific constructor parameters from the config.
 
     Returns:
-        A surrogate conforming to the ``SurrogateModel`` protocol.
+        A :class:`~pfns4neurostim.models.protocol.SurrogateAdapter` exposing
+        ``fit``, ``predict_marginals``, ``sample_marginal``, ``sample_joint``
+        and ``supports_joint``.
 
     Raises:
         KeyError: If the model key is unknown.
     """
     if name not in MODEL_REGISTRY:
         raise KeyError(f"Unknown model {name!r}. Registered: {sorted(MODEL_REGISTRY)}.")
-    return MODEL_REGISTRY[name].factory(device=device, **params)
+    from .protocol import SurrogateAdapter  # noqa: PLC0415 - avoid an import cycle
+
+    spec = MODEL_REGISTRY[name]
+    return SurrogateAdapter(spec.factory(device=device, **params), key=name, family=spec.family)
 
 
 def model_version(name: str) -> str:

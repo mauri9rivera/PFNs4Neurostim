@@ -232,70 +232,53 @@ class TestComputeProcrustesDisparity:
 # ---------------------------------------------------------------------------
 
 class TestComputeRsa:
-    """Tests for compute_rsa() Representational Similarity Analysis."""
+    """Tests for compute_rsa() Representational Similarity Analysis.
 
-    def test_self_rsa_with_same_indices_is_one(self):
-        """RSA(Z, Z) with n_subsample >= n and same RNG produces rho = 1.0.
+    Rewritten 2026-09-18 for the current contract (task #1 Phase 0): compute_rsa
+    takes the **upper triangles of two RDMs** over the same probe pairs, not two
+    embedding clouds. The previous tests still passed embedding matrices and a
+    removed ``n_subsample`` argument, so they failed with a TypeError and were
+    asserting an API that no longer exists.
+    """
 
-        Note: compute_rsa draws independent random indices from Z1 and Z2,
-        so RSA(Z, Z.copy()) may NOT equal 1.0 when n_subsample < len(Z).
-        True self-similarity (rho=1.0) is only guaranteed when both clouds
-        are sampled with identical row indices — which happens naturally when
-        Z1 and Z2 are identical arrays and we use n_subsample=1 (trivially 1 pair).
-        """
+    def test_identical_rdms_give_rho_one(self):
         compute_rsa = _import_rsa()
-        rng = np.random.RandomState(42)
-        Z = rng.randn(5, 4)
-        # With n=5 rows and n_subsample=5, both idx1 and idx2 use rng.choice(5,5)
-        # but with the same seed they draw the same indices, giving rho=1.0
-        result = compute_rsa(Z, Z, n_subsample=5, seed=0)
-        # When Z1 and Z2 are the same array, the two RDMs are identical by construction
-        # as long as the same row subset is used. Since the same rng is shared,
-        # idx1 and idx2 are drawn consecutively — they differ.
-        # Therefore we verify rho is in [-1, 1] and is a valid float.
-        assert -1.0 - 1e-9 <= result <= 1.0 + 1e-9
+        v = np.random.RandomState(0).rand(45)
+        assert compute_rsa(v, v.copy()) == pytest.approx(1.0)
+
+    def test_monotone_transform_preserves_rank_correlation(self):
+        """RSA is a *rank* correlation, so any increasing map leaves it at 1."""
+        compute_rsa = _import_rsa()
+        v = np.random.RandomState(1).rand(45) + 0.1
+        assert compute_rsa(v, np.exp(3.0 * v)) == pytest.approx(1.0)
+
+    def test_reversed_ranks_give_rho_minus_one(self):
+        compute_rsa = _import_rsa()
+        v = np.arange(1.0, 31.0)
+        assert compute_rsa(v, v[::-1].copy()) == pytest.approx(-1.0)
+
+    def test_returns_float_in_unit_interval(self):
+        compute_rsa = _import_rsa()
+        rng = np.random.RandomState(2)
+        result = compute_rsa(rng.rand(60), rng.rand(60))
         assert isinstance(result, float)
-
-    def test_returns_float(self):
-        """Returns a Python float."""
-        compute_rsa = _import_rsa()
-        Z1 = np.random.RandomState(1).randn(30, 6)
-        Z2 = np.random.RandomState(2).randn(30, 6)
-        result = compute_rsa(Z1, Z2)
-        assert isinstance(result, float)
-
-    def test_result_in_minus_one_to_one(self):
-        """Spearman rho is in [-1, 1]."""
-        compute_rsa = _import_rsa()
-        rng = np.random.RandomState(42)
-        Z1 = rng.randn(50, 8)
-        Z2 = rng.randn(50, 8)
-        result = compute_rsa(Z1, Z2)
         assert -1.0 - 1e-9 <= result <= 1.0 + 1e-9
 
-    def test_random_orthogonal_clouds_near_zero(self):
-        """Orthogonally-transformed random matrices have near-zero RSA."""
+    def test_independent_rdms_are_near_zero(self):
         compute_rsa = _import_rsa()
         rng = np.random.RandomState(55)
-        Z1 = rng.randn(60, 4)
-        # Completely independent Z2
-        Z2 = rng.randn(60, 4)
-        result = compute_rsa(Z1, Z2, n_subsample=60)
-        # For truly random independent clouds, rho should be small
-        assert abs(result) < 0.3
+        assert abs(compute_rsa(rng.rand(400), rng.rand(400))) < 0.2
 
-    def test_n_subsample_gte_n_uses_all_points_without_error(self):
-        """n_subsample >= len(Z) completes without error."""
+    def test_misaligned_shapes_return_nan(self):
+        """Probe pairs must correspond; a shape mismatch is a caller bug, not a score."""
         compute_rsa = _import_rsa()
-        Z1 = np.random.RandomState(5).randn(20, 4)
-        Z2 = np.random.RandomState(6).randn(20, 4)
-        result = compute_rsa(Z1, Z2, n_subsample=500)
-        assert np.isfinite(result)
+        assert np.isnan(compute_rsa(np.arange(10.0), np.arange(9.0)))
 
-    def test_degenerate_constant_matrix_returns_zero(self):
-        """Degenerate (constant) matrix → zero variance RDM → returns 0.0."""
+    def test_none_input_returns_nan(self):
         compute_rsa = _import_rsa()
-        Z1 = np.ones((20, 4))  # all rows identical → zero RDM
-        Z2 = np.random.RandomState(7).randn(20, 4)
-        result = compute_rsa(Z1, Z2, n_subsample=20)
-        assert result == 0.0
+        assert np.isnan(compute_rsa(None, np.arange(10.0)))
+
+    def test_zero_variance_returns_nan(self):
+        """A constant RDM has no ranks to correlate, so rho is undefined."""
+        compute_rsa = _import_rsa()
+        assert np.isnan(compute_rsa(np.ones(20), np.random.RandomState(7).rand(20)))

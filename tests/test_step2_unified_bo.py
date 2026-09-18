@@ -72,6 +72,20 @@ class _DummySurrogate:
         mean, std = self.predict(X)
         return mean + kappa * std
 
+    def predict_ts(self, X: np.ndarray, temperature: float = 1.0):
+        mean, _ = self.predict(X)
+        return mean
+
+    def predict_ts_marginal(self, X: np.ndarray, temperature: float = 1.0):
+        """Independent per-site predictive draws.
+
+        Added 2026-09-18: the SurrogateModel protocol gained ``predict_ts_marginal``
+        with the symmetric-TS design (task #4, 2026-09-17), so a *complete*
+        implementation must expose it for the isinstance check to pass.
+        """
+        mean, _ = self.predict(X)
+        return mean
+
 
 class _NoPredictUCBSurrogate:
     """Surrogate without predict_ucb -- tests fallback path."""

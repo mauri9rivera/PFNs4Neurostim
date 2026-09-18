@@ -1,0 +1,3 @@
+# Uniform random acquisition: the lower bound of the acquisition ladder.
+type: random
+params: {}

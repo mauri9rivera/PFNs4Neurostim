@@ -1,0 +1,7 @@
+# Joint Thompson sampling: one draw from the joint latent GP posterior, keeping
+# the inter-site correlations the kernel implies. GP-ONLY reference row - a PFN's
+# query rows do not attend to each other, so it raises for PFN surrogates
+# (task #4, 2026-09-17). Use ts_marginal for the symmetric GP-vs-PFN comparison.
+type: ts_joint
+params:
+  temperature: 1.0

@@ -1,0 +1,4 @@
+# Probability of Improvement (Kushner, 1964).
+type: pi
+params:
+  xi: 0.0

@@ -2,6 +2,7 @@
 
 Experiments are dispatched by name so a SLURM script never imports a module path::
 
+    python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml
     python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml
     python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml --replot
 
@@ -30,8 +31,23 @@ def _stress_sweep(argv: list[str]) -> int:
     return runner(argv)
 
 
+def _bo_benchmark(argv: list[str]) -> int:
+    """Dispatch to the models x acquisitions benchmark runner (Hyp 0 / Hyp A).
+
+    Args:
+        argv: Remaining CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+    from .experiments.bo_benchmark import main as runner  # noqa: PLC0415 - lazy
+
+    return runner(argv)
+
+
 #: Registered experiment runners, keyed by CLI name.
 EXPERIMENTS: dict[str, Callable[[list[str]], int]] = {
+    "bo_benchmark": _bo_benchmark,
     "stress_sweep": _stress_sweep,
 }
 

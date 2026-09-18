@@ -43,12 +43,7 @@ __all__ = [
 #: Root of the config-group tree, overridable for tests.
 CONFIG_ROOT: str = os.environ.get("PFNS4NEUROSTIM_CONFIG_ROOT", "configs")
 
-#: Acquisition types the package currently implements, with their allowed params.
-_ACQ_PARAMS: dict[str, frozenset[str]] = {
-    "ei": frozenset({"xi"}),
-    "ucb": frozenset({"kappa"}),
-    "ts_marginal": frozenset({"temperature"}),
-}
+
 
 
 @dataclass(frozen=True)
@@ -84,24 +79,19 @@ class AcquisitionConfig:
     schedules: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate the type and reject parameters it does not declare."""
-        if self.type not in _ACQ_PARAMS:
-            raise ValueError(
-                f"acquisition.type={self.type!r} is not implemented; "
-                f"available: {sorted(_ACQ_PARAMS)}."
-            )
-        unknown = set(self.params) - set(_ACQ_PARAMS[self.type])
-        if unknown:
-            raise ValueError(
-                f"acquisition.params has key(s) {sorted(unknown)} which "
-                f"{self.type!r} does not declare; allowed: {sorted(_ACQ_PARAMS[self.type])}."
-            )
-        unknown_sched = set(self.schedules) - set(_ACQ_PARAMS[self.type])
-        if unknown_sched:
-            raise ValueError(
-                f"acquisition.schedules has key(s) {sorted(unknown_sched)} which "
-                f"{self.type!r} does not declare."
-            )
+        """Validate type, params and schedules against the acquisition registry.
+
+        Delegating here means the registry is the single definition of what an
+        acquisition type accepts: adding a type or a parameter never requires a
+        parallel edit in the config layer.
+
+        Raises:
+            KeyError: If the type is not registered.
+            ValueError: If a parameter or schedule key is not declared by the type.
+        """
+        from .acquisition.registry import build_acquisition  # noqa: PLC0415 - cycle
+
+        build_acquisition(self.type, self.params, self.schedules)
 
     def as_block(self) -> dict[str, Any]:
         """Return the P0.2 acquisition block, as logged into the tidy CSV."""
@@ -162,7 +152,17 @@ class ExperimentConfig:
     output_root: str = "output"
     equivalence_margin: float = 0.05
     model_params: dict[str, dict[str, Any]] = field(default_factory=dict)
+    extra_acquisitions: tuple[AcquisitionConfig, ...] = ()
     source_path: str = ""
+
+    @property
+    def acquisitions(self) -> tuple[AcquisitionConfig, ...]:
+        """Every acquisition to run: the sweep list, or just the single block.
+
+        ``bo_benchmark`` sweeps acquisition types (Hyp 0's ragged table); every
+        other experiment uses exactly one, so this collapses to a 1-tuple.
+        """
+        return self.extra_acquisitions or (self.acquisition,)
 
     def __post_init__(self) -> None:
         """Validate cross-field constraints (budget semantics, non-empty grid)."""
@@ -304,7 +304,14 @@ def _compose(path: str) -> dict[str, Any]:
         if group == "dataset":
             resolved["dataset"] = _load_group("dataset", value)
         elif group == "acquisition":
-            resolved["acquisition"] = _load_group("acquisition", value)
+            if isinstance(value, str):
+                resolved["acquisition"] = _load_group("acquisition", value)
+            else:
+                blocks = [_load_group("acquisition", name) for name in value]
+                if not blocks:
+                    raise ValueError(f"{path}: defaults.acquisition is an empty list.")
+                resolved["acquisition"] = blocks[0]
+                resolved["acquisitions"] = blocks
         elif group == "model":
             names = [value] if isinstance(value, str) else list(value)
             resolved["models"] = names
@@ -359,16 +366,23 @@ def load_experiment_config(
     if ds_raw:
         raise ValueError(f"Unknown dataset config key(s): {sorted(ds_raw)}.")
 
-    acquisition = AcquisitionConfig(
-        type=acq_raw.pop("type"),
-        params=dict(acq_raw.pop("params", {}) or {}),
-        schedules=dict(acq_raw.pop("schedules", {}) or {}),
-    )
-    if acq_raw:
-        raise ValueError(f"Unknown acquisition config key(s): {sorted(acq_raw)}.")
+    def _acq(block: dict[str, Any]) -> AcquisitionConfig:
+        """Build and validate one acquisition block."""
+        data = dict(block)
+        built = AcquisitionConfig(
+            type=data.pop("type"),
+            params=dict(data.pop("params", {}) or {}),
+            schedules=dict(data.pop("schedules", {}) or {}),
+        )
+        if data:
+            raise ValueError(f"Unknown acquisition config key(s): {sorted(data)}.")
+        return built
+
+    acquisition = _acq(acq_raw)
+    extra_acquisitions = tuple(_acq(b) for b in (merged.pop("acquisitions", []) or []))
 
     knob = KnobConfig(
-        type=knob_raw.pop("type"),
+        type=knob_raw.pop("type", "nominal"),
         levels=(
             None if knob_raw.get("levels") is None else tuple(float(v) for v in knob_raw.pop("levels"))
         ),
@@ -406,6 +420,7 @@ def load_experiment_config(
         dataset=dataset,
         models=models,
         acquisition=acquisition,
+        extra_acquisitions=extra_acquisitions,
         knob=knob,
         model_params=model_params,
         device=os.path.expandvars(str(merged.pop("device", "cpu"))),
@@ -444,6 +459,7 @@ def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
         "model_version": {name: model_version(name) for name in cfg.models},
         "model_params": cfg.model_params,
         "acquisition": cfg.acquisition.as_block(),
+        "acquisitions": [a.as_block() for a in cfg.acquisitions],
         "knob": {
             "type": cfg.knob.type,
             "levels": None if cfg.knob.levels is None else list(cfg.knob.levels),

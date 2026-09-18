@@ -1,0 +1,4 @@
+# Pure exploitation: query the argmax of the predictive mean. Ablation row that
+# isolates how much of each model's performance comes from its uncertainty.
+type: greedy
+params: {}

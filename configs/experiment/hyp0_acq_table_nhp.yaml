@@ -1,0 +1,25 @@
+# Hypothesis 0 - acquisition table, NHP.
+#
+# Sweeps acquisition types across the model ladder. The table is deliberately
+# ragged: ts_joint is a GP-only reference row (a PFN's query rows do not attend
+# to each other), and the random-search baseline only serves random acquisition.
+# Unsupported combinations are skipped with a logged note.
+#
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_acq_table_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive, random]
+  acquisition: [ei, ucb, ts_marginal, ts_joint, greedy, random]
+
+experiment: bo_benchmark
+family: hyp0-acq
+tag: nhp
+
+budget: 50
+n_init: 5
+n_reps: 10
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05

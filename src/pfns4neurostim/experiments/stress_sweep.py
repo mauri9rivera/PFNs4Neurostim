@@ -37,6 +37,7 @@ from ..evaluation import results as _results
 from ..evaluation.bo_runner import run_channel_bo
 from ..evaluation.results import TidyRow
 from ..seeding import seed_for
+from ._rows import build_row
 
 __all__ = ["run_stress_sweep", "build_tidy_rows", "main"]
 
@@ -102,50 +103,25 @@ def build_tidy_rows(
                         model,
                         stressed,
                         acq_fn=cfg.acquisition.type,
+                        acq_params=cfg.acquisition.params,
+                        acq_schedules=cfg.acquisition.schedules,
                         budget=budget,
                         n_init=cfg.n_init,
                         seed=seed,
                         device=cfg.device,
                         model_params=cfg.model_params.get(model, {}),
-                        kappa_schedule=float(cfg.acquisition.params.get("kappa", 0.0)),
-                        ts_temperature=float(cfg.acquisition.params.get("temperature", 1.0)),
                     )
-                    row = TidyRow(
+                    row = build_row(
+                        result,
+                        stressed,
                         run_tag=run_tag,
                         experiment="stress_sweep",
-                        dataset=channel.dataset,
-                        demo=stressed.demo,
-                        subject=channel.subject,
-                        emg=channel.emg,
                         model=model,
-                        model_version=result.row["model_version"],
                         acq_type=cfg.acquisition.type,
+                        rep=rep,
                         knob=knob.name,
                         level=float(level),
-                        gt_mode=channel.gt_mode,
-                        rep=rep,
-                        r2=result.row["r2"],
-                        spearman=None if np.isnan(result.row["spearman"]) else result.row["spearman"],
-                        final_regret=result.row["recommended_regret"],
-                        cumulative_regret=result.row["cumulative_regret"],
-                        recommended_regret=result.row["recommended_regret"],
-                        best_queried_regret=result.row["best_queried_regret"],
-                        top1_hit=result.row["top1_hit"],
-                        top3_hit=result.row["top3_hit"],
-                        opt_distance=result.row["opt_distance"],
-                        coverage_50=result.row.get("coverage_50"),
-                        coverage_90=result.row.get("coverage_90"),
-                        ece=result.row.get("ece"),
-                        nll=result.row.get("nll"),
-                        crps=result.row.get("crps"),
-                        mean_query_latency_s=result.row["mean_query_latency_s"],
-                        median_query_latency_s=result.row["median_query_latency_s"],
-                        total_time_s=result.row["total_time_s"],
-                        achieved_snr_db=achieved.get("achieved_snr_db"),
-                        n_sites=stressed.n_sites,
-                        budget=budget,
-                        n_init=cfg.n_init,
-                        seed=seed,
+                        achieved=achieved,
                     )
                     rows.append(row)
                     extras.append(dict(achieved))
