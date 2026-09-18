@@ -17,7 +17,9 @@
 #   bash scripts/mila_setup.sh layout     # create directories + repo symlinks
 #   bash scripts/mila_setup.sh archive    # copy $SCRATCH data -> $ARCHIVE master
 #   bash scripts/mila_setup.sh stage      # restore $ARCHIVE master -> $SCRATCH
-#   bash scripts/mila_setup.sh env        # create/update the conda env + pip install -e .
+#   bash scripts/mila_setup.sh env        # create/update the conda env + install the package
+#   bash scripts/mila_setup.sh install    # only pip install -e . (reuse an existing env)
+#   bash scripts/mila_setup.sh deps       # report which declared dependencies import
 #   bash scripts/mila_setup.sh verify     # print the whole layout + import check
 #   bash scripts/mila_setup.sh touch      # refresh atimes so $SCRATCH is not purged
 #
@@ -72,10 +74,49 @@ cmd_stage() {
 
 cmd_env() {
   cd "${CODE_DIR}"
-  log "updating conda env '${CONDA_ENV}' from environment.yml"
-  conda env update -f environment.yml -n "${CONDA_ENV}"
-  log "installing the package editable"
-  conda run -n "${CONDA_ENV}" pip install -e .
+  if conda env list | grep -qE "^${CONDA_ENV}\s"; then
+    log "conda env '${CONDA_ENV}' exists; updating from environment.yml"
+    conda env update -f environment.yml -n "${CONDA_ENV}"
+  else
+    log "creating conda env '${CONDA_ENV}' from environment.yml"
+    conda env create -f environment.yml -n "${CONDA_ENV}"
+  fi
+  cmd_install
+}
+
+cmd_install() {
+  # Separate from cmd_env so a working environment can be reused without
+  # re-solving it (the dependency solve is the slow, failure-prone part).
+  cd "${CODE_DIR}"
+  log "installing pfns4neurostim editable into '${CONDA_ENV}'"
+  conda run -n "${CONDA_ENV}" pip install -e . --no-deps
+  conda run -n "${CONDA_ENV}" python -c "import pfns4neurostim; print('pfns4neurostim', pfns4neurostim.__version__, 'at', pfns4neurostim.__file__)"
+}
+
+cmd_deps() {
+  # Report which declared dependencies are actually importable, so a partially
+  # provisioned environment fails loudly here rather than inside a SLURM job.
+  conda run -n "${CONDA_ENV}" python - <<'PY'
+import importlib
+mods = [
+    "numpy", "scipy", "pandas", "sklearn", "matplotlib", "seaborn",
+    "statsmodels", "yaml", "torch", "gpytorch", "botorch", "tabpfn",
+]
+missing = []
+for m in mods:
+    try:
+        mod = importlib.import_module(m)
+        print(f"  OK      {m:<12} {getattr(mod, '__version__', '?')}")
+    except Exception as exc:  # noqa: BLE001 - report, do not hide
+        missing.append(m)
+        print(f"  MISSING {m:<12} {type(exc).__name__}: {exc}")
+try:
+    import torch
+    print(f"  cuda available: {torch.cuda.is_available()}")
+except Exception:
+    pass
+raise SystemExit(1 if missing else 0)
+PY
 }
 
 cmd_verify() {
@@ -106,6 +147,8 @@ cmd_touch() {
 
 case "${1:-}" in
   layout) cmd_layout ;;
+  install) cmd_install ;;
+  deps) cmd_deps ;;
   archive) cmd_archive ;;
   stage) cmd_stage ;;
   env) cmd_env ;;

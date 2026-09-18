@@ -7,6 +7,7 @@
 The following files are loaded on demand:
 - `.claude/roadmap.md` — load when ultrathink is specified
 - `.claude/research_design.md` — load when the user explicitly requests it
+- `.claude/research_design_log.md` — dated design decisions (formerly research_design.md §4); load alongside research_design.md when decision history matters
 
 ---
 
@@ -253,12 +254,25 @@ via function arguments, CLI flags, or YAML config keys.
 
 ## 7. Plotting & Figures
 
-- **Format:** SVG (primary, vector) + PNG (fallback, 300 dpi minimum)
-- **Colorblind-friendly:** use `seaborn.color_palette("colorblind")` or `"tab10"`
-- **Axes:** always label with units (e.g., `"R² Score"`, `"Cumulative Regret"`, `"Query Budget"`)
-- **LaTeX rendering:** only when explicitly requested by the user
-  (`plt.rc('text', usetex=True)`)
-- **Fonts:** TrueType (Type 1) by default
+**All figure style decisions live in one module: `src/pfns4neurostim/visualization/style.py`.**
+Every figure-producing function — and every agent writing one — must import geometry, colours,
+model labels and axis strings from it (`figure`, `save_figure`, `model_palette`, `plot_kwargs`,
+`axis_label`, `KNOB_LABELS`) and must never hardcode a colour, figsize, font size, model name
+or axis string. Settled with the user on 2026-09-18 for the JNE/IOP target:
+
+- **Format:** SVG only by default (`save_figure(..., formats=("svg",))`); PNG at 600 dpi and PDF opt-in
+- **Geometry:** single-column default (3.27 in / 8.3 cm); width tokens `single` / `onehalf` / `double`
+- **Typography:** Arial → Helvetica → DejaVu Sans; base 9 pt, ticks 8 pt, panel letters 10 pt bold;
+  TrueType/Type-42 (`pdf.fonttype=42`, `svg.fonttype="none"`)
+- **Palette:** Okabe–Ito with family logic — PFNs cool (TabPFN-2.5 `#0072B2`), GPs warm
+  (GP-MLL `#D55E00`, GP-fixed `#E69F00`, GP-oracle `#B8860B`), non-learning baselines grey
+- **Model names:** compact code-like — `TabPFN-2.5`, `GP-MLL`, `GP-fixed`, `GP-oracle`, `Random`
+- **Stress vocabulary:** roadmap jargon is canonical in code, figures *and* text — `knob`, `level`,
+  `K1`/`K2`/`K5`/`K6`, `Demo 1 (synthetic)` / `Demo 2 (in vivo)`, `breakdown point`; K2's x-axis is
+  always **achieved SNR (dB)**, never the raw α
+- **Axes:** always label with units, via `style.axis_label(<column name>)`
+- **LaTeX rendering:** only when explicitly requested by the user (`plt.rc('text', usetex=True)`);
+  mathtext is used by default
 
 ---
 

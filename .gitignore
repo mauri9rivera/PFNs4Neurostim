@@ -2,14 +2,20 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .vscode
-./data
-./output
 .claude/
-./future_work
-# Fixed 2026-09-18: './data' / './output' are not valid gitignore patterns,
-# so both trees were in fact untracked-but-committable (285 MB).
-data/
-output/
-future_work/
 *.egg-info/
 .pytest_cache/
+
+# Fixed 2026-09-18: './data' and './output' were never valid gitignore patterns,
+# so both trees were untracked-but-committable (4.5 GB / 285 MB).
+# Both forms are listed on purpose: a trailing slash matches directories only,
+# and on the Mila cluster these names are SYMLINKS into $SCRATCH (see
+# scripts/mila_setup.sh), which git treats as files.
+data
+data/
+output
+output/
+logs
+logs/
+future_work
+future_work/
