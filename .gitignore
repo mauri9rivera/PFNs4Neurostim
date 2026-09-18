@@ -5,3 +5,11 @@ __pycache__/
 ./data
 ./output
 .claude/
+./future_work
+# Fixed 2026-09-18: './data' / './output' are not valid gitignore patterns,
+# so both trees were in fact untracked-but-committable (285 MB).
+data/
+output/
+future_work/
+*.egg-info/
+.pytest_cache/

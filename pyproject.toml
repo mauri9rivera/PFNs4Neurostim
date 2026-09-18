@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pfns4neurostim"
+version = "0.1.0"
+description = "Evaluating TabPFNs as drop-in replacements for GP-based Bayesian optimization in neurostimulation."
+requires-python = ">=3.9,<3.10"
+readme = "README.md"
+license = { text = "LICENSE" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# `src/` is added to sys.path for the duration of the test session so both
+# the new installable package (`pfns4neurostim`) and the legacy flat `src/`
+# modules (`utils.*`, `models.*`, ...) are importable without an editable
+# install. Existing tests additionally do their own `sys.path.insert` for
+# the same directory (harmless duplicate) — see tests/test_data_utils_core.py.
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "slow: long-running test (> ~20 s); deselect with -m 'not slow'",
+    "gpu: requires CUDA; skipped automatically when unavailable",
+    "shadow: prototype tests that shadow future src/pfns4neurostim code",
+    "legacy: tests covering src/pfns4neurostim/legacy_code (finetuning, LoRA, ...)",
+]

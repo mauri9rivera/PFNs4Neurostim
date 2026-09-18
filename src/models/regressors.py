@@ -45,6 +45,40 @@ QUANTILE_LEVELS = np.round(
 ).clip(1e-6, 1.0 - 1e-6)  # [99]
 
 
+def _bar_distribution_moments(
+    criterion: Any,
+    logits: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the mean and standard deviation of a TabPFN bar distribution.
+
+    Uses the criterion's own moment methods, which integrate every bucket of the
+    predicted density including the half-normal tails, rather than approximating
+    the distribution as normal around its median (audit D7 / P0.11).
+
+    Args:
+        criterion: TabPFN ``FullSupportBarDistribution`` for these logits.
+        logits: Bar-distribution logits, shape [M, num_bars].  # [M, num_bars]
+
+    Returns:
+        Tuple of (mean, std), each shape [M].  # [M], [M]
+
+    Raises:
+        RuntimeError: If any summary is not finite.
+    """
+    with torch.no_grad():
+        mean = criterion.mean(logits)                                   # [M]
+        var = criterion.variance(logits).clamp_min(0.0)                 # [M]
+    mean_np = mean.detach().cpu().numpy()                               # [M]
+    std_np = var.sqrt().detach().cpu().numpy()                          # [M]
+    if not (np.isfinite(mean_np).all() and np.isfinite(std_np).all()):
+        raise RuntimeError(
+            "TabPFN bar-distribution summaries are not finite: "
+            f"{(~np.isfinite(mean_np)).sum()} mean and "
+            f"{(~np.isfinite(std_np)).sum()} std entries."
+        )
+    return mean_np, std_np                                              # [M], [M]
+
+
 # ---------------------------------------------------------------------------
 # SurrogateModel protocol — unified interface for all BO surrogate models
 # ---------------------------------------------------------------------------
@@ -654,17 +688,19 @@ class TabPFNSurrogate:
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Return predictive mean and standard deviation from the bar distribution.
 
-        Mean and standard deviation are obtained by integrating the predicted
-        quantile function over ``QUANTILE_LEVELS`` (see
-        ``gpbo_utils.moments_from_quantiles``), so the reported mean is the
-        distribution mean rather than the median, and the spread makes no
-        normality assumption (audit D7 / P0.11).
+        Mean and standard deviation are the bar distribution's own moments
+        (``criterion.mean`` / ``criterion.variance``), which integrate the full
+        predicted density including its half-normal tail buckets.  The reported
+        mean is therefore the distribution mean, not the median, and the spread
+        assumes no normality (audit D7 / P0.11).  ``QUANTILE_LEVELS`` +
+        ``gpbo_utils.moments_from_quantiles`` remain available as an independent
+        cross-check; they agree to 1e-4 on the mean and 2.5% on the std, the
+        latter being quantile-truncation error in the cross-check, not here.
 
         If a logit cache is valid for this X (populated by a preceding
-        ``predict_ucb(X)`` call with the same context), derives quantiles
-        directly from the cached logits via ``criterion.icdf`` — avoiding a
-        second transformer forward pass.  Falls back to a full
-        ``output_type='quantiles'`` forward pass otherwise.
+        ``predict_ucb(X)`` call with the same context), the moments come from the
+        cached logits, avoiding a second transformer forward pass; otherwise one
+        ``output_type='full'`` pass is run and the cache refreshed.
 
         Args:
             X: Query feature matrix, shape [M, D].  # [M, D]
@@ -675,30 +711,19 @@ class TabPFNSurrogate:
         Raises:
             RuntimeError: If the predictive summaries are not finite.
         """
-        from utils.gpbo_utils import moments_from_quantiles  # avoid circular import
-
-        quantile_levels = QUANTILE_LEVELS
-
-        # --- Try logit cache ---
+        # --- Try logit cache; no blanket except — a failing cache is a bug, not a
+        # fallback path to swallow (audit D7 / P0.11). ---
         if self._logit_cache is not None:
             X_ref, cached_logits, cached_criterion = self._logit_cache
             if X.shape == X_ref.shape and np.array_equal(X, X_ref):
-                # No blanket except here: a failing cache is a bug, not a fallback
-                # path to swallow (audit D7 / P0.11).
-                q_rows = [
-                    cached_criterion.icdf(cached_logits, float(q))
-                    .detach().cpu().numpy()
-                    for q in quantile_levels
-                ]  # each [M]
-                quantiles = np.stack(q_rows, axis=0)          # [L, M]
-                return moments_from_quantiles(quantiles, quantile_levels)  # [M], [M]
+                return _bar_distribution_moments(cached_criterion, cached_logits)
 
-        # --- Full forward pass ---
-        # TabPFN validates that quantile levels are built-in floats, not np.float64.
-        preds = self._model.predict(X, output_type="quantiles",
-                                     quantiles=[float(q) for q in quantile_levels])
-        quantiles = np.array(preds)  # [L, M]
-        mean, std = moments_from_quantiles(quantiles, quantile_levels)  # [M], [M]
+        # --- Full forward pass (refreshes the cache for later calls) ---
+        full_output = self._model.predict(X, output_type="full")
+        logits = full_output['logits']         # [M, num_bars]
+        criterion = full_output['criterion']
+        self._logit_cache = (X.copy(), logits.detach(), criterion)
+        mean, std = _bar_distribution_moments(criterion, logits)  # [M], [M]
 
         if np.isnan(mean).any() or np.isnan(std).any():
             raise RuntimeError(
