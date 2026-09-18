@@ -1,0 +1,7 @@
+# Naive GP: fixed RBF hyperparameters, no tuning at all. Isolates how much of a
+# tuned GP's performance comes from hyperparameter optimisation (roadmap S8).
+name: gp_naive
+params:
+  lengthscale: 0.2
+  outputscale: 1.0
+  noise: 0.01

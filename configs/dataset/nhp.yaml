@@ -1,0 +1,7 @@
+# NHP (macaque/cebus M1) cortical stimulation dataset.
+# Subjects: 0 Cebus1, 1 Cebus2, 2 Macaque1 (excluded: pure-noise signal), 3 Macaque2.
+# Held-out subject is 1 (data_utils.HELD_OUT_SUBJECTS); train subjects are 0 and 3.
+name: nhp
+subjects: [1]
+emgs: all            # 'all' or an explicit list, e.g. [0, 1, 2]
+data_root: ./data    # cluster jobs override with $SLURM_TMPDIR/data

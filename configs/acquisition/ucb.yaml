@@ -1,0 +1,5 @@
+# Upper Confidence Bound. kappa=0.0 selects the cosine-annealed auto schedule
+# derived from the search-space dimensionality (gpbo_utils auto-kappa bounds).
+type: ucb
+params:
+  kappa: 0.0

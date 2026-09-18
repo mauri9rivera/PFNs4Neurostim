@@ -1,0 +1,5 @@
+# Marginal Thompson sampling: independent per-site draws from each model's
+# predictive marginals. Symmetric headline TS for GP and PFN (task #4, 2026-09-17).
+type: ts_marginal
+params:
+  temperature: 1.0

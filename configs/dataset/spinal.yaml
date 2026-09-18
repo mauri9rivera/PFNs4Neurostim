@@ -1,0 +1,6 @@
+# Spinal-cord stimulation dataset (7 repetitions per site - lowest of the four,
+# so the full-mean ground truth is the most optimistic here; see roadmap S6).
+name: spinal
+subjects: [0]
+emgs: all
+data_root: ./data

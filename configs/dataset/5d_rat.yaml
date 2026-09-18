@@ -1,0 +1,7 @@
+# 5D rat motor-cortex stimulation dataset (4x4x3x32x8-style condition grids).
+# Larger candidate pool (~2048 conditions) than the 2D grids; used for the
+# scalability arm of Hyp A and as the second in-vivo arm of the Hyp B sweeps.
+name: 5d_rat
+subjects: [1]
+emgs: all
+data_root: ./data

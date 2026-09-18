@@ -1,0 +1,34 @@
+# Hypothesis B - K2 SNR stress sweep on the NHP dataset (Demo 2, in vivo).
+#
+# Knob:   y~[s,r] = y_gt[s] + alpha * (y[s,r] - y_gt[s]) on the trial bank only.
+# x-axis: achieved SNR (dB), never alpha (roadmap S2).
+# Models: TabPFN-2.5 vs GP-MLL vs GP-fixed (user decision 2026-09-18).
+# Budget: total queries INCLUDING n_init (P0.3); may be below the grid size.
+#
+# Run:
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ei
+
+experiment: stress_sweep
+family: stress-k2
+tag: nhp
+
+knob:
+  type: k2_snr
+  levels: [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
+
+budget: 50
+n_init: 5
+n_reps: 5
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+
+# Pre-registered TOST equivalence margin, in range-normalized regret units.
+# Fixed before inspecting any K2 result; the breakdown point is the first level
+# at which equivalence against GP-MLL fails.
+equivalence_margin: 0.05

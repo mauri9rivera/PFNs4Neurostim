@@ -53,6 +53,7 @@ KEY_COLUMNS: tuple[str, ...] = (
     "run_tag",
     "experiment",
     "dataset",
+    "demo",
     "subject",
     "emg",
     "model",
@@ -88,7 +89,10 @@ METRIC_COLUMNS: tuple[str, ...] = (
     "nll",
     "crps",
     "mean_query_latency_s",
+    "median_query_latency_s",
     "total_time_s",
+    "achieved_snr_db",
+    "n_sites",
     "budget",
     "n_init",
     "seed",
@@ -119,6 +123,8 @@ class TidyRow:
             applicable. Heterogeneous stress knobs may be numeric or
             categorical, hence ``str | float | int | None``.
         gt_mode: Ground-truth mode, ``'full_mean'`` or ``'split_half'`` (P0.7).
+        demo: ``'demo2'`` for in-vivo channels, ``'demo1'`` for synthetic ones
+            (roadmap Hyp B Demo 1 / Demo 2).
         rep: Integer BO-repetition index.
         r2: Final-prediction R² of the surrogate (secondary metric).
         spearman: Spearman correlation of the surrogate's final prediction.
@@ -140,6 +146,10 @@ class TidyRow:
         nll: Negative log-likelihood of held-out predictions.
         crps: Continuous ranked probability score.
         mean_query_latency_s: Mean per-query wall-clock latency, in seconds.
+        median_query_latency_s: Median per-query wall-clock latency, in seconds.
+        achieved_snr_db: Achieved SNR of the (possibly stressed) channel, in dB.
+            The canonical x-axis of every K2 figure (roadmap S2).
+        n_sites: Number of candidate electrode sites in the pool.
         total_time_s: Total wall-clock time for the run, in seconds.
         budget: Total BO iteration count, including ``n_init`` (P0.3).
         n_init: Number of initial (non-acquisition-driven) queries.
@@ -160,6 +170,9 @@ class TidyRow:
     gt_mode: str
     rep: int
 
+    # --- key column with a default (Demo 2 = in vivo is the common case) ---
+    demo: str = "demo2"
+
     # --- metric / value columns (optional; None => NaN at write time) ---
     r2: Optional[float] = None
     spearman: Optional[float] = None
@@ -178,7 +191,10 @@ class TidyRow:
     nll: Optional[float] = None
     crps: Optional[float] = None
     mean_query_latency_s: Optional[float] = None
+    median_query_latency_s: Optional[float] = None
     total_time_s: Optional[float] = None
+    achieved_snr_db: Optional[float] = None
+    n_sites: Optional[int] = None
     budget: Optional[int] = None
     n_init: Optional[int] = None
     seed: Optional[int] = None

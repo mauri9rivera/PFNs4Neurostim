@@ -1,0 +1,5 @@
+# Expected Improvement over the incumbent (best predicted value among queried
+# sites). Working default since 2026-09-17 (task #4 Step 5a).
+type: ei
+params:
+  xi: 0.0

@@ -1,0 +1,6 @@
+# MLL-tuned exact GP (RBF): hyperparameters refit by marginal likelihood at every
+# BO step. The primary comparator for every Hyp A and Hyp B claim (roadmap S8).
+name: gp_mll
+params:
+  n_opt_steps: 100
+  lr: 0.1

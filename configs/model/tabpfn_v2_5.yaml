@@ -1,0 +1,5 @@
+# TabPFN v2.5 (P0.1: the version is pinned and logged in every result row).
+# n_estimators=1 -> one transformer call per BO step, matching every kept benchmark.
+name: tabpfn_v2_5
+params:
+  n_estimators: 1

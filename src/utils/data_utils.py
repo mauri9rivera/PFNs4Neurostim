@@ -98,19 +98,22 @@ def _sort_valid_5drat_reps(resp: np.ndarray) -> np.ndarray:
     return sorted_isvalid
 
 
-def load_data(dataset_type, m_i):
+def load_data(dataset_type, m_i, data_root: str = './data'):
     '''
-    Input: 
+    Input:
         - dataset_type: str characterizing the modality of the experiment
         - m_i: int of subject
+        - data_root: directory holding the raw .mat trees.  Defaults to './data'
+          (the historical hardcoded value, so existing callers are unaffected).
+          Cluster jobs pass $SLURM_TMPDIR/data to read from node-local SSD.
 
     Output:
         - dictionary of neurostimulation data
-    
+
         Important: sorted response shape: (nChan, nEmgs, nReps)
     '''
-    
-    path_to_dataset = f'./data'
+
+    path_to_dataset = str(data_root)
     if dataset_type=='nhp':
         if m_i==0:
             data = scipy.io.loadmat(path_to_dataset+'/monkeys/Cebus1_M1_190221.mat')['Cebus1_M1_190221'][0][0]
