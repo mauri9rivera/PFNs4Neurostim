@@ -36,6 +36,17 @@ CONDA_ENV="pfns4neurostim"
 
 log() { printf '[mila_setup] %s\n' "$*"; }
 
+# A non-interactive shell (e.g. scripts/mila.sh run) has no conda on PATH: load it,
+# tolerating the unset variables that `module` and conda's hooks reference under `set -u`.
+load_conda() {
+  command -v conda >/dev/null 2>&1 && return 0
+  set +u
+  # shellcheck disable=SC1091
+  module load anaconda/3 2>/dev/null || true
+  set -u
+  command -v conda >/dev/null 2>&1 || { log "ERROR: conda unavailable (module load anaconda/3 failed)"; exit 1; }
+}
+
 cmd_layout() {
   log "code dir:    ${CODE_DIR}"
   log "scratch root:${SCRATCH_ROOT}"
