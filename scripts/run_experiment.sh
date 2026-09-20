@@ -13,13 +13,13 @@
 #
 #  ── Family 2 — aug sweep (single job, all values serial) ─────────
 #    FAMILY=2 DATASET=nhp HELD_OUT_SUBJ=1 sbatch --time=10:00:00 scripts/run_experiment.sh
-#    # aug_pct_sweep values come from configs/nhp_aug_sweep.yaml
+#    # aug_pct_sweep values come from configs/legacy/nhp_aug_sweep.yaml
 #    # Override sweep values: AUG_PCT_SWEEP="0.1 0.5 1.0" FAMILY=2 ...
 #    # Config: configs/{dataset}_aug_sweep.yaml
 #
 #  ── Family 3 — budget sweep (single job, finetunes once) ─────────
 #    FAMILY=3 DATASET=nhp HELD_OUT_SUBJ=1 sbatch scripts/run_experiment.sh
-#    # budgets come from configs/nhp_optimization_budget.yaml
+#    # budgets come from configs/legacy/nhp_optimization_budget.yaml
 #    # Override: BUDGET_VALUES_STR="10 50 100" FAMILY=3 ...
 #    # Config: configs/{dataset}_optimization_budget.yaml  (nhp only)
 #
@@ -30,14 +30,14 @@
 #
 #  ── Family 5 — ID/OOD B1-B7 full suite ──────────────────────────
 #    FAMILY=5 sbatch --gres=gpu:rtx8000:1 --mem-per-gpu=16G --cpus-per-task=4 --time=12:00:00 scripts/run_experiment.sh
-#    # Config: configs/id_ood_bfull.yaml
+#    # Config: configs/legacy/id_ood_bfull.yaml
 #    # Override dataset subset: DATASETS="nhp rat" FAMILY=5 sbatch ...
 #
 #  ── Family 6 — LoRA per held_out_subject (mirrors Family 1) ──────
 #    FAMILY=6 DATASET=nhp sbatch --array=0%1 scripts/run_experiment.sh
 #    FAMILY=6 DATASET=rat sbatch --array=0-1%2 scripts/run_experiment.sh
-#    # Config: configs/nhp_lora_ablation.yaml (nhp); set CONFIG= for others
-#    # LoRA aug sweep: CONFIG=configs/nhp_lora_aug_sweep.yaml FAMILY=6 ...
+#    # Config: configs/legacy/nhp_lora_ablation.yaml (nhp); set CONFIG= for others
+#    # LoRA aug sweep: CONFIG=configs/legacy/nhp_lora_aug_sweep.yaml FAMILY=6 ...
 #
 #  ── Family 7 — vanilla benchmark per held_out_subject ────────────
 #    FAMILY=7 DATASET=nhp sbatch --array=0%1 scripts/run_experiment.sh
@@ -47,11 +47,11 @@
 #    # Also accepts VANILLA_CONFIG=<path> for backward compatibility
 #
 #  ── Family 8 — post-hoc aggregation (no GPU) ─────────────────────
-#    FAMILY=8 AGG_CONFIG=configs/nhp_vanilla_benchmark.yaml sbatch --gres='' --cpus-per-task=4 --mem=8G scripts/run_experiment.sh
+#    FAMILY=8 AGG_CONFIG=configs/legacy/nhp_vanilla_benchmark.yaml sbatch --gres='' --cpus-per-task=4 --mem=8G scripts/run_experiment.sh
 #
 #  ── Family 9 — dense CKA layer sweep ─────────────────────────────
 #    FAMILY=9 sbatch --gres=gpu:rtx8000:1 --mem-per-gpu=16G --cpus-per-task=4 --time=8:00:00 scripts/run_experiment.sh
-#    # Config: configs/id_ood_b4dense.yaml
+#    # Config: configs/legacy/id_ood_b4dense.yaml
 #
 #  ── Family 0 — legacy single-run (backward compatible) ───────────
 #    FAMILY=0 SPLIT=inter_subject MODE=optimization HELD_OUT_SUBJ=1 sbatch scripts/run_experiment.sh
@@ -134,10 +134,10 @@ elif [ "$FAMILY" = "4" ]; then
     CFG=${CONFIG:-configs/${DATASET}_optimization.yaml}
 
 elif [ "$FAMILY" = "5" ]; then
-    CFG=${CONFIG:-configs/id_ood_bfull.yaml}
+    CFG=${CONFIG:-configs/legacy/id_ood_bfull.yaml}
 
 elif [ "$FAMILY" = "9" ]; then
-    CFG=${CONFIG:-configs/id_ood_b4dense.yaml}
+    CFG=${CONFIG:-configs/legacy/id_ood_b4dense.yaml}
 
 elif [ "$FAMILY" = "6" ]; then
     [ "$TASK_ID" -ge "${#_SUBJECTS[@]}" ] && { echo "ERROR: TASK_ID=$TASK_ID out of range for DATASET=$DATASET (max index $((${#_SUBJECTS[@]}-1)))" >&2; exit 1; }
@@ -148,7 +148,7 @@ elif [ "$FAMILY" = "6" ]; then
     USE_LORA=1
     # Only nhp has a dedicated LoRA config; for other datasets set CONFIG= explicitly.
     case "$DATASET" in
-        nhp) CFG=${CONFIG:-configs/nhp_lora_ablation.yaml} ;;
+        nhp) CFG=${CONFIG:-configs/legacy/nhp_lora_ablation.yaml} ;;
         *)   CFG=${CONFIG:-} ;;
     esac
 
@@ -190,7 +190,7 @@ if [ "$FAMILY" = "5" ] || [ "$FAMILY" = "9" ]; then
     DATASETS=${DATASETS:-"nhp rat spinal"}
     echo "[$(date)] family=$FAMILY config=$CFG datasets=$DATASETS"
     mkdir -p output/id_ood
-    srun python src/id_ood_analysis.py --config "$CFG" --datasets $DATASETS
+    srun python -m pfns4neurostim.legacy_code.id_ood_analysis --config "$CFG" --datasets $DATASETS
     echo "[$(date)] Done. Results in output/id_ood/"
 
 elif [ "$FAMILY" = "7" ]; then
@@ -198,19 +198,19 @@ elif [ "$FAMILY" = "7" ]; then
     VFLAGS="--device cuda --held_out_subj $HELD_OUT_SUBJ --save"
     [ -n "${BUDGET:-}" ] && VFLAGS="$VFLAGS --budget $BUDGET"
     [ -n "${N_REPS:-}" ] && VFLAGS="$VFLAGS --n_reps $N_REPS"
-    srun python src/vanilla_benchmark.py --config "$CFG" $VFLAGS
+    srun python -m pfns4neurostim.legacy_code.vanilla_benchmark --config "$CFG" $VFLAGS
     echo "[$(date)] Done. Results in output/runs/"
 
 elif [ "$FAMILY" = "8" ]; then
     echo "[$(date)] family=8 config=$AGG_CONFIG"
     mkdir -p output/aggregated
-    srun python src/aggregate.py --config "$AGG_CONFIG"
+    srun python -m pfns4neurostim.legacy_code.aggregate --config "$AGG_CONFIG"
     echo "[$(date)] Done. Results in output/aggregated/"
 
 else
     echo "[$(date)] family=$FAMILY task=$TASK_ID dataset=$DATASET split=$SPLIT mode=$MODE ${HELD_OUT_SUBJ:+subj=$HELD_OUT_SUBJ} ${HELD_OUT_EMG:+emg=$HELD_OUT_EMG} ${CFG:+config=$CFG}"
     FFLAGS="--dataset $DATASET --split $SPLIT --mode $MODE --device cuda --save"
     [ -n "${CFG:-}" ] && FFLAGS="$FFLAGS --config $CFG"
-    srun python src/finetuning.py $FFLAGS $EXTRA_FLAGS
+    srun python -m pfns4neurostim.legacy_code.finetuning.cli $FFLAGS $EXTRA_FLAGS
     echo "[$(date)] Done. Results in output/runs/"
 fi

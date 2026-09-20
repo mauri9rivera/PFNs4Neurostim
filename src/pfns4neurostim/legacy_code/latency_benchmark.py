@@ -34,11 +34,12 @@ _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from models.regressors import GPSurrogate, TabPFNSurrogate
-from scaling_timing import _time_query
+from pfns4neurostim.models.gp.surrogates import GPSurrogate
+from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
+from pfns4neurostim.legacy_code.scaling_timing import _time_query
 from tabpfn import TabPFNRegressor
-from utils.data_utils import load_data, preprocess_neural_data, ALL_SUBJECTS
-from utils.visualization import plot_latency_vs_isi
+from pfns4neurostim.data.legacy_io import load_data, preprocess_neural_data, ALL_SUBJECTS
+from pfns4neurostim.legacy_code.visualization import plot_latency_vs_isi
 
 
 # Reference inter-stimulus intervals (seconds).  Cortical/spinal microstimulation

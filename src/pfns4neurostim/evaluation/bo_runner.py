@@ -8,8 +8,8 @@ Budget semantics (**P0.3**): ``budget`` is the total number of queries including
 ``n_init``, stated as an explicit iteration count and allowed to be below the
 grid size.
 
-As of task #1 Steps 4-5 the legacy ``utils.bo_loops`` seam is gone: the loop,
-the acquisition functions and the surrogate interface are all package-native.
+As of task #1 Steps 4-5 the legacy BO-loop seam is gone: the loop, the
+acquisition functions and the surrogate interface are all package-native.
 """
 from __future__ import annotations
 

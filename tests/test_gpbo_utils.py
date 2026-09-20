@@ -31,27 +31,27 @@ if _SRC_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 
 def _import_compute_ucb_kappa():
-    from utils.gpbo_utils import compute_ucb_kappa
+    from pfns4neurostim.legacy_code.gpbo_utils import compute_ucb_kappa
     return compute_ucb_kappa
 
 
 def _import_auto_kappa_max():
-    from utils.gpbo_utils import _auto_kappa_max
+    from pfns4neurostim.legacy_code.gpbo_utils import _auto_kappa_max
     return _auto_kappa_max
 
 
 def _import_auto_kappa_min():
-    from utils.gpbo_utils import _auto_kappa_min
+    from pfns4neurostim.legacy_code.gpbo_utils import _auto_kappa_min
     return _auto_kappa_min
 
 
 def _import_std_from_quantiles():
-    from utils.gpbo_utils import std_from_quantiles
+    from pfns4neurostim.legacy_code.gpbo_utils import std_from_quantiles
     return std_from_quantiles
 
 
 def _import_ei_numpy():
-    from utils.gpbo_utils import expected_improvement_numpy
+    from pfns4neurostim.legacy_code.gpbo_utils import expected_improvement_numpy
     return expected_improvement_numpy
 
 

@@ -127,7 +127,7 @@ class _MissingFitSurrogate:
 class TestSurrogateModelProtocol:
 
     def _import(self):
-        from models.regressors import SurrogateModel
+        from pfns4neurostim.models.protocol import LegacySurrogateModel as SurrogateModel
         return SurrogateModel
 
     def test_full_implementation_satisfies(self):
@@ -158,7 +158,7 @@ class TestSurrogateModelProtocol:
 class TestGPSurrogateConstructor:
 
     def _import(self):
-        from models.regressors import GPSurrogate
+        from pfns4neurostim.models.gp.surrogates import GPSurrogate
         return GPSurrogate
 
     def test_default_construction(self):
@@ -194,7 +194,8 @@ class TestGPSurrogateConstructor:
             s.fit(np.array([[1.0, 2.0]]), np.array([np.nan]))
 
     def test_satisfies_protocol(self):
-        from models.regressors import GPSurrogate, SurrogateModel
+        from pfns4neurostim.models.gp.surrogates import GPSurrogate
+        from pfns4neurostim.models.protocol import LegacySurrogateModel as SurrogateModel
         assert isinstance(GPSurrogate(), SurrogateModel)
 
 
@@ -205,24 +206,24 @@ class TestGPSurrogateConstructor:
 class TestTabPFNSurrogateConstructor:
 
     def test_stores_model_reference(self):
-        from models.regressors import TabPFNSurrogate
+        from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
         mock = MagicMock()
         s = TabPFNSurrogate(mock)
         assert s._model is mock
 
     def test_stores_logit_cache_as_none_initially(self):
-        from models.regressors import TabPFNSurrogate
+        from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
         s = TabPFNSurrogate(MagicMock())
         assert s._logit_cache is None
 
     def test_model_reference_stored_correctly(self):
-        from models.regressors import TabPFNSurrogate
+        from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
         mock = MagicMock()
         s = TabPFNSurrogate(mock)
         assert s._model is mock
 
     def test_fit_delegates_to_inner_model(self):
-        from models.regressors import TabPFNSurrogate
+        from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
         mock = MagicMock()
         s = TabPFNSurrogate(mock)
         X = np.random.rand(10, 2)
@@ -233,19 +234,20 @@ class TestTabPFNSurrogateConstructor:
         np.testing.assert_array_equal(mock.fit.call_args[0][1], y)
 
     def test_fit_raises_on_nan_x(self):
-        from models.regressors import TabPFNSurrogate
+        from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
         s = TabPFNSurrogate(MagicMock())
         with pytest.raises(RuntimeError, match="NaN"):
             s.fit(np.array([[1.0, np.nan]]), np.array([1.0]))
 
     def test_fit_raises_on_nan_y(self):
-        from models.regressors import TabPFNSurrogate
+        from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
         s = TabPFNSurrogate(MagicMock())
         with pytest.raises(RuntimeError, match="NaN"):
             s.fit(np.array([[1.0, 2.0]]), np.array([np.nan]))
 
     def test_satisfies_protocol(self):
-        from models.regressors import TabPFNSurrogate, SurrogateModel
+        from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
+        from pfns4neurostim.models.protocol import LegacySurrogateModel as SurrogateModel
         assert isinstance(TabPFNSurrogate(MagicMock()), SurrogateModel)
 
 
@@ -256,7 +258,7 @@ class TestTabPFNSurrogateConstructor:
 class TestRunBoLoop:
 
     def test_returns_all_required_keys(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         result = run_bo_loop(
@@ -268,7 +270,7 @@ class TestRunBoLoop:
             assert key in result, f"Missing key: {key}"
 
     def test_observed_indices_length_equals_budget(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         result = run_bo_loop(
@@ -278,7 +280,7 @@ class TestRunBoLoop:
         assert len(result["observed_indices"]) == 8
 
     def test_y_pred_shape_matches_x_test(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         result = run_bo_loop(
@@ -288,7 +290,7 @@ class TestRunBoLoop:
         assert result["y_pred"].shape == (X_test.shape[0],)
 
     def test_times_length_equals_n_steps(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         result = run_bo_loop(
@@ -298,7 +300,7 @@ class TestRunBoLoop:
         assert len(result["times"]) == 8 - 3
 
     def test_raises_when_budget_le_n_init(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         with pytest.raises(ValueError, match="budget"):
             run_bo_loop(
@@ -307,7 +309,7 @@ class TestRunBoLoop:
             )
 
     def test_raises_when_budget_equals_n_init(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         with pytest.raises(ValueError, match="budget"):
             run_bo_loop(
@@ -316,7 +318,7 @@ class TestRunBoLoop:
             )
 
     def test_raises_on_all_nan_ucb(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         with pytest.raises(RuntimeError, match="non-finite"):
@@ -326,7 +328,7 @@ class TestRunBoLoop:
             )
 
     def test_snapshots_none_when_not_requested(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         result = run_bo_loop(
@@ -337,7 +339,7 @@ class TestRunBoLoop:
         assert result["snapshots"] is None
 
     def test_snapshots_dict_when_requested(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         budget = 8
@@ -350,7 +352,7 @@ class TestRunBoLoop:
         assert budget in result["snapshots"]
 
     def test_snapshot_predictions_correct_shape(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         budget = 8
@@ -365,7 +367,7 @@ class TestRunBoLoop:
         assert isinstance(snap["best_pred_val"], float)
 
     def test_accepts_surrogate_without_predict_ucb(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         result = run_bo_loop(
@@ -375,7 +377,7 @@ class TestRunBoLoop:
         assert result["y_pred"].shape == (X_test.shape[0],)
 
     def test_real_values_length_matches_observed(self, small_pool):
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
         X_pool, y_pool, X_test, y_test = small_pool
         np.random.seed(42)
         result = run_bo_loop(
@@ -392,22 +394,22 @@ class TestRunBoLoop:
 class TestSnapshotIters:
 
     def test_always_includes_budget(self):
-        from utils.bo_loops import _snapshot_iters
+        from pfns4neurostim.legacy_code.bo_loops import _snapshot_iters
         assert 20 in _snapshot_iters(budget=20, n_init=5)
 
     def test_result_is_sorted(self):
-        from utils.bo_loops import _snapshot_iters
+        from pfns4neurostim.legacy_code.bo_loops import _snapshot_iters
         result = _snapshot_iters(budget=64, n_init=4)
         assert result == sorted(result)
 
     def test_all_values_between_n_init_and_budget(self):
-        from utils.bo_loops import _snapshot_iters
+        from pfns4neurostim.legacy_code.bo_loops import _snapshot_iters
         result = _snapshot_iters(budget=30, n_init=5)
         for v in result:
             assert 5 < v <= 30
 
     def test_single_step_budget(self):
-        from utils.bo_loops import _snapshot_iters
+        from pfns4neurostim.legacy_code.bo_loops import _snapshot_iters
         assert _snapshot_iters(budget=6, n_init=5) == [6]
 
 
@@ -418,7 +420,9 @@ class TestSnapshotIters:
 class TestEvaluateOptimizationSignature:
 
     def _parse_eval(self):
-        eval_path = os.path.join(_SRC_DIR, "evaluation.py")
+        eval_path = os.path.join(
+            _SRC_DIR, "pfns4neurostim", "legacy_code", "evaluation.py"
+        )
         with open(eval_path) as f:
             return ast.parse(f.read())
 

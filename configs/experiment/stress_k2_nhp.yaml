@@ -18,11 +18,11 @@ tag: nhp
 
 knob:
   type: k2_snr
-  levels: [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
+  levels: [ 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
 
-budget: 50
+budget: 96
 n_init: 5
-n_reps: 5
+n_reps: 15
 gt_mode: full_mean
 device: cuda
 seed: 42

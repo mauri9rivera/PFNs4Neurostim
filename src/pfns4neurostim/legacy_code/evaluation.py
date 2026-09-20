@@ -22,13 +22,13 @@ import gpytorch
 from sklearn.metrics import r2_score
 from tabpfn import TabPFNRegressor
 
-from models.gaussians import ExactGP
-from models.regressors import (
-    _make_finetuned_regressor, extract_inference_model,
-    GPSurrogate, TabPFNSurrogate, SurrogateModel,
-)
-from utils.bo_loops import run_bo_loop, _snapshot_iters
-from utils.data_utils import (
+from pfns4neurostim.models.gp.exact_gp import ExactGP
+from pfns4neurostim.legacy_code.finetuning.regressors import _make_finetuned_regressor, extract_inference_model
+from pfns4neurostim.models.gp.surrogates import GPSurrogate
+from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
+from pfns4neurostim.models.protocol import SurrogateModel
+from pfns4neurostim.legacy_code.bo_loops import run_bo_loop, _snapshot_iters
+from pfns4neurostim.data.legacy_io import (
     build_finetuning_dataset, load_data, preprocess_neural_data,
     shuffle_response_pairing,
     HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS,
@@ -37,8 +37,8 @@ from utils.data_utils import (
     load_subject_result, save_subject_result,
     _safe_spearman,
 )
-from utils.surface_geometry import compute_gfs
-from utils.visualization import (
+from pfns4neurostim.analysis.surface_geometry import compute_gfs
+from pfns4neurostim.legacy_code.visualization import (
     r2_by_subject,
     regret_with_timing, regret_by_emg,
     budget_sweep_plot, augmentation_sweep_plot,

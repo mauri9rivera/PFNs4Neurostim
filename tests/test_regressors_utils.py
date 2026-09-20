@@ -32,17 +32,17 @@ if _SRC_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 
 def _import_linear_cka():
-    from models.regressors import linear_cka
+    from pfns4neurostim.analysis.cka import linear_cka
     return linear_cka
 
 
 def _import_make_finetuned_regressor():
-    from models.regressors import _make_finetuned_regressor
+    from pfns4neurostim.legacy_code.finetuning.regressors import _make_finetuned_regressor
     return _make_finetuned_regressor
 
 
 def _import_gp_surrogate():
-    from models.regressors import GPSurrogate
+    from pfns4neurostim.models.gp.surrogates import GPSurrogate
     return GPSurrogate
 
 
@@ -138,14 +138,14 @@ class TestMakeFinetunedRegressor:
     def test_silence_diagnostics_false_returns_gradient_monitored_regressor(self):
         """silence_diagnostics=False, use_lora=False → GradientMonitoredRegressor."""
         _make_finetuned_regressor = _import_make_finetuned_regressor()
-        from models.regressors import GradientMonitoredRegressor
+        from pfns4neurostim.legacy_code.finetuning.regressors import GradientMonitoredRegressor
         model = _make_finetuned_regressor(silence_diagnostics=False, use_lora=False)
         assert isinstance(model, GradientMonitoredRegressor)
 
     def test_use_lora_true_returns_lora_regressor(self):
         """use_lora=True → LoRAFinetunedRegressor."""
         _make_finetuned_regressor = _import_make_finetuned_regressor()
-        from models.regressors import LoRAFinetunedRegressor
+        from pfns4neurostim.legacy_code.finetuning.regressors import LoRAFinetunedRegressor
         model = _make_finetuned_regressor(use_lora=True)
         assert isinstance(model, LoRAFinetunedRegressor)
 

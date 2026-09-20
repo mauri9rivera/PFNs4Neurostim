@@ -22,8 +22,9 @@ _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from models.regressors import GPSurrogate, TabPFNSurrogate
-from utils.bo_loops import run_bo_loop
+from pfns4neurostim.models.gp.surrogates import GPSurrogate
+from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
+from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
 from tabpfn import TabPFNRegressor
 
 
@@ -243,7 +244,7 @@ def test_acq_fn_ts_yaml_loading(tmp_path):
     config_path = tmp_path / 'test_ts.yaml'
     config_path.write_text(yaml.dump(cfg_dict))
 
-    from vanilla_benchmark import _load_yaml_config
+    from pfns4neurostim.legacy_code.vanilla_benchmark import _load_yaml_config
     cfg = _load_yaml_config(str(config_path))
 
     assert cfg['acq_fn'] == 'ts', f"Expected 'ts', got {cfg['acq_fn']!r}"
@@ -271,7 +272,7 @@ def test_acq_fn_ucb_auto_schedule_yaml(tmp_path):
     config_path = tmp_path / 'test_ucb_auto.yaml'
     config_path.write_text(yaml.dump(cfg_dict))
 
-    from vanilla_benchmark import _load_yaml_config
+    from pfns4neurostim.legacy_code.vanilla_benchmark import _load_yaml_config
     cfg = _load_yaml_config(str(config_path))
 
     assert cfg['acq_fn'] == 'ucb', f"Expected 'ucb', got {cfg['acq_fn']!r}"

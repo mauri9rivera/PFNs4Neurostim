@@ -31,12 +31,11 @@ import torch
 import yaml
 from tabpfn import TabPFNRegressor
 
-from evaluation import evaluate_optimization, _unpack_budget_trajectory
-from models.regressors import (
-    GPSurrogate, TabPFNSurrogate,
-    DeepKernelGPSurrogate, NaiveGPSurrogate, RandomSearchSurrogate,
-)
-from utils.data_utils import (
+from pfns4neurostim.legacy_code.evaluation import evaluate_optimization, _unpack_budget_trajectory
+from pfns4neurostim.models.baselines.random_search import RandomSearchSurrogate
+from pfns4neurostim.models.gp.surrogates import DeepKernelGPSurrogate, GPSurrogate, NaiveGPSurrogate
+from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
+from pfns4neurostim.data.legacy_io import (
     load_data,
     HELD_OUT_SUBJECTS,
     ALL_SUBJECTS,
@@ -47,7 +46,7 @@ from utils.data_utils import (
     load_subject_result,
     save_subject_result,
 )
-from utils.visualization import (
+from pfns4neurostim.legacy_code.visualization import (
     r2_by_subject,
     spearman_by_subject,
     spearman_by_emg,
@@ -1099,7 +1098,7 @@ def run_benchmark() -> None:
         held_out_subj_idx=args.held_out_subj,
         subjects_mode=args.subjects_mode,
     )
-    from utils.cluster_diagnostics import ClusterDiagnostics as _CD
+    from pfns4neurostim.legacy_code.diagnostics.cluster_diagnostics import ClusterDiagnostics as _CD
     with _CD(tag=f"{args.dataset}-vanilla-benchmark", device=args.device,
              n_planned=len(_experiments) * len(args.mode),
              enabled=args.cluster_diag) as _diag:

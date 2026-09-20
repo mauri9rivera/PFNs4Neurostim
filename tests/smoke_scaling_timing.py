@@ -10,10 +10,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import numpy as np
 import pandas as pd
-from scaling_timing import run_scaling_benchmark, _make_synthetic_data, _time_query
-from models.regressors import GPSurrogate, TabPFNSurrogate
+from pfns4neurostim.legacy_code.scaling_timing import (
+    run_scaling_benchmark,
+    _make_synthetic_data,
+    _time_query,
+)
+from pfns4neurostim.models.gp.surrogates import GPSurrogate
+from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
 from tabpfn import TabPFNRegressor
-from utils.visualization import plot_scaling_timing
+from pfns4neurostim.legacy_code.visualization import plot_scaling_timing
 
 GRID_SIZES = [10, 20, 30]
 N_REPS = 2

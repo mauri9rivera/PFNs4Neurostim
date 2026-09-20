@@ -842,7 +842,7 @@ def plot_augmented_maps(
     """
 
 
-    from utils.visualization import _to_grid  # local import to avoid cycle
+    from pfns4neurostim.legacy_code.visualization import _to_grid  # local import to avoid cycle
 
     if subject_data.get('grid_shape') is None:
         print(f"[plot_augmented_maps] No 2D grid_shape for {dataset_type} (e.g. 5D dataset) — skipping.")

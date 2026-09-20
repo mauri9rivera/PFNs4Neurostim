@@ -31,22 +31,22 @@ if _SRC_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 
 def _import_layer_name():
-    from analysis.id_ood import _layer_name
+    from pfns4neurostim.analysis.id_ood import _layer_name
     return _layer_name
 
 
 def _import_normalize_for_tabpfn():
-    from analysis.id_ood import _normalize_for_tabpfn
+    from pfns4neurostim.analysis.id_ood import _normalize_for_tabpfn
     return _normalize_for_tabpfn
 
 
 def _import_procrustes():
-    from analysis.id_ood import compute_procrustes_disparity
+    from pfns4neurostim.analysis.id_ood import compute_procrustes_disparity
     return compute_procrustes_disparity
 
 
 def _import_rsa():
-    from analysis.id_ood import compute_rsa
+    from pfns4neurostim.analysis.id_ood import compute_rsa
     return compute_rsa
 
 

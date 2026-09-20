@@ -153,102 +153,132 @@ if torch.isnan(loss):
 
 ## 5. Architecture & File Structure
 
+Everything is one installable package: `pip install -e .` then
+`python -m pfns4neurostim <experiment> --config <yaml>`. The flat `src/` tree is gone
+(task #1, migrated 2026-09-18).
+
 ```
 PFNs4Neurostim/
-├── CLAUDE.md                    ← This file
-├── environment.yml              ← Conda environment (pfns4neurostim)
-├── configs/                     ← Canonical YAML experiment configs
-│   ├── nhp_optimization.yaml
-│   └── rat_optimization.yaml
-├── src/
-│   ├── finetuning.py            ← CLI entry: finetune_tabpfn(), run_experiment()
-│   ├── evaluation.py            ← Core eval: gp_baseline + finetuned_optimization (+ budget sweeps)
-│   ├── vanilla_benchmark.py     ← Vanilla TabPFN v2 vs GP benchmark (Hypothesis A)
-│   ├── aggregate.py             ← Post-hoc aggregation CLI: --config <yaml> → output/aggregated/
-│   ├── id_ood_analysis.py       ← ID/OOD analysis CLI entry
-│   ├── models/
-│   │   ├── regressors.py        ← GradientMonitoredRegressor, extract_inference_model
-│   │   ├── gaussians.py         ← ExactGP (gpytorch)
-│   │   └── lora.py              ← LoRA parameter-efficient finetuning
-│   ├── utils/
-│   │   ├── bo_loops.py          ← run_gpbo_loop, run_finetunedbo_loop
-│   │   ├── data_utils.py        ← Data loading, augmentation, split constants
-│   │   ├── gpbo_utils.py        ← UCB acquisition function
-│   │   ├── query_transforms.py  ← Data transforms (ZScore, MinMax, YeoJohnson, BoxCox)
-│   │   └── visualization.py     ← All publication figures
-│   └── analysis/
-│       ├── id_ood.py            ← run_id_ood_analysis() — statistical divergence metrics
-│       ├── id_ood_visualization.py
-│       ├── synthetic_gp.py
-│       ├── synthetic_noise.py
-│       └── synthetic_tabpfn_prior.py
-├── data/
-│   ├── cortical/
-│   ├── monkeys/
-│   ├── rat/
-│   └── spinal/
-├── output/
-│   ├── runs/<tag>/              ← diagnostics/, optimization/, results/
-│   └── aggregated/<dataset>-<family>/  ← CSVs + plots from aggregate.py
-├── libs/                        ← Git submodules — READ-ONLY, never modify
-│   ├── PFNs/
-│   ├── PFNs4BO/
-│   └── tabpfn-v1-prior/
-└── scripts/
-    ├── run_experiment.sh
-    └── export_results.sh
+├── CLAUDE.md  README.md  LICENSE
+├── pyproject.toml               ← package metadata + optional extras for the Hyp 0 models
+├── environment.yml              ← cross-platform conda env (Windows dev + Mila cluster)
+├── configs/
+│   ├── dataset/                 ← nhp · 5d_rat · spinal
+│   ├── model/                   ← tabpfn_v2_5 · gp_mll · gp_naive · random
+│   ├── acquisition/             ← ei · ucb · pi · ts_marginal · ts_joint · greedy · random
+│   ├── experiment/              ← hyp_a_nhp · hyp0_acq_table_nhp · stress_k2_{nhp,5d_rat}
+│   └── legacy/                  ← the 24 pre-restructure YAMLs
+├── data/  output/  logs/        ← gitignored; symlinks into $SCRATCH on the cluster
+├── libs/                        ← git submodules, READ-ONLY (PFNs, PFNs4BO, tabpfn-v1-prior)
+├── scripts/                     ← mila_setup.sh · run_stress_sweep.sh · run_*_experiments.sh
+├── tests/                       ← mirrors the package (+ integration/, shadow/)
+└── src/pfns4neurostim/
+    ├── __main__.py              ← CLI dispatch: bo_benchmark | stress_sweep
+    ├── config.py                ← YAML group composition, validation, --set, resolved dump
+    ├── seeding.py               ← set_seed, rng_for/seed_for (per-cell reproducibility)
+    ├── data/
+    │   ├── channels.py          ← ChannelData (the one object every experiment consumes)
+    │   ├── splits.py            ← HELD_OUT / TRAIN / ALL subjects
+    │   ├── stress.py            ← StressKnob ABC + registry; K2 live, K1/K5/K6/K7 declared
+    │   ├── snr.py               ← achieved SNR (dB) — the canonical K2 x-axis
+    │   ├── synthetic_neurostim.py ← Demo 1 generator (placeholder)
+    │   ├── references/          ← prior bag + noise banks for the Hyp C placement analysis
+    │   └── legacy_io.py         ← pre-restructure loader; being carved into loaders/preprocessing
+    ├── models/
+    │   ├── protocol.py          ← SurrogateModel + SurrogateAdapter (+ LegacySurrogateModel)
+    │   ├── registry.py          ← name → constructor + version string (P0.1)
+    │   ├── gp/                  ← exact_gp.py · surrogates.py (MLL, naive, deep-kernel)
+    │   ├── pfn/                 ← tabpfn.py · bar_distribution.py · external.py · wrappers.py
+    │   └── baselines/           ← random_search.py
+    ├── acquisition/             ← base · registry · schedules · thompson (P0.2 schema)
+    ├── evaluation/
+    │   ├── bo_loop.py           ← model- and acquisition-agnostic loop
+    │   ├── bo_runner.py         ← one instrumented repetition → tidy metrics
+    │   ├── metrics.py           ← range-normalized regrets, R², top-k, calibration
+    │   ├── robustness.py        ← breakdown point, degradation AUC, CVaR, relative robustness
+    │   ├── stats.py             ← TOST, equivalence margins, bootstrap
+    │   └── results.py           ← tidy schema + run-dir I/O
+    ├── experiments/             ← bo_benchmark.py (Hyp 0/A) · stress_sweep.py (Hyp B)
+    ├── analysis/                ← cka.py · id_ood.py · surface_geometry.py  (Hyp C)
+    ├── visualization/           ← style.py (single source of style) · bo · stress · mechanism
+    └── legacy_code/             ← superseded CLIs, finetuning/LoRA, old loop and plotting
 ```
 
 ### Dependency Graph (no cycles)
 
 ```
-tabpfn (external)
-  └─▶ models/regressors.py
-        └─▶ utils/bo_loops.py
-              └─▶ evaluation.py
-                    └─▶ finetuning.py          (CLI entry)
-                    └─▶ vanilla_benchmark.py   (CLI entry, Hypothesis A)
-      models/gaussians.py    ──▶ evaluation.py
-      utils/data_utils.py    ──▶ evaluation.py, finetuning.py, vanilla_benchmark.py, aggregate.py
-      utils/visualization.py ──▶ evaluation.py, finetuning.py, vanilla_benchmark.py, aggregate.py
-      utils/gpbo_utils.py    ──▶ utils/bo_loops.py
-      utils/query_transforms.py ──▶ (pending integration)
-      aggregate.py           ──▶ utils/data_utils.aggregate_results(), utils/visualization (post-hoc)
+data/{channels,splits,stress,snr}
+  └─▶ models/{protocol,registry,gp,pfn,baselines}
+        └─▶ acquisition/{base,registry,schedules,thompson}
+              └─▶ evaluation/{bo_loop,bo_runner,metrics,robustness,stats,results}
+                    └─▶ experiments/{bo_benchmark,stress_sweep}   (CLI via __main__)
+                          └─▶ visualization/{style,bo,stress}
+analysis/*  ──▶ visualization/mechanism.py
+legacy_code/*  — imports the package, never the reverse
 ```
 
-### Split Constants (`data_utils.py`)
+`visualization/style.py` is imported by every figure module and imports nothing from the
+package, so it can never introduce a cycle.
+
+### Split Constants (`data/splits.py`)
 
 ```python
-HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [1]}
-TRAIN_SUBJECTS    = {'rat': [1, 2, 3, 4], 'nhp': [0, 3]}
-ALL_SUBJECTS      = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 3]}
+HELD_OUT_SUBJECTS = {'rat': (0, 5), 'nhp': (1,), 'spinal': (0, 2, 5, 9), '5d_rat': (1, 4, 5)}
+TRAIN_SUBJECTS    = {'rat': (1, 2, 3, 4), 'nhp': (0, 3), ...}
+ALL_SUBJECTS      = {'rat': (0, 1, 2, 3, 4, 5), 'nhp': (0, 1, 3), ...}
 # NHP subject 2 excluded — pure noise signal
 ```
+
+Anything *chosen* by looking at results (primary acquisition, knob ranges, equivalence
+margins) is chosen on TRAIN subjects and only then applied to held-out ones.
 
 ---
 
 ## 6. Config Pattern
 
-All canonical experiment hyperparameters live in `configs/` as YAML files.
+Experiment YAMLs **compose config groups** through a `defaults:` block and may override any
+resolved key inline. Groups live in `configs/{dataset,model,acquisition}/`.
 
-**Naming convention:** `{dataset}_{mode}[_{split}].yaml`
+```yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ei          # or a list, to sweep types (bo_benchmark)
 
-All four CLI scripts support `--config <path>`. YAML keys are loaded as defaults;
-any CLI flag that is explicitly provided overrides the YAML value.
+knob:                      # stress sweeps only
+  type: k2_snr
+  levels: [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
 
-**Each YAML must have a `family:` key** — this is used by `aggregate.py` to identify
-which run directories belong to a given experiment family.
-
-```bash
-# Use canonical config
-python src/finetuning.py --config configs/nhp_optimization.yaml
-
-# Override a single parameter at runtime
-python src/finetuning.py --config configs/nhp_optimization.yaml --epochs 100
+budget: 50                 # TOTAL queries including n_init (P0.3)
+n_init: 5
+n_reps: 5
+equivalence_margin: 0.05   # pre-registered, in range-normalized regret units
 ```
 
-**Do not hardcode hyperparameter values in function bodies.** All values must be reachable
-via function arguments, CLI flags, or YAML config keys.
+**Acquisition schema (P0.2).** `acquisition: {type, params, schedules}`. `params` holds only
+the parameters that type declares — an unknown key raises at load time, it is never ignored —
+and `schedules` anneals a named parameter over the BO steps
+(`kind ∈ constant | linear | cosine | auto_dim`). The registry in
+`acquisition/registry.py` is the single definition; `config.py` delegates to it.
+
+**Every run writes its resolved config** to `<run_dir>/config.yaml`, including `model_version`
+(P0.1) and the verbatim acquisition block (P0.2), so a result is always traceable to the exact
+settings that produced it.
+
+```bash
+pip install -e .
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml
+python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml --set n_reps=2
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml --replot
+pytest tests -m "not slow and not gpu and not legacy" -q
+```
+
+`--set` takes dotted keys (`--set dataset.emgs=[0] budget=30`) and **refuses to invent keys**,
+so a typo fails instead of silently running something else. `--replot` rebuilds every figure
+and table from the run's `tidy.csv` alone — no experiment re-run.
+
+**Do not hardcode hyperparameter values in function bodies.** All values must be reachable via
+function arguments, CLI flags, or YAML config keys.
 
 ---
 

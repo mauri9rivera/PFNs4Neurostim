@@ -38,7 +38,7 @@ class TestLoadData5dRat:
 
     @pytest.mark.parametrize("m_i", [0, 1, 2, 3, 4, 5])
     def test_returns_expected_keys(self, m_i):
-        from utils.data_utils import load_data
+        from pfns4neurostim.data.legacy_io import load_data
         data = load_data('5d_rat', m_i)
         expected_keys = {
             'emgs', 'nChan', 'sorted_isvalid', 'sorted_resp', 'sorted_respMean',
@@ -48,20 +48,20 @@ class TestLoadData5dRat:
 
     @pytest.mark.parametrize("m_i", [0, 1, 2, 3, 4, 5])
     def test_grid_shape_is_none(self, m_i):
-        from utils.data_utils import load_data
+        from pfns4neurostim.data.legacy_io import load_data
         data = load_data('5d_rat', m_i)
         assert data['grid_shape'] is None
 
     @pytest.mark.parametrize("m_i", [0, 1, 2, 3, 4, 5])
     def test_ch2xy_is_5d(self, m_i):
-        from utils.data_utils import load_data
+        from pfns4neurostim.data.legacy_io import load_data
         data = load_data('5d_rat', m_i)
         assert data['ch2xy'].ndim == 2
         assert data['ch2xy'].shape[1] == 5
 
     @pytest.mark.parametrize("m_i", [0, 1, 2, 3, 4, 5])
     def test_sorted_resp_shape_consistent(self, m_i):
-        from utils.data_utils import load_data
+        from pfns4neurostim.data.legacy_io import load_data
         data = load_data('5d_rat', m_i)
         n_cond, n_emgs, n_reps = data['sorted_resp'].shape
         assert data['ch2xy'].shape[0] == n_cond
@@ -72,7 +72,7 @@ class TestLoadData5dRat:
 
     @pytest.mark.parametrize("m_i", [0, 1, 2, 3, 4, 5])
     def test_dim_search_space_equals_n_cond(self, m_i):
-        from utils.data_utils import load_data
+        from pfns4neurostim.data.legacy_io import load_data
         data = load_data('5d_rat', m_i)
         assert data['DimSearchSpace'] == data['sorted_resp'].shape[0]
         assert data['nChan'] == data['sorted_resp'].shape[0]
@@ -80,13 +80,13 @@ class TestLoadData5dRat:
     @pytest.mark.parametrize("m_i, expected_n_emgs", [(0, 1), (1, 1), (2, 4), (3, 4), (4, 5), (5, 3)])
     def test_emg_count_matches_valid_idx(self, m_i, expected_n_emgs):
         """Per-subject EMG validity filtering yields the expected channel count."""
-        from utils.data_utils import load_data
+        from pfns4neurostim.data.legacy_io import load_data
         data = load_data('5d_rat', m_i)
         assert len(data['emgs']) == expected_n_emgs
         assert data['sorted_resp'].shape[1] == expected_n_emgs
 
     def test_unknown_dataset_type_raises(self):
-        from utils.data_utils import load_data
+        from pfns4neurostim.data.legacy_io import load_data
         with pytest.raises(ValueError):
             load_data('not_a_real_dataset', 0)
 
@@ -99,7 +99,7 @@ class TestPipeline5dRat:
     """Tests that the generic [N, D] pipeline runs on 5D 5d_rat data."""
 
     def test_preprocess_neural_data_produces_5d_x(self):
-        from utils.data_utils import load_data, preprocess_neural_data
+        from pfns4neurostim.data.legacy_io import load_data, preprocess_neural_data
         data = load_data('5d_rat', 1)
         X_train, Y_train, X_test, Y_test, scaler_y = preprocess_neural_data(data, emg_idx=0)
         assert X_train.shape[1] == 5
@@ -107,7 +107,7 @@ class TestPipeline5dRat:
         assert len(Y_test) == X_test.shape[0]
 
     def test_augment_maps_runs_with_none_and_y_shift(self):
-        from utils.data_utils import load_data, augment_maps
+        from pfns4neurostim.data.legacy_io import load_data, augment_maps
         data = load_data('5d_rat', 1)
         pairs = augment_maps(
             data, emg_idx=0, n_augmentations=3, seed=42,
@@ -128,7 +128,7 @@ class TestApplyAugTransformDimGuard:
 
     @pytest.mark.parametrize("transform", ["h_flip", "v_flip", "d_flip"])
     def test_raises_for_5d_input(self, transform):
-        from utils.data_utils import _apply_aug_transform
+        from pfns4neurostim.data.legacy_io import _apply_aug_transform
         rng = np.random.RandomState(0)
         X = rng.rand(10, 5)
         y = rng.randn(10)
@@ -137,7 +137,7 @@ class TestApplyAugTransformDimGuard:
 
     @pytest.mark.parametrize("transform", ["none", "y_shift"])
     def test_does_not_raise_for_5d_input(self, transform):
-        from utils.data_utils import _apply_aug_transform
+        from pfns4neurostim.data.legacy_io import _apply_aug_transform
         rng = np.random.RandomState(0)
         X = rng.rand(10, 5)
         y = rng.randn(10)
@@ -147,7 +147,7 @@ class TestApplyAugTransformDimGuard:
 
     @pytest.mark.parametrize("transform", ["h_flip", "v_flip", "d_flip"])
     def test_does_not_raise_for_2d_input(self, transform):
-        from utils.data_utils import _apply_aug_transform
+        from pfns4neurostim.data.legacy_io import _apply_aug_transform
         rng = np.random.RandomState(0)
         X = rng.rand(10, 2)
         y = rng.randn(10)
@@ -164,13 +164,13 @@ class TestSplitConstants5dRat:
     """5d_rat split constants are present and self-consistent."""
 
     def test_keys_present(self):
-        from utils.data_utils import HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS
+        from pfns4neurostim.data.legacy_io import HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS
         assert '5d_rat' in HELD_OUT_SUBJECTS
         assert '5d_rat' in TRAIN_SUBJECTS
         assert '5d_rat' in ALL_SUBJECTS
 
     def test_train_and_held_out_partition_all(self):
-        from utils.data_utils import HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS
+        from pfns4neurostim.data.legacy_io import HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS
         train = set(TRAIN_SUBJECTS['5d_rat'])
         held_out = set(HELD_OUT_SUBJECTS['5d_rat'])
         all_subj = set(ALL_SUBJECTS['5d_rat'])

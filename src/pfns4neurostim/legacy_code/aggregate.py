@@ -30,8 +30,8 @@ _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from utils.data_utils import aggregate_results, load_results
-from utils.visualization import (
+from pfns4neurostim.data.legacy_io import aggregate_results, load_results
+from pfns4neurostim.legacy_code.visualization import (
     r2_by_subject,
     spearman_by_subject,
     spearman_by_emg,
@@ -43,7 +43,7 @@ from utils.visualization import (
     exploration_by_emg,
     plot_tost_forest,
 )
-from utils.stats import (
+from pfns4neurostim.evaluation.stats import (
     compute_equivalence_margin,
     run_tost_on_results,
 )
@@ -600,7 +600,7 @@ def main() -> None:
     _src_dir = os.path.dirname(os.path.abspath(__file__))
     if _src_dir not in _sys.path:
         _sys.path.insert(0, _src_dir)
-    from utils.cluster_diagnostics import ClusterDiagnostics as _CD
+    from pfns4neurostim.legacy_code.diagnostics.cluster_diagnostics import ClusterDiagnostics as _CD
 
     with _CD(tag='aggregate', device='cpu', n_planned=1,
              enabled=args.cluster_diag) as _diag:

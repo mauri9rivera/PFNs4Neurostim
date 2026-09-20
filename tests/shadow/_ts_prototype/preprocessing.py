@@ -82,7 +82,7 @@ def load_neurostim(dataset: str, subject: int, emg: int) -> SharedData:
     """
     if SRC_DIR not in sys.path:
         sys.path.insert(0, SRC_DIR)
-    from utils.data_utils import load_data  # noqa: WPS433  (read-only import)
+    from pfns4neurostim.data.legacy_io import load_data  # noqa: WPS433  (read-only import)
 
     cwd = os.getcwd()
     os.chdir(PROJECT_ROOT)  # src loader uses './data'

@@ -68,7 +68,7 @@ def _make_fake_diagnostics(n_epochs: int = 5) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def _import_load_diagnostics():
-    from finetuning import load_diagnostics
+    from pfns4neurostim.legacy_code.finetuning.cli import load_diagnostics
     return load_diagnostics
 
 

@@ -15,9 +15,9 @@ from typing import Any
 import numpy as np
 import yaml
 
-from analysis.id_ood import run_id_ood_analysis, compute_procrustes_auc
-from analysis.id_ood import compute_cohens_d_per_metric
-from analysis.id_ood_visualization import (
+from pfns4neurostim.analysis.id_ood import run_id_ood_analysis, compute_procrustes_auc
+from pfns4neurostim.analysis.id_ood import compute_cohens_d_per_metric
+from pfns4neurostim.visualization.mechanism import (
     plot_entropy_distribution, plot_entropy_heatmap,
     plot_mmd_heatmap, plot_mahalanobis_distribution,
     plot_cka_heatmap, plot_cka_layerwise_heatmap,
@@ -205,7 +205,7 @@ def main():
     if not getattr(args, 'cluster_diag', False) and os.environ.get('CLUSTER_DIAG', '0') == '1':
         args.cluster_diag = True
 
-    from utils.cluster_diagnostics import ClusterDiagnostics as _CD
+    from pfns4neurostim.legacy_code.diagnostics.cluster_diagnostics import ClusterDiagnostics as _CD
     _n_planned = len(args.datasets) * len(args.analyses)
     with _CD(tag=f"id-ood-{args.prior_source}", device=args.device,
              n_planned=_n_planned,

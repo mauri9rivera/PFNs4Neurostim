@@ -20,8 +20,6 @@ margin), reached through the same migration seam as the rest of the package.
 """
 from __future__ import annotations
 
-import os
-import sys
 from typing import Any, Sequence
 
 import numpy as np
@@ -33,13 +31,6 @@ __all__ = [
     "relative_robustness",
     "bootstrap_ci",
 ]
-
-
-def _ensure_legacy_on_path() -> None:
-    """Put the flat ``src/`` tree on ``sys.path`` so ``utils.*`` imports resolve."""
-    src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    if src_dir not in sys.path:
-        sys.path.insert(0, src_dir)
 
 
 def _tost(a: np.ndarray, b: np.ndarray, margin: float, alpha: float = 0.05) -> dict[str, Any]:
@@ -54,8 +45,7 @@ def _tost(a: np.ndarray, b: np.ndarray, margin: float, alpha: float = 0.05) -> d
     Returns:
         The legacy result dict (keys ``equivalent``, ``tost_p``, ``mean_diff``, ...).
     """
-    _ensure_legacy_on_path()
-    from utils.stats import tost_equivalence  # noqa: PLC0415 - seam, intentional
+    from .stats import tost_equivalence  # noqa: PLC0415 - heavy scipy import, load on demand
 
     return tost_equivalence(np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64), margin, alpha)
 

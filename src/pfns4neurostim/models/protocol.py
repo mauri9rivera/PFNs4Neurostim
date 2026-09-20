@@ -23,7 +23,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
-__all__ = ["SurrogateModel", "SurrogateAdapter", "marginals"]
+__all__ = ["SurrogateModel", "LegacySurrogateModel", "SurrogateAdapter", "marginals"]
 
 
 @runtime_checkable
@@ -211,3 +211,99 @@ def marginals(surrogate: Any, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         return surrogate.predict_marginals(X)
     mean, std = surrogate.predict(X)
     return np.asarray(mean, dtype=np.float64), np.asarray(std, dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Legacy protocol (moved from src/models/regressors.py at task #1 Step 3)
+# ---------------------------------------------------------------------------
+# The pre-restructure loop checks a different surface: fit/predict plus the
+# acquisition-specific predict_ucb / predict_ts / predict_ts_marginal. The new
+# SurrogateModel above is narrower on purpose - acquisition lives in
+# `pfns4neurostim.acquisition`, not on the model - so both are kept, with this
+# one used only by `legacy_code.bo_loops`.
+
+# ---------------------------------------------------------------------------
+# SurrogateModel protocol — unified interface for all BO surrogate models
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class LegacySurrogateModel(Protocol):
+    """Protocol for Bayesian optimisation surrogate models.
+
+    Any surrogate (GP, vanilla TabPFN, finetuned TabPFN, LoRA TabPFN) must
+    implement these two methods to be used with ``run_bo_loop()``.
+
+    The ``predict_ucb`` method is optional: surrogates that implement native
+    bar-distribution UCB (TabPFN variants) should override it; surrogates
+    that do not (GP) will fall back to the ``mean + kappa * std`` formula
+    computed by ``run_bo_loop`` from the ``predict`` return values.
+    """
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Fit or update the surrogate on observed data.
+
+        For GP surrogates this trains kernel hyperparameters via marginal
+        likelihood. For TabPFN surrogates this stores in-context examples
+        (no gradient updates).
+
+        Args:
+            X: Feature matrix of observed points, shape [N, D].
+            y: Response vector of observed targets, shape [N].
+        """
+        ...
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return predictive mean and standard deviation.
+
+        Args:
+            X: Query feature matrix, shape [M, D].
+
+        Returns:
+            Tuple of (mean, std), each shape [M].
+        """
+        ...
+
+    def predict_ucb(
+        self,
+        X: np.ndarray,
+        kappa: float,
+        t: int,
+        n_steps: int,
+    ) -> np.ndarray:
+        """Return UCB acquisition values for each candidate in X.
+
+        Surrogates with native uncertainty representations (e.g. the TabPFN
+        bar-distribution) should override this for a more accurate UCB.
+        The default implementation (used by ``run_bo_loop`` when the surrogate
+        does not override) computes ``mean + kappa * std``.
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].
+            kappa: Current UCB exploration coefficient.
+            t: Current BO step index (0-indexed), used for annealing.
+            n_steps: Total number of BO steps (``budget - n_init``).
+
+        Returns:
+            UCB values, shape [M].
+        """
+        ...
+
+    def predict_ts(self, X: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        """Return one Thompson Sample value for each candidate in X.
+
+        Draws a single function sample from the surrogate's predictive
+        distribution.  For GP, this is an exact draw from the joint posterior
+        MVN.  For TabPFN, this samples a bin from the temperature-scaled
+        bar distribution at each candidate independently.
+
+        Args:
+            X: Candidate feature matrix, shape [M, D].
+            temperature: Softmax temperature for bar-distribution sampling
+                (TabPFN only).  ``1.0`` = exact predictive distribution;
+                ``<1.0`` = sharper / greedier; ``>1.0`` = more uniform.
+                Ignored for GP (posterior is uniquely determined by kernel).
+
+        Returns:
+            Thompson sample values, shape [M].
+        """
+        ...

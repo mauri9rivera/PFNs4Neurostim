@@ -34,9 +34,10 @@ _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from models.regressors import GPSurrogate, TabPFNSurrogate
+from pfns4neurostim.models.gp.surrogates import GPSurrogate
+from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
 from tabpfn import TabPFNRegressor
-from utils.visualization import plot_scaling_timing
+from pfns4neurostim.legacy_code.visualization import plot_scaling_timing
 
 
 def set_seed(seed: int = 42) -> None:

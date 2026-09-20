@@ -34,9 +34,9 @@ import torch
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from utils.data_utils import load_data, preprocess_neural_data
-from utils.bo_loops import run_finetunedbo_loop, run_gpbo_loop
-from utils.gpbo_utils import compute_ucb_kappa, _auto_kappa_max, _auto_kappa_min
+from pfns4neurostim.data.legacy_io import load_data, preprocess_neural_data
+from pfns4neurostim.legacy_code.bo_loops import run_finetunedbo_loop, run_gpbo_loop
+from pfns4neurostim.legacy_code.gpbo_utils import compute_ucb_kappa, _auto_kappa_max, _auto_kappa_min
 from tabpfn import TabPFNRegressor
 
 # ── Config ────────────────────────────────────────────────────────────────────

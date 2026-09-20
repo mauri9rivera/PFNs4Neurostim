@@ -8,7 +8,7 @@ test is run.
 
 Usage (from aggregate.py or standalone)::
 
-    from utils.stats import tost_equivalence, compute_equivalence_margin, run_tost_on_results
+    from pfns4neurostim.evaluation.stats import tost_equivalence, compute_equivalence_margin, run_tost_on_results
 
     margin = compute_equivalence_margin(gp_results, metric='final_regret')
     tost_df = run_tost_on_results(results_dict, margin=margin)

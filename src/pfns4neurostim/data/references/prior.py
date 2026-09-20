@@ -19,7 +19,9 @@ from sklearn.preprocessing import StandardScaler
 
 # Add the tabpfn-v1-prior submodule to the path
 _PRIOR_LIB = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), '..', '..', 'libs', 'tabpfn-v1-prior'),
+    # data/references/ -> package -> src/ -> repo root -> libs/ (four levels up;
+    # the module moved one level deeper at task #1 Step 8).
+    os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'libs', 'tabpfn-v1-prior'),
 )
 if _PRIOR_LIB not in sys.path:
     sys.path.insert(0, _PRIOR_LIB)

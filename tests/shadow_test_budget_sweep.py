@@ -22,8 +22,12 @@ _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from evaluation import _unpack_budget_trajectory, evaluate_optimization
-from models.regressors import GPSurrogate, TabPFNSurrogate
+from pfns4neurostim.legacy_code.evaluation import (
+    _unpack_budget_trajectory,
+    evaluate_optimization,
+)
+from pfns4neurostim.models.gp.surrogates import GPSurrogate
+from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
 from tabpfn import TabPFNRegressor
 
 
@@ -137,7 +141,7 @@ class TestEvaluateOptimizationSnapshot:
         }
             mock_pre.return_value = (X, y_pool, X, y_test, None)
 
-            from evaluation import evaluate_optimization
+            from pfns4neurostim.legacy_code.evaluation import evaluate_optimization
             result = evaluate_optimization(
                 surrogate=surrogate,
                 dataset_type='synthetic',
@@ -177,7 +181,7 @@ class TestBudgetSweepPlotProduction:
     def test_plot_produced(self, tmp_path):
         from unittest.mock import patch
         import pandas as pd
-        from utils.visualization import budget_sweep_plot
+        from pfns4neurostim.legacy_code.visualization import budget_sweep_plot
 
         # Simulate the DataFrame that _vanilla_optimization_budget would produce
         rng = np.random.RandomState(42)

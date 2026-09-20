@@ -9,6 +9,38 @@ We address two key research questions:
 1. **Approximation**: Can the PFN accurately approximate EMG responses from neural stimulation data?
 2. **Optimization**: Can the PFN perform Bayesian Optimization experiments on par with GP?
 
+## Quick start
+
+```bash
+pip install -e .
+python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml
+```
+
+Every runner writes a tidy `tidy.csv`, a trajectory pickle, the resolved `config.yaml` and its
+figures into `output/<experiment>/<dataset>/`. Figures regenerate from the CSV alone:
+
+```bash
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml --replot
+```
+
+On the Mila cluster, `scripts/mila_setup.sh` creates the storage layout (code on `$HOME`, data
+master on `$ARCHIVE`, working copies on `$SCRATCH`) and `scripts/run_stress_sweep.sh` submits a
+sweep, staging the dataset to `$SLURM_TMPDIR` first.
+
+```bash
+sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_nhp.yaml
+```
+
+## Repository layout
+
+The code is a single installable package, `src/pfns4neurostim/`: `data/` (channels, splits,
+stress knobs), `models/` (GP and PFN surrogates + registry), `acquisition/` (EI, UCB, PI,
+Thompson, greedy, random), `evaluation/` (BO loop, metrics, robustness statistics),
+`experiments/` (one runner per experiment type), `visualization/` (`style.py` is the single
+source of figure style), `analysis/` (Hypothesis C), and `legacy_code/` (superseded code kept
+for reproducing earlier results). See CLAUDE.md section 5 for the full tree.
+
 ## Installation
 
 ### 1. Clone the repository with submodules

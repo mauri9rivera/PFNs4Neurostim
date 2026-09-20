@@ -123,7 +123,7 @@ def test_gp_converged_noise_matches_trial_sd(neurostim_loader: Callable[[str, in
             in_band.append(lo <= s <= hi)
             rows.append(round(s / float(np.mean(sd_site)), 2))
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
-    from models.regressors import GPSurrogate  # read-only import
+    from pfns4neurostim.legacy_code.finetuning.regressors import GPSurrogate  # read-only import
 
     d = neurostim_loader("nhp", 1, 0)
     rng = np.random.default_rng(1)

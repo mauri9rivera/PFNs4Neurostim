@@ -6,14 +6,12 @@ the version is logged rather than assumed). Keys match
 ``visualization.style.MODEL_STYLES`` exactly, so a model name is enough to get
 its colour, label and provenance.
 
-**Migration seam.** Constructors wrap the existing classes in
-``src/models/regressors.py``. Task #1 Step 3 moves those classes into
-``models/gp/`` and ``models/pfn/`` and only the bodies here change.
+Constructors import from ``models/gp/`` and ``models/pfn/`` lazily, so building a
+GP does not pay for the TabPFN import and vice versa. As of task #1 Step 3 these
+are package-native modules; nothing here reaches into the old flat ``src/`` tree.
 """
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -25,13 +23,6 @@ __all__ = [
     "available_models",
     "STRESS_COMPARATORS",
 ]
-
-
-def _ensure_legacy_on_path() -> None:
-    """Put the flat ``src/`` tree on ``sys.path`` so ``models.*`` imports resolve."""
-    src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    if src_dir not in sys.path:
-        sys.path.insert(0, src_dir)
 
 
 @dataclass(frozen=True)
@@ -74,9 +65,8 @@ def _build_tabpfn_v2_5(device: str = "cpu", n_estimators: int = 1, **kwargs: Any
     Returns:
         A ``TabPFNSurrogate`` wrapping a fresh ``TabPFNRegressor``.
     """
-    _ensure_legacy_on_path()
     from tabpfn import TabPFNRegressor  # noqa: PLC0415 - heavy import, load on demand
-    from models.regressors import TabPFNSurrogate  # noqa: PLC0415 - seam
+    from .pfn.tabpfn import TabPFNSurrogate  # noqa: PLC0415 - heavy import, load on demand
 
     regressor = TabPFNRegressor(
         device=device,
@@ -99,8 +89,7 @@ def _build_gp_mll(device: str = "cpu", n_opt_steps: int = 100, lr: float = 0.1, 
     Returns:
         A ``GPSurrogate``.
     """
-    _ensure_legacy_on_path()
-    from models.regressors import GPSurrogate  # noqa: PLC0415 - seam
+    from .gp.surrogates import GPSurrogate  # noqa: PLC0415 - gpytorch import, load on demand
 
     return GPSurrogate(device=device, n_opt_steps=n_opt_steps, lr=lr, **kwargs)
 
@@ -115,8 +104,7 @@ def _build_gp_naive(device: str = "cpu", **kwargs: Any) -> Any:
     Returns:
         A ``NaiveGPSurrogate``.
     """
-    _ensure_legacy_on_path()
-    from models.regressors import NaiveGPSurrogate  # noqa: PLC0415 - seam
+    from .gp.surrogates import NaiveGPSurrogate  # noqa: PLC0415 - gpytorch import, load on demand
 
     return NaiveGPSurrogate(device=device, **kwargs)
 
@@ -131,8 +119,7 @@ def _build_random(device: str = "cpu", **kwargs: Any) -> Any:
     Returns:
         A ``RandomSearchSurrogate``.
     """
-    _ensure_legacy_on_path()
-    from models.regressors import RandomSearchSurrogate  # noqa: PLC0415 - seam
+    from .baselines.random_search import RandomSearchSurrogate  # noqa: PLC0415 - load on demand
 
     return RandomSearchSurrogate()
 

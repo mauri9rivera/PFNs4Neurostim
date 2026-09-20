@@ -29,27 +29,42 @@ import numpy as np
 import pandas as pd
 import torch
 
-from models.regressors import _make_finetuned_regressor, extract_inference_model
-from evaluation import (
-    gp_baseline, finetuned_optimization,
+from pfns4neurostim.legacy_code.finetuning.regressors import _make_finetuned_regressor, extract_inference_model
+from pfns4neurostim.legacy_code.evaluation import (
+    gp_baseline,
+    finetuned_optimization,
     finetuned_optimization_budget,
-    finetuned_percentage, load_sweep_results,
+    finetuned_percentage,
+    load_sweep_results,
 )
-from utils.data_utils import (
-    build_finetuning_dataset, load_data,
-    HELD_OUT_SUBJECTS, TRAIN_SUBJECTS, ALL_SUBJECTS,
-    generate_experiment_tag, save_results,
-    create_run_dir, write_run_config,
-    load_subject_result, save_subject_result,
+from pfns4neurostim.data.legacy_io import (
+    build_finetuning_dataset,
+    load_data,
+    HELD_OUT_SUBJECTS,
+    TRAIN_SUBJECTS,
+    ALL_SUBJECTS,
+    generate_experiment_tag,
+    save_results,
+    create_run_dir,
+    write_run_config,
+    load_subject_result,
+    save_subject_result,
 )
-from utils.visualization import (
+from pfns4neurostim.legacy_code.visualization import (
     r2_by_subject,
-    spearman_by_subject, spearman_by_emg,
-    regret_with_timing, regret_traces_by_subject, regret_by_emg,
-    exploration_by_subject, exploration_by_emg,
+    spearman_by_subject,
+    spearman_by_emg,
+    regret_with_timing,
+    regret_traces_by_subject,
+    regret_by_emg,
+    exploration_by_subject,
+    exploration_by_emg,
     augmentation_sweep_plot,
-    visualize_representation, show_emg_map,
-    plot_gradient_metrics, plot_weight_metrics, plot_cka_similarity,
+    visualize_representation,
+    show_emg_map,
+    plot_gradient_metrics,
+    plot_weight_metrics,
+    plot_cka_similarity,
     plot_gradient_share,
 )
 
@@ -428,7 +443,7 @@ def run_experiment(
 
     # --- Obtain finetuned model: load checkpoint or train from scratch ---
     if lora_weights:
-        from models.regressors import load_lora_as_inference_model
+        from pfns4neurostim.legacy_code.finetuning.regressors import load_lora_as_inference_model
         print("=" * 60)
         print(f"Loading LoRA checkpoint  [{lora_weights}]")
         print("=" * 60)
@@ -824,7 +839,9 @@ def run_finetuning():
             # None → run_experiment uses default HELD_OUT_SUBJECTS
             loo_subjects = [args.held_out_subj]
 
-        from utils.cluster_diagnostics import ClusterDiagnostics as _CD
+        from pfns4neurostim.legacy_code.diagnostics.cluster_diagnostics import (
+            ClusterDiagnostics as _CD,
+        )
         with _CD(tag=f"{args.dataset}-finetuning", device=args.device,
                  n_planned=len(loo_subjects),
                  enabled=args.cluster_diag) as _diag:

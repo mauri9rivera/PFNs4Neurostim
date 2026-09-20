@@ -33,12 +33,12 @@ if _SRC_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 
 def _import_generate_experiment_tag():
-    from utils.data_utils import generate_experiment_tag
+    from pfns4neurostim.data.legacy_io import generate_experiment_tag
     return generate_experiment_tag
 
 
 def _import_create_run_dir():
-    from utils.data_utils import create_run_dir
+    from pfns4neurostim.data.legacy_io import create_run_dir
     return create_run_dir
 
 

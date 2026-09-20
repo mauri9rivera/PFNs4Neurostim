@@ -37,14 +37,19 @@ _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from evaluation import evaluate_optimization
-from models.regressors import GPSurrogate, TabPFNSurrogate
+from pfns4neurostim.legacy_code.evaluation import evaluate_optimization
+from pfns4neurostim.models.gp.surrogates import GPSurrogate
+from pfns4neurostim.models.pfn.tabpfn import TabPFNSurrogate
 from tabpfn import TabPFNRegressor
-from utils.data_utils import (
-    load_data, ALL_SUBJECTS, HELD_OUT_SUBJECTS,
-    generate_experiment_tag, create_run_dir, write_run_config,
+from pfns4neurostim.data.legacy_io import (
+    load_data,
+    ALL_SUBJECTS,
+    HELD_OUT_SUBJECTS,
+    generate_experiment_tag,
+    create_run_dir,
+    write_run_config,
 )
-from utils.visualization import plot_shuffle_ablation
+from pfns4neurostim.legacy_code.visualization import plot_shuffle_ablation
 
 
 def set_seed(seed: int = 42) -> None:

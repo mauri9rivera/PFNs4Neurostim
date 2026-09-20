@@ -105,7 +105,7 @@ class TestBoPipelineIntegration:
 
     def test_full_pipeline_no_data_loading(self):
         """BO loop runs on synthetic pool and returns expected keys/shapes."""
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
 
         np.random.seed(42)
         N = 50
@@ -133,7 +133,7 @@ class TestBoPipelineIntegration:
 
     def test_save_load_round_trip(self, tmp_path):
         """save_results then load_results returns consistent dict."""
-        from utils.data_utils import save_results, load_results
+        from pfns4neurostim.data.legacy_io import save_results, load_results
 
         np.random.seed(42)
         rng = np.random.RandomState(42)
@@ -171,7 +171,7 @@ class TestBoPipelineIntegration:
 
     def test_write_run_config_round_trip(self, tmp_path):
         """write_run_config creates config.yaml with correct values."""
-        from utils.data_utils import create_run_dir, write_run_config
+        from pfns4neurostim.data.legacy_io import create_run_dir, write_run_config
 
         run_dir = create_run_dir(
             'dummy', base_dir=str(tmp_path), tag='test-00000'
@@ -192,7 +192,7 @@ class TestBoPipelineIntegration:
 
     def test_preprocess_neural_data_runs_on_synthetic(self):
         """preprocess_neural_data processes synthetic subject_data without error."""
-        from utils.data_utils import preprocess_neural_data
+        from pfns4neurostim.data.legacy_io import preprocess_neural_data
 
         subject_data = _make_subject_data(n_chan=12, n_emgs=4, n_reps=6, seed=7)
         X_train, Y_train, X_test, Y_test, scaler_y = preprocess_neural_data(
@@ -214,7 +214,7 @@ class TestBoPipelineIntegration:
 
     def test_bo_loop_values_track_pool(self):
         """BO loop's observed indices are all valid and values come from y_pool rows."""
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
 
         np.random.seed(0)
         N = 30
@@ -242,7 +242,7 @@ class TestBoPipelineIntegration:
 
     def test_bo_loop_real_values_are_finite(self):
         """BO loop's 'real_values' list contains only finite floats."""
-        from utils.bo_loops import run_bo_loop
+        from pfns4neurostim.legacy_code.bo_loops import run_bo_loop
 
         np.random.seed(3)
         N = 25

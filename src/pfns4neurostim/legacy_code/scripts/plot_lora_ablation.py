@@ -17,7 +17,7 @@ import sys
 from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-from utils.visualization import r2_barplot_by_subject, regret_traces_by_subject
+from pfns4neurostim.legacy_code.visualization import r2_barplot_by_subject, regret_traces_by_subject
 
 
 def load_lora_runs(

@@ -4,8 +4,8 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import numpy as np
-from utils.stats import tost_equivalence, compute_equivalence_margin, run_tost_on_results
-from utils.visualization import plot_gradient_share, plot_tost_forest
+from pfns4neurostim.evaluation.stats import tost_equivalence, compute_equivalence_margin, run_tost_on_results
+from pfns4neurostim.legacy_code.visualization import plot_gradient_share, plot_tost_forest
 
 np.random.seed(42)
 

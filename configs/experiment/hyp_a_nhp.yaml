@@ -15,7 +15,7 @@ experiment: bo_benchmark
 family: hyp-a
 tag: nhp
 
-budget: 50
+budget: 96
 n_init: 5
 n_reps: 20
 gt_mode: full_mean

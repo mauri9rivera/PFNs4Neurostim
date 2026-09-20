@@ -6,7 +6,7 @@ import seaborn as sns
 import numpy as np
 import os
 
-from utils.data_utils import _safe_spearman
+from pfns4neurostim.data.legacy_io import _safe_spearman
 
 # ============================================
 #           Visualization
@@ -1986,7 +1986,7 @@ def gfs_by_subject(
             ``<output_dir>/optimization/gfs_by_subject.svg``.
         output_dir: Run directory root.
     """
-    from utils.surface_geometry import GFS_SUMMARY_SIGMA
+    from pfns4neurostim.analysis.surface_geometry import GFS_SUMMARY_SIGMA
 
     rows = [
         {

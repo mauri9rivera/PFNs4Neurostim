@@ -28,7 +28,7 @@ import matplotlib.gridspec as gridspec
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from analysis.synthetic_noise import generate_noise_dataset
+from pfns4neurostim.data.references.noise import generate_noise_dataset
 from tabpfn import TabPFNRegressor
 
 # ---------------------------------------------------------------------------

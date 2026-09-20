@@ -17,8 +17,8 @@ import numpy as np
 import torch
 import gpytorch
 
-from models.gaussians import ExactGP
-from utils.gpbo_utils import (
+from pfns4neurostim.models.gp.exact_gp import ExactGP
+from pfns4neurostim.legacy_code.gpbo_utils import (
     compute_ucb_kappa, expected_improvement_numpy, _auto_kappa_max, _auto_kappa_min,
 )
 
@@ -72,7 +72,7 @@ def run_bo_loop(
     query is selected via the chosen acquisition function.
 
     The ``model`` argument must conform to the ``SurrogateModel`` protocol
-    (defined in ``models.regressors``):
+    (defined in ``pfns4neurostim.models.protocol``):
       - ``model.fit(X, y)`` — update the surrogate on observed data
       - ``model.predict(X)`` — return ``(mean, std)`` for candidate points
       - ``model.predict_ucb(X, kappa, t, n_steps)`` — UCB acquisition values

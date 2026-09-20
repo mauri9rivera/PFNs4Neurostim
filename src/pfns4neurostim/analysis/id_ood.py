@@ -22,12 +22,12 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from tabpfn import TabPFNRegressor
 
-from models.regressors import linear_cka
+from pfns4neurostim.analysis.cka import linear_cka
 
-from utils.data_utils import load_data, ALL_SUBJECTS
+from pfns4neurostim.data.legacy_io import load_data, ALL_SUBJECTS
 
-from analysis.synthetic_noise import generate_noise_bank
-from analysis.synthetic_tabpfn_prior import generate_tabpfn_prior_bank
+from pfns4neurostim.data.references.noise import generate_noise_bank
+from pfns4neurostim.data.references.prior import generate_tabpfn_prior_bank
 
 
 def generate_synthetic_gp_bank(n_datasets=500, n_features=2,

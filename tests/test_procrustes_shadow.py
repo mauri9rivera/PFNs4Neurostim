@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import numpy as np
 from tabpfn import TabPFNRegressor
 
-from analysis.id_ood import (
+from pfns4neurostim.analysis.id_ood import (
     compute_procrustes_disparity,
     _trajectory_disparities,
     embedding_trajectory_analysis,

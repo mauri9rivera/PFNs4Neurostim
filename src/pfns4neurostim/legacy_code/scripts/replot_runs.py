@@ -19,7 +19,7 @@ from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from utils.visualization import (
+from pfns4neurostim.legacy_code.visualization import (
     r2_by_subject,
     regret_with_timing,
     regret_curve,
