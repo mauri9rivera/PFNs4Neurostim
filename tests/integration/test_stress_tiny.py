@@ -175,7 +175,7 @@ class TestBudgetSemantics:
             run_channel_bo("gp_naive", channel, budget=3, n_init=3, device="cpu")
 
     def test_budget_above_pool_size_raises(self, channel: ChannelData) -> None:
-        with pytest.raises(ValueError, match="exceeds the 20 sites"):
+        with pytest.raises(ValueError, match="exceeds the 20 queryable site"):
             run_channel_bo("gp_naive", channel, budget=25, n_init=3, device="cpu")
 
 

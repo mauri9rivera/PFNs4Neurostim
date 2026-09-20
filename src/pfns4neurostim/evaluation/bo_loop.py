@@ -18,6 +18,9 @@ Differences from the legacy loop, all deliberate:
 * Acquisition parameters actually used at each step are recorded (P0.2), so a
   schedule is visible in the output rather than inferred from the config.
 * A site whose trials are all NaN raises instead of silently contributing a zero.
+* ``channel.queryable`` restricts the initial design, the acquisition and the
+  recommendation (the K6 dropout knob), while every metric still reads the full
+  ground-truth map: losing electrodes must not redefine the target.
 """
 from __future__ import annotations
 
@@ -126,15 +129,17 @@ def run_bo_loop(
             surrogate does not have (``ts_joint`` with a PFN).
     """
     n_sites = channel.n_sites
+    queryable = channel.queryable_indices              # [n_queryable]
+    n_queryable = int(queryable.size)
     if budget <= n_init:
         raise ValueError(
             f"budget ({budget}) must exceed n_init ({n_init}); budget counts total "
             "queries including the initial design (P0.3)."
         )
-    if budget > n_sites:
+    if budget > n_queryable:
         raise ValueError(
-            f"budget ({budget}) exceeds the {n_sites} sites of {channel.label}; "
-            "queries are drawn without replacement."
+            f"budget ({budget}) exceeds the {n_queryable} queryable site(s) of "
+            f"{channel.label} (of {n_sites} total); queries are drawn without replacement."
         )
     if spec.needs_joint and not getattr(surrogate, "supports_joint", False):
         raise NotImplementedError(
@@ -146,7 +151,7 @@ def run_bo_loop(
     X_pool = channel.X_pool                                  # [N, D]
 
     # --- initial design: uniform random sites without replacement ------------
-    initial = rng.choice(n_sites, size=n_init, replace=False)
+    initial = rng.choice(queryable, size=n_init, replace=False)
     for index in initial:
         traj.observed_indices.append(int(index))
         traj.observed_values.append(draw_trial(channel.Y_trials, int(index), rng))
@@ -163,11 +168,14 @@ def run_bo_loop(
             n_dims=channel.n_dims,
         )
         surrogate.fit(X_pool[np.asarray(traj.observed_indices, dtype=int)], np.asarray(traj.observed_values))
-        result = acquire(spec.score_fn, surrogate, X_pool, state, rng, params)
+        result = acquire(
+            spec.score_fn, surrogate, X_pool, state, rng, params, allowed=channel.queryable
+        )
 
-        # Pure-exploitation recommendation: what the model would advise right now.
+        # Pure-exploitation recommendation: the best site the operator could
+        # actually act on, so unqueryable electrodes are not recommendable either.
         pool_mean, _ = marginals(surrogate, X_pool)           # [N]
-        traj.recommendations.append(int(np.argmax(pool_mean)))
+        traj.recommendations.append(int(queryable[np.argmax(pool_mean[queryable])]))
 
         index = result.index
         traj.observed_indices.append(index)
@@ -181,5 +189,5 @@ def run_bo_loop(
     mean, std = marginals(surrogate, X_pool)                  # [N], [N]
     traj.y_pred = np.asarray(mean, dtype=np.float64)
     traj.y_std = np.asarray(std, dtype=np.float64)
-    traj.recommendations.append(int(np.argmax(traj.y_pred)))
+    traj.recommendations.append(int(queryable[np.argmax(traj.y_pred[queryable])]))
     return traj

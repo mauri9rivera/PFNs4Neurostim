@@ -1,0 +1,30 @@
+# Hypothesis B - K6 sparsity via electrode dropout, NHP (Demo 2, in vivo).
+#
+# A fraction of electrodes becomes unqueryable (broken contacts, or a smaller
+# array). Sites are MASKED, not deleted: the ground truth still spans the full
+# map, so regret is measured against the true optimum even when that optimum is
+# among the dropped electrodes. Deleting rows instead would quietly redefine the
+# target and make dropout look harmless exactly when it hurts most.
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k6_dropout_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ei
+
+experiment: stress_sweep
+family: stress-k6-dropout
+tag: nhp
+
+knob:
+  type: k6_dropout
+  levels: [0.0, 0.1, 0.25, 0.5]
+
+budget: 40          # must not exceed the queryable count at the harshest level
+n_init: 5
+n_reps: 5
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05

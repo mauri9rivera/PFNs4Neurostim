@@ -4,7 +4,7 @@ Covers:
 - generate_experiment_tag() in src/utils/data_utils.py
 - create_run_dir() in src/utils/data_utils.py
 - _load_yaml_config() (standalone reimplementation tested in isolation)
-- All YAML config files in configs/ parse correctly and contain required keys
+- All legacy YAML config files in configs/legacy/ parse correctly and contain required keys
 - YAML-then-CLI merge logic
 
 All tests are low-cost: no GPU, no model loading, no dataset I/O.
@@ -222,7 +222,10 @@ class TestLoadYamlConfig:
 # YAML config files -- parse and required keys
 # ---------------------------------------------------------------------------
 
-_CONFIGS_DIR = os.path.join(_PROJECT_ROOT, "configs")
+# The pre-restructure YAMLs moved to configs/legacy/ at task #1 Step 6; the
+# new config groups live in configs/{dataset,model,acquisition,experiment}/ and
+# are covered by the package tests instead.
+_CONFIGS_DIR = os.path.join(_PROJECT_ROOT, "configs", "legacy")
 
 # Step 1 finetuning configs (created by agent)
 _FINETUNING_CONFIGS = [

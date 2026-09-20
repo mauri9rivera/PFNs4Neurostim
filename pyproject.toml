@@ -20,6 +20,7 @@ tabpfn-v1 = ["tabpfn<2"]
 tabfm = ["tabfm"]
 mitra = ["autogluon.tabular>=1.4"]
 tabflex = ["ticl"]
+tabicl = ["tabicl"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

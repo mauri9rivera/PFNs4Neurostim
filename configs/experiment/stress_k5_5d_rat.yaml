@@ -1,0 +1,35 @@
+# Hypothesis B - K5 outlier contamination on the 5D rat dataset (Demo 2, in vivo).
+#
+# Knob: a fraction of valid trials is overwritten with trials the lab flagged
+# invalid (sorted_isvalid == 0) - real artefacts, not synthetic heavy tails.
+#
+# Dataset choice matters here. Measured 2026-09-20, lab-flagged trials are:
+#   5d_rat  6.60% of trial slots   <- enough donors for a real-artefact sweep
+#   nhp     0.41%
+#   spinal  0.11%
+# So 5d_rat is the primary K5 arm; NHP and spinal channels mostly raise
+# KnobNotApplicable and are skipped (the runner logs each skip). To sweep them
+# anyway, switch the knob to the synthetic fallback and say so in the caption.
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k5_5d_rat.yaml
+defaults:
+  dataset: 5d_rat
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ei
+
+experiment: stress_sweep
+family: stress-k5
+tag: 5drat
+
+knob:
+  type: k5_outliers
+  levels: [0.0, 0.05, 0.1, 0.2, 0.4]
+
+budget: 150
+n_init: 5
+n_reps: 5
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05

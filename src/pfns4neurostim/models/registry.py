@@ -146,6 +146,7 @@ def _build_external(key: str) -> Callable[..., Any]:
             "tabfm": wrappers.TabFMSurrogate,
             "mitra": wrappers.MitraSurrogate,
             "tabflex": wrappers.TabFlexSurrogate,
+            "tabicl": wrappers.TabICLSurrogate,
         }
         return classes[key](device=device, **params)
 
@@ -244,6 +245,14 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         factory=_build_external("tabflex"),
         supports=("ei", "ucb", "ts_marginal"),
         notes="Classifier binned into a bar distribution; needs libs/ticl.",
+    ),
+    "tabicl": ModelSpec(
+        key="tabicl",
+        version="TabICL (classification-head adaptation)",
+        family="pfn",
+        factory=_build_external("tabicl"),
+        supports=("ei", "ucb", "ts_marginal"),
+        notes="Added 2026-09-20; bucketized route provisional, confirm native regression.",
     ),
     "random": ModelSpec(
         key="random",

@@ -19,6 +19,10 @@ remains, which is per-model and not uniform:
   acquisition, which would make its Hyp 0 row incomparable.
 * **TabFlex** — in ``microsoft/ticl``, to be added as ``libs/ticl``.
   Classification-focused upstream, so it uses the bucketized adapter.
+* **TabICL** — ``soda-inria/tabicl`` (pip ``tabicl``). Added 2026-09-20 on
+  request; it was not in the original H0-1 table. Registered on the bucketized
+  route because upstream is classification-focused, which must be re-checked
+  against the installed version before any TabICL number is reported.
 
 Rows produced by the two adapter-based models must be labelled
 **"classification-head adaptation"** in every table and caption.
@@ -33,6 +37,7 @@ from .external import BucketizedClassifierSurrogate, ExternalSurrogate
 
 __all__ = [
     "PFNs4BOSurrogate",
+    "TabICLSurrogate",
     "TabPFNv1Surrogate",
     "TabFMSurrogate",
     "MitraSurrogate",
@@ -176,4 +181,31 @@ class TabFlexSurrogate(BucketizedClassifierSurrogate):
         raise NotImplementedError(
             "TabFlexSurrogate is not implemented yet (task #8 Step 3); add libs/ticl "
             "as a submodule first."
+        )
+
+
+class TabICLSurrogate(BucketizedClassifierSurrogate):
+    """TabICL as a bucketized regressor (classification-head adaptation, provisional).
+
+    Args:
+        device: Torch device string.
+        n_bins: Number of response bins.
+        **backend_kwargs: Forwarded to the backend classifier.
+    """
+
+    def __init__(self, device: str = "cpu", n_bins: int = 32, **backend_kwargs: Any) -> None:
+        super().__init__("tabicl", device=device, n_bins=n_bins, **backend_kwargs)
+
+    def _make_classifier(self) -> Any:
+        """Construct the TabICL classifier. **Not implemented.**
+
+        Raises:
+            NotImplementedError: Task #8 Step 3. Confirm first whether the
+                installed version exposes a native regressor: if it does, this
+                model should not go through the bucketized adapter at all.
+        """
+        raise NotImplementedError(
+            "TabICLSurrogate is not implemented yet (task #8 Step 3). Before "
+            "implementing, check whether the installed tabicl exposes a native "
+            "regressor - if so, drop the bucketized route for it."
         )

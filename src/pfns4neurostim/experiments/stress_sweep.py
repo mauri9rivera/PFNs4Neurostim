@@ -32,7 +32,7 @@ import pandas as pd
 
 from ..config import ExperimentConfig, load_experiment_config, resolved_dict
 from ..data.channels import ChannelData, iter_channels
-from ..data.stress import build_knob
+from ..data.stress import KnobNotApplicable, build_knob
 from ..evaluation import results as _results
 from ..evaluation.bo_runner import run_channel_bo
 from ..evaluation.results import TidyRow
@@ -85,13 +85,22 @@ def build_tidy_rows(
     rows: list[TidyRow] = []
     trajectories: dict[tuple[Any, ...], dict[str, Any]] = {}
     extras: list[dict[str, Any]] = []
+    skipped: list[str] = []
 
     for channel in _channels(cfg):
         for level in knob.levels:
             rng = np.random.default_rng(
                 seed_for(channel.label, knob.name, level, base_seed=cfg.seed)
             )
-            stressed = knob.apply(channel, level, rng)
+            try:
+                stressed = knob.apply(channel, level, rng)
+            except KnobNotApplicable as exc:
+                # Some channels simply lack what a knob needs (no lab-flagged
+                # artefacts for K5, too few sites for K6 dropout). Skip the cell,
+                # keep the rest of the grid, and make the gap visible in the log.
+                skipped.append(f"{channel.label} @ {knob.name}={level:g}: {exc}")
+                print(f"[stress_sweep] skipping {skipped[-1]}", flush=True)
+                continue
             achieved = knob.achieved(stressed)
             budget = knob.budget_for(level, cfg.budget)
 
@@ -138,9 +147,12 @@ def build_tidy_rows(
                         )
     if not rows:
         raise RuntimeError(
-            "stress_sweep produced no rows: check dataset.subjects / dataset.emgs "
-            "and that the raw data is present under dataset.data_root."
+            "stress_sweep produced no rows: check dataset.subjects / dataset.emgs, "
+            "that the raw data is present under dataset.data_root, and the skip list "
+            f"({len(skipped)} cell(s) skipped): {skipped[:3]}"
         )
+    if skipped:
+        print(f"[stress_sweep] {len(skipped)} cell(s) skipped as not applicable", flush=True)
     return rows, trajectories, extras
 
 

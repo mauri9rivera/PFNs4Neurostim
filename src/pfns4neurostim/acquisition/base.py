@@ -63,6 +63,7 @@ def masked_argmax(
     values: np.ndarray,
     observed: tuple[int, ...] | list[int],
     rng: np.random.Generator,
+    allowed: np.ndarray | None = None,
 ) -> int:
     """Pick the best unobserved candidate, breaking ties at random.
 
@@ -70,6 +71,9 @@ def masked_argmax(
         values: Acquisition surface, shape [N].
         observed: Indices already queried, which are excluded.
         rng: Seeded generator used for the tie-break.
+        allowed: Optional boolean mask of selectable sites, shape [N]. Used by the
+            K6 dropout knob, where the ground-truth map still spans every site but
+            the optimizer may only query the surviving electrodes.
 
     Returns:
         The selected index.
@@ -80,6 +84,8 @@ def masked_argmax(
     """
     values = np.asarray(values, dtype=np.float64)          # [N]
     mask = np.ones(values.shape[0], dtype=bool)            # [N]
+    if allowed is not None:
+        mask &= np.asarray(allowed, dtype=bool)
     if len(observed):
         mask[np.asarray(observed, dtype=int)] = False
     if not mask.any():
@@ -105,6 +111,7 @@ def acquire(
     state: BOState,
     rng: np.random.Generator,
     params: Any,
+    allowed: np.ndarray | None = None,
 ) -> AcqResult:
     """Score every candidate and select the next query.
 
@@ -115,6 +122,7 @@ def acquire(
         state: Loop state at this step.
         rng: Seeded generator.
         params: The acquisition type's params dataclass instance.
+        allowed: Optional boolean mask of selectable sites, shape [N].
 
     Returns:
         The :class:`AcqResult` for this step.
@@ -124,5 +132,5 @@ def acquire(
         raise RuntimeError(
             f"Acquisition returned {values.shape[0]} values for {X_pool.shape[0]} candidates."
         )
-    index = masked_argmax(values, state.observed_indices, rng)
+    index = masked_argmax(values, state.observed_indices, rng, allowed=allowed)
     return AcqResult(index=index, values=values, params=params.resolved(state))

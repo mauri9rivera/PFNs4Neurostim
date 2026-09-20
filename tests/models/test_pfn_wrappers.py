@@ -14,7 +14,7 @@ from pfns4neurostim.models.pfn import external
 from pfns4neurostim.models.pfn.bar_distribution import BarDistribution, quantile_borders
 from pfns4neurostim.models.registry import MODEL_REGISTRY, build_surrogate
 
-EXTERNAL_KEYS = ("pfns4bo", "tabpfn_v1", "tabfm", "mitra", "tabflex")
+EXTERNAL_KEYS = ("pfns4bo", "tabpfn_v1", "tabfm", "mitra", "tabflex", "tabicl")
 
 
 class TestBarDistribution:
@@ -95,7 +95,7 @@ class TestExternalRegistration:
         assert key in MODEL_REGISTRY
         assert MODEL_REGISTRY[key].version
 
-    @pytest.mark.parametrize("key", ("tabpfn_v1", "tabflex"))
+    @pytest.mark.parametrize("key", ("tabpfn_v1", "tabflex", "tabicl"))
     def test_classifier_models_are_labelled_as_adaptations(self, key: str) -> None:
         """The adaptation must be visible in the version string every table prints."""
         assert "classification-head adaptation" in MODEL_REGISTRY[key].version

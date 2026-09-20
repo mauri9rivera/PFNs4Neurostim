@@ -111,6 +111,20 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         source="https://huggingface.co/autogluon/mitra-regressor",
         notes="Heavy install (AutoGluon >= 1.4); verify predictive-distribution access.",
     ),
+    "tabicl": ExternalSpec(
+        key="tabicl",
+        module="tabicl",
+        extra="tabicl",
+        route="classification-head adaptation",
+        source="https://github.com/soda-inria/tabicl",
+        notes=(
+            "Added 2026-09-20 at the user's request; it was not in the original H0-1 "
+            "table. Upstream is classification-focused (TabICLClassifier), so it is "
+            "registered on the bucketized route; if a native regressor exists in the "
+            "installed version, switch the wrapper to ExternalSurrogate and update "
+            "this route before reporting any result."
+        ),
+    ),
     "tabflex": ExternalSpec(
         key="tabflex",
         module="ticl",

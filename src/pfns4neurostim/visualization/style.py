@@ -118,6 +118,7 @@ MODEL_STYLES: dict[str, ModelStyle] = {
     "tabflex": ModelStyle("TabFlex", "#7E4E9B", "-", "<", "pfn", zorder=3),
     "tabfm": ModelStyle("TabFM", "#00688B", "-", ">", "pfn", zorder=3),
     "mitra": ModelStyle("Mitra", "#4C9BE8", "-", "P", "pfn", zorder=3),
+    "tabicl": ModelStyle("TabICL", "#3A7CA5", "-", "d", "pfn", zorder=3),
     # --- GP family (warm) ---
     "gp_mll": ModelStyle("GP-MLL", "#D55E00", "--", "s", "gp", zorder=4),
     "gp_naive": ModelStyle("GP-fixed", "#E69F00", "-.", "D", "gp", zorder=3),
@@ -154,6 +155,7 @@ MODEL_ORDER: tuple[str, ...] = (
     "tabflex",
     "tabfm",
     "mitra",
+    "tabicl",
     "random",
 )
 
@@ -261,6 +263,11 @@ AXIS_LABELS: dict[str, str] = {
     "budget": r"BO iterations (incl. $n_\mathrm{init}$)",
     "iteration": "BO iteration",
     "achieved_snr_db": "Achieved SNR (dB)",
+    "achieved_contamination": r"Achieved contamination (fraction of trials)",
+    "achieved_dropout": "Achieved electrode dropout (fraction)",
+    "achieved_budget": r"BO iterations (incl. $n_\mathrm{init}$)",
+    "n_queryable": "Queryable electrodes",
+    "n_donor_trials": "Distinct artefact donors",
     "alpha": r"Residual amplification $\alpha$",
     "coverage_50": "50% interval coverage",
     "coverage_90": "90% interval coverage",

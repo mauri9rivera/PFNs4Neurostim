@@ -1,0 +1,29 @@
+# Hypothesis B - K6 sparsity via BO budget, NHP (Demo 2, in vivo).
+#
+# The level IS the budget, in total queries including n_init (P0.3): never a
+# percentage of the grid, so the numbers mean the same thing on a 96-site array
+# and on a 2048-condition 5D grid. The data is untouched; this asks how each
+# surrogate degrades when the experiment simply gets fewer stimulations.
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k6_budget_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ei
+
+experiment: stress_sweep
+family: stress-k6-budget
+tag: nhp
+
+knob:
+  type: k6_budget
+  levels: [10, 20, 30, 50]
+
+budget: 50          # overridden per level by the knob
+n_init: 5
+n_reps: 5
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05
