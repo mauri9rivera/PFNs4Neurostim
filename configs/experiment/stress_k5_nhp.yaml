@@ -1,0 +1,39 @@
+# Hypothesis B - K5 outlier contamination, NHP (Demo 2, SYNTHETIC artefacts).
+#
+# NHP channels carry almost no lab-flagged trials (0.41% of trial slots, many
+# channels zero), and those that exist are so large that replacing a single trial
+# costs more than 12 dB - a step function, not a ladder. This arm therefore uses
+# the heavy-tail source, whose magnitude is continuous, and every resulting row
+# must be captioned as a *synthetic* outlier result, not a real-artefact one.
+# The real-artefact arm is stress_k5_5d_rat.yaml.
+#
+# Calibrated ladder on nhp-s1-e0 (floor +1.75 dB): eps 0.025/0.050/0.060 reach
+# -1.2/-2.0/-4.0 dB; -6 dB sits just outside the bracket and is reported as
+# unresolved rather than silently mislabelled.
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k5_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ei
+
+experiment: stress_sweep
+family: stress-k5-synthetic
+tag: nhp
+
+knob:
+  type: k5_outliers
+  targets_db: [0, -1, -2, -4]
+  params:
+    source: heavy_tail     # Student-t artefacts; magnitude is continuous
+    df: 2.0
+    scale: 3.0
+
+budget: 50
+n_init: 5
+n_reps: 5
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05

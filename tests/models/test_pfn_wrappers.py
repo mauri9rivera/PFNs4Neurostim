@@ -95,15 +95,27 @@ class TestExternalRegistration:
         assert key in MODEL_REGISTRY
         assert MODEL_REGISTRY[key].version
 
-    @pytest.mark.parametrize("key", ("tabpfn_v1", "tabflex", "tabicl"))
+    @pytest.mark.parametrize("key", ("tabpfn_v1", "tabflex"))
     def test_classifier_models_are_labelled_as_adaptations(self, key: str) -> None:
         """The adaptation must be visible in the version string every table prints."""
         assert "classification-head adaptation" in MODEL_REGISTRY[key].version
         assert external.EXTERNAL_SPECS[key].route == "classification-head adaptation"
 
-    @pytest.mark.parametrize("key", ("pfns4bo", "tabfm", "mitra"))
+    @pytest.mark.parametrize("key", ("pfns4bo", "mitra", "tabicl"))
     def test_native_models_are_marked_native(self, key: str) -> None:
+        """TabICL v2 ships a native regressor, so it is not a bucketized model."""
         assert external.EXTERNAL_SPECS[key].route == "native"
+
+    def test_python_version_gate_is_reported_before_the_import(self) -> None:
+        """A Python-version mismatch must be named, not surface as a SyntaxError."""
+        import sys
+
+        for key in ("tabicl", "tabfm"):
+            spec = external.EXTERNAL_SPECS[key]
+            assert spec.python_min is not None
+            if sys.version_info[:2] < spec.python_min:
+                with pytest.raises(ImportError, match="needs Python >="):
+                    external.require_backend(key)
 
     def test_availability_reports_every_model(self) -> None:
         avail = external.availability()
@@ -119,19 +131,81 @@ class TestExternalRegistration:
             external.require_backend("tabpfn_v1")
 
     @pytest.mark.parametrize("key", EXTERNAL_KEYS)
-    def test_missing_backend_names_the_extra_to_install(self, key: str) -> None:
+    def test_unavailable_backend_says_how_to_get_it(self, key: str) -> None:
+        """Either the pip extra, or the submodule to initialise - never a bare failure."""
         if external.availability()[key]:
-            pytest.skip(f"{key} backend is installed in this environment")
-        with pytest.raises(ImportError, match=r"pip install -e"):
+            pytest.skip(f"{key} backend is available in this environment")
+        with pytest.raises(ImportError, match=r"pip install -e|git submodule update"):
             build_surrogate(key)
 
-    @pytest.mark.parametrize("key", EXTERNAL_KEYS)
-    def test_unimplemented_wrapper_says_which_step_implements_it(self, key: str) -> None:
+    #: Models whose wrapper body is still outstanding (task #8 Step 3).
+    PENDING = ("pfns4bo", "tabpfn_v1", "mitra")
+
+    @pytest.mark.parametrize("key", PENDING)
+    def test_pending_wrapper_explains_what_is_outstanding(self, key: str) -> None:
         if not external.availability()[key]:
-            pytest.skip(f"{key} backend is not installed")
+            pytest.skip(f"{key} backend is not available")
         surrogate = build_surrogate(key)
-        with pytest.raises(NotImplementedError, match="task #8"):
+        with pytest.raises(NotImplementedError, match="not implemented yet|needs an environment"):
             surrogate.fit(np.zeros((4, 2)), np.arange(4.0))
+
+    def test_implemented_wrappers_are_not_in_the_pending_list(self) -> None:
+        """TabFlex, TabICL and TabFM have real bodies as of 2026-09-20."""
+        assert set(self.PENDING).isdisjoint({"tabflex", "tabicl", "tabfm"})
+
+    def test_tabfm_refuses_a_single_ensemble_member(self) -> None:
+        """Its only uncertainty signal is ensemble spread, which is zero for one member."""
+        from pfns4neurostim.models.pfn.wrappers import TabFMSurrogate
+
+        with pytest.raises((ValueError, ImportError), match="n_estimators >= 2|needs Python"):
+            TabFMSurrogate(n_estimators=1)
+
+
+class TestQuantileMoments:
+    """The quantile-integration used by the TabICL wrapper."""
+
+    def test_normal_quantiles_recover_mean_and_sd(self) -> None:
+        from scipy import stats
+
+        from pfns4neurostim.models.pfn.wrappers import _QUANTILE_ALPHAS, _moments_from_quantiles
+
+        q = stats.norm.ppf(np.asarray(_QUANTILE_ALPHAS), loc=2.0, scale=3.0)[None, :]
+        mean, std = _moments_from_quantiles(q)
+        assert mean[0] == pytest.approx(2.0, abs=0.02)
+        assert std[0] == pytest.approx(3.0, rel=0.10)
+
+    def test_degenerate_quantiles_give_near_zero_spread(self) -> None:
+        from pfns4neurostim.models.pfn.wrappers import _moments_from_quantiles
+
+        from pfns4neurostim.models.pfn.wrappers import _QUANTILE_ALPHAS
+
+        q = np.full((1, len(_QUANTILE_ALPHAS)), 5.0)
+        mean, std = _moments_from_quantiles(q)
+        assert mean[0] == pytest.approx(5.0)
+        assert std[0] < 1e-5
+
+    def test_shape_mismatch_raises(self) -> None:
+        from pfns4neurostim.models.pfn.wrappers import _moments_from_quantiles
+
+        with pytest.raises(ValueError, match="quantiles for"):
+            _moments_from_quantiles(np.zeros((2, 3)))
+
+
+@pytest.mark.slow
+class TestTabFlexRuns:
+    """TabFlex actually fits and predicts (downloads weights on first use)."""
+
+    def test_fit_predict_on_a_toy_grid(self) -> None:
+        if not external.availability()["tabflex"]:
+            pytest.skip("TabFlex backend unavailable (libs/ticl not initialised)")
+        rng = np.random.default_rng(0)
+        X = rng.random((40, 2))
+        y = np.exp(-((X[:, 0] - 0.7) ** 2 + (X[:, 1] - 0.3) ** 2) / 0.1)
+        surrogate = build_surrogate("tabflex", device="cpu", n_bins=8)
+        surrogate.fit(X[:20], y[:20])
+        mean, std = surrogate.predict_marginals(X)
+        assert mean.shape == (40,) and std.shape == (40,)
+        assert np.isfinite(mean).all() and (std > 0).all()
 
     def test_unknown_external_key_raises(self) -> None:
         with pytest.raises(KeyError, match="Unknown external model"):

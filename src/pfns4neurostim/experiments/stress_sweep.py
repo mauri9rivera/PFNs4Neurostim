@@ -32,7 +32,7 @@ import pandas as pd
 
 from ..config import ExperimentConfig, load_experiment_config, resolved_dict
 from ..data.channels import ChannelData, iter_channels
-from ..data.stress import KnobNotApplicable, build_knob
+from ..data.stress import KnobNotApplicable, build_knob, calibrate_levels, floor_snr_db
 from ..evaluation import results as _results
 from ..evaluation.bo_runner import run_channel_bo
 from ..evaluation.results import TidyRow
@@ -81,16 +81,64 @@ def build_tidy_rows(
         ``(rows, trajectories, extras)`` where ``extras`` holds the non-schema
         columns (achieved metrics) aligned with ``rows`` by position.
     """
-    knob = build_knob(cfg.knob.type, cfg.knob.levels)
+    knob = build_knob(cfg.knob.type, cfg.knob.levels, **cfg.knob.params)
     rows: list[TidyRow] = []
     trajectories: dict[tuple[Any, ...], dict[str, Any]] = {}
     extras: list[dict[str, Any]] = []
     skipped: list[str] = []
 
     for channel in _channels(cfg):
-        for level in knob.levels:
+        floor_db = floor_snr_db(channel)
+        if cfg.knob.targets_db is not None:
+            # Solve the ladder against *this channel's* floor SNR, so the same
+            # config means the same severity on a clean and a noisy dataset.
+            try:
+                calibrated = calibrate_levels(
+                    knob,
+                    channel,
+                    cfg.knob.targets_db,
+                    np.random.default_rng(seed_for(channel.label, knob.name, base_seed=cfg.seed)),
+                )
+            except KnobNotApplicable as exc:
+                skipped.append(f"{channel.label} @ calibration: {exc}")
+                print(f"[stress_sweep] skipping {skipped[-1]}", flush=True)
+                continue
+            levels = [c.level for c in calibrated]
+            targets = [c.target_db for c in calibrated]
+            # Apply each level with the seed its calibration used, so the realized
+            # degradation equals the ladder the run reports rather than a re-roll.
+            level_seeds = {c.level: c.seed for c in calibrated}
+            print(
+                f"[stress_sweep] {channel.label} floor={floor_db:.2f}dB -> "
+                + ", ".join(
+                    f"{c.target_db:+.0f}dB@{c.level:.4g}({c.achieved_db:+.1f}dB"
+                    + ("" if c.resolved else " UNRESOLVED")
+                    + ")"
+                    for c in calibrated
+                ),
+                flush=True,
+            )
+            unreachable = [c for c in calibrated if not c.resolved]
+            if unreachable:
+                # A step-function response (K5 with few donor artefacts) cannot hit
+                # intermediate targets; say so rather than plotting the miss silently.
+                print(
+                    f"[stress_sweep] WARNING {channel.label}: "
+                    f"{len(unreachable)} target(s) unreachable "
+                    f"({', '.join(f'{c.target_db:+.0f}dB' for c in unreachable)}); "
+                    "each row still records its achieved SNR.",
+                    flush=True,
+                )
+        else:
+            levels = list(knob.levels)
+            targets = [float("nan")] * len(levels)
+            level_seeds = {}
+
+        for level, target_db in zip(levels, targets):
             rng = np.random.default_rng(
-                seed_for(channel.label, knob.name, level, base_seed=cfg.seed)
+                level_seeds.get(level)
+                if level_seeds
+                else seed_for(channel.label, knob.name, level, base_seed=cfg.seed)
             )
             try:
                 stressed = knob.apply(channel, level, rng)
@@ -102,6 +150,9 @@ def build_tidy_rows(
                 print(f"[stress_sweep] skipping {skipped[-1]}", flush=True)
                 continue
             achieved = knob.achieved(stressed)
+            achieved["floor_snr_db"] = floor_db
+            if np.isfinite(target_db):
+                achieved["target_delta_snr_db"] = float(target_db)
             budget = knob.budget_for(level, cfg.budget)
 
             for model in cfg.models:

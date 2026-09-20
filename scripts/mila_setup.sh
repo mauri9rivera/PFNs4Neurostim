@@ -21,6 +21,7 @@
 #   bash scripts/mila_setup.sh install    # only pip install -e . (reuse an existing env)
 #   bash scripts/mila_setup.sh deps       # report which declared dependencies import
 #   bash scripts/mila_setup.sh verify     # print the whole layout + import check
+#   bash scripts/mila_setup.sh submodules # init libs/ and exclude downloaded weights
 #   bash scripts/mila_setup.sh touch      # refresh atimes so $SCRATCH is not purged
 #
 # Nothing in this script deletes anything.
@@ -138,6 +139,24 @@ cmd_verify() {
   conda run -n "${CONDA_ENV}" python -c "import pfns4neurostim, torch; from pfns4neurostim.visualization import style; print('package OK, torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 }
 
+cmd_submodules() {
+  cd "${CODE_DIR}"
+  log "initialising submodules (PFNs, PFNs4BO, tabpfn-v1-prior, ticl, tabicl, tabfm)"
+  git submodule update --init --recursive
+  # TabFlex fetches ~GB of checkpoints into the ticl working tree on first use.
+  # A submodule has its own index, so our .gitignore cannot cover it; a local
+  # exclude keeps `git status` clean there without modifying the vendored repo
+  # (libs/ is read-only by project rule).
+  local ticl_git="${CODE_DIR}/.git/modules/libs/ticl"
+  if [ -d "${ticl_git}" ]; then
+    mkdir -p "${ticl_git}/info"
+    printf '%s
+' 'ticl/models_diff/' '*.cpkt' > "${ticl_git}/info/exclude"
+    log "excluded ticl/models_diff/ and *.cpkt inside libs/ticl"
+  fi
+  git submodule status
+}
+
 cmd_touch() {
   # $SCRATCH is purged after 90 days without access. Refresh atimes monthly.
   log "refreshing access times under ${SCRATCH_ROOT}"
@@ -147,6 +166,7 @@ cmd_touch() {
 
 case "${1:-}" in
   layout) cmd_layout ;;
+  submodules) cmd_submodules ;;
   install) cmd_install ;;
   deps) cmd_deps ;;
   archive) cmd_archive ;;

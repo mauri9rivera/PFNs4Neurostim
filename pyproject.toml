@@ -15,12 +15,14 @@ license = { file = "LICENSE" }
 # heavy and some conflict with the pinned Python 3.9 / torch 2.5.1 stack:
 # tabpfn-v1 in particular cannot coexist with the tabpfn 6.3.2 used for v2.5,
 # so it needs its own environment rather than a co-installed extra.
+# TabFlex, TabICL and TabFM are vendored as git submodules under libs/, so these
+# groups list only the dependencies those projects need but do not declare.
 pfns4bo = ["pfns4bo==0.1.5"]
-tabpfn-v1 = ["tabpfn<2"]
-tabfm = ["tabfm"]
+tabpfn-v1 = ["tabpfn<2"]                       # separate env: collides with tabpfn 6.3.2
 mitra = ["autogluon.tabular>=1.4"]
-tabflex = ["ticl"]
-tabicl = ["tabicl"]
+tabflex = ["wandb", "mlflow", "interpret"]     # ticl imports these at module level
+tabicl = ["einops", "huggingface-hub"]         # needs Python >= 3.10
+tabfm = ["jax", "flax"]                        # needs Python >= 3.11
 
 [tool.setuptools.packages.find]
 where = ["src"]

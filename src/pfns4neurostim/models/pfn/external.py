@@ -11,7 +11,7 @@ lazily and, when it is missing, raises a message naming the extra to install rat
 than failing at import time. ``availability()`` reports the whole table at once, so
 a benchmark config can be validated before a cluster job starts.
 
-Integration routes (web check 2026-09-16, recorded in the roadmap H0-1 table):
+Integration routes (submodules vendored and APIs read 2026-09-20):
 
 ======================  =========================================  ==================================
 Model                   Source                                     Regression route
@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,6 +65,12 @@ class ExternalSpec:
         major_below: If set, the installed major version must be below this.
             TabPFN v1 and v2.5 share the module name ``tabpfn``, so importability
             alone would report v1 as available whenever v2.5 is installed.
+        python_min: Minimum Python version the upstream project declares. Checked
+            *before* the import, because the failure is otherwise a confusing
+            SyntaxError from inside someone else's package.
+        repo_subdir: Path under ``libs/`` holding the vendored submodule, and the
+            sub-path within it that must go on ``sys.path`` (``'libs/tabicl/src'``).
+            Set when the model is used from the submodule rather than from pip.
         notes: Constraints worth knowing before installing.
     """
 
@@ -73,6 +81,8 @@ class ExternalSpec:
     source: str
     dist: str = ""
     major_below: int | None = None
+    python_min: tuple[int, int] | None = None
+    repo_subdir: str = ""
     notes: str = ""
 
 
@@ -93,15 +103,23 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         source="https://github.com/automl/TabPFN",
         dist="tabpfn",
         major_below=2,
+        python_min=(3, 8),
         notes="Requires tabpfn<2, which conflicts with the installed 6.3.2: use a separate env.",
     ),
     "tabfm": ExternalSpec(
         key="tabfm",
         module="tabfm",
         extra="tabfm",
-        route="native",
+        route="native (point prediction; uncertainty from ensemble spread)",
         source="https://github.com/google-research/tabfm",
-        notes="Released 2026-06-30; check its Python/JAX requirements against Python 3.9.25.",
+        python_min=(3, 11),
+        repo_subdir="tabfm",
+        notes=(
+            "Vendored as libs/tabfm (2026-09-20). Requires Python >= 3.11, so it cannot "
+            "run in the pinned 3.9 env. TabFMRegressor.predict returns point predictions "
+            "only; the wrapper derives uncertainty from the spread across ensemble "
+            "members, which is a proxy and not a calibrated predictive distribution."
+        ),
     ),
     "mitra": ExternalSpec(
         key="mitra",
@@ -115,14 +133,15 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         key="tabicl",
         module="tabicl",
         extra="tabicl",
-        route="classification-head adaptation",
+        route="native",
         source="https://github.com/soda-inria/tabicl",
+        python_min=(3, 10),
+        repo_subdir="tabicl/src",
         notes=(
-            "Added 2026-09-20 at the user's request; it was not in the original H0-1 "
-            "table. Upstream is classification-focused (TabICLClassifier), so it is "
-            "registered on the bucketized route; if a native regressor exists in the "
-            "installed version, switch the wrapper to ExternalSurrogate and update "
-            "this route before reporting any result."
+            "Vendored as libs/tabicl at tag v2.2.0 (2026-09-20). **Route corrected**: "
+            "v2 ships a native TabICLRegressor whose predict(output_type='quantiles') "
+            "returns a full predictive distribution, so it is NOT a classification-head "
+            "adaptation. Needs Python >= 3.10, so it cannot run in the pinned 3.9 env."
         ),
     ),
     "tabflex": ExternalSpec(
@@ -131,7 +150,14 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         extra="tabflex",
         route="classification-head adaptation",
         source="https://github.com/microsoft/ticl",
-        notes="Add libs/ticl as a submodule; regression via naive binning upstream.",
+        python_min=(3, 8),
+        repo_subdir="ticl",
+        notes=(
+            "Vendored as libs/ticl (2026-09-20). Runs on the pinned Python 3.9. "
+            "Classification-only upstream, so it goes through the bucketized adapter. "
+            "Weights are fetched on first use into libs/ticl/ticl/models_diff/ "
+            "(excluded locally, see scripts/mila_setup.sh submodules)."
+        ),
     ),
 }
 
@@ -145,8 +171,37 @@ def availability() -> dict[str, bool]:
     return {key: _backend_ok(spec)[0] for key, spec in EXTERNAL_SPECS.items()}
 
 
+def libs_root() -> str:
+    """Return the absolute path of the repository's ``libs/`` directory."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(here, "..", "..", "..", "..", "libs"))
+
+
+def _ensure_repo_on_path(spec: ExternalSpec) -> str | None:
+    """Put a vendored submodule on ``sys.path`` so it imports without pip install.
+
+    Args:
+        spec: The external model's spec.
+
+    Returns:
+        The path added, or None when the model has no vendored submodule or the
+        submodule has not been initialised.
+    """
+    if not spec.repo_subdir:
+        return None
+    path = os.path.join(libs_root(), *spec.repo_subdir.split("/"))
+    if not os.path.isdir(path):
+        return None
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    return path
+
+
 def _backend_ok(spec: ExternalSpec) -> tuple[bool, str]:
-    """Check whether one backend is importable *and* of the required version.
+    """Check whether one backend is usable: right Python, importable, right version.
+
+    The Python check comes first because the alternative failure mode is a
+    confusing ``SyntaxError`` raised from inside somebody else's package.
 
     Args:
         spec: The external model's spec.
@@ -154,6 +209,14 @@ def _backend_ok(spec: ExternalSpec) -> tuple[bool, str]:
     Returns:
         ``(ok, reason)``; ``reason`` is empty when ok.
     """
+    if spec.python_min is not None and sys.version_info[:2] < spec.python_min:
+        need = ".".join(str(v) for v in spec.python_min)
+        have = ".".join(str(v) for v in sys.version_info[:3])
+        return False, (
+            f"needs Python >= {need} but this environment is {have}; it must run in a "
+            "separate environment (see the environment matrix in the task plan)"
+        )
+    _ensure_repo_on_path(spec)
     try:
         # find_spec raises rather than returning None when a *parent* package is
         # missing (e.g. 'autogluon.tabular' with no 'autogluon' installed).
@@ -198,11 +261,17 @@ def require_backend(key: str) -> Any:
     spec = EXTERNAL_SPECS[key]
     ok, reason = _backend_ok(spec)
     if not ok:
+        hint = (
+            f"Vendored at libs/{spec.repo_subdir.split('/')[0]} - run "
+            "`git submodule update --init --recursive` if that directory is empty. "
+            if spec.repo_subdir
+            else f"Install it with: pip install -e '.[{spec.extra}]'. "
+        )
         raise ImportError(
-            f"Model {key!r} is unavailable: {reason}. "
-            f"Install it with: pip install -e '.[{spec.extra}]'  "
+            f"Model {key!r} is unavailable: {reason}. {hint}"
             f"(official implementation: {spec.source}). {spec.notes}"
         )
+    _ensure_repo_on_path(spec)
     return importlib.import_module(spec.module)
 
 

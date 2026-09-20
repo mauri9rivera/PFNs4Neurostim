@@ -1,0 +1,65 @@
+# Benchmark environment for the Hypothesis 0 external surrogates.
+#
+# WHY A SECOND ENVIRONMENT (measured 2026-09-20, by reading each upstream project):
+#
+#   model      requires        can it run in the pinned py3.9 main env?
+#   ---------  --------------  ----------------------------------------------
+#   TabICL v2  Python >= 3.10  no
+#   TabFM      Python >= 3.11  no
+#   TabFlex    Python >= 3.8   yes, but it imports wandb + mlflow + interpret at
+#                              module level even for inference, and CLAUDE.md
+#                              keeps those out of the main environment
+#   TabPFN v1  tabpfn < 2      no - collides with the pinned tabpfn 6.3.2
+#                              (see docs/tabpfn_v1_adaptation.md, its own env)
+#
+# Rather than loosen the main environment's pins for three optional models, the
+# external benchmark runs here and its tidy CSVs are merged with the main run's.
+# The package code is identical in both; only the interpreter differs.
+#
+#   conda env create -f environment.bench.yml
+#   conda activate pfns4neurostim-bench
+#   pip install -e .
+#   git submodule update --init --recursive        # libs/tabicl, libs/tabfm, libs/ticl
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_acq_table_nhp.yaml
+#
+# TabPFN v2.5 is installed here too, so the headline model can be re-run in this
+# environment as a cross-check that the interpreter change does not move results.
+name: pfns4neurostim-bench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy=1.26.*
+  - scipy=1.13.*
+  - pandas=2.3.*
+  - scikit-learn=1.6.*
+  - matplotlib=3.9.*
+  - seaborn=0.13.*
+  - statsmodels=0.14.*
+  - pyyaml
+  - tqdm
+  - pytest
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - torch==2.5.1
+      - torchvision==0.20.1
+      # --- the project's own stack, so results are comparable ---
+      - tabpfn==6.3.2
+      - gpytorch==1.11
+      - linear-operator==0.5.1
+      - botorch==0.10.0
+      - pyro-ppl==1.9.1
+      # --- TabICL v2 (vendored at libs/tabicl @ v2.2.0; these are its deps) ---
+      - einops
+      - huggingface-hub
+      # --- TabFM (vendored at libs/tabfm) ---
+      - jax
+      - flax
+      # --- TabFlex via microsoft/ticl (vendored at libs/ticl) ---
+      # Undeclared module-level imports on ticl's *inference* path, found by
+      # walking the import chain: without these, `import ticl.prediction.tabpfn`
+      # raises ModuleNotFoundError before any model is loaded.
+      - wandb
+      - mlflow
+      - interpret

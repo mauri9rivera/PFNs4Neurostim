@@ -1,15 +1,21 @@
-# Hypothesis B - K5 outlier contamination on the 5D rat dataset (Demo 2, in vivo).
+# Hypothesis B - K5 outlier contamination, 5D rat (Demo 2, REAL lab artefacts).
 #
-# Knob: a fraction of valid trials is overwritten with trials the lab flagged
-# invalid (sorted_isvalid == 0) - real artefacts, not synthetic heavy tails.
+# The ladder is specified in dB of SNR degradation relative to each channel's own
+# floor, and the contamination fraction achieving it is solved per channel
+# (data/stress.py::calibrate_levels). A fixed epsilon means different things on
+# different channels; dB of degradation means the same thing everywhere, and it
+# is the axis the figures already use.
 #
-# Dataset choice matters here. Measured 2026-09-20, lab-flagged trials are:
-#   5d_rat  6.60% of trial slots   <- enough donors for a real-artefact sweep
-#   nhp     0.41%
-#   spinal  0.11%
-# So 5d_rat is the primary K5 arm; NHP and spinal channels mostly raise
-# KnobNotApplicable and are skipped (the runner logs each skip). To sweep them
-# anyway, switch the knob to the synthetic fallback and say so in the caption.
+# Why 5d_rat is the real-artefact arm (measured 2026-09-20):
+#   dataset   lab-flagged trials   K5 with source=invalid
+#   5d_rat    6.60% of slots       smooth ladder: eps 0.006/0.012/0.037/0.100
+#                                  -> -0.6/-1.6/-3.6/-6.3 dB   <- usable
+#   nhp       0.41%                step function: one donor trial already costs
+#                                  >12 dB, intermediate targets unreachable
+#   spinal    0.11%                same problem, worse
+# NHP and spinal therefore use source=heavy_tail (see stress_k5_nhp.yaml), whose
+# magnitude is continuous. Any row from that arm is a *synthetic* outlier result
+# and must be captioned as such.
 #
 #   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k5_5d_rat.yaml
 defaults:
@@ -23,7 +29,9 @@ tag: 5drat
 
 knob:
   type: k5_outliers
-  levels: [0.0, 0.05, 0.1, 0.2, 0.4]
+  targets_db: [0, -1, -2, -4, -6]
+  params:
+    source: invalid        # real trials the lab flagged sorted_isvalid == 0
 
 budget: 150
 n_init: 5

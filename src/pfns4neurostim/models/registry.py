@@ -224,11 +224,14 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "tabfm": ModelSpec(
         key="tabfm",
-        version="Google TabFM",
+        version="Google TabFM (uncertainty from ensemble spread)",
         family="pfn",
         factory=_build_external("tabfm"),
         supports=("ei", "ucb", "ts_marginal"),
-        notes="Native regression; Python/JAX compatibility to be verified.",
+        notes=(
+            "Native point prediction; the std is ensemble disagreement, not a "
+            "calibrated predictive distribution. Needs Python >= 3.11 (py311 env)."
+        ),
     ),
     "mitra": ModelSpec(
         key="mitra",
@@ -244,15 +247,21 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         family="pfn",
         factory=_build_external("tabflex"),
         supports=("ei", "ucb", "ts_marginal"),
-        notes="Classifier binned into a bar distribution; needs libs/ticl.",
+        notes=(
+            "Classifier binned into a bar distribution; vendored at libs/ticl and "
+            "runnable on the pinned Python 3.9. Weights download on first use."
+        ),
     ),
     "tabicl": ModelSpec(
         key="tabicl",
-        version="TabICL (classification-head adaptation)",
+        version="TabICL v2.2.0",
         family="pfn",
         factory=_build_external("tabicl"),
         supports=("ei", "ucb", "ts_marginal"),
-        notes="Added 2026-09-20; bucketized route provisional, confirm native regression.",
+        notes=(
+            "Native regressor with a quantile predictive distribution (vendored at "
+            "libs/tabicl @ v2.2.0). Needs Python >= 3.10, so it runs in the py311 env."
+        ),
     ),
     "random": ModelSpec(
         key="random",

@@ -7,3 +7,12 @@
 [submodule "libs/tabpfn-v1-prior"]
 	path = libs/tabpfn-v1-prior
 	url = https://github.com/automl/tabpfn-v1-prior.git
+[submodule "libs/tabicl"]
+	path = libs/tabicl
+	url = https://github.com/soda-inria/tabicl
+[submodule "libs/ticl"]
+	path = libs/ticl
+	url = https://github.com/microsoft/ticl
+[submodule "libs/tabfm"]
+	path = libs/tabfm
+	url = https://github.com/google-research/tabfm

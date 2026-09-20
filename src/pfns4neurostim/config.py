@@ -104,11 +104,36 @@ class KnobConfig:
 
     Attributes:
         type: Registered knob name (``'k2_snr'``, ...).
-        levels: Level ladder, or ``None`` for the knob's pre-registered default.
+        levels: Explicit level ladder, or ``None`` for the knob's default.
+        targets_db: SNR-degradation targets in dB (e.g. ``[0, -1, -2, -4]``). When
+            given, the level achieving each target is solved **per channel**, so a
+            sweep is comparable across datasets whose floor SNRs differ. Mutually
+            exclusive with an explicit ``levels`` ladder.
+        params: Knob-specific parameters, e.g. ``{source: heavy_tail}`` for K5.
     """
 
     type: str
     levels: tuple[float, ...] | None = None
+    targets_db: tuple[float, ...] | None = None
+    params: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject a ladder specified two ways at once.
+
+        Raises:
+            ValueError: If both ``levels`` and ``targets_db`` are given, or a
+                target is positive.
+        """
+        if self.levels is not None and self.targets_db is not None:
+            raise ValueError(
+                "knob.levels and knob.targets_db are mutually exclusive: a ladder is "
+                "either explicit levels or SNR-degradation targets solved per channel."
+            )
+        if self.targets_db is not None and any(t > 0 for t in self.targets_db):
+            raise ValueError(
+                f"knob.targets_db entries are SNR degradations and must be <= 0 dB, "
+                f"got {list(self.targets_db)}."
+            )
 
 
 @dataclass(frozen=True)
@@ -386,8 +411,15 @@ def load_experiment_config(
         levels=(
             None if knob_raw.get("levels") is None else tuple(float(v) for v in knob_raw.pop("levels"))
         ),
+        targets_db=(
+            None
+            if knob_raw.get("targets_db") is None
+            else tuple(float(v) for v in knob_raw.pop("targets_db"))
+        ),
+        params=dict(knob_raw.pop("params", {}) or {}),
     )
     knob_raw.pop("levels", None)
+    knob_raw.pop("targets_db", None)
     if knob_raw:
         raise ValueError(f"Unknown knob config key(s): {sorted(knob_raw)}.")
 
@@ -463,6 +495,8 @@ def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
         "knob": {
             "type": cfg.knob.type,
             "levels": None if cfg.knob.levels is None else list(cfg.knob.levels),
+            "targets_db": None if cfg.knob.targets_db is None else list(cfg.knob.targets_db),
+            "params": cfg.knob.params,
         },
         "budget": cfg.budget,
         "n_init": cfg.n_init,
