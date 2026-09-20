@@ -1,0 +1,8 @@
+# TabFlex (microsoft/ticl, vendored at libs/ticl): a CLASSIFICATION-HEAD ADAPTATION.
+# y is discretized into `n_bins` buckets and the class probabilities are read as a bar
+# distribution, so this row must be labelled "classification-head adaptation" in every
+# table and caption (guardrail G3). Runs in the pfns4neurostim-bench env.
+name: tabflex
+params:
+  device: null   # per-model override of the experiment `device`
+  n_bins: 32

@@ -67,8 +67,9 @@ def run_channel_bo(
         budget: Total queries including ``n_init`` (P0.3).
         n_init: Number of random initial queries.
         seed: Seed for this repetition.
-        device: Torch device string.
-        model_params: Extra constructor parameters for the surrogate.
+        device: Default torch device string.
+        model_params: Extra constructor parameters for the surrogate. A ``device`` key
+            overrides ``device`` for this model only (e.g. GP on CPU, TabPFN on CUDA).
         with_calibration: Compute coverage/ECE/NLL/CRPS from the final posterior.
             Ignored for models without a predictive distribution (random search).
 
@@ -87,7 +88,9 @@ def run_channel_bo(
     rng = np.random.default_rng(seed)
 
     spec, params = build_acquisition(acq_fn, acq_params, acq_schedules)
-    surrogate = build_surrogate(model, device=device, **(model_params or {}))
+    extra = dict(model_params or {})
+    device = extra.pop("device", None) or device  # per-model override (P0.12)
+    surrogate = build_surrogate(model, device=device, **extra)
 
     t0 = time.time()
     traj = run_bo_loop(

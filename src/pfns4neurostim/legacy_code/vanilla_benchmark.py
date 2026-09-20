@@ -1098,7 +1098,7 @@ def run_benchmark() -> None:
         held_out_subj_idx=args.held_out_subj,
         subjects_mode=args.subjects_mode,
     )
-    from pfns4neurostim.legacy_code.diagnostics.cluster_diagnostics import ClusterDiagnostics as _CD
+    from pfns4neurostim.diagnostics.cluster import ClusterDiagnostics as _CD
     with _CD(tag=f"{args.dataset}-vanilla-benchmark", device=args.device,
              n_planned=len(_experiments) * len(args.mode),
              enabled=args.cluster_diag) as _diag:

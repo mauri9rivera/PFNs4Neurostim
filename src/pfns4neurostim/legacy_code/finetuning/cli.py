@@ -839,7 +839,7 @@ def run_finetuning():
             # None → run_experiment uses default HELD_OUT_SUBJECTS
             loo_subjects = [args.held_out_subj]
 
-        from pfns4neurostim.legacy_code.diagnostics.cluster_diagnostics import (
+        from pfns4neurostim.diagnostics.cluster import (
             ClusterDiagnostics as _CD,
         )
         with _CD(tag=f"{args.dataset}-finetuning", device=args.device,

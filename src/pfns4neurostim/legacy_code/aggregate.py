@@ -600,7 +600,7 @@ def main() -> None:
     _src_dir = os.path.dirname(os.path.abspath(__file__))
     if _src_dir not in _sys.path:
         _sys.path.insert(0, _src_dir)
-    from pfns4neurostim.legacy_code.diagnostics.cluster_diagnostics import ClusterDiagnostics as _CD
+    from pfns4neurostim.diagnostics.cluster import ClusterDiagnostics as _CD
 
     with _CD(tag='aggregate', device='cpu', n_planned=1,
              enabled=args.cluster_diag) as _diag:

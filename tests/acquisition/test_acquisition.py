@@ -260,3 +260,32 @@ class TestSchedules:
         )
         assert params.value("kappa", _state(step=0, n_steps=9)) == pytest.approx(8.0)
         assert params.value("kappa", _state(step=8, n_steps=9)) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Shipped UCB configs (regression: ucb.yaml once resolved to kappa == 0, i.e. greedy)
+# ---------------------------------------------------------------------------
+class TestShippedUcbConfigs:
+    """The UCB configs in configs/acquisition/ must actually explore."""
+
+    @staticmethod
+    def _resolved_kappa(name: str, step: int, n_steps: int) -> float:
+        import yaml
+
+        from pfns4neurostim.acquisition.registry import build_acquisition
+
+        with open(f"configs/acquisition/{name}.yaml", encoding="utf-8") as fh:
+            block = yaml.safe_load(fh)
+        _, params = build_acquisition(block["type"], block.get("params"), block.get("schedules"))
+        return params.value("kappa", _state(step=step, n_steps=n_steps))
+
+    def test_auto_ucb_is_not_greedy_and_anneals(self) -> None:
+        first = self._resolved_kappa("ucb", 0, 50)
+        last = self._resolved_kappa("ucb", 49, 50)
+        assert first > 0.0
+        assert first > last > 0.0
+
+    @pytest.mark.parametrize("k", ["0.5", "1", "2", "3", "5"])
+    def test_fixed_kappa_configs_are_constant(self, k: str) -> None:
+        values = {self._resolved_kappa(f"ucb_k{k}", s, 50) for s in (0, 10, 49)}
+        assert values == {float(k)}

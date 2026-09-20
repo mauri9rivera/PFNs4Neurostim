@@ -30,6 +30,8 @@ from typing import Any, Sequence
 
 import yaml
 
+from .data.preprocessing import DEFAULT_NORMALIZATION, get_normalization
+
 __all__ = [
     "DatasetConfig",
     "AcquisitionConfig",
@@ -56,12 +58,24 @@ class DatasetConfig:
         emgs: EMG indices, or ``None`` for every EMG of each subject.
         data_root: Directory holding the raw ``.mat`` trees. Cluster jobs set
             this to ``$SLURM_TMPDIR/data``.
+        normalization: Preprocessing mode, a key of
+            :data:`pfns4neurostim.data.preprocessing.NORMALIZATIONS`. Logged in
+            the resolved config and in every tidy row.
     """
 
     name: str
     subjects: tuple[int, ...]
     emgs: tuple[int, ...] | None = None
     data_root: str = "./data"
+    normalization: str = DEFAULT_NORMALIZATION
+
+    def __post_init__(self) -> None:
+        """Reject an unregistered normalization at load time.
+
+        Raises:
+            ValueError: If ``normalization`` is not registered.
+        """
+        get_normalization(self.normalization)
 
 
 @dataclass(frozen=True)
@@ -72,11 +86,19 @@ class AcquisitionConfig:
         type: Acquisition name; must be a key of :data:`_ACQ_PARAMS`.
         params: Parameters for that type only; unknown keys raise.
         schedules: Optional per-parameter annealing schedules.
+        label: Config-group name (e.g. ``'ucb_k2'``), so several configurations of
+            one type stay distinguishable in tables and plots.
     """
 
     type: str
     params: dict[str, Any] = field(default_factory=dict)
     schedules: dict[str, Any] = field(default_factory=dict)
+    label: str = ""
+
+    @property
+    def name(self) -> str:
+        """Display/grouping name: the config-group name, else the type."""
+        return self.label or self.type
 
     def __post_init__(self) -> None:
         """Validate type, params and schedules against the acquisition registry.
@@ -158,6 +180,9 @@ class ExperimentConfig:
         output_root: Root for outputs, normally ``output``.
         equivalence_margin: Pre-registered TOST margin in range-normalized
             regret units, used by the robustness table.
+        cache_version: Invalidation stamp of the cell cache; bump it to discard
+            every cached cell. Part of every cell identity.
+        cache_root: Cell-cache directory; empty means ``{output_root}/cells``.
         source_path: Path of the YAML this was loaded from.
     """
 
@@ -176,9 +201,16 @@ class ExperimentConfig:
     seed: int = 42
     output_root: str = "output"
     equivalence_margin: float = 0.05
+    cache_version: int = 1
+    cache_root: str = ""
     model_params: dict[str, dict[str, Any]] = field(default_factory=dict)
     extra_acquisitions: tuple[AcquisitionConfig, ...] = ()
     source_path: str = ""
+
+    @property
+    def cell_cache_root(self) -> str:
+        """Resolved cell-cache directory."""
+        return self.cache_root or os.path.join(self.output_root, "cells")
 
     @property
     def acquisitions(self) -> tuple[AcquisitionConfig, ...]:
@@ -330,9 +362,9 @@ def _compose(path: str) -> dict[str, Any]:
             resolved["dataset"] = _load_group("dataset", value)
         elif group == "acquisition":
             if isinstance(value, str):
-                resolved["acquisition"] = _load_group("acquisition", value)
+                resolved["acquisition"] = {**_load_group("acquisition", value), "label": value}
             else:
-                blocks = [_load_group("acquisition", name) for name in value]
+                blocks = [{**_load_group("acquisition", name), "label": name} for name in value]
                 if not blocks:
                     raise ValueError(f"{path}: defaults.acquisition is an empty list.")
                 resolved["acquisition"] = blocks[0]
@@ -386,6 +418,7 @@ def load_experiment_config(
             else tuple(int(e) for e in ds_raw.pop("emgs"))
         ),
         data_root=os.path.expandvars(str(ds_raw.pop("data_root", "./data"))),
+        normalization=str(ds_raw.pop("normalization", DEFAULT_NORMALIZATION)),
     )
     ds_raw.pop("emgs", None)
     if ds_raw:
@@ -398,6 +431,7 @@ def load_experiment_config(
             type=data.pop("type"),
             params=dict(data.pop("params", {}) or {}),
             schedules=dict(data.pop("schedules", {}) or {}),
+            label=str(data.pop("label", "") or ""),
         )
         if data:
             raise ValueError(f"Unknown acquisition config key(s): {sorted(data)}.")
@@ -438,6 +472,8 @@ def load_experiment_config(
         "seed",
         "output_root",
         "equivalence_margin",
+        "cache_version",
+        "cache_root",
     }
     unknown = set(merged) - known
     if unknown:
@@ -486,6 +522,7 @@ def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
             "subjects": list(cfg.dataset.subjects),
             "emgs": None if cfg.dataset.emgs is None else list(cfg.dataset.emgs),
             "data_root": cfg.dataset.data_root,
+            "normalization": cfg.dataset.normalization,
         },
         "models": list(cfg.models),
         "model_version": {name: model_version(name) for name in cfg.models},
@@ -506,6 +543,8 @@ def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
         "seed": cfg.seed,
         "output_root": cfg.output_root,
         "equivalence_margin": cfg.equivalence_margin,
+        "cache_version": cfg.cache_version,
+        "cache_root": cfg.cell_cache_root,
         "source_path": cfg.source_path,
     }
     # Guarantee plain Python types (no numpy scalars) reach the YAML dump.

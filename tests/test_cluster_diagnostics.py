@@ -1,4 +1,4 @@
-"""Unit tests for src/utils/cluster_diagnostics.py.
+"""Unit tests for src/pfns4neurostim/diagnostics/cluster.py.
 
 All tests use only stdlib — no SLURM, no GPU, no TabPFN required.
 Safe to run on any machine (Windows, Linux, macOS, CI).
@@ -22,7 +22,7 @@ _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from pfns4neurostim.legacy_code.diagnostics.cluster_diagnostics import (
+from pfns4neurostim.diagnostics.cluster import (
     ClusterDiagnostics,
     _DiagMetrics,
     _GpuPoller,

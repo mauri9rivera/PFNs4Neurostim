@@ -5,3 +5,4 @@ name: nhp
 subjects: [1]
 emgs: all            # 'all' or an explicit list, e.g. [0, 1, 2]
 data_root: ./data    # cluster jobs override with $SLURM_TMPDIR/data
+normalization: pfn   # data/preprocessing.py NORMALIZATIONS; pfn = MinMax X, z-scored y

@@ -1,0 +1,25 @@
+# Hypothesis A - on-par-but-cheaper, 5D rat held-out subject.
+#
+# One acquisition (EI, the working default since 2026-09-17) across the model
+# ladder. Regrets are range-normalized (P0.9) and the three co-primary outcomes
+# are reported together; latency is measured in the same timed window for every
+# model, so the "cheaper" claim is EI-vs-EI rather than across acquisitions.
+#
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_5d_rat.yaml
+defaults:
+  dataset: 5d_rat
+  model: [tabpfn_v2_5, gp_mll, gp_naive, random]
+  acquisition: ei
+
+experiment: bo_benchmark
+family: hyp-a
+tag: 5d_rat
+
+budget: 150
+n_init: 5
+n_reps: 20
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05

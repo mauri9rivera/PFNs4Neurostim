@@ -1,0 +1,6 @@
+# TabICL v2.2.0 (vendored at libs/tabicl): native regressor with a quantile predictive
+# distribution. Needs Python >= 3.10 -> runs in the pfns4neurostim-bench env.
+name: tabicl
+params:
+  device: null   # per-model override of the experiment `device`
+  n_estimators: 1

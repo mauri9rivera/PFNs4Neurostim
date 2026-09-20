@@ -1,0 +1,4 @@
+# UCB with a fixed exploration coefficient kappa=2 (no schedule); same grid as the legacy kappa ablation.
+type: ucb
+params:
+  kappa: 2

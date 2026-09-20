@@ -205,7 +205,7 @@ def main():
     if not getattr(args, 'cluster_diag', False) and os.environ.get('CLUSTER_DIAG', '0') == '1':
         args.cluster_diag = True
 
-    from pfns4neurostim.legacy_code.diagnostics.cluster_diagnostics import ClusterDiagnostics as _CD
+    from pfns4neurostim.diagnostics.cluster import ClusterDiagnostics as _CD
     _n_planned = len(args.datasets) * len(args.analyses)
     with _CD(tag=f"id-ood-{args.prior_source}", device=args.device,
              n_planned=_n_planned,

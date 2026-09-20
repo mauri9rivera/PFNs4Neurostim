@@ -1,0 +1,2 @@
+# Shell scripts run on the Linux cluster: never CRLF.
+*.sh text eol=lf

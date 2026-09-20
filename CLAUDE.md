@@ -139,6 +139,12 @@ def set_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
 ```
 
+### Preprocessing Contract
+- **X:** MinMax to `[0, 1]^D` for every model (GP lengthscale priors assume O(1) inputs; `5d_rat` axes have different physical units).
+- **y:** z-scored, scaler fitted on valid trials only (GP priors assume standardized targets; TabPFN standardizes internally).
+- Regret is divided by the ground-truth range, so it is **independent of the y scaler**.
+- Implemented natively in `data/preprocessing.py` (`NORMALIZATIONS`, default `pfn`); selected by `dataset.normalization`, recorded in `config.yaml` and the tidy `normalization` column. `data/legacy_io.py` is frozen and only used as a numerical reference in tests.
+
 ### Fail Fast on NaN/Inf
 - Never silently swallow NaN or Inf values. Raise immediately with a descriptive message.
 
@@ -294,8 +300,10 @@ or axis string. Settled with the user on 2026-09-18 for the JNE/IOP target:
 - **Geometry:** single-column default (3.27 in / 8.3 cm); width tokens `single` / `onehalf` / `double`
 - **Typography:** Arial → Helvetica → DejaVu Sans; base 9 pt, ticks 8 pt, panel letters 10 pt bold;
   TrueType/Type-42 (`pdf.fonttype=42`, `svg.fonttype="none"`)
-- **Palette:** Okabe–Ito with family logic — PFNs cool (TabPFN-2.5 `#0072B2`), GPs warm
-  (GP-MLL `#D55E00`, GP-fixed `#E69F00`, GP-oracle `#B8860B`), non-learning baselines grey
+- **Palette:** two hardcoded anchors, everything else derived (`style.ANCHOR_PFN` `#0072B2` = TabPFN-2.5,
+  `style.ANCHOR_GP` `#D55E00` = GP-MLL; `NEUTRAL_GREY` for non-learning baselines). Other PFNs/GPs are shades of
+  their family anchor via `derive_shade` (hue held, lightness walks a bounded band), and `acquisition_style(model, acq)`
+  shades a model's colour by acquisition while linestyle carries the acquisition. Never add a hex literal for a model
 - **Model names:** compact code-like — `TabPFN-2.5`, `GP-MLL`, `GP-fixed`, `GP-oracle`, `Random`
 - **Stress vocabulary:** roadmap jargon is canonical in code, figures *and* text — `knob`, `level`,
   `K1`/`K2`/`K5`/`K6`, `Demo 1 (synthetic)` / `Demo 2 (in vivo)`, `breakdown point`; K2's x-axis is

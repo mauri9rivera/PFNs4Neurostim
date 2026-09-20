@@ -6,7 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "pfns4neurostim"
 version = "0.1.0"
 description = "Evaluating TabPFNs as drop-in replacements for GP-based Bayesian optimization in neurostimulation."
-requires-python = ">=3.9,<3.10"
+# The MAIN environment stays Python 3.9 (CLAUDE.md section 3, environment.yml); 3.10+ is only
+# for the bench environment (environment.bench.yml), which hosts TabICL v2 / TabFM / TabFlex.
+requires-python = ">=3.9"
 readme = "README.md"
 license = { file = "LICENSE" }
 

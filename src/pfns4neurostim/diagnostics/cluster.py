@@ -851,3 +851,15 @@ class ClusterDiagnostics:
             lines.append(_sep())
 
         return '\n'.join(lines)
+
+
+def diagnostics_enabled(flag: bool = False) -> bool:
+    """Return whether cluster diagnostics are on: the CLI flag or ``CLUSTER_DIAG=1``.
+
+    Args:
+        flag: Value of the ``--cluster-diag`` CLI flag.
+
+    Returns:
+        ``True`` if either the flag or the environment variable requests it.
+    """
+    return bool(flag) or os.environ.get('CLUSTER_DIAG', '') == '1'

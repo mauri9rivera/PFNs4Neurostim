@@ -1,0 +1,5 @@
+# PFNs4BO (HEBO prior): a full BO policy, integrated as a native policy. DEFERRED - the
+# wrapper body still raises (see .claude/sprint_2026-09-20_meeting_deliverables.md, Task 7.3).
+name: pfns4bo
+params:
+  device: null   # per-model override of the experiment `device`

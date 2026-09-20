@@ -33,10 +33,13 @@ import pandas as pd
 from ..config import ExperimentConfig, load_experiment_config, resolved_dict
 from ..data.channels import ChannelData, iter_channels
 from ..data.stress import KnobNotApplicable, build_knob, calibrate_levels, floor_snr_db
+from ..diagnostics import ClusterDiagnostics, diagnostics_enabled
 from ..evaluation import results as _results
+from ..evaluation.cache import CellStore, row_payload
 from ..evaluation.bo_runner import run_channel_bo
 from ..evaluation.results import TidyRow
 from ..seeding import seed_for
+from ._cells import cell_identity, row_from_payload
 from ._rows import build_row
 
 __all__ = ["run_stress_sweep", "build_tidy_rows", "main"]
@@ -57,7 +60,76 @@ def _channels(cfg: ExperimentConfig) -> Iterable[ChannelData]:
         cfg.dataset.emgs,
         data_root=cfg.dataset.data_root,
         gt_mode=cfg.gt_mode,
+        normalization=cfg.dataset.normalization,
     )
+
+
+def _compute_cell(
+    cfg: ExperimentConfig,
+    run_tag: str,
+    knob_name: str,
+    level: float,
+    stressed: ChannelData,
+    achieved: dict[str, Any],
+    budget: int,
+    model: str,
+    rep: int,
+    seed: int,
+    label: str,
+    progress: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run one BO repetition on a stressed channel; return its cacheable cell.
+
+    Args:
+        cfg: Resolved experiment configuration.
+        run_tag: Run tag written into the row.
+        knob_name: Registered knob name.
+        level: Knob level.
+        stressed: The already-stressed channel.
+        achieved: Knob-reported achieved metrics for this level.
+        budget: Effective budget (K6-budget overrides the config's).
+        model: Registered model key.
+        rep: Repetition index.
+        seed: Seed of this repetition.
+        label: Cell label for the progress line.
+        progress: Print a progress line.
+
+    Returns:
+        The tidy-row payload (with the achieved extras) and the trajectory.
+    """
+    t0 = time.time()
+    result = run_channel_bo(
+        model,
+        stressed,
+        acq_fn=cfg.acquisition.type,
+        acq_params=cfg.acquisition.params,
+        acq_schedules=cfg.acquisition.schedules,
+        budget=budget,
+        n_init=cfg.n_init,
+        seed=seed,
+        device=cfg.device,
+        model_params=cfg.model_params.get(model, {}),
+    )
+    row = build_row(
+        result,
+        stressed,
+        run_tag=run_tag,
+        experiment="stress_sweep",
+        model=model,
+        acq_type=cfg.acquisition.type,
+        acq_label=cfg.acquisition.name,
+        rep=rep,
+        knob=knob_name,
+        level=float(level),
+        achieved=achieved,
+    )
+    if progress:
+        print(
+            f"[stress_sweep] {label} snr={achieved.get('achieved_snr_db', float('nan')):6.2f}dB "
+            f"rec_regret={row.recommended_regret:.4f} ({time.time() - t0:.1f}s)",
+            flush=True,
+        )
+    return row_payload(row, achieved), result.trajectory
 
 
 def build_tidy_rows(
@@ -65,6 +137,7 @@ def build_tidy_rows(
     run_tag: str,
     *,
     progress: bool = True,
+    store: CellStore | None = None,
 ) -> tuple[list[TidyRow], dict[tuple[Any, ...], dict[str, Any]], list[dict[str, Any]]]:
     """Execute the whole sweep grid.
 
@@ -76,11 +149,14 @@ def build_tidy_rows(
         cfg: Resolved experiment configuration.
         run_tag: Run tag written into every row.
         progress: Print a per-cell progress line to stdout.
+        store: Cell cache; ``None`` means a fresh store under the config's cache
+            root. Cells are persisted the moment they finish, so a killed run resumes.
 
     Returns:
         ``(rows, trajectories, extras)`` where ``extras`` holds the non-schema
         columns (achieved metrics) aligned with ``rows`` by position.
     """
+    store = store or CellStore(cfg.cell_cache_root)
     knob = build_knob(cfg.knob.type, cfg.knob.levels, **cfg.knob.params)
     rows: list[TidyRow] = []
     trajectories: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -158,44 +234,31 @@ def build_tidy_rows(
             for model in cfg.models:
                 for rep in range(cfg.n_reps):
                     seed = seed_for(channel.label, knob.name, level, model, rep, base_seed=cfg.seed)
-                    t0 = time.time()
-                    result = run_channel_bo(
-                        model,
-                        stressed,
-                        acq_fn=cfg.acquisition.type,
-                        acq_params=cfg.acquisition.params,
-                        acq_schedules=cfg.acquisition.schedules,
-                        budget=budget,
-                        n_init=cfg.n_init,
-                        seed=seed,
-                        device=cfg.device,
-                        model_params=cfg.model_params.get(model, {}),
-                    )
-                    row = build_row(
-                        result,
-                        stressed,
-                        run_tag=run_tag,
-                        experiment="stress_sweep",
-                        model=model,
-                        acq_type=cfg.acquisition.type,
-                        rep=rep,
-                        knob=knob.name,
+                    label = f"{channel.label} {knob.name}={level:g} {model} rep{rep}"
+                    identity = cell_identity(
+                        cfg, stressed, model, cfg.acquisition, experiment="stress_sweep",
+                        rep=rep, seed=seed, budget=budget, knob=knob.name,
                         level=float(level),
-                        achieved=achieved,
+                        target_db=float(target_db) if np.isfinite(target_db) else None,
                     )
+                    cell = store.run(
+                        channel.dataset, "stress_sweep", identity, label,
+                        lambda m=model, r=rep, s=seed, lb=label: _compute_cell(
+                            cfg, run_tag, knob.name, level, stressed, achieved, budget, m, r, s, lb,
+                            progress,
+                        ),
+                    )
+                    if cell is None:
+                        continue
+                    row = row_from_payload(cell[0], run_tag)
                     rows.append(row)
-                    extras.append(dict(achieved))
-                    trajectories[_results.make_trajectory_key(row)] = result.trajectory
-
-                    if progress:
-                        print(
-                            f"[stress_sweep] {channel.label} {knob.name}={level:g} "
-                            f"snr={achieved.get('achieved_snr_db', float('nan')):6.2f}dB "
-                            f"{model:<12} rep{rep} "
-                            f"rec_regret={row.recommended_regret:.4f} "
-                            f"({time.time() - t0:.1f}s)",
-                            flush=True,
-                        )
+                    extras.append(dict(cell[0]["extras"]))
+                    trajectories[_results.make_trajectory_key(row)] = cell[1]
+    print(
+        f"[stress_sweep] cells: {store.hits} cached, {store.computed} computed, "
+        f"{len(store.failures)} failed",
+        flush=True,
+    )
     if not rows:
         raise RuntimeError(
             "stress_sweep produced no rows: check dataset.subjects / dataset.emgs, "
@@ -213,6 +276,8 @@ def run_stress_sweep(
     *,
     replot: bool = False,
     run_dir: str | None = None,
+    use_cache: bool = True,
+    only_cached: bool = False,
 ) -> str:
     """Run (or re-plot) one stress sweep.
 
@@ -222,16 +287,23 @@ def run_stress_sweep(
         replot: Skip execution and rebuild every figure and table from the
             existing ``tidy.csv`` in the run directory.
         run_dir: Explicit run directory; defaults to
-            ``{output_root}/stress/{knob}/{dataset}``.
+            ``{output_root}/stress/{knob}/{dataset}/{family}-{tag}``.
+        use_cache: ``False`` (``--no-cache``) neither reads nor writes the cell cache.
+        only_cached: ``True`` (``--only-cached``) assembles outputs from cached cells
+            without computing any.
 
     Returns:
         Path to the run directory holding the deliverables.
 
     Raises:
         FileNotFoundError: With ``replot=True`` and no ``tidy.csv`` present.
+        RuntimeError: If any cell failed (raised after every completed cell is
+            written and cached).
     """
     cfg = load_experiment_config(config_path, overrides)
-    target = run_dir or os.path.join(cfg.output_root, "stress", cfg.knob.type, cfg.dataset.name)
+    target = run_dir or os.path.join(
+        cfg.output_root, "stress", cfg.knob.type, cfg.dataset.name, f"{cfg.family}-{cfg.tag}"
+    )
     os.makedirs(target, exist_ok=True)
     tidy_path = os.path.join(target, "tidy.csv")
 
@@ -243,7 +315,8 @@ def run_stress_sweep(
         df = pd.read_csv(tidy_path)
     else:
         run_tag = f"{cfg.dataset.name}-{cfg.knob.type}-{cfg.tag}"
-        rows, trajectories, extras = build_tidy_rows(cfg, run_tag)
+        store = CellStore(cfg.cell_cache_root, enabled=use_cache, only_cached=only_cached)
+        rows, trajectories, extras = build_tidy_rows(cfg, run_tag, store=store)
         df = _results.rows_to_dataframe(rows, acquisition=cfg.acquisition.as_block())
         # Achieved metrics that are not part of the fixed schema (future knobs
         # may report e.g. amplitude ratio) ride along as extra columns.
@@ -253,6 +326,7 @@ def run_stress_sweep(
         _results.write_trajectories(target, trajectories)
         _results.write_config(target, resolved_dict(cfg))
         print(f"[stress_sweep] wrote {len(df)} rows -> {tidy_path}")
+        store.raise_if_failed()
 
     from ..visualization import stress as stress_figs  # deferred: matplotlib import
 
@@ -290,7 +364,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Rebuild figures and tables from the existing tidy.csv without re-running.",
     )
     parser.add_argument("--run-dir", default=None, help="Override the output run directory.")
+    parser.add_argument("--no-cache", action="store_true", help="Neither read nor write the cell cache.")
+    parser.add_argument(
+        "--cluster-diag", action="store_true",
+        help="Print the SLURM job-efficiency report at the end (or set CLUSTER_DIAG=1).",
+    )
+    parser.add_argument(
+        "--only-cached", action="store_true",
+        help="Assemble outputs from cached cells only; compute nothing.",
+    )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
-    run_stress_sweep(args.config, args.overrides, replot=args.replot, run_dir=args.run_dir)
+    cfg = load_experiment_config(args.config, args.overrides)
+    with ClusterDiagnostics(
+        tag=f"{cfg.family}-{cfg.tag}", device=cfg.device,
+        enabled=diagnostics_enabled(args.cluster_diag),
+    ):
+        run_stress_sweep(
+            args.config, args.overrides, replot=args.replot, run_dir=args.run_dir,
+            use_cache=not args.no_cache, only_cached=args.only_cached,
+        )
     return 0

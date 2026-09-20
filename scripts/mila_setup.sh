@@ -17,7 +17,8 @@
 #   bash scripts/mila_setup.sh layout     # create directories + repo symlinks
 #   bash scripts/mila_setup.sh archive    # copy $SCRATCH data -> $ARCHIVE master
 #   bash scripts/mila_setup.sh stage      # restore $ARCHIVE master -> $SCRATCH
-#   bash scripts/mila_setup.sh env        # create/update the conda env + install the package
+#   bash scripts/mila_setup.sh env        # create/update the MAIN conda env (Python 3.9) + install the package
+#   bash scripts/mila_setup.sh env bench  # same for pfns4neurostim-bench (Python 3.11) from environment.bench.yml
 #   bash scripts/mila_setup.sh install    # only pip install -e . (reuse an existing env)
 #   bash scripts/mila_setup.sh deps       # report which declared dependencies import
 #   bash scripts/mila_setup.sh verify     # print the whole layout + import check
@@ -74,18 +75,27 @@ cmd_stage() {
 }
 
 cmd_env() {
+  load_conda
+  # Optional argument: `main` (default) or `bench`.
+  local which="${1:-main}" env_file="environment.yml"
+  case "${which}" in
+    main) ;;
+    bench) CONDA_ENV="pfns4neurostim-bench"; env_file="environment.bench.yml" ;;
+    *) log "usage: env [main|bench]"; exit 1 ;;
+  esac
   cd "${CODE_DIR}"
   if conda env list | grep -qE "^${CONDA_ENV}\s"; then
-    log "conda env '${CONDA_ENV}' exists; updating from environment.yml"
-    conda env update -f environment.yml -n "${CONDA_ENV}"
+    log "conda env '${CONDA_ENV}' exists; updating from ${env_file}"
+    conda env update -f "${env_file}" -n "${CONDA_ENV}"
   else
-    log "creating conda env '${CONDA_ENV}' from environment.yml"
-    conda env create -f environment.yml -n "${CONDA_ENV}"
+    log "creating conda env '${CONDA_ENV}' from ${env_file}"
+    conda env create -f "${env_file}" -n "${CONDA_ENV}"
   fi
   cmd_install
 }
 
 cmd_install() {
+  load_conda
   # Separate from cmd_env so a working environment can be reused without
   # re-solving it (the dependency solve is the slow, failure-prone part).
   cd "${CODE_DIR}"
@@ -95,6 +105,7 @@ cmd_install() {
 }
 
 cmd_deps() {
+  load_conda
   # Report which declared dependencies are actually importable, so a partially
   # provisioned environment fails loudly here rather than inside a SLURM job.
   conda run -n "${CONDA_ENV}" python - <<'PY'
@@ -121,6 +132,7 @@ PY
 }
 
 cmd_verify() {
+  load_conda
   log "--- quotas ---"; disk-quota 2>/dev/null || log "(disk-quota unavailable)"
   log "--- code ---"
   cd "${CODE_DIR}"
@@ -171,7 +183,7 @@ case "${1:-}" in
   deps) cmd_deps ;;
   archive) cmd_archive ;;
   stage) cmd_stage ;;
-  env) cmd_env ;;
+  env) cmd_env "${2:-}" ;;
   verify) cmd_verify ;;
   touch) cmd_touch ;;
   *) sed -n '1,30p' "$0"; exit 1 ;;

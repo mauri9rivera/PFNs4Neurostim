@@ -2,6 +2,7 @@
 # tuned GP's performance comes from hyperparameter optimisation (roadmap S8).
 name: gp_naive
 params:
+  device: null   # per-model override of the experiment `device`
   lengthscale: 0.2
   outputscale: 1.0
   noise: 0.01

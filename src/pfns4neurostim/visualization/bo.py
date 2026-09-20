@@ -37,14 +37,14 @@ def _channel_means(df: pd.DataFrame, metric: str) -> pd.DataFrame:
         metric: Metric column.
 
     Returns:
-        Frame with ``model``, ``acq_type``, ``mean`` and ``ci`` columns.
+        Frame with ``model``, ``acq_label``, ``mean`` and ``ci`` columns.
     """
     per_channel = (
-        df.groupby(["model", "acq_type", "subject", "emg"], dropna=False)[metric]
+        df.groupby(["model", "acq_label", "subject", "emg"], dropna=False)[metric]
         .mean()
         .reset_index()
     )
-    grouped = per_channel.groupby(["model", "acq_type"], dropna=False)[metric]
+    grouped = per_channel.groupby(["model", "acq_label"], dropna=False)[metric]
     out = grouped.agg(["mean", "std", "count"]).reset_index()
     with np.errstate(invalid="ignore", divide="ignore"):
         out["ci"] = 1.96 * out["std"] / np.sqrt(out["count"])
@@ -75,7 +75,7 @@ def plot_acquisition_table(
     """
     metrics = [m for m in metrics if m in df.columns]
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
-    acqs = sorted(set(df["acq_type"]))
+    acqs = sorted(set(df["acq_label"]))
 
     fig, axes = S.figure("double", nrows=1, ncols=len(metrics), aspect=1.25)
     axes = np.atleast_1d(axes)
@@ -84,7 +84,7 @@ def plot_acquisition_table(
     for ax, metric in zip(axes, metrics):
         summary = _channel_means(df, metric)
         for m_idx, model in enumerate(models):
-            sub = summary[summary["model"] == model].set_index("acq_type")
+            sub = summary[summary["model"] == model].set_index("acq_label")
             xs, heights, errs = [], [], []
             for a_idx, acq in enumerate(acqs):
                 if acq not in sub.index:
@@ -132,13 +132,13 @@ def plot_latency(df: pd.DataFrame, out_dir: str, *, dataset: str) -> list[str]:
         return []
 
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
-    acqs = sorted(set(df["acq_type"]))
+    acqs = sorted(set(df["acq_label"]))
     summary = _channel_means(df, "mean_query_latency_s")
 
     fig, ax = S.figure("single", aspect=0.75)
     width = 0.8 / max(len(models), 1)
     for m_idx, model in enumerate(models):
-        sub = summary[summary["model"] == model].set_index("acq_type")
+        sub = summary[summary["model"] == model].set_index("acq_label")
         xs, heights = [], []
         for a_idx, acq in enumerate(acqs):
             if acq not in sub.index:

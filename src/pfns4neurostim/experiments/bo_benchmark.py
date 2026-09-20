@@ -33,11 +33,14 @@ import pandas as pd
 
 from ..config import ExperimentConfig, load_experiment_config, resolved_dict
 from ..data.channels import iter_channels
+from ..diagnostics import ClusterDiagnostics, diagnostics_enabled
 from ..evaluation import results as _results
+from ..evaluation.cache import CellStore, row_payload
 from ..evaluation.bo_runner import run_channel_bo
 from ..evaluation.results import TidyRow
 from ..models.registry import MODEL_REGISTRY
 from ..seeding import seed_for
+from ._cells import cell_identity, row_from_payload
 from ._rows import build_row
 
 __all__ = ["run_bo_benchmark", "build_acquisition_table", "main"]
@@ -87,12 +90,12 @@ def build_acquisition_table(df: pd.DataFrame, out_dir: str) -> tuple[pd.DataFram
     """
     metrics = [m for m in _TABLE_METRICS if m in df.columns]
     per_channel = (
-        df.groupby(["model", "acq_type", "dataset", "subject", "emg"], dropna=False)[metrics]
+        df.groupby(["model", "acq_label", "dataset", "subject", "emg"], dropna=False)[metrics]
         .mean()
         .reset_index()
     )
     table = (
-        per_channel.groupby(["model", "acq_type"], dropna=False)[metrics]
+        per_channel.groupby(["model", "acq_label"], dropna=False)[metrics]
         .agg(["mean", "std", "count"])
         .reset_index()
     )
@@ -105,12 +108,64 @@ def build_acquisition_table(df: pd.DataFrame, out_dir: str) -> tuple[pd.DataFram
     return table, path
 
 
+def _compute_cell(
+    cfg: ExperimentConfig,
+    run_tag: str,
+    model: str,
+    channel: Any,
+    acq: Any,
+    rep: int,
+    seed: int,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run one BO repetition and return its cacheable ``(payload, trajectory)``.
+
+    Args:
+        cfg: Resolved experiment configuration.
+        run_tag: Run tag written into the row.
+        model: Registered model key.
+        channel: Channel to optimize over.
+        acq: Acquisition block of this cell.
+        rep: Repetition index.
+        seed: Seed of this repetition.
+        label: Cell label for the progress line.
+
+    Returns:
+        The tidy-row payload and the per-step trajectory.
+    """
+    t0 = time.time()
+    result = run_channel_bo(
+        model,
+        channel,
+        acq_fn=acq.type,
+        acq_params=acq.params,
+        acq_schedules=acq.schedules,
+        budget=cfg.budget,
+        n_init=cfg.n_init,
+        seed=seed,
+        device=cfg.device,
+        model_params=cfg.model_params.get(model, {}),
+    )
+    row = build_row(
+        result, channel, run_tag=run_tag, experiment="bo_benchmark",
+        model=model, acq_type=acq.type, rep=rep, acq_label=acq.name,
+    )
+    print(
+        f"[bo_benchmark] {label} rec_regret={row.recommended_regret:.4f} "
+        f"({time.time() - t0:.1f}s)",
+        flush=True,
+    )
+    return row_payload(row, {}), result.trajectory
+
+
 def run_bo_benchmark(
     config_path: str,
     overrides: list[str] | None = None,
     *,
     replot: bool = False,
     run_dir: str | None = None,
+    use_cache: bool = True,
+    only_cached: bool = False,
 ) -> str:
     """Run (or re-summarize) a models x acquisitions benchmark.
 
@@ -120,17 +175,23 @@ def run_bo_benchmark(
         overrides: ``key=value`` overrides.
         replot: Rebuild tables from the existing ``tidy.csv`` without re-running.
         run_dir: Explicit run directory; defaults to
-            ``{output_root}/benchmark/{dataset}``.
+            ``{output_root}/benchmark/{dataset}/{family}-{tag}``.
+        use_cache: ``False`` (``--no-cache``) neither reads nor writes the cell cache.
+        only_cached: ``True`` (``--only-cached``) assembles outputs from cached cells
+            without computing any.
 
     Returns:
         Path to the run directory.
 
     Raises:
         FileNotFoundError: With ``replot=True`` and no ``tidy.csv``.
-        RuntimeError: If every (model, acquisition) combination was skipped.
+        RuntimeError: If every (model, acquisition) combination was skipped, or any
+            cell failed (raised after every completed cell is written and cached).
     """
     cfg = load_experiment_config(config_path, overrides)
-    target = run_dir or os.path.join(cfg.output_root, "benchmark", cfg.dataset.name)
+    target = run_dir or os.path.join(
+        cfg.output_root, "benchmark", cfg.dataset.name, f"{cfg.family}-{cfg.tag}"
+    )
     os.makedirs(target, exist_ok=True)
     tidy_path = os.path.join(target, "tidy.csv")
 
@@ -144,6 +205,7 @@ def run_bo_benchmark(
         rows: list[TidyRow] = []
         trajectories: dict[tuple[Any, ...], dict[str, Any]] = {}
         skipped: list[str] = []
+        store = CellStore(cfg.cell_cache_root, enabled=use_cache, only_cached=only_cached)
 
         for channel in iter_channels(
             cfg.dataset.name,
@@ -151,6 +213,7 @@ def run_bo_benchmark(
             cfg.dataset.emgs,
             data_root=cfg.dataset.data_root,
             gt_mode=cfg.gt_mode,
+            normalization=cfg.dataset.normalization,
         ):
             for model in cfg.models:
                 for acq in acquisitions:
@@ -161,35 +224,27 @@ def run_bo_benchmark(
                         continue
                     for rep in range(cfg.n_reps):
                         seed = seed_for(channel.label, acq.type, model, rep, base_seed=cfg.seed)
-                        t0 = time.time()
-                        result = run_channel_bo(
-                            model,
-                            channel,
-                            acq_fn=acq.type,
-                            acq_params=acq.params,
-                            acq_schedules=acq.schedules,
-                            budget=cfg.budget,
-                            n_init=cfg.n_init,
-                            seed=seed,
-                            device=cfg.device,
-                            model_params=cfg.model_params.get(model, {}),
+                        label = f"{channel.label} {model} {acq.type} rep{rep}"
+                        identity = cell_identity(
+                            cfg, channel, model, acq, experiment="bo_benchmark",
+                            rep=rep, seed=seed, budget=cfg.budget,
                         )
-                        row = build_row(
-                            result,
-                            channel,
-                            run_tag=run_tag,
-                            experiment="bo_benchmark",
-                            model=model,
-                            acq_type=acq.type,
-                            rep=rep,
+                        cell = store.run(
+                            channel.dataset, "bo_benchmark", identity, label,
+                            lambda m=model, ch=channel, a=acq, r=rep, s=seed, lb=label: _compute_cell(
+                                cfg, run_tag, m, ch, a, r, s, lb
+                            ),
                         )
+                        if cell is None:
+                            continue
+                        row = row_from_payload(cell[0], run_tag)
                         rows.append(row)
-                        trajectories[_results.make_trajectory_key(row)] = result.trajectory
-                        print(
-                            f"[bo_benchmark] {channel.label} {model:<12} {acq.type:<12} rep{rep} "
-                            f"rec_regret={row.recommended_regret:.4f} ({time.time() - t0:.1f}s)",
-                            flush=True,
-                        )
+                        trajectories[_results.make_trajectory_key(row)] = cell[1]
+        print(
+            f"[bo_benchmark] cells: {store.hits} cached, {store.computed} computed, "
+            f"{len(store.failures)} failed",
+            flush=True,
+        )
         if not rows:
             raise RuntimeError(
                 "bo_benchmark produced no rows. Skipped combinations: "
@@ -201,16 +256,17 @@ def run_bo_benchmark(
         # One acquisition block per row: flatten per-acquisition rather than globally.
         frames = [
             _results.rows_to_dataframe(
-                [r for r in rows if r.acq_type == acq.type], acquisition=acq.as_block()
+                [r for r in rows if r.acq_label == acq.name], acquisition=acq.as_block()
             )
             for acq in acquisitions
-            if any(r.acq_type == acq.type for r in rows)
+            if any(r.acq_label == acq.name for r in rows)
         ]
         df = pd.concat(frames, ignore_index=True, sort=False)
         df.to_csv(tidy_path, index=False)
         _results.write_trajectories(target, trajectories)
         _results.write_config(target, resolved_dict(cfg))
         print(f"[bo_benchmark] wrote {len(df)} rows -> {tidy_path}")
+        store.raise_if_failed()
 
     _, table_path = build_acquisition_table(df, target)
     print(f"[bo_benchmark] wrote {table_path}")
@@ -242,7 +298,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--replot", action="store_true", help="Rebuild tables from tidy.csv.")
     parser.add_argument("--run-dir", default=None, help="Override the output run directory.")
+    parser.add_argument("--no-cache", action="store_true", help="Neither read nor write the cell cache.")
+    parser.add_argument(
+        "--cluster-diag", action="store_true",
+        help="Print the SLURM job-efficiency report at the end (or set CLUSTER_DIAG=1).",
+    )
+    parser.add_argument(
+        "--only-cached", action="store_true",
+        help="Assemble outputs from cached cells only; compute nothing.",
+    )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
-    run_bo_benchmark(args.config, args.overrides, replot=args.replot, run_dir=args.run_dir)
+    cfg = load_experiment_config(args.config, args.overrides)
+    with ClusterDiagnostics(
+        tag=f"{cfg.family}-{cfg.tag}", device=cfg.device,
+        enabled=diagnostics_enabled(args.cluster_diag),
+    ):
+        run_bo_benchmark(
+            args.config, args.overrides, replot=args.replot, run_dir=args.run_dir,
+            use_cache=not args.no_cache, only_cached=args.only_cached,
+        )
     return 0

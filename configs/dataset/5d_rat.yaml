@@ -5,3 +5,4 @@ name: 5d_rat
 subjects: [1]
 emgs: all
 data_root: ./data
+normalization: pfn   # data/preprocessing.py NORMALIZATIONS; pfn = MinMax X, z-scored y

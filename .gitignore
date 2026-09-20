@@ -11,8 +11,8 @@ __pycache__/
 # Both forms are listed on purpose: a trailing slash matches directories only,
 # and on the Mila cluster these names are SYMLINKS into $SCRATCH (see
 # scripts/mila_setup.sh), which git treats as files.
-data
-data/
+/data
+/data/
 output
 output/
 logs

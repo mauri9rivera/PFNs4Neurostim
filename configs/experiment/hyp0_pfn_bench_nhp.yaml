@@ -1,0 +1,26 @@
+# Hypothesis 0 - PFN benchmark, nhp: TabPFN-2.5 vs TabICL v2 vs TabFlex vs GP-MLL, EI.
+#
+# Runs in the Python 3.11 bench env (CONDA_ENV=pfns4neurostim-bench). Labelling (guardrail G3):
+# TabFlex is a classification-head adaptation (n_bins=32); every table row and caption says so.
+# PFNs4BO is DEFERRED (native-policy integration not implemented; see the sprint file, Task 7.3).
+# Latency here is descriptive only (guardrail G1: the GP comparator is the unconverged Adam fit).
+#
+# TabFlex downloads weights on first use: trigger that on a LOGIN node first.
+#   CONDA_ENV=pfns4neurostim-bench sbatch --export=ALL scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml n_reps=5
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, tabicl, tabflex, gp_mll]
+  acquisition: ei
+
+experiment: bo_benchmark
+family: hyp0-pfn-bench
+tag: nhp
+
+budget: 96
+n_init: 5
+n_reps: 5
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05

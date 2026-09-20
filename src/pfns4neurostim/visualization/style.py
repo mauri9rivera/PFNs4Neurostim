@@ -23,6 +23,7 @@ Decisions settled with the user on 2026-09-18 (JNE / IOP submission target):
 """
 from __future__ import annotations
 
+import colorsys
 import os
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -33,6 +34,13 @@ import matplotlib.pyplot as plt
 __all__ = [
     "FIG_WIDTHS",
     "FONT_SIZES",
+    "ANCHOR_PFN",
+    "ANCHOR_GP",
+    "NEUTRAL_GREY",
+    "ACQUISITION_ORDER",
+    "ACQUISITION_LINESTYLES",
+    "derive_shade",
+    "acquisition_style",
     "ModelStyle",
     "MODEL_STYLES",
     "MODEL_ORDER",
@@ -108,42 +116,58 @@ class ModelStyle:
     zorder: int = 2
 
 
-# Okabe-Ito reference: blue #0072B2, sky #56B4E9, green #009E73, yellow #F0E442,
-# orange #E69F00, vermillion #D55E00, purple #CC79A7, grey #999999.
-MODEL_STYLES: dict[str, ModelStyle] = {
-    # --- PFN family (cool) ---
-    "tabpfn_v2_5": ModelStyle("TabPFN-2.5", "#0072B2", "-", "o", "pfn", zorder=5),
-    "pfns4bo": ModelStyle("PFNs4BO", "#56B4E9", "-", "^", "pfn", zorder=3),
-    "tabpfn_v1": ModelStyle("TabPFN-1", "#CC79A7", "-", "v", "pfn", zorder=3),
-    "tabflex": ModelStyle("TabFlex", "#7E4E9B", "-", "<", "pfn", zorder=3),
-    "tabfm": ModelStyle("TabFM", "#00688B", "-", ">", "pfn", zorder=3),
-    "mitra": ModelStyle("Mitra", "#4C9BE8", "-", "P", "pfn", zorder=3),
-    "tabicl": ModelStyle("TabICL", "#3A7CA5", "-", "d", "pfn", zorder=3),
-    # --- GP family (warm) ---
-    "gp_mll": ModelStyle("GP-MLL", "#D55E00", "--", "s", "gp", zorder=4),
-    "gp_naive": ModelStyle("GP-fixed", "#E69F00", "-.", "D", "gp", zorder=3),
-    "gp_oracle": ModelStyle("GP-oracle", "#B8860B", ":", "*", "gp", zorder=3),
-    "gp_deep_kernel": ModelStyle("GP-deep", "#A64B00", "--", "X", "gp", zorder=2),
-    # --- Non-learning baselines (grey) ---
-    "random": ModelStyle("Random", "#999999", ":", "x", "baseline", zorder=1),
-}
+# ---------------------------------------------------------------------------
+# Palette: two anchors, everything else derived
+# ---------------------------------------------------------------------------
+#: The only two literal model colours in the package (Okabe-Ito blue / vermillion).
+#: Every other model and acquisition colour is derived from them by
+#: :func:`derive_shade`, so the palette is a rule rather than a list.
+ANCHOR_PFN: str = "#0072B2"   # TabPFN-2.5 (cool = PFN family)
+ANCHOR_GP: str = "#D55E00"    # GP-MLL (warm = GP family)
+NEUTRAL_GREY: str = "#999999"  # non-learning baselines
 
-#: Aliases from legacy result-dict ``model_type`` strings to canonical keys.
-MODEL_ALIASES: dict[str, str] = {
-    "gp": "gp_mll",
-    "exact_gp": "gp_mll",
-    "mll_gp": "gp_mll",
-    "naive_gp": "gp_naive",
-    "oracle_gp": "gp_oracle",
-    "deep_kernel_gp": "gp_deep_kernel",
-    "vanilla_tabpfn": "tabpfn_v2_5",
-    "tabpfn": "tabpfn_v2_5",
-    "tabpfn_v2": "tabpfn_v2_5",
-    "pfn": "tabpfn_v2_5",
-    "random_search": "random",
-}
+#: Lightness band (HLS) that derived shades walk; bounded so shades stay mutually
+#: distinguishable, lighter than either anchor, and never wash out on white.
+SHADE_LIGHTNESS_BAND: tuple[float, float] = (0.48, 0.78)
+
+
+def derive_shade(
+    anchor_hex: str,
+    rank: int,
+    n: int,
+    band: tuple[float, float] = SHADE_LIGHTNESS_BAND,
+) -> str:
+    """Derive the ``rank``-th of ``n`` shades of an anchor colour.
+
+    The hue and saturation of the anchor are held; lightness walks monotonically
+    over ``band``. Deterministic and order-stable (stdlib ``colorsys`` only).
+
+    Args:
+        anchor_hex: Anchor colour, ``'#RRGGBB'``.
+        rank: Zero-based position among the ``n`` shades.
+        n: Number of shades in the family (>= 1).
+        band: ``(low, high)`` HLS lightness range to walk.
+
+    Returns:
+        Hex colour ``'#RRGGBB'``.
+
+    Raises:
+        ValueError: If ``rank`` is outside ``[0, n)`` or the band is invalid.
+    """
+    if not 0 <= rank < n:
+        raise ValueError(f"derive_shade: rank {rank} outside [0, {n}).")
+    lo, hi = band
+    if not 0.0 <= lo <= hi <= 1.0:
+        raise ValueError(f"derive_shade: invalid lightness band {band}.")
+    r, g, b = (int(anchor_hex[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+    h, _, sat = colorsys.rgb_to_hls(r, g, b)
+    frac = 0.0 if n == 1 else rank / (n - 1)
+    r2, g2, b2 = colorsys.hls_to_rgb(h, lo + frac * (hi - lo), sat)
+    return "#{:02X}{:02X}{:02X}".format(*(round(c * 255) for c in (r2, g2, b2)))
+
 
 #: Legend / table ordering: headline pair first, then the GP ladder, then baselines.
+#: It also fixes each model's shade rank within its family.
 MODEL_ORDER: tuple[str, ...] = (
     "tabpfn_v2_5",
     "gp_mll",
@@ -159,6 +183,61 @@ MODEL_ORDER: tuple[str, ...] = (
     "random",
 )
 
+#: ``key -> (label, linestyle, marker, family, zorder)``; colours come from the anchors.
+_MODEL_SPECS: dict[str, tuple[str, str, str, str, int]] = {
+    "tabpfn_v2_5": ("TabPFN-2.5", "-", "o", "pfn", 5),
+    "pfns4bo": ("PFNs4BO", "-", "^", "pfn", 3),
+    "tabpfn_v1": ("TabPFN-1", "-", "v", "pfn", 3),
+    "tabflex": ("TabFlex", "-", "<", "pfn", 3),
+    "tabfm": ("TabFM", "-", ">", "pfn", 3),
+    "mitra": ("Mitra", "-", "P", "pfn", 3),
+    "tabicl": ("TabICL", "-", "d", "pfn", 3),
+    "gp_mll": ("GP-MLL", "--", "s", "gp", 4),
+    "gp_naive": ("GP-fixed", "-.", "D", "gp", 3),
+    "gp_oracle": ("GP-oracle", ":", "*", "gp", 3),
+    "gp_deep_kernel": ("GP-deep", "--", "X", "gp", 2),
+    "random": ("Random", ":", "x", "baseline", 1),
+}
+
+_FAMILY_ANCHOR: dict[str, str] = {"pfn": ANCHOR_PFN, "gp": ANCHOR_GP}
+_ANCHOR_KEYS: frozenset[str] = frozenset({"tabpfn_v2_5", "gp_mll"})
+
+
+def _build_model_styles() -> dict[str, ModelStyle]:
+    """Build :data:`MODEL_STYLES`: anchors verbatim, every other model derived."""
+    derived: dict[str, list[str]] = {
+        fam: [k for k in MODEL_ORDER if _MODEL_SPECS[k][3] == fam and k not in _ANCHOR_KEYS]
+        for fam in _FAMILY_ANCHOR
+    }
+    styles: dict[str, ModelStyle] = {}
+    for key, (label, ls, marker, fam, z) in _MODEL_SPECS.items():
+        if fam == "baseline":
+            color = NEUTRAL_GREY
+        elif key in _ANCHOR_KEYS:
+            color = _FAMILY_ANCHOR[fam]
+        else:
+            members = derived[fam]
+            color = derive_shade(_FAMILY_ANCHOR[fam], members.index(key), len(members))
+        styles[key] = ModelStyle(label, color, ls, marker, fam, zorder=z)
+    return styles
+
+
+MODEL_STYLES: dict[str, ModelStyle] = _build_model_styles()
+
+#: Aliases from legacy result-dict ``model_type`` strings to canonical keys.
+MODEL_ALIASES: dict[str, str] = {
+    "gp": "gp_mll",
+    "exact_gp": "gp_mll",
+    "mll_gp": "gp_mll",
+    "naive_gp": "gp_naive",
+    "oracle_gp": "gp_oracle",
+    "deep_kernel_gp": "gp_deep_kernel",
+    "vanilla_tabpfn": "tabpfn_v2_5",
+    "tabpfn": "tabpfn_v2_5",
+    "tabpfn_v2": "tabpfn_v2_5",
+    "pfn": "tabpfn_v2_5",
+    "random_search": "random",
+}
 
 def _canonical_key(model: str) -> str:
     """Resolve a raw model identifier to a key of :data:`MODEL_STYLES`.
@@ -203,6 +282,61 @@ def model_label(model: str) -> str:
 def model_color(model: str) -> str:
     """Return the canonical hex colour for ``model``."""
     return model_style(model).color
+
+
+#: Acquisition order fixes its shade rank; the first is drawn in the model's own colour.
+ACQUISITION_ORDER: tuple[str, ...] = (
+    "ei", "ucb", "ts_marginal", "ts_joint", "pi", "greedy", "random",
+)
+
+#: Linestyle carries acquisition identity, so a model's rows read as one colour family.
+ACQUISITION_LINESTYLES: dict[str, str] = {
+    "ei": "-",
+    "ucb": "--",
+    "ts_marginal": "-.",
+    "ts_joint": ":",
+    "pi": (0, (5, 1, 1, 1, 1, 1)),
+    "greedy": (0, (1, 1)),
+    "random": (0, (3, 1, 1, 1)),
+}
+
+
+def acquisition_style(model: str, acq_type: str) -> ModelStyle:
+    """Return the style of one (model, acquisition) series.
+
+    Colour: the model's colour, shaded by acquisition rank (the first acquisition,
+    ``ei``, keeps the model colour exactly). Linestyle carries the acquisition.
+
+    Args:
+        model: Model identifier (alias-tolerant).
+        acq_type: Acquisition type; must be in :data:`ACQUISITION_ORDER`.
+
+    Returns:
+        A :class:`ModelStyle` whose label reads ``'<model> (<acq>)'``.
+
+    Raises:
+        KeyError: If ``acq_type`` is unknown (fail fast, never a silent default).
+    """
+    if acq_type not in ACQUISITION_ORDER:
+        raise KeyError(
+            f"Unknown acquisition {acq_type!r}; add it to ACQUISITION_ORDER in "
+            f"visualization/style.py (known: {list(ACQUISITION_ORDER)})."
+        )
+    base = model_style(model)
+    rank = ACQUISITION_ORDER.index(acq_type)
+    color = (
+        base.color
+        if rank == 0
+        else derive_shade(base.color, rank - 1, len(ACQUISITION_ORDER) - 1)
+    )
+    return ModelStyle(
+        f"{base.label} ({acq_type})",
+        color,
+        ACQUISITION_LINESTYLES[acq_type],
+        base.marker,
+        base.family,
+        base.zorder,
+    )
 
 
 def model_palette(

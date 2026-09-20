@@ -46,6 +46,7 @@ def build_row(
     model: str,
     acq_type: str,
     rep: int,
+    acq_label: str | None = None,
     knob: str | None = None,
     level: float | None = None,
     achieved: dict[str, float] | None = None,
@@ -59,6 +60,7 @@ def build_row(
         experiment: Experiment type (``'bo_benchmark'`` or ``'stress_sweep'``).
         model: Canonical model key.
         acq_type: Acquisition type name.
+        acq_label: Acquisition config name; defaults to ``acq_type``.
         rep: Repetition index.
         knob: Stress knob name, or None outside a stress sweep.
         level: Knob level, or None.
@@ -74,11 +76,14 @@ def build_row(
         experiment=experiment,
         dataset=channel.dataset,
         demo=channel.demo,
+        normalization=channel.normalization,
         subject=channel.subject,
         emg=channel.emg,
         model=model,
         model_version=row["model_version"],
         acq_type=acq_type,
+        acq_label=acq_label or acq_type,
+        device=str(row.get("device", "")),
         knob=knob,
         level=None if level is None else float(level),
         gt_mode=channel.gt_mode,

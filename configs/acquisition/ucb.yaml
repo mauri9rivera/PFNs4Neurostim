@@ -1,5 +1,11 @@
-# Upper Confidence Bound. kappa=0.0 selects the cosine-annealed auto schedule
-# derived from the search-space dimensionality (gpbo_utils auto-kappa bounds).
+# Upper Confidence Bound with the cosine-annealed, dimensionality-aware kappa schedule
+# (`auto_dim`: alpha=2.5, beta=0.2, floor=3.0). `params.kappa` is only the base value:
+# the schedule overrides it at every step.
+#
+# BUG FIXED 2026-09-20: this file used to set `kappa: 0.0` claiming it selected the auto
+# schedule. Nothing implemented that, so shipped UCB was `mean + 0 * std` = pure greedy.
 type: ucb
 params:
-  kappa: 0.0
+  kappa: 2.0
+schedules:
+  kappa: {kind: auto_dim}

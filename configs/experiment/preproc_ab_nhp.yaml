@@ -1,0 +1,25 @@
+# Task 1 Step 2 - preprocessing A/B on NHP: which (X, y) scaling should GP-MLL see?
+#
+# One arm per invocation, selected with dataset.normalization:
+#   pfn (minmax X, zscore y - the contract) | minmax_x_minmax_y | raw_x_zscore_y | raw_x_minmax_y
+# Compare median recommended regret across arms; the fitted lengthscale/outputscale/noise
+# explain *why*. If the data disagree with the contract, the contract follows the data.
+#
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/preproc_ab_nhp.yaml --set dataset.emgs=[0,1,2] n_reps=5 dataset.normalization=raw_x_minmax_y tag=ab-raw-x-minmax-y
+defaults:
+  dataset: nhp
+  model: [gp_mll]
+  acquisition: ei
+
+experiment: bo_benchmark
+family: preproc-ab
+tag: ab
+
+budget: 50
+n_init: 5
+n_reps: 5
+gt_mode: full_mean
+device: cpu
+seed: 42
+output_root: output
+equivalence_margin: 0.05

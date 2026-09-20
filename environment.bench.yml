@@ -50,8 +50,11 @@ dependencies:
       - linear-operator==0.5.1
       - botorch==0.10.0
       - pyro-ppl==1.9.1
+      # pfns4bo==0.1.5 is deliberately NOT installed here: it pins scikit-learn<1.2, which would
+      # downgrade the 1.6 stack the other models need. PFNs4BO is deferred (sprint Task 7.3); when it
+      # lands, install it with `pip install --no-deps pfns4bo==0.1.5` after resolving its imports.
       # --- TabICL v2 (vendored at libs/tabicl @ v2.2.0; these are its deps) ---
-      - einops
+      - einops==0.8.2   # pinned to match the main env
       - huggingface-hub
       # --- TabFM (vendored at libs/tabfm) ---
       - jax

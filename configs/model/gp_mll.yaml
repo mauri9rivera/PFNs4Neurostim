@@ -2,5 +2,6 @@
 # BO step. The primary comparator for every Hyp A and Hyp B claim (roadmap S8).
 name: gp_mll
 params:
+  device: null   # per-model override of the experiment `device`
   n_opt_steps: 100
   lr: 0.1

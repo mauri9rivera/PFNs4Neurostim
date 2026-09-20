@@ -54,11 +54,14 @@ KEY_COLUMNS: tuple[str, ...] = (
     "experiment",
     "dataset",
     "demo",
+    "normalization",
+    "device",
     "subject",
     "emg",
     "model",
     "model_version",
     "acq_type",
+    "acq_label",
     "knob",
     "level",
     "gt_mode",
@@ -126,6 +129,11 @@ class TidyRow:
         demo: ``'demo2'`` for in-vivo channels, ``'demo1'`` for synthetic ones
             (roadmap Hyp B Demo 1 / Demo 2).
         rep: Integer BO-repetition index.
+        acq_label: Name of the acquisition config (e.g. ``'ucb_k2'``); tells apart
+            several configurations of one ``acq_type``. Defaults to ``acq_type``.
+        device: Torch device this model ran on (per-model override aware).
+        normalization: Preprocessing mode that produced the channel (a key of
+            ``data.preprocessing.NORMALIZATIONS``).
         r2: Final-prediction R² of the surrogate (secondary metric).
         spearman: Spearman correlation of the surrogate's final prediction.
         final_regret: Regret at the last BO step, range-normalized (P0.9).
@@ -172,6 +180,9 @@ class TidyRow:
 
     # --- key column with a default (Demo 2 = in vivo is the common case) ---
     demo: str = "demo2"
+    normalization: str = "pfn"
+    acq_label: str = ""
+    device: str = ""
 
     # --- metric / value columns (optional; None => NaN at write time) ---
     r2: Optional[float] = None
@@ -200,6 +211,8 @@ class TidyRow:
     seed: Optional[int] = None
 
     def __post_init__(self) -> None:
+        if not self.acq_label:
+            object.__setattr__(self, "acq_label", self.acq_type)
         for col in METRIC_COLUMNS:
             value = getattr(self, col)
             if value is None:

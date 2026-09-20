@@ -2,4 +2,5 @@
 # n_estimators=1 -> one transformer call per BO step, matching every kept benchmark.
 name: tabpfn_v2_5
 params:
+  device: null   # per-model override of the experiment `device`
   n_estimators: 1
