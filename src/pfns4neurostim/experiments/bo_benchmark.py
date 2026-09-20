@@ -26,7 +26,7 @@ import argparse
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -40,7 +40,7 @@ from ..evaluation.bo_runner import run_channel_bo
 from ..evaluation.results import TidyRow
 from ..models.registry import MODEL_REGISTRY
 from ..seeding import seed_for
-from ._cells import cell_identity, row_from_payload
+from ._cells import cell_identity, count_channels, row_from_payload
 from ._rows import build_row
 
 __all__ = ["run_bo_benchmark", "build_acquisition_table", "main"]
@@ -166,6 +166,7 @@ def run_bo_benchmark(
     run_dir: str | None = None,
     use_cache: bool = True,
     only_cached: bool = False,
+    on_cell: Callable[[], None] | None = None,
 ) -> str:
     """Run (or re-summarize) a models x acquisitions benchmark.
 
@@ -179,6 +180,8 @@ def run_bo_benchmark(
         use_cache: ``False`` (``--no-cache``) neither reads nor writes the cell cache.
         only_cached: ``True`` (``--only-cached``) assembles outputs from cached cells
             without computing any.
+        on_cell: Called once per cell served (computed or cached); drives the
+            cluster-diagnostics throughput counter.
 
     Returns:
         Path to the run directory.
@@ -205,7 +208,9 @@ def run_bo_benchmark(
         rows: list[TidyRow] = []
         trajectories: dict[tuple[Any, ...], dict[str, Any]] = {}
         skipped: list[str] = []
-        store = CellStore(cfg.cell_cache_root, enabled=use_cache, only_cached=only_cached)
+        store = CellStore(
+            cfg.cell_cache_root, enabled=use_cache, only_cached=only_cached, on_cell=on_cell
+        )
 
         for channel in iter_channels(
             cfg.dataset.name,
@@ -310,12 +315,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     cfg = load_experiment_config(args.config, args.overrides)
+    diag_on = diagnostics_enabled(args.cluster_diag)
+    planned = (
+        count_channels(cfg)
+        * cfg.n_reps
+        * sum(_supported(m, a.type) for m in cfg.models for a in cfg.acquisitions)
+        if diag_on and not args.replot
+        else 0
+    )
     with ClusterDiagnostics(
-        tag=f"{cfg.family}-{cfg.tag}", device=cfg.device,
-        enabled=diagnostics_enabled(args.cluster_diag),
-    ):
+        tag=f"{cfg.family}-{cfg.tag}", device=cfg.device, n_planned=planned,
+        enabled=diag_on,
+    ) as diag:
         run_bo_benchmark(
             args.config, args.overrides, replot=args.replot, run_dir=args.run_dir,
             use_cache=not args.no_cache, only_cached=args.only_cached,
+            on_cell=diag.record_experiment,
         )
     return 0

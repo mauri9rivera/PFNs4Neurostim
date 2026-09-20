@@ -214,6 +214,31 @@ def _parse_slurm_timelimit(raw: Optional[str]) -> Optional[float]:
         return None
 
 
+def _read_slurm_timelimit() -> Optional[float]:
+    """Return the job time limit in seconds, or ``None`` if it cannot be found.
+
+    ``SLURM_TIMELIMIT`` is not exported into every job step (it was absent on Mila),
+    so fall back to asking the scheduler: ``squeue -h -j $SLURM_JOB_ID -o %l``.
+
+    Returns:
+        Time limit in seconds, or ``None``.
+    """
+    limit = _parse_slurm_timelimit(os.environ.get('SLURM_TIMELIMIT'))
+    if limit is not None:
+        return limit
+    job_id = os.environ.get('SLURM_JOB_ID', '').strip()
+    if not job_id.isdigit():
+        return None
+    try:
+        out = subprocess.run(
+            ['squeue', '-h', '-j', job_id, '-o', '%l'],
+            capture_output=True, text=True, timeout=10, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _parse_slurm_timelimit(out.strip().splitlines()[0] if out.strip() else None)
+
+
 def _parse_slurm_mem_mb() -> Optional[int]:
     """Parse ``SLURM_MEM_PER_NODE`` to megabytes.
 
@@ -315,10 +340,10 @@ _WARNING_RULES: List[Dict[str, Any]] = [
         ),
         'text': (
             'GPU_MEM_UNDERUSE: Peak GPU memory {peak_gpu_gb:.1f} GB is below '
-            '75%% of requested {req_gb:.1f} GB ({pct:.0f}%% utilisation).'
+            '75% of requested {req_gb:.1f} GB ({pct:.0f}% utilisation).'
         ),
         'fix': (
-            'Reduce --mem to peak + 20%% headroom:\n'
+            'Reduce --mem to peak + 20% headroom:\n'
             '  #SBATCH --mem={suggested_mem_gb:.0f}G'
         ),
     },
@@ -331,11 +356,11 @@ _WARNING_RULES: List[Dict[str, Any]] = [
         ),
         'text': (
             'WALLTIME_OVERREQUEST: Job used {elapsed_h:.2f}h of '
-            '{limit_h:.2f}h requested ({pct:.0f}%%). '
+            '{limit_h:.2f}h requested ({pct:.0f}%). '
             'Over-requesting time lowers your Fairshare score.'
         ),
         'fix': (
-            'Reduce --time to elapsed + 20%% rounded to 15 min:\n'
+            'Reduce --time to elapsed + 20% rounded to 15 min:\n'
             '  #SBATCH --time={suggested_time}'
         ),
     },
@@ -347,7 +372,7 @@ _WARNING_RULES: List[Dict[str, Any]] = [
             and (sum(m.gpu_util_samples) / len(m.gpu_util_samples)) < 50
         ),
         'text': (
-            'GPU_IDLE: Mean GPU utilisation {mean_util:.0f}%% < 50%%. '
+            'GPU_IDLE: Mean GPU utilisation {mean_util:.0f}% < 50%. '
             'The GPU is idle for more than half the job.'
         ),
         'fix': (
@@ -369,7 +394,7 @@ _WARNING_RULES: List[Dict[str, Any]] = [
         ),
         'text': (
             'CUDA_FRAGMENTATION: PyTorch reserved {res_gb:.2f} GB but peak '
-            'allocation was only {peak_gb:.2f} GB ({frag_pct:.0f}%% wasted by '
+            'allocation was only {peak_gb:.2f} GB ({frag_pct:.0f}% wasted by '
             'allocator caching).'
         ),
         'fix': (
@@ -403,10 +428,10 @@ _WARNING_RULES: List[Dict[str, Any]] = [
         ),
         'text': (
             'RAM_UNDERUSE: Peak RSS {peak_rss_gb:.1f} GB is below '
-            '70%% of requested RAM {req_ram_gb:.1f} GB ({pct:.0f}%%).'
+            '70% of requested RAM {req_ram_gb:.1f} GB ({pct:.0f}%).'
         ),
         'fix': (
-            'Reduce --mem to peak RSS + 25%% headroom:\n'
+            'Reduce --mem to peak RSS + 25% headroom:\n'
             '  #SBATCH --mem={suggested_mem_gb:.0f}G'
         ),
     },
@@ -478,9 +503,7 @@ class ClusterDiagnostics:
         m.job_id = os.environ.get('SLURM_JOB_ID')
         m.array_task_id = os.environ.get('SLURM_ARRAY_TASK_ID')
         m.cluster_name = _detect_cluster()
-        m.slurm_timelimit_s = _parse_slurm_timelimit(
-            os.environ.get('SLURM_TIMELIMIT')
-        )
+        m.slurm_timelimit_s = _read_slurm_timelimit()
         mem_mb = _parse_slurm_mem_mb()
         if mem_mb is not None:
             m.requested_mem_bytes = mem_mb * 1024 * 1024
@@ -746,7 +769,7 @@ class ClusterDiagnostics:
         else:
             lines.append(_row(
                 f'  [??] Walltime : {m.elapsed_s/3600:.2f}h  '
-                f'(SLURM_TIMELIMIT not set)'
+                f'(time limit unavailable)'
             ))
 
         # ---- GPU Memory ----

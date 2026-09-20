@@ -435,3 +435,42 @@ class TestEdgeCases:
         diag._t0 = time.time()
         diag._metrics.elapsed_s = 60.0
         _ = diag.format_terminal_report()
+
+
+# ---------------------------------------------------------------------------
+# Time limit fallback and template text (2026-09-20 fixes)
+# ---------------------------------------------------------------------------
+class TestTimelimitAndText:
+    def test_env_var_wins(self) -> None:
+        from pfns4neurostim.diagnostics.cluster import _read_slurm_timelimit
+
+        with patch.dict(os.environ, {"SLURM_TIMELIMIT": "1:00:00"}):
+            assert _read_slurm_timelimit() == 3600.0
+
+    def test_falls_back_to_squeue(self) -> None:
+        from types import SimpleNamespace
+
+        from pfns4neurostim.diagnostics.cluster import _read_slurm_timelimit
+
+        env = {k: v for k, v in os.environ.items() if k != "SLURM_TIMELIMIT"}
+        env["SLURM_JOB_ID"] = "123"
+        with patch.dict(os.environ, env, clear=True), patch(
+            "pfns4neurostim.diagnostics.cluster.subprocess.run",
+            return_value=SimpleNamespace(stdout="1-00:00:00\n"),
+        ) as run:
+            assert _read_slurm_timelimit() == 86400.0
+        assert run.call_args[0][0][:4] == ["squeue", "-h", "-j", "123"]
+
+    def test_no_job_no_limit(self) -> None:
+        from pfns4neurostim.diagnostics.cluster import _read_slurm_timelimit
+
+        env = {k: v for k, v in os.environ.items() if k not in ("SLURM_TIMELIMIT", "SLURM_JOB_ID")}
+        with patch.dict(os.environ, env, clear=True):
+            assert _read_slurm_timelimit() is None
+
+    def test_warning_templates_have_no_doubled_percent(self) -> None:
+        import inspect
+
+        from pfns4neurostim.diagnostics import cluster
+
+        assert "%%" not in inspect.getsource(cluster)

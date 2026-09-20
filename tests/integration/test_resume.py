@@ -115,3 +115,13 @@ def test_per_model_device_override_wins_and_is_logged(channel: ChannelData) -> N
     row = build_row(res, channel, run_tag="t", experiment="bo_benchmark", model="gp_naive",
                     acq_type="ei", rep=0, acq_label="ei")
     assert row.device == "cpu" and row.acq_label == "ei"
+
+
+def test_count_channels_uses_explicit_emgs(tmp_path: Any) -> None:
+    from pfns4neurostim.experiments._cells import count_channels
+
+    cfg2 = load_experiment_config(
+        "configs/experiment/stress_k2_nhp.yaml",
+        ["dataset.subjects=[0,3]", "dataset.emgs=[0,1,2]", f"output_root={tmp_path}"],
+    )
+    assert count_channels(cfg2) == 6

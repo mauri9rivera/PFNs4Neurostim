@@ -91,3 +91,12 @@ class TestCellStore:
         assert store.run("nhp", "x", IDENT, "cellA", boom) is None
         with pytest.raises(RuntimeError, match="cellA: ValueError: bad cell"):
             store.raise_if_failed()
+
+
+def test_on_cell_called_for_hits_and_computes_not_failures(tmp_path: Any) -> None:
+    seen: list[int] = []
+    store = CellStore(str(tmp_path), on_cell=lambda: seen.append(1))
+    store.run("nhp", "x", IDENT, "c", lambda: ({"row": {}}, {}))       # computed
+    store.run("nhp", "x", IDENT, "c", lambda: pytest.fail("cached"))   # hit
+    store.run("nhp", "x", {**IDENT, "seed": 9}, "f", lambda: 1 / 0)    # failure
+    assert len(seen) == 2

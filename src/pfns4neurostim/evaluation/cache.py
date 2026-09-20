@@ -175,6 +175,8 @@ class CellStore:
         enabled: ``False`` (``--no-cache``) neither reads nor writes the store.
         only_cached: ``True`` (``--only-cached``) never computes: cached cells are
             harvested, everything else is skipped. Used to assemble partial output.
+        on_cell: Called once per cell that was served (computed or cached), e.g. to
+            feed a progress/throughput counter. Not called for failed cells.
         hits: Cells served from the cache this run.
         computed: Cells computed this run.
         failures: Cells that raised.
@@ -183,6 +185,7 @@ class CellStore:
     root: str
     enabled: bool = True
     only_cached: bool = False
+    on_cell: Callable[[], None] | None = None
     hits: int = 0
     computed: int = 0
     failures: list[CellFailure] = field(default_factory=list)
@@ -214,6 +217,7 @@ class CellStore:
             if hit is not None:
                 self.hits += 1
                 print(f"[cache] hit {label}", flush=True)
+                self._served()
                 return hit
         if self.only_cached:
             return None
@@ -226,7 +230,13 @@ class CellStore:
         self.computed += 1
         if self.enabled:
             save_cell(self.root, dataset, experiment, key, identity, payload, trajectory)
+        self._served()
         return payload, trajectory
+
+    def _served(self) -> None:
+        """Notify the progress callback that one cell was served."""
+        if self.on_cell is not None:
+            self.on_cell()
 
     def raise_if_failed(self) -> None:
         """Raise one error listing every failed cell (call after outputs are written).

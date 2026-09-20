@@ -1,22 +1,37 @@
 #!/bin/bash
 # ============================================================
-#  Run from the LOCAL machine to pull results from Mila.
-#  Usage:
-#    bash scripts/export_results.sh <mila_username>                # benchmark/, stress/ and cells/
-#    bash scripts/export_results.sh <mila_username> stress/k2_snr  # one sub-tree of output/
+#  Pull results from Mila into the local ./output tree.
 #
-#  The remote root matches scripts/mila_setup.sh ($SCRATCH/pfns4neurostim). Pulling
-#  output/cells/ brings the per-cell cache home too, so figures regenerate with `--replot`
-#  and a later local run reuses every finished cell.
+#  Run it from a shell that has rsync AND the SSH control socket. On the Windows dev box that
+#  is WSL (Git Bash has no rsync, and the socket lives in WSL):
+#
+#    wsl -e bash -lc 'cd /mnt/c/workspace/PFNs4Neurostim && bash scripts/export_results.sh'
+#    wsl -e bash -lc 'cd /mnt/c/workspace/PFNs4Neurostim && bash scripts/export_results.sh stress/k2_snr/nhp'
+#
+#  Usage:
+#    bash scripts/export_results.sh [subpath under output/]     # default: benchmark/ stress/ cells/
+#
+#  It reuses the control socket opened with `bash scripts/mila.sh open`, so it never asks for an
+#  OTP and fails within seconds if the socket is down. Transfer is one-way (Mila -> local) and
+#  never deletes local files. Pulling output/cells/ also brings the per-cell cache home, so a
+#  later local run reuses every finished cell and `--replot` rebuilds figures from tidy.csv.
+#
+#  Env: MILA_HOST (default mila), MILA_SOCKET (default ~/.ssh/cm-mila.sock),
+#       MILA_REMOTE_OUTPUT (default ~/scratch/pfns4neurostim/output).
 # ============================================================
-MILA_USER=${1:?Usage: $0 <mila_username> [subpath under output/]}
-SUBPATH=${2:-}
-REMOTE="$MILA_USER@login.server.mila.quebec"
+set -euo pipefail
+
+SUBPATH="${1:-}"
+MILA_HOST="${MILA_HOST:-mila}"
+MILA_SOCKET="${MILA_SOCKET:-$HOME/.ssh/cm-mila.sock}"
 REMOTE_OUT="${MILA_REMOTE_OUTPUT:-~/scratch/pfns4neurostim/output}"
 LOCAL_OUT="./output"
 
-if [ -n "$SUBPATH" ]; then
-    TARGETS=("$SUBPATH")
+command -v rsync >/dev/null 2>&1 || { echo "rsync not found: run this from WSL/Linux." >&2; exit 1; }
+SSH_CMD="ssh -S ${MILA_SOCKET} -o ControlMaster=no -o BatchMode=yes -o ConnectTimeout=10"
+
+if [ -n "${SUBPATH}" ]; then
+    TARGETS=("${SUBPATH}")
 else
     TARGETS=(benchmark stress cells)
 fi
@@ -24,7 +39,7 @@ fi
 for t in "${TARGETS[@]}"; do
     mkdir -p "${LOCAL_OUT}/${t}"
     echo "Syncing ${t}"
-    rsync -avz --progress "${REMOTE}:${REMOTE_OUT}/${t}/" "${LOCAL_OUT}/${t}/"
+    rsync -avz --progress -e "${SSH_CMD}" "${MILA_HOST}:${REMOTE_OUT}/${t}/" "${LOCAL_OUT}/${t}/"
 done
 
 echo "Sync complete -> ${LOCAL_OUT}"
