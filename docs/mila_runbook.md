@@ -33,7 +33,7 @@ cd ~/projects/PFNs4Neurostim
 git checkout scripts/mila_setup.sh && git pull          # drop the hand-copied file first, then pull
 bash scripts/mila_setup.sh install                      # editable install into the MAIN env
 # 2. bench env (Python 3.11: TabICL, TabFM) - ~10-20 min, only needed for the D3 PFN benchmark
-bash scripts/mila_setup.sh env bench
+sbatch scripts/setup_env_job.sh bench                 # NOT on the login node: conda is killed there (memory limit)
 bash scripts/mila_setup.sh submodules                   # libs/tabicl + libs/tabfm are used from the submodules via sys.path
 # 3. smoke-test the bench env on a login node (no GPU needed for the import checks)
 module load anaconda/3 && conda run -n pfns4neurostim-bench python -c "from pfns4neurostim.models.pfn.external import availability; print(availability())"
@@ -112,6 +112,7 @@ Run directories are `output/benchmark/<dataset>/<family>-<tag>/` and
 | `ModuleNotFoundError: No module named 'pfns4neurostim.data'` (jobs 10854595, 10854603) | `.gitignore` had `data` / `data/`, which also matched `src/pfns4neurostim/data/` and `tests/data/`, so the package was **never committed** and the cluster checkout lacks it | `.gitignore` now anchors `/data` and `/data/`. Commit, push, then on the cluster `git checkout scripts/run_stress_sweep.sh && git pull` (drop the local hand-patch first) and re-run `bash scripts/mila_setup.sh install` |
 | `conda: command not found` from `bash scripts/mila.sh run -- 'bash scripts/mila_setup.sh verify'` | a non-interactive SSH shell has no conda on `PATH` | `mila_setup.sh` now calls `load_conda` (loads `anaconda/3`) in `env`, `install`, `deps`, `verify` |
 | `set: pipefail: invalid option name` | a shell script with CRLF line endings (Windows edit) | `.gitattributes` forces `*.sh` to LF; run `sed -i 's/\r$//' scripts/*.sh` if a working copy was edited on Windows |
+| `Killed` from `conda env create` on the login node | the login node's per-process memory limit is hit parsing the conda-forge index | build inside a job: `sbatch scripts/setup_env_job.sh bench` |
 | `Permission denied (keyboard-interactive)` from `mila.sh run` | control socket not open | `bash scripts/mila.sh open`, run the printed command, enter the OTP |
 
 Other state observed on the cluster: the checkout is at commit `1bf4a0a` (stale); the main env
