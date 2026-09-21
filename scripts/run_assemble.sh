@@ -28,5 +28,6 @@ job_activate
 # Do NOT override `device` here: it is part of every cell's cache identity, so overriding it makes the assembly miss the
 # cells the GPU jobs wrote (found on Mila 2026-09-20: TabPFN cells were silently absent). Assembly never computes,
 # so the configured device is never used.
-python -m pfns4neurostim "${EXPERIMENT}" --config "${CONFIG}" --only-cached "$@"
+# `--set` takes zero or more key=value overrides, so it is safe when "$@" is empty (the portfolio passes none).
+python -m pfns4neurostim "${EXPERIMENT}" --config "${CONFIG}" --only-cached --set "$@"
 echo "[run_assemble] done: ${EXPERIMENT} ${CONFIG}"
