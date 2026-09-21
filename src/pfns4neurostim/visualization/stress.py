@@ -604,7 +604,8 @@ def plot_breakdown_vs_budget(
         ax.plot(grp["budget"][~broken], y[~broken], linestyle="none", marker=S.model_style(str(model)).marker,
                 markerfacecolor="white", color=color, markersize=S.MARKER_SIZE + 1)
     ax.set_xlabel(S.axis_label("budget"))
-    ax.set_ylabel(f"Breakdown point ({S.axis_label(x_col)})")
+    ax.set_ylabel(f"Breakdown point
+({S.axis_label(x_col)})")
     ax.set_title(f"{S.DATASET_LABELS.get(dataset, dataset)} - {S.KNOB_LABELS.get(knob, knob)} breakdown", loc="left")
     ax.legend(loc="best")
     fig.tight_layout()

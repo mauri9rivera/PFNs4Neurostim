@@ -459,7 +459,7 @@ AXIS_LABELS: dict[str, str] = {
 KNOB_LABELS: dict[str, str] = {
     "k1_decoy": r"K1 decoy peak (amplitude ratio $a_2/a_1$)",
     "k2_snr": "K2 SNR",
-    "k5_outliers": r"K5 outlier contamination (fraction $\epsilon$)",
+    "k5_outliers": "K5 outlier contamination",
     "k6_budget": "K6 sparsity (BO iterations)",
     "k6_dropout": "K6 sparsity (electrode dropout fraction)",
     "k7_shuffle": r"K7 spatial shuffle fraction $f$",
