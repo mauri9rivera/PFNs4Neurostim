@@ -25,7 +25,7 @@ SUBPATH="${1:-}"
 MILA_HOST="${MILA_HOST:-mila}"
 MILA_SOCKET="${MILA_SOCKET:-$HOME/.ssh/cm-mila.sock}"
 REMOTE_OUT="${MILA_REMOTE_OUTPUT:-~/scratch/pfns4neurostim/output}"
-LOCAL_OUT="./output"
+LOCAL_OUT="${LOCAL_OUT:-./output}"
 
 command -v rsync >/dev/null 2>&1 || { echo "rsync not found: run this from WSL/Linux." >&2; exit 1; }
 SSH_CMD="ssh -S ${MILA_SOCKET} -o ControlMaster=no -o BatchMode=yes -o ConnectTimeout=10"
