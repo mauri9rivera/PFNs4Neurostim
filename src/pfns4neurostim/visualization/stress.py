@@ -310,13 +310,13 @@ def plot_outcome_panels(
     axes[0].legend(loc="best")
     n_reps = int(df["rep"].nunique()) if "rep" in df.columns else 0
     n_chan = int(df[["subject", "emg"]].drop_duplicates().shape[0])
-    axes[0].set_title(
+    fig.suptitle(
         f"{S.DATASET_LABELS.get(dataset, dataset)} - {S.KNOB_LABELS.get(knob, knob)} "
         f"(n={n_reps} reps, {n_chan} channels)",
-        loc="left",
+        x=0.01, ha="left", fontsize=S.FONT_SIZES["title"],
     )
-    S.panel_letters(axes, x=-0.22)
-    fig.tight_layout()
+    S.panel_letters(axes, x=-0.3)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
     return S.save_figure(fig, out_dir, f"outcomes_{'invivo' if demo == 'demo2' else 'synthetic'}")
 
 
