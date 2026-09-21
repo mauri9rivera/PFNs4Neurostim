@@ -25,5 +25,8 @@ cd "${REPO_DIR}"
 source "${REPO_DIR}/scripts/_job_common.sh"
 
 job_activate
-python -m pfns4neurostim "${EXPERIMENT}" --config "${CONFIG}" --only-cached --set "device=cpu" "$@"
+# Do NOT override `device` here: it is part of every cell's cache identity, so overriding it makes the assembly miss the
+# cells the GPU jobs wrote (found on Mila 2026-09-20: TabPFN cells were silently absent). Assembly never computes,
+# so the configured device is never used.
+python -m pfns4neurostim "${EXPERIMENT}" --config "${CONFIG}" --only-cached "$@"
 echo "[run_assemble] done: ${EXPERIMENT} ${CONFIG}"

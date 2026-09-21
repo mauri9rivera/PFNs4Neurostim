@@ -185,3 +185,38 @@ def test_empty_shard_noop_in_stress_sweep(
         OVERRIDES + [f"output_root={tmp_path}"], shard=(5, 8),
     )
     assert "owns no channels" in capsys.readouterr().out
+
+
+def test_cell_identity_depends_on_experiment_device_so_job_scripts_must_not_override_it(channel: ChannelData) -> None:
+    """Regression (found on Mila 2026-09-20): forcing device=cpu in the CPU/assemble scripts hid cells from each other."""
+    import re
+
+    from pfns4neurostim.evaluation.cache import cell_key
+    from pfns4neurostim.experiments._cells import cell_identity
+
+    keys = {}
+    for dev in ("cuda", "cpu"):
+        cfg = load_experiment_config("configs/experiment/hyp_a_nhp.yaml", [f"device={dev}"])
+        acq = cfg.acquisitions[0]
+        keys[dev] = cell_key(cell_identity(cfg, channel, "gp_naive", acq, experiment="bo_benchmark", rep=0, seed=1, budget=96))
+    assert keys["cuda"] != keys["cpu"]  # the reason the scripts below must leave `device` alone
+
+    for script in ("scripts/run_cpu.sh", "scripts/run_assemble.sh"):
+        code = "\n".join(l for l in open(script, encoding="utf-8").read().splitlines() if not l.lstrip().startswith("#"))
+        assert not re.search(r"device=", code), f"{script} must not override the experiment device"
+
+
+def test_host_info_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provenance is written at the end of a run; a broken CUDA query must not fail it."""
+    import torch
+
+    from pfns4neurostim import config
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def boom(_i: int) -> str:
+        raise RuntimeError("no CUDA GPUs are available")
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", boom)
+    info = config._host_info()
+    assert info["cuda_device"] is None and info["node"]

@@ -26,7 +26,10 @@ set -euo pipefail
 EXPERIMENT="${1:?usage: sbatch scripts/run_cpu.sh <bo_benchmark|stress_sweep> <config.yaml> [key=value ...]}"
 CONFIG="${2:?missing config.yaml}"
 shift 2 || true
-OVERRIDES=("$@" "device=cpu")
+# Do NOT force `device=cpu` here: `device` is part of every cell's cache identity, so forcing it makes these cells invisible
+# to the GPU jobs and to the assembly of the same config (found on Mila 2026-09-20). The GP models carry their own CPU pin
+# (model_params.<gp>.device: cpu) and Random is numpy-only, so no GPU is touched either way.
+OVERRIDES=("$@")
 
 REPO_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "${REPO_DIR}"

@@ -513,8 +513,8 @@ def _host_info() -> dict[str, Any]:
 
         if torch.cuda.is_available():
             device = torch.cuda.get_device_name(0)
-    except ImportError:
-        pass
+    except Exception:  # noqa: BLE001 - provenance must never fail a finished run (e.g. CUDA half-visible)
+        device = None
     return {
         "node": platform.node(),
         "cuda_device": device,
