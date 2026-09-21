@@ -44,6 +44,10 @@ R2_AXIS_FLOOR: float = -1.0
 #: Columns per row of the shared legend.
 LEGEND_COLUMNS: int = 4
 
+#: Models left out of the latency figure: random search is trivially the fastest, and GP-fixed (no
+#: hyperparameter fitting) is not a like-for-like cost comparison with the fitted models.
+LATENCY_EXCLUDED_MODELS: tuple[str, ...] = ("random", "gp_naive")
+
 LATENCY_NOTE: str = "Latency comparison pending the converged-GP fix (P0.10); not evidence of a speed advantage."
 
 
@@ -202,7 +206,7 @@ def plot_latency_curves(frame: pd.DataFrame, out_dir: str, *, dataset: str, name
     Returns:
         Paths written (empty when no latency was recorded).
     """
-    frame = frame[frame["latency"].map(len) > 0]
+    frame = frame[(frame["latency"].map(len) > 0) & ~frame["model"].isin(LATENCY_EXCLUDED_MODELS)]
     if frame.empty:
         return []
     frame = frame.assign(latency=frame["latency"].map(lambda a: a if len(a) else None))
