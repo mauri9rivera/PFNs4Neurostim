@@ -30,7 +30,5 @@ submit_unit "2b. K2 noise amplification 5d_rat" stress_sweep scripts/run_stress_
 submit_unit "3a. D3 PFN benchmark NHP (TabPFN-2.5, TabICL, GP-MLL)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll"
 submit_unit "3b. D3 PFN benchmark 5d_rat (TabPFN-2.5, TabICL, GP-MLL)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll"
 submit_unit "4. K5 outliers 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive"
-submit_unit "5a. D3 TabFM NHP (LAST PFN job)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml pfns4neurostim-bench "tabfm" "-"
-submit_unit "5b. D3 TabFM 5d_rat (LAST PFN job)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml pfns4neurostim-bench "tabfm" "-"
 
 echo "Done. Check with: squeue --me"

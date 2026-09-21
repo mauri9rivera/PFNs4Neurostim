@@ -42,7 +42,7 @@ class Unit:
         gpu_models: Models needing a GPU (may be empty).
         cpu_models: Models run on the CPU partition (may be empty).
         multiplier: Cells per repetition per model (knob levels, or a budget-scaling factor).
-        machine: ``mila`` or ``local``.
+        machine: ``mila``, ``local`` or ``deferred`` (planned but not scheduled).
         env: Conda env for the cluster jobs.
         note: Free-text remark.
     """
@@ -74,11 +74,13 @@ UNITS: tuple[Unit, ...] = (
          "bench env (py3.11); TabICL cost assumed = TabPFN until calibrated"),
     Unit("4. K5 outliers 5d_rat", "stress_sweep", "configs/experiment/stress_k5_5d_rat.yaml", "5d_rat",
          ("tabpfn_v2_5",), ("gp_mll", "gp_naive"), 5, "mila", note="real lab artefacts; 5 calibrated levels"),
-    Unit("5a. D3 TabFM NHP (LAST PFN job)", "bo_benchmark", "configs/experiment/hyp0_pfn_bench_nhp.yaml", "nhp",
-         ("tabfm",), (), 1, "mila", BENCH_ENV,
-         "COST UNMEASURED: ~340 s per 96-site predict on CPU, so GPU-only; calibrate first (see the printed calibration line)"),
-    Unit("5b. D3 TabFM 5d_rat (LAST PFN job)", "bo_benchmark", "configs/experiment/hyp0_pfn_bench_5d_rat.yaml", "5d_rat",
-         ("tabfm",), (), 1, "mila", BENCH_ENV, "COST UNMEASURED: GPU-only; calibrate first"),
+    Unit("L3b. D3 TabFM NHP", "bo_benchmark", "configs/experiment/hyp0_pfn_bench_nhp.yaml", "nhp",
+         ("tabfm",), (), 1, "local", BENCH_ENV,
+         "MEASURED on Mila (job 10871697, RTX 8000): 99 s/rep = ~5 h serial, ~9.9 GB RAM per process (needs --mem=24G and <=2 lanes "
+         "if ever run on the cluster); run locally on the RTX 3060 (bf16) with 1-2 lanes"),
+    Unit("D. D3 TabFM 5d_rat (DEFERRED)", "bo_benchmark", "configs/experiment/hyp0_pfn_bench_5d_rat.yaml", "5d_rat",
+         ("tabfm",), (), 1, "deferred", BENCH_ENV,
+         "UNMEASURED and probably infeasible: TabFM predict cost grows with query rows (2048 sites vs 96 on NHP); calibrate on 5d_rat first"),
     Unit("L1. D1 NHP (RUNNING locally)", "bo_benchmark", "configs/experiment/hyp_a_nhp.yaml", "nhp",
          ("tabpfn_v2_5",), ("gp_mll", "gp_naive", "random"), 1, "local"),
     Unit("L2. K6-budget NHP", "stress_sweep", "configs/experiment/stress_k6_budget_nhp.yaml", "nhp",
@@ -126,10 +128,15 @@ def print_plan(machine: str) -> None:
             if "tabfm" in unit.gpu_models:
                 print(f"# calibrate first: {env}sbatch scripts/run_bo_benchmark.sh {unit.config} \"models=[tabfm]\" "
                       "dataset.subjects=[1] dataset.emgs=[0] n_reps=2 tag=calib")
+        elif unit.machine == "local":
+            py = "python" if unit.env == "pfns4neurostim" else f"conda run -n {unit.env} python"
+            if gm:
+                print(f"{py} -m pfns4neurostim {unit.experiment} --config {unit.config} --set \"models=[{gm}]\" tag=local-gpu")
+            if cm:
+                print(f"{py} -m pfns4neurostim {unit.experiment} --config {unit.config} --set \"models=[{cm}]\" tag=local-cpu")
+            print(f"{py} -m pfns4neurostim {unit.experiment} --config {unit.config} --only-cached")
         else:
-            print(f"python -m pfns4neurostim {unit.experiment} --config {unit.config} --set \"models=[{gm}]\" tag=local-gpu")
-            print(f"python -m pfns4neurostim {unit.experiment} --config {unit.config} --set \"models=[{cm}]\" tag=local-cpu")
-            print(f"python -m pfns4neurostim {unit.experiment} --config {unit.config} --only-cached")
+            print("# deferred: not scheduled")
     print("\n# Mila caps: 2 GPUs on `main` (extra GPU jobs queue), 8 CPUs on `main-cpu`. Watch: bash scripts/mila.sh queue")
     print("# One command submits everything with dependencies: bash scripts/submit_portfolio.sh")
 
@@ -175,7 +182,7 @@ def emit_bash() -> None:
 def main() -> None:
     """Entry point."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--machine", choices=["mila", "local", "all"], default="all")
+    parser.add_argument("--machine", choices=["mila", "local", "deferred", "all"], default="all")
     parser.add_argument("--emit-bash", action="store_true", help="Write scripts/submit_portfolio.sh to stdout.")
     args = parser.parse_args()
     if args.emit_bash:
