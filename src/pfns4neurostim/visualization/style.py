@@ -433,6 +433,7 @@ AXIS_LABELS: dict[str, str] = {
     "budget": r"BO iterations (incl. $n_\mathrm{init}$)",
     "iteration": "BO iteration",
     "achieved_snr_db": "Achieved SNR (dB)",
+    "target_delta_snr_db": "SNR degradation vs channel floor (dB)",
     "achieved_contamination": r"Achieved contamination (fraction of trials)",
     "achieved_dropout": "Achieved electrode dropout (fraction)",
     "achieved_budget": r"BO iterations (incl. $n_\mathrm{init}$)",
@@ -469,7 +470,7 @@ KNOB_LABELS: dict[str, str] = {
 KNOB_X_AXIS: dict[str, str] = {
     "k1_decoy": "level",
     "k2_snr": "achieved_snr_db",
-    "k5_outliers": "level",
+    "k5_outliers": "target_delta_snr_db",
     "k6_budget": "budget",
     "k6_dropout": "level",
     "k7_shuffle": "level",

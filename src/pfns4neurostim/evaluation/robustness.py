@@ -33,6 +33,31 @@ __all__ = [
 ]
 
 
+def _noninferiority(a: np.ndarray, b: np.ndarray, margin: float, alpha: float = 0.05) -> dict[str, Any]:
+    """One-sided paired non-inferiority test for a lower-is-better metric.
+
+    H0: mean(a - b) >= margin (the model is worse than the reference by at least ``margin``);
+    H1: mean(a - b) < margin. Unlike a two-sided equivalence test, a model that is clearly *better*
+    than the reference passes.
+
+    Args:
+        a: Metric values of the model, shape [n].
+        b: Paired values of the reference, shape [n].
+        margin: Non-inferiority margin, in the metric's units.
+        alpha: Significance level.
+
+    Returns:
+        ``p`` (one-sided p-value) and ``ok`` (True when non-inferiority is shown at ``alpha``).
+    """
+    from scipy import stats
+
+    diff = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)   # [n]
+    if diff.size < 2 or float(np.std(diff, ddof=1)) == 0.0:
+        return {"p": float("nan"), "ok": bool(diff.size > 0 and float(np.mean(diff)) < margin)}
+    res = stats.ttest_1samp(diff, margin, alternative="less")
+    return {"p": float(res.pvalue), "ok": bool(res.pvalue < alpha)}
+
+
 def _tost(a: np.ndarray, b: np.ndarray, margin: float, alpha: float = 0.05) -> dict[str, Any]:
     """Run the paired TOST equivalence test through the legacy implementation.
 
@@ -158,6 +183,7 @@ def breakdown_point(
     severity_ascending: bool = True,
     random_per_level: dict[float, np.ndarray] | None = None,
     alpha: float = 0.05,
+    test: str = "tost",
 ) -> dict[str, Any]:
     """Find the first knob level at which a model breaks down.
 
@@ -176,17 +202,23 @@ def breakdown_point(
             sweep is evaluated against achieved SNR, which *decreases* with
             severity, so the caller passes False in that case.
         random_per_level: Level -> per-repetition values for random search.
-        alpha: TOST significance level.
+        alpha: Test significance level.
+        test: ``'tost'`` (two-sided equivalence, the original pre-registered rule) or ``'noninferiority'``
+            (one-sided: the model is not worse than the reference by more than ``margin``). Two-sided
+            equivalence also fails for a model that is clearly *better*, which makes it degenerate as a
+            breakdown rule when a model beats the reference; non-inferiority does not (2026-09-21).
 
     Returns:
         ``breakdown_level`` (NaN when the model never breaks down),
-        ``breakdown_reason`` (``'tost'``, ``'random'`` or ``'none'``), and
+        ``breakdown_reason`` (``'tost'``, ``'noninferiority'``, ``'random'`` or ``'none'``), and
         ``levels_tested`` / ``tost_p`` / ``equivalent`` per level for the audit
         trail behind the figure.
 
     Raises:
-        ValueError: If the two level sets disagree.
+        ValueError: If the two level sets disagree or ``test`` is unknown.
     """
+    if test not in ("tost", "noninferiority"):
+        raise ValueError(f"breakdown_point: unknown test {test!r}.")
     levels = sorted(per_level, reverse=not severity_ascending)
     if set(levels) != set(reference_per_level):
         raise ValueError(
@@ -209,9 +241,14 @@ def breakdown_point(
             tost_p.append(float("nan"))
             equivalent.append(False)
             continue
-        res = _tost(a[:n], b[:n], margin=margin, alpha=alpha)
-        tost_p.append(float(res["tost_p"]))
-        is_equiv = bool(res["equivalent"])
+        if test == "tost":
+            res = _tost(a[:n], b[:n], margin=margin, alpha=alpha)
+            tost_p.append(float(res["tost_p"]))
+            is_equiv = bool(res["equivalent"])
+        else:
+            res = _noninferiority(a[:n], b[:n], margin=margin, alpha=alpha)
+            tost_p.append(float(res["p"]))
+            is_equiv = bool(res["ok"])
         equivalent.append(is_equiv)
 
         worse_than_random = False
@@ -222,7 +259,7 @@ def breakdown_point(
 
         if np.isnan(breakdown) and (not is_equiv or worse_than_random):
             breakdown = float(level)
-            reason = "random" if worse_than_random and is_equiv else "tost"
+            reason = "random" if worse_than_random and is_equiv else test
 
     return {
         "breakdown_level": breakdown,

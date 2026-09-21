@@ -40,6 +40,10 @@ __all__ = [
     "render_all",
 ]
 
+#: Rule used to declare a breakdown against the reference. Non-inferiority (2026-09-21, user decision) replaces
+#: the two-sided TOST equivalence, which fails whenever a model is clearly better than the reference too.
+BREAKDOWN_TEST: str = "noninferiority"
+
 #: Reference model for equivalence testing and relative robustness (roadmap S8).
 REFERENCE_MODEL: str = "gp_mll"
 
@@ -68,19 +72,73 @@ def _knob_axis(df: pd.DataFrame, knob: str) -> str:
 LEVEL_SEVERITY_DESCENDING: frozenset[str] = frozenset({"k6_budget"})
 
 
-def _level_severity_ascending(knob: str) -> bool:
+#: Axes on which a *lower* value means more stress (SNR, or SNR degradation relative to a channel's floor).
+X_DESCENDS_WITH_STRESS: frozenset[str] = frozenset({"achieved_snr_db", "target_delta_snr_db"})
+
+#: Column holding a calibrated ladder shared by every channel (dB of SNR degradation vs each channel's floor).
+CALIBRATED_TARGET_COLUMN: str = "target_delta_snr_db"
+
+
+def _is_calibrated(df: pd.DataFrame) -> bool:
+    """Whether the sweep used per-channel calibrated levels (a shared dB ladder)."""
+    return CALIBRATED_TARGET_COLUMN in df.columns and bool(df[CALIBRATED_TARGET_COLUMN].notna().all())
+
+
+def _shared_ladder(df: pd.DataFrame) -> pd.DataFrame:
+    """Use the shared dB ladder as the level when the sweep was calibrated per channel.
+
+    Calibrated sweeps (K5, and K2 in dB form) solve a different raw level per channel to hit the same SNR
+    degradation, so the raw level (a contamination fraction) is different in every channel and there is no
+    shared ladder to test or average over. The target dB is the shared ladder, so it becomes ``level``;
+    the raw value is kept as ``level_raw``.
+
+    Args:
+        df: Tidy sweep frame.
+
+    Returns:
+        The frame with ``level`` replaced by the target dB when calibrated, otherwise unchanged.
+    """
+    if not _is_calibrated(df) or "level_raw" in df.columns:
+        return df
+    return df.assign(level_raw=df["level"], level=df[CALIBRATED_TARGET_COLUMN].astype(float))
+
+
+def _trace_frame_on_ladder(frame: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
+    """Re-key a trace frame's raw levels to the shared calibrated ladder of ``df`` (no-op otherwise).
+
+    Args:
+        frame: Trace frame (its ``level`` is the raw per-channel level).
+        df: Tidy frame after :func:`_shared_ladder`.
+
+    Returns:
+        The trace frame with ``level`` on the shared ladder.
+    """
+    if "level_raw" not in df.columns:
+        return frame
+    mapping = df[["subject", "emg", "level_raw", "level"]].drop_duplicates().rename(columns={"level": "ladder"})
+    mapping = mapping.assign(key=mapping["level_raw"].astype(float).round(12))
+    keyed = frame.assign(key=frame["level"].astype(float).round(12))
+    merged = keyed.merge(mapping[["subject", "emg", "key", "ladder"]], on=["subject", "emg", "key"], how="inner")
+    return merged.assign(level=merged["ladder"]).drop(columns=["key", "ladder"])
+
+
+def _level_severity_ascending(knob: str, df: pd.DataFrame | None = None) -> bool:
     """Whether a larger knob *level* means more stress (the order in which breakdown walks the ladder).
 
     This is about the level, not the plotted axis: K2 is plotted against achieved SNR, which falls with
     stress, but its level (alpha) rises with stress. Passing the axis direction here made the walk start at
-    the harshest level and report a breakdown there for every model.
+    the harshest level and report a breakdown there for every model. A calibrated ladder is in dB of SNR
+    degradation, where a more negative level is more severe.
 
     Args:
         knob: Knob name.
+        df: The sweep frame after :func:`_shared_ladder`, to detect a calibrated ladder.
 
     Returns:
         True when larger levels are more severe.
     """
+    if df is not None and _is_calibrated(df):
+        return False
     return knob not in LEVEL_SEVERITY_DESCENDING
 
 
@@ -95,7 +153,7 @@ def _severity_ascending(x_col: str) -> bool:
     Returns:
         True when larger x means more severe stress.
     """
-    return x_col != "achieved_snr_db"
+    return x_col not in X_DESCENDS_WITH_STRESS
 
 
 def _model_curve(sub: pd.DataFrame, x_col: str, y_col: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -156,9 +214,10 @@ def _per_level_values(sub: pd.DataFrame, y_col: str) -> dict[float, np.ndarray]:
     Returns:
         Mapping level -> values.
     """
+    ordered = sub.sort_values(["subject", "emg", "rep"])
     return {
         float(level): grp[y_col].to_numpy(dtype=float)
-        for level, grp in sub.groupby("level", dropna=False)
+        for level, grp in ordered.groupby("level", dropna=False)
     }
 
 
@@ -248,7 +307,7 @@ def plot_degradation_curves(
 
     # Achieved SNR decreases with stress: plot it decreasing left to right so the
     # x-axis always reads "more stress to the right" (roadmap S2).
-    if x_col == "achieved_snr_db":
+    if x_col in X_DESCENDS_WITH_STRESS:
         axes[0].invert_xaxis()
     axes[-1].set_xlabel(S.axis_label(x_col))
     S.panel_letters(axes, x=-0.13)
@@ -305,7 +364,7 @@ def plot_outcome_panels(
             ax.fill_between(x, mean - ci, mean + ci, color=S.model_color(model), alpha=S.BAND_ALPHA, linewidth=0)
         ax.set_ylabel(S.axis_label(key))
         ax.set_xlabel(S.axis_label(x_col))
-        if x_col == "achieved_snr_db":
+        if x_col in X_DESCENDS_WITH_STRESS:
             ax.invert_xaxis()
     axes[0].legend(loc="best")
     n_reps = int(df["rep"].nunique()) if "rep" in df.columns else 0
@@ -344,7 +403,7 @@ def build_robustness_table(
     """
     x_col = _knob_axis(df, knob)
     ascending = _severity_ascending(x_col)
-    level_ascending = _level_severity_ascending(knob)
+    level_ascending = _level_severity_ascending(knob, df)
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
     ref_sub = df[df["model"] == reference]
     level_x = _level_to_x(df, x_col)
@@ -378,6 +437,7 @@ def build_robustness_table(
                 _per_level_values(ref_sub, metric),
                 margin=margin,
                 severity_ascending=level_ascending,
+                test=BREAKDOWN_TEST,
             )
             rec["breakdown_level"] = bp["breakdown_level"]
             rec["breakdown_x"] = level_x.get(bp["breakdown_level"], float("nan"))
@@ -394,6 +454,7 @@ def build_robustness_table(
                         _per_level_values(grp, metric),
                         _per_level_values(ref_grp, metric),
                         margin=margin,
+                        test=BREAKDOWN_TEST,
                         severity_ascending=level_ascending,
                     )
                 except ValueError:
@@ -461,7 +522,7 @@ def breakdown_vs_budget(
         Long frame with ``model``, ``budget``, ``breakdown_level``, ``breakdown_x``, ``reason``.
     """
     x_col = _knob_axis(df, knob)
-    level_ascending = _level_severity_ascending(knob)
+    level_ascending = _level_severity_ascending(knob, df)
     level_x = _level_to_x(df, x_col)
     field = "recommended_regret_per_step"
     frame = frame[frame[field].notna()].sort_values(["level", "subject", "emg", "rep"])
@@ -483,7 +544,8 @@ def breakdown_vs_budget(
     for model in [m for m in S.MODEL_ORDER if m in set(frame["model"]) and m != reference]:
         for t in budgets:
             bp = breakdown_point(
-                per_level(model, t), per_level(reference, t), margin=margin, severity_ascending=level_ascending
+                per_level(model, t), per_level(reference, t), margin=margin, severity_ascending=level_ascending,
+                test=BREAKDOWN_TEST,
             )
             level = bp["breakdown_level"]
             records.append(
@@ -578,6 +640,7 @@ def render_all(
     Returns:
         Every path written, figures and tables.
     """
+    df = _shared_ladder(df)
     table, table_path = build_robustness_table(df, out_dir, knob=knob, margin=margin)
     breakdowns = {
         str(r["model"]): float(r["breakdown_x"])
@@ -591,6 +654,6 @@ def render_all(
     written += plot_outcome_panels(df, out_dir, knob=knob, dataset=dataset)
     frame = T.load_trace_frame(out_dir)
     if frame is not None and not frame.empty and knob != "k6_budget":
-        bd = breakdown_vs_budget(frame, df, knob=knob, margin=margin)
+        bd = breakdown_vs_budget(_trace_frame_on_ladder(frame, df), df, knob=knob, margin=margin)
         written += plot_breakdown_vs_budget(bd, df, out_dir, knob=knob, dataset=dataset)
     return written
