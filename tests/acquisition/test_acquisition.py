@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from scipy import stats
 
-from pfns4neurostim.acquisition import build_acquisition, masked_argmax
+from pfns4neurostim.acquisition import build_acquisition, select_argmax
 from pfns4neurostim.acquisition.base import BOState, acquire
 from pfns4neurostim.acquisition.registry import ACQUISITION_REGISTRY, available_acquisitions
 from pfns4neurostim.acquisition.schedules import Schedule, build_schedule
@@ -188,24 +188,32 @@ class TestThompson:
 
 
 class TestSelection:
-    """Masked, randomly tie-broken argmax (defect D6)."""
+    """Randomly tie-broken argmax over every selectable site (defect D6)."""
 
-    def test_observed_sites_are_never_reselected(self) -> None:
+    def test_best_site_is_selected_even_if_already_observed(self) -> None:
+        """Re-querying is allowed: noise averaging is how the optimizer exploits."""
+        spec, params = build_acquisition("greedy")
+        surrogate = _FakeSurrogate(np.array([10.0, 9.0, 8.0]), np.ones(3))
+        res = acquire(spec.score_fn, surrogate, np.zeros((3, 2)), _state((0,)), np.random.default_rng(0), params)
+        assert res.index == 0
+
+    def test_allowed_mask_still_restricts_selection(self) -> None:
         values = np.array([10.0, 9.0, 8.0])
-        assert masked_argmax(values, (0,), np.random.default_rng(0)) == 1
+        allowed = np.array([False, True, True])
+        assert select_argmax(values, np.random.default_rng(0), allowed=allowed) == 1
 
     def test_ties_are_broken_at_random_not_by_index(self) -> None:
         values = np.ones(6)
-        picks = {masked_argmax(values, (), np.random.default_rng(s)) for s in range(40)}
+        picks = {select_argmax(values, np.random.default_rng(s)) for s in range(40)}
         assert len(picks) > 1, "tie-break collapsed to a single index (D6 regression)"
 
     def test_non_finite_surface_raises(self) -> None:
         with pytest.raises(RuntimeError, match="non-finite"):
-            masked_argmax(np.array([np.nan, np.inf * -1, np.nan]), (), np.random.default_rng(0))
+            select_argmax(np.array([np.nan, np.inf * -1, np.nan]), np.random.default_rng(0))
 
-    def test_exhausted_pool_raises(self) -> None:
-        with pytest.raises(RuntimeError, match="already been queried"):
-            masked_argmax(np.zeros(2), (0, 1), np.random.default_rng(0))
+    def test_no_selectable_site_raises(self) -> None:
+        with pytest.raises(RuntimeError, match="no site is selectable"):
+            select_argmax(np.zeros(2), np.random.default_rng(0), allowed=np.zeros(2, dtype=bool))
 
     def test_acquire_returns_index_values_and_params(self) -> None:
         spec, params = build_acquisition("ucb", {"kappa": 1.0})

@@ -8,7 +8,7 @@ the two Thompson-sampling types under their own module for discoverability.
 from __future__ import annotations
 
 from . import base, registry, schedules, thompson
-from .base import AcqResult, BOState, acquire, masked_argmax
+from .base import AcqResult, BOState, acquire, select_argmax
 from .registry import ACQUISITION_REGISTRY, available_acquisitions, build_acquisition
 
 __all__ = [
@@ -19,7 +19,7 @@ __all__ = [
     "BOState",
     "AcqResult",
     "acquire",
-    "masked_argmax",
+    "select_argmax",
     "ACQUISITION_REGISTRY",
     "build_acquisition",
     "available_acquisitions",

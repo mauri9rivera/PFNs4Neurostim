@@ -90,6 +90,7 @@ def build_row(
         rep=int(rep),
         r2=_clean(row.get("r2")),
         spearman=_clean(row.get("spearman")),
+        exploration_score=_clean(row.get("exploration_score")),
         # final_regret is kept as an alias of the recommended-site regret so older
         # aggregation code keeps working; the three co-primary regrets are explicit.
         final_regret=_clean(row.get("recommended_regret")),

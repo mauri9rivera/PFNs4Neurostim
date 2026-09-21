@@ -21,6 +21,8 @@ from scipy import stats
 
 __all__ = [
     "regret_metrics",
+    "r2_score",
+    "exploration_score",
     "surrogate_accuracy",
     "identification_metrics",
     "calibration_metrics",
@@ -66,6 +68,58 @@ def regret_metrics(
     return out
 
 
+def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Coefficient of determination of a prediction over the whole pool.
+
+    Args:
+        y_true: Ground-truth responses, shape [N].
+        y_pred: Predicted responses on the same sites, shape [N].
+
+    Returns:
+        R-squared; NaN only when the ground truth is constant.
+
+    Raises:
+        RuntimeError: If ``y_pred`` contains non-finite values.
+    """
+    y_true = np.asarray(y_true, dtype=np.float64)   # [N]
+    y_pred = np.asarray(y_pred, dtype=np.float64)   # [N]
+    if not np.isfinite(y_pred).all():
+        raise RuntimeError(f"r2_score: y_pred has {int((~np.isfinite(y_pred)).sum())} non-finite values.")
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+
+def exploration_score(y_raw: np.ndarray, recommended_index: int) -> float:
+    """Exploration score: true response at the recommended site over the true maximum.
+
+    Follows the exploration performance of the autonomous-optimization work of
+    Bonizzato et al. as specified by the user (2026-09-21): the response at the
+    site the surrogate recommends (argmax of its posterior mean) divided by the
+    best achievable response. The ratio is only meaningful in **raw** response
+    units (non-negative), not in standardized ones, where the maximum can sit
+    near or below zero. 1.0 means the optimum was recommended.
+
+    Args:
+        y_raw: Ground-truth response per site in raw (unstandardized) units, shape [N].
+        recommended_index: Recommended site.
+
+    Returns:
+        The score, in [0, 1] for a non-negative response.
+
+    Raises:
+        RuntimeError: If the raw maximum is not positive.
+    """
+    y_raw = np.asarray(y_raw, dtype=np.float64)   # [N]
+    y_max = float(np.max(y_raw))
+    if not np.isfinite(y_max) or y_max <= 0.0:
+        raise RuntimeError(
+            f"exploration_score: the raw response maximum is {y_max}; the score needs raw, "
+            "non-negative units (was the standardized response passed by mistake?)."
+        )
+    return float(y_raw[int(recommended_index)]) / y_max
+
+
 def surrogate_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     """R-squared and Spearman correlation of the surrogate's final prediction.
 
@@ -86,9 +140,7 @@ def surrogate_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, floa
         raise RuntimeError(
             f"surrogate_accuracy: y_pred has {int((~np.isfinite(y_pred)).sum())} non-finite values."
         )
-    ss_res = float(np.sum((y_true - y_pred) ** 2))
-    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    r2 = r2_score(y_true, y_pred)
     if np.std(y_true) == 0 or np.std(y_pred) == 0:
         rho = float("nan")
     else:

@@ -119,6 +119,16 @@ def run_channel_bo(
     row.update(_metrics.surrogate_accuracy(channel.y_gt, traj.y_pred))
     row.update(_metrics.identification_metrics(channel.y_gt, recommended, channel.ch2xy))
 
+    # Per-step curves along the BO run (post-processing reads these, never re-runs).
+    y_star = float(np.max(channel.y_gt))
+    recs = np.asarray(traj.recommendations, dtype=int)                              # [T+1]
+    regret_per_step = (y_star - channel.y_gt[recs]) / channel.gt_range              # [T+1], simple regret in [0, 1]
+    y_raw = channel.y_gt_raw
+    exploration_per_step = None
+    if y_raw is not None:
+        exploration_per_step = [_metrics.exploration_score(y_raw, int(i)) for i in recs]  # [T+1]
+        row["exploration_score"] = float(exploration_per_step[-1])
+
     # Random search has no predictive distribution, so coverage/ECE/NLL/CRPS are
     # undefined for it and are reported as "not computed" rather than invented.
     if with_calibration and MODEL_REGISTRY[model].has_predictive_distribution:
@@ -137,6 +147,9 @@ def run_channel_bo(
         "real_values": list(traj.real_values),
         "best_rec_indices": list(traj.recommendations),
         "step_times_s": list(step_times),
+        "r2_per_step": list(traj.r2_per_step),
+        "recommended_regret_per_step": regret_per_step.tolist(),
+        "exploration_per_step": exploration_per_step,
         "acq_params": list(traj.acq_params),
         "y_pred": np.asarray(traj.y_pred, dtype=np.float64),
         "y_std": np.asarray(traj.y_std, dtype=np.float64),

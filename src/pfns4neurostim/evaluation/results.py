@@ -77,6 +77,7 @@ KEY_COLUMNS: tuple[str, ...] = (
 METRIC_COLUMNS: tuple[str, ...] = (
     "r2",
     "spearman",
+    "exploration_score",
     "final_regret",
     "cumulative_regret",
     "recommended_regret",
@@ -136,6 +137,8 @@ class TidyRow:
             ``data.preprocessing.NORMALIZATIONS``).
         r2: Final-prediction R² of the surrogate (secondary metric).
         spearman: Spearman correlation of the surrogate's final prediction.
+        exploration_score: True response at the recommended site over the true
+            maximum, in raw response units (1.0 = the optimum was recommended).
         final_regret: Regret at the last BO step, range-normalized (P0.9).
         cumulative_regret: Cumulative regret over the BO trajectory,
             range-normalized (P0.9). Co-primary regret outcome.
@@ -187,6 +190,7 @@ class TidyRow:
     # --- metric / value columns (optional; None => NaN at write time) ---
     r2: Optional[float] = None
     spearman: Optional[float] = None
+    exploration_score: Optional[float] = None
     final_regret: Optional[float] = None
     cumulative_regret: Optional[float] = None
     recommended_regret: Optional[float] = None

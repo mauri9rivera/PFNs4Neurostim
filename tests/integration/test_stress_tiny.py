@@ -174,9 +174,16 @@ class TestBudgetSemantics:
         with pytest.raises(ValueError, match="must exceed n_init"):
             run_channel_bo("gp_naive", channel, budget=3, n_init=3, device="cpu")
 
-    def test_budget_above_pool_size_raises(self, channel: ChannelData) -> None:
-        with pytest.raises(ValueError, match="exceeds the 20 queryable site"):
-            run_channel_bo("gp_naive", channel, budget=25, n_init=3, device="cpu")
+    def test_budget_above_pool_size_is_allowed_and_requeries(self, channel: ChannelData) -> None:
+        """Noisy responses make re-querying legitimate, so budget may exceed the pool."""
+        res = run_channel_bo("gp_naive", channel, acq_fn="ei", budget=25, n_init=3, seed=1, device="cpu")
+        idx = res.trajectory["observed_indices"]
+        assert len(idx) == 25
+        assert len(set(idx)) < len(idx), "no site was ever re-queried"
+
+    def test_n_init_above_pool_size_raises(self, channel: ChannelData) -> None:
+        with pytest.raises(ValueError, match="n_init"):
+            run_channel_bo("gp_naive", channel, budget=30, n_init=25, device="cpu")
 
 
 class TestDeliverables:

@@ -214,10 +214,21 @@ class TestDropoutConstrainsTheLoop:
         assert set(res.trajectory["observed_indices"]) <= allowed
         assert set(res.trajectory["best_rec_indices"]) <= allowed
 
-    def test_budget_above_the_queryable_count_raises(self) -> None:
+    def test_budget_above_the_queryable_count_requeries(self) -> None:
+        """Re-querying is allowed, so a budget may exceed the surviving electrodes."""
         from pfns4neurostim.evaluation.bo_runner import run_channel_bo
 
         ch = _channel(n_sites=40, n_invalid=0)
         stressed = stress.build_knob("k6_dropout").apply(ch, 0.5, np.random.default_rng(0))
-        with pytest.raises(ValueError, match="queryable site"):
-            run_channel_bo("gp_naive", stressed, budget=30, n_init=3, device="cpu")
+        allowed = set(stressed.queryable_indices.tolist())
+        res = run_channel_bo("gp_naive", stressed, acq_fn="ei", budget=30, n_init=3, seed=2, device="cpu")
+        assert len(res.trajectory["observed_indices"]) == 30
+        assert set(res.trajectory["observed_indices"]) <= allowed
+
+    def test_n_init_above_the_queryable_count_raises(self) -> None:
+        from pfns4neurostim.evaluation.bo_runner import run_channel_bo
+
+        ch = _channel(n_sites=40, n_invalid=0)
+        stressed = stress.build_knob("k6_dropout").apply(ch, 0.5, np.random.default_rng(0))
+        with pytest.raises(ValueError, match="n_init"):
+            run_channel_bo("gp_naive", stressed, budget=30, n_init=25, device="cpu")

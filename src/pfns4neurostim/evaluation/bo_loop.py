@@ -8,11 +8,17 @@ real experimental protocol — the optimizer never sees the ground truth), and
 records the pure-exploitation recommendation at every step.
 
 Budget semantics (**P0.3**): ``budget`` is the total number of queries including
-the ``n_init`` random initial ones, and may be below the pool size.
+the ``n_init`` random initial ones. It may be below **or above** the pool size:
+sites can be re-queried (each query is a fresh noisy trial), so the optimizer can
+concentrate its budget on promising configurations and narrow its posterior there.
 
 Differences from the legacy loop, all deliberate:
 
 * Selection uses a **random tie-break** (D6) instead of the lowest index.
+* Re-querying an observed site is allowed, exactly as in the legacy loop. An
+  intermediate version (2026-09-17 to 2026-09-21) masked observed sites; that
+  turned budget = pool size into an exhaustive scan and removed the exploitation
+  that noise averaging makes possible, so it was removed.
 * Every RNG draw comes from an explicit :class:`numpy.random.Generator` (D8);
   nothing touches the global NumPy or torch RNG state mid-loop.
 * Acquisition parameters actually used at each step are recorded (P0.2), so a
@@ -34,6 +40,7 @@ from ..acquisition.base import BOState, acquire
 from ..acquisition.registry import AcqParams, AcquisitionSpec
 from ..data.channels import ChannelData
 from ..models.protocol import marginals
+from .metrics import r2_score
 
 __all__ = ["BOTrajectory", "run_bo_loop", "draw_trial"]
 
@@ -48,6 +55,10 @@ class BOTrajectory:
         real_values: The ground-truth value of each queried site (for regret).
         recommendations: Pure-exploitation recommendation after each acquisition
             step (argmax of the predictive mean over the whole pool).
+        r2_per_step: R-squared of the surrogate's predictive mean over the whole
+            pool after each acquisition step (fit on the observations so far), plus
+            a final entry after the last observation; same length as
+            ``recommendations``.
         step_times_s: Wall-clock seconds per acquisition step (fit + score + readout).
         acq_params: Resolved acquisition parameters at each step.
         y_pred: Final predictive mean over the pool, shape [N].
@@ -58,6 +69,7 @@ class BOTrajectory:
     observed_values: list[float] = field(default_factory=list)
     real_values: list[float] = field(default_factory=list)
     recommendations: list[int] = field(default_factory=list)
+    r2_per_step: list[float] = field(default_factory=list)
     step_times_s: list[float] = field(default_factory=list)
     acq_params: list[dict[str, float]] = field(default_factory=list)
     y_pred: np.ndarray | None = None
@@ -124,7 +136,7 @@ def run_bo_loop(
         The :class:`BOTrajectory`.
 
     Raises:
-        ValueError: If the budget is inconsistent with ``n_init`` or the pool size.
+        ValueError: If the budget is inconsistent with ``n_init`` or ``n_init`` exceeds the pool.
         NotImplementedError: If the acquisition needs a joint posterior the
             surrogate does not have (``ts_joint`` with a PFN).
     """
@@ -136,10 +148,11 @@ def run_bo_loop(
             f"budget ({budget}) must exceed n_init ({n_init}); budget counts total "
             "queries including the initial design (P0.3)."
         )
-    if budget > n_queryable:
+    if n_init > n_queryable:
         raise ValueError(
-            f"budget ({budget}) exceeds the {n_queryable} queryable site(s) of "
-            f"{channel.label} (of {n_sites} total); queries are drawn without replacement."
+            f"n_init ({n_init}) exceeds the {n_queryable} queryable site(s) of "
+            f"{channel.label} (of {n_sites} total); the initial design is drawn "
+            "without replacement."
         )
     if spec.needs_joint and not getattr(surrogate, "supports_joint", False):
         raise NotImplementedError(
@@ -176,6 +189,7 @@ def run_bo_loop(
         # actually act on, so unqueryable electrodes are not recommendable either.
         pool_mean, _ = marginals(surrogate, X_pool)           # [N]
         traj.recommendations.append(int(queryable[np.argmax(pool_mean[queryable])]))
+        traj.r2_per_step.append(r2_score(channel.y_gt, pool_mean))
 
         index = result.index
         traj.observed_indices.append(index)
@@ -190,4 +204,5 @@ def run_bo_loop(
     traj.y_pred = np.asarray(mean, dtype=np.float64)
     traj.y_std = np.asarray(std, dtype=np.float64)
     traj.recommendations.append(int(queryable[np.argmax(traj.y_pred[queryable])]))
+    traj.r2_per_step.append(r2_score(channel.y_gt, traj.y_pred))
     return traj

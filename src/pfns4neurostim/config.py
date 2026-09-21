@@ -182,7 +182,9 @@ class ExperimentConfig:
         equivalence_margin: Pre-registered TOST margin in range-normalized
             regret units, used by the robustness table.
         cache_version: Invalidation stamp of the cell cache; bump it to discard
-            every cached cell. Part of every cell identity.
+            every cached cell. Part of every cell identity. Version 2
+            (2026-09-21) discards the cells computed while the loop was
+            forbidden to re-query observed sites.
         cache_root: Cell-cache directory; empty means ``{output_root}/cells``.
         source_path: Path of the YAML this was loaded from.
     """
@@ -202,7 +204,7 @@ class ExperimentConfig:
     seed: int = 42
     output_root: str = "output"
     equivalence_margin: float = 0.05
-    cache_version: int = 1
+    cache_version: int = 2
     cache_root: str = ""
     model_params: dict[str, dict[str, Any]] = field(default_factory=dict)
     extra_acquisitions: tuple[AcquisitionConfig, ...] = ()

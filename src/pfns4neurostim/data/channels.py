@@ -194,6 +194,23 @@ class ChannelData:
         """Short identifier, e.g. ``'nhp-s1-e0'``."""
         return f"{self.dataset}-s{self.subject}-e{self.emg}"
 
+    @property
+    def y_gt_raw(self) -> np.ndarray | None:
+        """Ground truth in raw response units, or ``None`` if no scaler is recorded.
+
+        The exploration score is a ratio and needs raw (non-negative) units, so it
+        is undefined for a channel that carries no ``scaler_y`` (only hand-built
+        test channels; every loaded channel records one).
+
+        Returns:
+            The unscaled ground truth, shape [N], or ``None``.
+        """
+        scaler = self.meta.get("scaler_y")
+        if scaler is None:
+            return None
+        raw = scaler.inverse_transform(self.y_gt.reshape(-1, 1))  # [N, 1]
+        return np.asarray(raw, dtype=np.float64).reshape(-1)      # [N]
+
     def with_trials(self, Y_trials: np.ndarray, **updates: Any) -> "ChannelData":
         """Return a copy carrying a new trial bank (the knob-application path).
 
