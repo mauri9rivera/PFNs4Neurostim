@@ -443,7 +443,8 @@ def breakdown_vs_budget(
     level_x = _level_to_x(df, x_col)
     field = "recommended_regret_per_step"
     frame = frame[frame[field].notna()].sort_values(["level", "subject", "emg", "rep"])
-    if frame.empty:
+    if frame.empty or reference not in set(frame["model"]):
+        # A shard that holds only some models (e.g. the GPU job without the GP reference) has no breakdown to report.
         return pd.DataFrame(columns=["model", "budget", "breakdown_level", "breakdown_x", "reason"])
     n_init = int(frame["n_init"].iloc[0])
     total = int(frame[field].iloc[0].shape[0]) - 1 + n_init

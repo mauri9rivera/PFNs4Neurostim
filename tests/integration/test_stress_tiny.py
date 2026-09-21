@@ -214,6 +214,14 @@ class TestDeliverables:
         assert table["budget"].nunique() > 1
         assert table["breakdown_x"].notna().any(), "a clearly worse model must break down somewhere"
 
+    def test_breakdown_vs_budget_without_reference_is_empty(self, sweep: pd.DataFrame) -> None:
+        """A shard without the reference model (the GPU-only job) yields no breakdown instead of raising."""
+        n_steps = BUDGET - N_INIT + 1
+        rows = [{"model": "tabpfn_v2_5", "level": float(lv), "subject": 1, "emg": 0, "rep": r, "n_init": N_INIT,
+                 "recommended_regret_per_step": np.full(n_steps, 0.2)} for lv in LEVELS for r in range(N_REPS)]
+        table = stress_figs.breakdown_vs_budget(pd.DataFrame(rows), sweep, knob="k2_snr", margin=0.05)
+        assert table.empty
+
     def test_robustness_table_has_one_row_per_model(self, sweep: pd.DataFrame, tmp_path) -> None:
         table, path = stress_figs.build_robustness_table(sweep, str(tmp_path), knob="k2_snr")
         assert set(table["model"]) == set(MODELS)
