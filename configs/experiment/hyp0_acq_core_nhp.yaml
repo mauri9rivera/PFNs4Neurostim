@@ -1,0 +1,30 @@
+# Core acquisition experiment, NHP: ts_marginal (headline) vs EI vs UCB (auto_dim kappa schedule) for the model ladder.
+#
+# The ts_marginal and random cells are IDENTICAL to Deliverable 1's (same budget, reps, seeds and parameters), so they come
+# from the shared cell cache for free; only the EI and UCB cells are new compute. The full 11-acquisition table with the
+# fixed-kappa grid is configs/experiment/hyp0_acq_table_nhp.yaml.
+#
+# PRE-REGISTERED DECISION RULE (fixed before running): the acquisition with the lowest median RECOMMENDED regret over all
+# NHP channels, ties broken by cumulative regret; the full table is always reported next to the choice.
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive, random]
+  acquisition: [ts_marginal, ei, ucb, random]
+
+experiment: bo_benchmark
+family: hyp0-acq-core
+tag: nhp
+
+budget: 96
+n_init: 5
+n_reps: 10
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05
+
+# GP models run on CPU (measured 2.2x faster than CUDA for this Adam GP; P0.12).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

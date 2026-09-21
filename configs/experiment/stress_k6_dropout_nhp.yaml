@@ -10,7 +10,7 @@
 defaults:
   dataset: nhp
   model: [tabpfn_v2_5, gp_mll, gp_naive]
-  acquisition: ei
+  acquisition: ts_marginal   # headline (2026-09-20)
 
 experiment: stress_sweep
 family: stress-k6-dropout
@@ -22,9 +22,14 @@ knob:
 
 budget: 40          # must not exceed the queryable count at the harshest level
 n_init: 5
-n_reps: 5
+n_reps: 10
 gt_mode: full_mean
 device: cuda
 seed: 42
 output_root: output
 equivalence_margin: 0.05
+
+# GP models run on CPU (measured 2.2x faster than CUDA for this Adam GP; P0.12).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

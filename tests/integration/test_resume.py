@@ -159,3 +159,29 @@ def test_shard_runs_get_distinct_run_dirs_and_share_the_cache(
     )
     assert merged.replace("\\", "/").endswith("hyp-a-nhp")
     assert (0, 2) in calls and None in calls
+
+
+def test_empty_shard_is_a_clean_noop(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, channel: ChannelData, capsys: Any
+) -> None:
+    """More lanes than channels leaves some shards empty: they must succeed, not raise."""
+    from pfns4neurostim.experiments import bo_benchmark
+
+    monkeypatch.setattr(bo_benchmark, "iter_channels", lambda *a, **k: [])
+    args = ["models=[gp_naive]", "n_reps=1", "budget=6", "n_init=3", "device=cpu", f"output_root={tmp_path}"]
+    bo_benchmark.run_bo_benchmark("configs/experiment/hyp_a_nhp.yaml", args, shard=(5, 8))
+    assert "owns no channels" in capsys.readouterr().out
+    # An unsharded run that finds nothing is still an error.
+    with pytest.raises(RuntimeError, match="produced no rows"):
+        bo_benchmark.run_bo_benchmark("configs/experiment/hyp_a_nhp.yaml", args)
+
+
+def test_empty_shard_noop_in_stress_sweep(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, cfg: Any, capsys: Any
+) -> None:
+    monkeypatch.setattr(stress_sweep, "_channels", lambda _cfg, _shard=None: [])
+    stress_sweep.run_stress_sweep(
+        "configs/experiment/stress_k2_nhp.yaml",
+        OVERRIDES + [f"output_root={tmp_path}"], shard=(5, 8),
+    )
+    assert "owns no channels" in capsys.readouterr().out

@@ -262,6 +262,10 @@ def run_bo_benchmark(
             f"{len(store.failures)} failed",
             flush=True,
         )
+        if not rows and shard is not None and not store.failures and not skipped:
+            # An empty shard (more lanes than channels) is a clean no-op, not an error.
+            print(f"[bo_benchmark] shard {shard[0]}/{shard[1]} owns no channels; nothing to do.", flush=True)
+            return target
         if not rows:
             raise RuntimeError(
                 "bo_benchmark produced no rows. Skipped combinations: "

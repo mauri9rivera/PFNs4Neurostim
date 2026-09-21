@@ -266,6 +266,10 @@ def build_tidy_rows(
         f"{len(store.failures)} failed",
         flush=True,
     )
+    if not rows and shard is not None and not store.failures and not skipped:
+        # An empty shard (more lanes than channels) is a clean no-op, not an error.
+        print(f"[stress_sweep] shard {shard[0]}/{shard[1]} owns no channels; nothing to do.", flush=True)
+        return [], {}, []
     if not rows:
         raise RuntimeError(
             "stress_sweep produced no rows: check dataset.subjects / dataset.emgs, "
@@ -334,6 +338,8 @@ def run_stress_sweep(
             cfg.cell_cache_root, enabled=use_cache, only_cached=only_cached, on_cell=on_cell
         )
         rows, trajectories, extras = build_tidy_rows(cfg, run_tag, store=store, shard=shard)
+        if not rows:
+            return target
         df = _results.rows_to_dataframe(rows, acquisition=cfg.acquisition.as_block())
         # Achieved metrics that are not part of the fixed schema (future knobs
         # may report e.g. amplitude ratio) ride along as extra columns.

@@ -1,0 +1,20 @@
+# UCB kappa sensitivity for TabPFN-2.5 on NHP: the fixed-kappa grid (0.5, 1, 2, 3, 5; the legacy kappa-ablation grid) that
+# the `ucb` (auto_dim schedule) row of the core acquisition experiment is compared against. TabPFN only: the question is
+# how much a tuned UCB can close the gap to Thompson sampling, which has no kappa. Same budget/reps/seeds as Deliverable 1.
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5]
+  acquisition: [ucb_k0.5, ucb_k1, ucb_k2, ucb_k3, ucb_k5]
+
+experiment: bo_benchmark
+family: hyp0-ucb-kappa
+tag: nhp
+
+budget: 96
+n_init: 5
+n_reps: 10
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05
