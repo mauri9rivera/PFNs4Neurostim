@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import ExperimentConfig, load_experiment_config, resolved_dict
-from ..data.channels import iter_channels
+from ..data.channels import parse_shard, iter_channels
 from ..diagnostics import ClusterDiagnostics, diagnostics_enabled
 from ..evaluation import results as _results
 from ..evaluation.cache import CellStore, row_payload
@@ -70,8 +70,10 @@ def _supported(model: str, acq_type: str) -> bool:
         return False
     if acq_type == "ts_joint":
         return spec.family == "gp"
-    if spec.family == "baseline":
-        return acq_type == "random"
+    # The random acquisition is served only by the random-search baseline: any other model
+    # would still fit a surrogate every step and add a full run's cost for a random policy.
+    if acq_type == "random" or spec.family == "baseline":
+        return acq_type == "random" and spec.family == "baseline"
     return True
 
 
@@ -106,6 +108,11 @@ def build_acquisition_table(df: pd.DataFrame, out_dir: str) -> tuple[pd.DataFram
     path = os.path.join(out_dir, "acquisition_table.csv")
     table.to_csv(path, index=False)
     return table, path
+
+
+def _shard_suffix(shard: tuple[int, int] | None) -> str:
+    """Run-directory suffix that keeps shards from overwriting each other's outputs."""
+    return "" if shard is None else f"-shard{shard[0]}of{shard[1]}"
 
 
 def _compute_cell(
@@ -167,6 +174,7 @@ def run_bo_benchmark(
     use_cache: bool = True,
     only_cached: bool = False,
     on_cell: Callable[[], None] | None = None,
+    shard: tuple[int, int] | None = None,
 ) -> str:
     """Run (or re-summarize) a models x acquisitions benchmark.
 
@@ -182,6 +190,9 @@ def run_bo_benchmark(
             without computing any.
         on_cell: Called once per cell served (computed or cached); drives the
             cluster-diagnostics throughput counter.
+        shard: ``(i, n)`` runs only every n-th channel starting at ``i``. The default
+            run directory gets a ``-shard{i}of{n}`` suffix; assemble the union with a
+            final ``--only-cached`` run without ``--shard``.
 
     Returns:
         Path to the run directory.
@@ -193,7 +204,7 @@ def run_bo_benchmark(
     """
     cfg = load_experiment_config(config_path, overrides)
     target = run_dir or os.path.join(
-        cfg.output_root, "benchmark", cfg.dataset.name, f"{cfg.family}-{cfg.tag}"
+        cfg.output_root, "benchmark", cfg.dataset.name, f"{cfg.family}-{cfg.tag}{_shard_suffix(shard)}"
     )
     os.makedirs(target, exist_ok=True)
     tidy_path = os.path.join(target, "tidy.csv")
@@ -219,6 +230,7 @@ def run_bo_benchmark(
             data_root=cfg.dataset.data_root,
             gt_mode=cfg.gt_mode,
             normalization=cfg.dataset.normalization,
+            shard=shard,
         ):
             for model in cfg.models:
                 for acq in acquisitions:
@@ -305,6 +317,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-dir", default=None, help="Override the output run directory.")
     parser.add_argument("--no-cache", action="store_true", help="Neither read nor write the cell cache.")
     parser.add_argument(
+        "--shard", type=parse_shard, default=None, metavar="I/N",
+        help="Run only every N-th channel starting at I (multi-process lanes).",
+    )
+    parser.add_argument(
         "--cluster-diag", action="store_true",
         help="Print the SLURM job-efficiency report at the end (or set CLUSTER_DIAG=1).",
     )
@@ -317,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_experiment_config(args.config, args.overrides)
     diag_on = diagnostics_enabled(args.cluster_diag)
     planned = (
-        count_channels(cfg)
+        count_channels(cfg, args.shard)
         * cfg.n_reps
         * sum(_supported(m, a.type) for m in cfg.models for a in cfg.acquisitions)
         if diag_on and not args.replot
@@ -330,6 +346,6 @@ def main(argv: list[str] | None = None) -> int:
         run_bo_benchmark(
             args.config, args.overrides, replot=args.replot, run_dir=args.run_dir,
             use_cache=not args.no_cache, only_cached=args.only_cached,
-            on_cell=diag.record_experiment,
+            on_cell=diag.record_experiment, shard=args.shard,
         )
     return 0

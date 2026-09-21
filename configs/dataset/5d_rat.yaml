@@ -1,8 +1,9 @@
 # 5D rat motor-cortex stimulation dataset (4x4x3x32x8-style condition grids).
 # Larger candidate pool (~2048 conditions) than the 2D grids; used for the
 # scalability arm of Hyp A and as the second in-vivo arm of the Hyp B sweeps.
+# All six valid subjects are evaluated (no train/held-out split; subject 6 is a loader placeholder).
 name: 5d_rat
-subjects: [1]
+subjects: [0, 1, 2, 3, 4, 5]
 emgs: all
 data_root: ./data
 normalization: pfn   # data/preprocessing.py NORMALIZATIONS; pfn = MinMax X, z-scored y

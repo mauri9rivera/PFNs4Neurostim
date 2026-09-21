@@ -4,7 +4,7 @@
 #   source "${SLURM_SUBMIT_DIR:-$PWD}/scripts/_job_common.sh"
 #   job_activate                       # conda env: $CONDA_ENV (default pfns4neurostim)
 #   job_stage_data "${CONFIG}"         # copies the dataset to $SLURM_TMPDIR, sets STAGED_ROOT
-#   job_run bo_benchmark "${CONFIG}" "${OVERRIDES[@]}"
+#   job_dispatch bo_benchmark "${CONFIG}" "${OVERRIDES[@]}"    # LANES=N (default 1) processes
 #
 # Preemption/timeouts: sbatch sends TERM 300 s before the limit (--signal=B:TERM@300).
 # `job_run` forwards it to the experiment, then requeues the job. Every finished cell is
@@ -42,4 +42,41 @@ job_run() {
   local pid=$!
   trap 'echo "[job] TERM received: stopping and requeueing"; kill -TERM ${pid} 2>/dev/null || true; wait ${pid} || true; scontrol requeue "${SLURM_JOB_ID}"; exit 0' TERM
   wait "${pid}"
+}
+
+# Multi-process lanes: N independent processes inside ONE job, each owning every N-th channel
+# (`--shard i/N`). TabPFN uses ~5% of a GPU and ~1.3 GB of RAM, so the lanes share the job's GPU
+# (measured ~1.7x aggregate throughput with 3 lanes); GP-only CPU jobs use one lane per core.
+# Each lane runs single-threaded (lanes ARE the parallelism). A failed lane does not stop the
+# others, its finished cells are already cached, and the job exits non-zero at the end.
+LANE_PIDS=()
+
+job_run_lanes() {
+  local lanes="${1:?lanes}" experiment="${2:?experiment}" config="${3:?config}"
+  shift 3
+  export CLUSTER_DIAG="${CLUSTER_DIAG:-1}"
+  export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+  local i
+  for ((i = 0; i < lanes; i++)); do
+    python -m pfns4neurostim "${experiment}" --config "${config}" --set "dataset.data_root=${STAGED_ROOT}" "$@" --shard "${i}/${lanes}" > "logs/lane${i}_${SLURM_JOB_ID:-local}.out" 2>&1 &
+    LANE_PIDS+=($!)
+  done
+  echo "[job] started ${lanes} lanes: logs/lane*_${SLURM_JOB_ID:-local}.out"
+  trap 'echo "[job] TERM received: stopping lanes and requeueing"; kill -TERM "${LANE_PIDS[@]}" 2>/dev/null || true; wait || true; scontrol requeue "${SLURM_JOB_ID}"; exit 0' TERM
+  local failed=0 pid
+  for pid in "${LANE_PIDS[@]}"; do
+    wait "${pid}" || failed=1
+  done
+  return "${failed}"
+}
+
+# LANES=1 (default) keeps the single-process behaviour; LANES>1 runs that many sharded lanes.
+job_dispatch() {
+  local experiment="${1:?experiment}" config="${2:?config}"
+  shift 2
+  if [ "${LANES:-1}" -gt 1 ]; then
+    job_run_lanes "${LANES}" "${experiment}" "${config}" "$@"
+  else
+    job_run "${experiment}" "${config}" "$@"
+  fi
 }

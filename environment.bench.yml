@@ -1,4 +1,4 @@
-# Benchmark environment for the Hypothesis 0 external surrogates.
+# Benchmark environment for the Hypothesis 0 external surrogates (Python 3.11).
 #
 # WHY A SECOND ENVIRONMENT (measured 2026-09-20, by reading each upstream project):
 #
@@ -6,63 +6,53 @@
 #   ---------  --------------  ----------------------------------------------
 #   TabICL v2  Python >= 3.10  no
 #   TabFM      Python >= 3.11  no
-#   TabFlex    Python >= 3.8   yes, but it imports wandb + mlflow + interpret at
-#                              module level even for inference, and CLAUDE.md
-#                              keeps those out of the main environment
-#   TabPFN v1  tabpfn < 2      no - collides with the pinned tabpfn 6.3.2
-#                              (see docs/tabpfn_v1_adaptation.md, its own env)
+#   TabFlex    Python >= 3.8   dropped: its weight host no longer resolves (microsoft/ticl issue #27)
+#   TabPFN v1  tabpfn < 2      no - collides with the pinned tabpfn 6.3.2 (own env, deferred)
 #
-# Rather than loosen the main environment's pins for three optional models, the
-# external benchmark runs here and its tidy CSVs are merged with the main run's.
-# The package code is identical in both; only the interpreter differs.
+# The external benchmark runs here and its cells are merged with the main run's through the shared cell cache.
+# The package code is identical in both; only the interpreter and the library pins differ.
 #
-#   conda env create -f environment.bench.yml
-#   conda activate pfns4neurostim-bench
-#   pip install -e .
-#   git submodule update --init --recursive        # libs/tabicl, libs/tabfm, libs/ticl
-#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_acq_table_nhp.yaml
+# Every version below is EXACTLY what was validated on 2026-09-20 (TabPFN-2.5, TabICL v2.2.0 and TabFM run end to end,
+# `pip check` clean). The science stack is pip-only on purpose: mixing conda's numpy 1.26 build with pip packages that
+# require numpy >= 2 (jax/flax, shap) produces a broken ABI.
 #
-# TabPFN v2.5 is installed here too, so the headline model can be re-run in this
-# environment as a cross-check that the interpreter change does not move results.
+#   bash scripts/mila_setup.sh env bench          # creates pfns4neurostim-bench from this file + installs the package
+#   bash scripts/mila_setup.sh submodules         # libs/tabicl and libs/tabfm are used from the submodules (no pip install)
+#
+# pfns4bo==0.1.5 is deliberately NOT installed here: it pins scikit-learn<1.2. PFNs4BO is deferred (sprint Task 7.3).
 name: pfns4neurostim-bench
 channels:
   - conda-forge
 dependencies:
   - python=3.11
   - pip
-  - numpy=1.26.*
-  - scipy=1.13.*
-  - pandas=2.3.*
-  - scikit-learn=1.6.*
-  - matplotlib=3.9.*
-  - seaborn=0.13.*
-  - statsmodels=0.14.*
-  - pyyaml
-  - tqdm
-  - pytest
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu118
       - torch==2.5.1
-      - torchvision==0.20.1
+      # --- science stack (validated pins) ---
+      - numpy==2.2.6
+      - scipy==1.17.1
+      - pandas==2.3.3
+      - scikit-learn==1.6.1
+      - matplotlib==3.11.2
+      - seaborn==0.13.2
+      - statsmodels==0.15.0
+      - pyyaml==6.0.3
+      - tqdm==4.70.1
+      - pytest==9.1.1
       # --- the project's own stack, so results are comparable ---
       - tabpfn==6.3.2
       - gpytorch==1.11
       - linear-operator==0.5.1
       - botorch==0.10.0
       - pyro-ppl==1.9.1
-      # pfns4bo==0.1.5 is deliberately NOT installed here: it pins scikit-learn<1.2, which would
-      # downgrade the 1.6 stack the other models need. PFNs4BO is deferred (sprint Task 7.3); when it
-      # lands, install it with `pip install --no-deps pfns4bo==0.1.5` after resolving its imports.
       # --- TabICL v2 (vendored at libs/tabicl @ v2.2.0; these are its deps) ---
-      - einops==0.8.2   # pinned to match the main env
-      - huggingface-hub
-      # --- TabFM (vendored at libs/tabfm) ---
-      - jax
-      - flax
-      # --- TabFlex via microsoft/ticl (vendored at libs/ticl) ---
-      # Undeclared module-level imports on ticl's *inference* path, found by
-      # walking the import chain: without these, `import ticl.prediction.tabpfn`
-      # raises ModuleNotFoundError before any model is loaded.
-      - wandb
-      - mlflow
-      - interpret
+      - einops==0.8.2
+      - huggingface-hub==1.32.0
+      # --- TabFM (vendored at libs/tabfm; TORCH backend on GPU; the jax/flax backend is not used or validated) ---
+      - safetensors==0.8.0     # weight loading; not declared upstream (found 2026-09-20)
+      - absl-py==2.5.0
+      - jaxtyping==0.2.38
+      - typeguard==2.13.3
+      - jax==0.10.2
+      - jaxlib==0.10.2

@@ -5,7 +5,7 @@
 #   sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_nhp.yaml
 #   sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_5d_rat.yaml n_reps=10
 #
-# Everything after the config path is forwarded to `--set`. The dataset is staged to
+# Everything after the config path is forwarded to `--set`. LANES=4 runs 4 sharded processes in the job. The dataset is staged to
 # $SLURM_TMPDIR (node-local SSD). Finished cells are cached in output/cells, so a
 # preempted, timed-out or crashed job resumes on requeue; results land under
 # output/stress/<knob>/<dataset>/<family>-<tag>/ and are pulled home with
@@ -19,7 +19,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
-#SBATCH --mem=32G
+#SBATCH --mem=10G
 #SBATCH --time=12:00:00
 set -euo pipefail
 
@@ -37,6 +37,6 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 job_activate
 job_stage_data "${CONFIG}"
-job_run stress_sweep "${CONFIG}" "${OVERRIDES[@]}"
+job_dispatch stress_sweep "${CONFIG}" "${OVERRIDES[@]}"
 
 echo "[run_stress_sweep] done; deliverables under output/stress/"

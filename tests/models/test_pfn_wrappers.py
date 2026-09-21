@@ -198,6 +198,16 @@ class TestTabFlexRuns:
     def test_fit_predict_on_a_toy_grid(self) -> None:
         if not external.availability()["tabflex"]:
             pytest.skip("TabFlex backend unavailable (libs/ticl not initialised)")
+        try:
+            import ticl.prediction.tabpfn  # noqa: F401 - needs wandb/mlflow/interpret
+        except ImportError as exc:
+            pytest.skip(f"ticl dependencies missing: {exc}")
+        import socket
+
+        try:
+            socket.gethostbyname("amuellermothernet.blob.core.windows.net")
+        except OSError:
+            pytest.skip("TabFlex weight host does not resolve (upstream microsoft/ticl issue #27)")
         rng = np.random.default_rng(0)
         X = rng.random((40, 2))
         y = np.exp(-((X[:, 0] - 0.7) ** 2 + (X[:, 1] - 0.3) ** 2) / 0.1)

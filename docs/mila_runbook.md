@@ -24,20 +24,27 @@ bash scripts/mila.sh close
 * `submit <script> <config>` only **prints** the `sbatch` line for you to run.
 * Socket path: `MILA_SOCKET` (default `~/.ssh/cm-mila.sock`); host alias: `MILA_HOST` (default `mila`).
 
-## 2. Layout and setup (run on a login node)
+## 2. Deployment steps (run on a login node unless noted)
 
 ```bash
-git clone --recurse-submodules https://github.com/mauri9rivera/PFNs4Neurostim.git ~/projects/PFNs4Neurostim
+# 0. (you, once per 8 h) open the SSH control socket so the agent can read queue/logs: bash scripts/mila.sh open
+# 1. update the code
 cd ~/projects/PFNs4Neurostim
-bash scripts/mila_setup.sh layout       # $SCRATCH data/output/logs + repo symlinks
-bash scripts/mila_setup.sh env          # MAIN env  (pfns4neurostim, Python 3.9)
-bash scripts/mila_setup.sh env bench    # BENCH env (pfns4neurostim-bench, Python 3.11)
-bash scripts/mila_setup.sh submodules   # libs/tabicl, libs/ticl, libs/tabfm (+ local exclude for weights)
-bash scripts/mila_setup.sh verify
+git checkout scripts/mila_setup.sh && git pull          # drop the hand-copied file first, then pull
+bash scripts/mila_setup.sh install                      # editable install into the MAIN env
+# 2. bench env (Python 3.11: TabICL, TabFM) - ~10-20 min, only needed for the D3 PFN benchmark
+bash scripts/mila_setup.sh env bench
+bash scripts/mila_setup.sh submodules                   # libs/tabicl + libs/tabfm are used from the submodules via sys.path
+# 3. smoke-test the bench env on a login node (no GPU needed for the import checks)
+module load anaconda/3 && conda run -n pfns4neurostim-bench python -c "from pfns4neurostim.models.pfn.external import availability; print(availability())"
+# 4. calibrate TabFM (unmeasured, GPU only): 2 reps of one channel
+CONDA_ENV=pfns4neurostim-bench sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabfm]" dataset.subjects=[1] dataset.emgs=[0] n_reps=2 tag=calib
+# 5. submit EVERYTHING in priority order (one command; jobs then run unattended)
+bash scripts/submit_portfolio.sh
 ```
 
-Code lives on `$HOME`, working data and outputs on `$SCRATCH` (purged after 90 days without
-access: `bash scripts/mila_setup.sh touch`), and the raw-data master on `$ARCHIVE`.
+`python scripts/portfolio.py --machine mila` prints the same plan with wall-time estimates. `submit_portfolio.sh` is generated from it
+(`python scripts/portfolio.py --emit-bash > scripts/submit_portfolio.sh`); edit `scripts/portfolio.py`, not the generated file.
 
 ## 3. Which environment runs what
 
@@ -45,28 +52,47 @@ access: `bash scripts/mila_setup.sh touch`), and the raw-data master on `$ARCHIV
 |---|---|---|
 | `bo_benchmark` with TabPFN-2.5 / GP / Random (`hyp_a_*`, `hyp0_acq_table_*`) | `pfns4neurostim` (3.9) | pinned stack |
 | `stress_sweep` (K2, K5, K6) | `pfns4neurostim` (3.9) | pinned stack |
-| `bo_benchmark` with TabICL v2 / TabFlex / TabFM (`hyp0_pfn_bench_*`) | `pfns4neurostim-bench` (3.11) | TabICL needs >= 3.10, TabFM >= 3.11, TabFlex pulls wandb/mlflow |
+| `bo_benchmark` with TabICL v2 / TabFM (`hyp0_pfn_bench_*`) | `pfns4neurostim-bench` (3.11) | TabICL needs >= 3.10, TabFM >= 3.11 (TabFlex dropped: dead weight host) |
 | TabPFN v1, Mitra | not yet | deferred (own env / AutoGluon) |
 
 `scripts/run_*.sh` select the env with `CONDA_ENV` (default `pfns4neurostim`).
 
 ## 4. Submitting (you run these)
 
+`python scripts/portfolio.py --machine mila` prints every job in priority order with wall-time estimates; it only prints.
+
+**Multi-process lanes.** Per-user caps on Mila are 2 GPUs + 8 CPUs + 48 GB on `main`, and a separate 8 CPUs + 64 GB on
+`main-cpu`. TabPFN uses ~5% of a GPU and ~1.3 GB of RAM, so one job runs several processes ("lanes"), each owning every
+N-th channel (`--shard i/N`); the GP models need no GPU and run on `main-cpu`, one lane per core.
+
 ```bash
 cd ~/projects/PFNs4Neurostim
-sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml n_reps=5 dataset.emgs=[0,1,2]
-sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_nhp.yaml n_reps=5
-CONDA_ENV=pfns4neurostim-bench sbatch --export=ALL scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml n_reps=5
+# GPU job: 4 lanes share one GPU (4 CPUs, 10 GB)
+LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp_a_5d_rat.yaml "models=[tabpfn_v2_5]" tag=gpu
+LANES=4 sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_nhp.yaml "models=[tabpfn_v2_5]" tag=gpu
+# CPU job: GP models + random on main-cpu, 8 single-thread lanes (device=cpu is forced)
+sbatch scripts/run_cpu.sh bo_benchmark configs/experiment/hyp_a_5d_rat.yaml "models=[gp_mll,gp_naive,random]" tag=cpu
+sbatch scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_nhp.yaml "models=[gp_mll,gp_naive]" tag=cpu
+# bench env (TabICL / TabFlex): select it with CONDA_ENV
+CONDA_ENV=pfns4neurostim-bench LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v2_5,tabicl,tabflex]" tag=gpu
 ```
 
-TabFlex downloads its weights on first use: run one short TabFlex fit on a **login node**
-first, since a compute node may have no outbound network.
+Lane logs are `logs/lane<i>_<jobid>.out` (`bash scripts/mila.sh logs <jobid>` reads them together with the job log). Each lane
+writes its own run dir `<family>-<tag>-shard<i>of<N>`; **all cells go to the shared cache**, so GPU jobs, CPU jobs and shards of
+one config never conflict. When the jobs of a unit finish, assemble the union with NO compute (login node or locally):
 
-**Resume.** Every finished cell is written to `output/cells/` as it completes. Jobs carry
-`--requeue --signal=B:TERM@300`: on preemption or 5 minutes before the time limit the job
-stops, requeues itself, and resumes from the cache. Re-running any command is safe and only
-computes missing cells. `--no-cache` ignores the cache; `--only-cached` assembles outputs from
-cached cells without computing.
+```bash
+python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_5d_rat.yaml --only-cached
+```
+
+A failed lane does not stop the others; its finished cells are already cached, and re-submitting the same command computes only
+what is missing. TabFlex downloads its weights on first use: run one short TabFlex fit on a **login node** first, since a compute
+node may have no outbound network.
+
+**Resume.** Every finished cell is written to `output/cells/` as it completes. Jobs carry `--requeue --signal=B:TERM@300`: on
+preemption or 5 minutes before the time limit the lanes stop, the job requeues itself, and resumes from the cache. Re-running any
+command is safe and only computes missing cells. `--no-cache` ignores the cache; `--only-cached` assembles outputs from cached
+cells without computing.
 
 ## 5. Collecting results (run locally)
 

@@ -35,6 +35,8 @@ __all__ = [
     "load_channel",
     "iter_channels",
     "count_emgs",
+    "parse_shard",
+    "shard_size",
     "DEFAULT_DATA_ROOT",
 ]
 
@@ -309,6 +311,44 @@ def load_channel(
     )
 
 
+def parse_shard(spec: str) -> tuple[int, int]:
+    """Parse a ``--shard`` spec ``'i/n'`` into ``(i, n)``.
+
+    Args:
+        spec: Text such as ``'2/4'`` (the third of four shards).
+
+    Returns:
+        ``(index, count)`` with ``0 <= index < count``.
+
+    Raises:
+        ValueError: If the spec is malformed or out of range.
+    """
+    try:
+        i_txt, n_txt = spec.split("/")
+        i, n = int(i_txt), int(n_txt)
+    except ValueError as exc:
+        raise ValueError(f"--shard must look like 'i/n' (e.g. 0/4), got {spec!r}.") from exc
+    if n < 1 or not 0 <= i < n:
+        raise ValueError(f"--shard {spec!r}: need n >= 1 and 0 <= i < n.")
+    return i, n
+
+
+def shard_size(total: int, shard: tuple[int, int] | None) -> int:
+    """Number of channels a shard owns out of ``total`` (round-robin partition).
+
+    Args:
+        total: Total channel count.
+        shard: ``(i, n)`` or ``None`` for everything.
+
+    Returns:
+        Count of channel positions ``p`` in ``range(total)`` with ``p % n == i``.
+    """
+    if shard is None:
+        return total
+    i, n = shard
+    return max(0, (total - i + n - 1) // n)
+
+
 def iter_channels(
     dataset: str,
     subjects: Sequence[int],
@@ -317,6 +357,7 @@ def iter_channels(
     data_root: str = DEFAULT_DATA_ROOT,
     gt_mode: str = "full_mean",
     normalization: str = DEFAULT_NORMALIZATION,
+    shard: tuple[int, int] | None = None,
 ) -> Iterator[ChannelData]:
     """Yield every (subject, EMG) channel of a dataset, loading each subject once.
 
@@ -327,17 +368,26 @@ def iter_channels(
         data_root: Raw-data root.
         gt_mode: Ground-truth mode, see :func:`load_channel`.
         normalization: Preprocessing mode, see :func:`load_channel`.
+        shard: ``(i, n)`` keeps every n-th channel starting at ``i`` in iteration order
+            (subject-major), so ``n`` processes cover all channels exactly once with
+            balanced load. The position counts every candidate channel, even ones that
+            later fail preprocessing, so shards stay disjoint and complete.
 
     Yields:
         One :class:`ChannelData` per (subject, EMG) pair, skipping EMGs whose
         preprocessing fails (e.g. no valid trials), with a warning to stderr.
     """
+    position = 0
     for subject in subjects:
         data = _load_legacy_subject(dataset, subject, data_root)
         emg_indices = (
             list(emgs) if emgs is not None else list(range(int(np.asarray(data["sorted_resp"]).shape[1])))
         )
         for emg in emg_indices:
+            mine = shard is None or position % shard[1] == shard[0]
+            position += 1
+            if not mine:
+                continue
             try:
                 yield load_channel(
                     dataset,

@@ -22,9 +22,11 @@ O(n³) complexity hinders real-time and large-scale use.
   task). R² of the surrogate's final prediction (after the BO loop) is reported
   as a secondary metric inside the same run; there is no standalone "fit task"
   (random-subset R² evaluation was removed on 2026-04-27).
-- **Default acquisition function is Thompson Sampling (`acq_fn: ts`)** as of 2026-07-13
-  (Hyp A is TS-primary). UCB/kappa remains available (`acq_fn: ucb`); the `kappa_*`
-  config keys are inert unless `acq_fn: ucb` is set.
+- **Headline acquisition function is `ts_marginal`** (as of 2026-09-20): independent per-site
+  Thompson draws from each model's predictive marginals, symmetric for GP and PFN. `ts_joint` (exact
+  joint draw) is a GP-only reference. EI, UCB (`auto_dim` schedule and the fixed-kappa grid) and the
+  rest are comparison rows of the formal acquisition experiment (`configs/experiment/hyp0_acq_table_*`),
+  to be run later. The legacy name `acq_fn: ts` no longer exists; `kappa_*` keys apply to `ucb` only.
 
 **ID/OOD reference policy:** the in-distribution reference is the TabPFN prior *bag*
 (`prior_source: prior_bag`/`tabpfn_prior` — the GP+MLP mixture the network is pretrained
@@ -235,8 +237,12 @@ ALL_SUBJECTS      = {'rat': (0, 1, 2, 3, 4, 5), 'nhp': (0, 1, 3), ...}
 # NHP subject 2 excluded — pure noise signal
 ```
 
-Anything *chosen* by looking at results (primary acquisition, knob ranges, equivalence
-margins) is chosen on TRAIN subjects and only then applied to held-out ones.
+**Policy change (2026-09-20): there is no train/held-out split any more.** Every valid subject
+(`ALL_SUBJECTS`: NHP without subject 2, `5d_rat` without the subject-6 placeholder) is evaluated and the
+dataset configs list them all. Because choices made by looking at results (primary acquisition, knob
+ranges, equivalence margins) are then made on the data that is reported, pre-register the decision rule
+in the config header and always report the full comparison table next to the chosen setting. The
+constants above are kept only as a regression reference.
 
 ---
 

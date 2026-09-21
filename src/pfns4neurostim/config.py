@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import platform
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -497,6 +498,30 @@ def load_experiment_config(
     )
 
 
+def _host_info() -> dict[str, Any]:
+    """Describe the machine a run executes on, for result provenance.
+
+    Local and cluster cells with the same seed are statistically equivalent but not bitwise
+    identical (different GPU floating point), so every run records where it ran.
+
+    Returns:
+        ``{'node': hostname, 'cuda_device': GPU name or None, 'slurm_job_id': id or None}``.
+    """
+    device: str | None = None
+    try:
+        import torch  # noqa: PLC0415 - optional, keeps config import light
+
+        if torch.cuda.is_available():
+            device = torch.cuda.get_device_name(0)
+    except ImportError:
+        pass
+    return {
+        "node": platform.node(),
+        "cuda_device": device,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+    }
+
+
 def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
     """Serialize a config for ``config.yaml``, JSON-round-tripped for plain types.
 
@@ -546,6 +571,7 @@ def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
         "cache_version": cfg.cache_version,
         "cache_root": cfg.cell_cache_root,
         "source_path": cfg.source_path,
+        "host": _host_info(),
     }
     # Guarantee plain Python types (no numpy scalars) reach the YAML dump.
     return json.loads(json.dumps(out, default=str))

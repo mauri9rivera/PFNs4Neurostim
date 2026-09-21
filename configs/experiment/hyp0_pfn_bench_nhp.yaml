@@ -1,16 +1,19 @@
-# Hypothesis 0 - PFN benchmark, nhp: TabPFN-2.5 vs TabICL v2 vs TabFlex vs GP-MLL, EI.
+# Hypothesis 0 - PFN benchmark, nhp: TabPFN-2.5 vs TabICL v2.2.0 vs TabFM vs GP-MLL, ts_marginal.
 #
-# Runs in the Python 3.11 bench env (CONDA_ENV=pfns4neurostim-bench). Labelling (guardrail G3):
-# TabFlex is a classification-head adaptation (n_bins=32); every table row and caption says so.
-# PFNs4BO is DEFERRED (native-policy integration not implemented; see the sprint file, Task 7.3).
-# Latency here is descriptive only (guardrail G1: the GP comparator is the unconverged Adam fit).
+# Runs in the Python 3.11 bench env (CONDA_ENV=pfns4neurostim-bench).
+#  - TabICL: native quantile predictive distribution (Thompson draws invert its quantile function).
+#  - TabFM: point predictions only; sigma is the across-ensemble-member spread, a PROXY and not a calibrated
+#    distribution (guardrail G3: say so in every table and caption). It is by far the slowest model, so it is
+#    submitted as its own LAST job (see scripts/portfolio.py).
+#  - TabFlex is dropped: upstream's weight host no longer resolves (microsoft/ticl issue #27).
+#  - PFNs4BO is deferred (native-policy integration not implemented).
+# Latency is descriptive only (guardrail G1).
 #
-# TabFlex downloads weights on first use: trigger that on a LOGIN node first.
-#   CONDA_ENV=pfns4neurostim-bench sbatch --export=ALL scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml n_reps=5
+#   CONDA_ENV=pfns4neurostim-bench LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v2_5,tabicl]" tag=gpu
 defaults:
   dataset: nhp
-  model: [tabpfn_v2_5, tabicl, tabflex, gp_mll]
-  acquisition: ei
+  model: [tabpfn_v2_5, tabicl, tabfm, gp_mll]
+  acquisition: ts_marginal
 
 experiment: bo_benchmark
 family: hyp0-pfn-bench
@@ -18,9 +21,13 @@ tag: nhp
 
 budget: 96
 n_init: 5
-n_reps: 5
+n_reps: 10
 gt_mode: full_mean
 device: cuda
 seed: 42
 output_root: output
 equivalence_margin: 0.05
+
+# GP-MLL runs on CPU (measured 2.2x faster than CUDA for this Adam GP; P0.12).
+model_params:
+  gp_mll: {device: cpu}

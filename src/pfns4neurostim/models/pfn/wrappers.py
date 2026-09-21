@@ -179,6 +179,11 @@ class TabFlexSurrogate(BucketizedClassifierSurrogate):
     must be labelled "classification-head adaptation": its resolution is bounded
     by the bin width, which is a property of the adaptation, not of the model.
 
+    **Weights unavailable (checked 2026-09-20):** upstream downloads its checkpoints from
+    ``amuellermothernet.blob.core.windows.net``, which no longer resolves (microsoft/ticl issue #27,
+    NXDOMAIN); no mirror exists, so this wrapper cannot run unless the ``.cpkt`` files are placed in
+    ``libs/ticl/ticl/models_diff/`` by hand. It is therefore left out of the D3 benchmark.
+
     Upstream's ``TabFlex`` convenience class hardcodes ``device='cuda'`` and picks
     one of three checkpoints by data size. This wrapper calls the underlying
     ``TabPFNClassifier`` directly so the device is configurable, and defaults to
@@ -249,19 +254,32 @@ class TabFMSurrogate(ExternalSurrogate):
     Args:
         device: Torch device string (TabFM also has a JAX backend).
         n_estimators: Ensemble members; must be >= 2 for a usable spread.
+        tabfm_backend: ``'torch'`` (default) or ``'jax'`` upstream checkpoint implementation.
         **backend_kwargs: Forwarded to ``TabFMRegressor``.
 
     Raises:
         ValueError: If ``n_estimators`` < 2.
     """
 
-    def __init__(self, device: str = "cpu", n_estimators: int = 8, **backend_kwargs: Any) -> None:
+    #: Loaded checkpoints, shared across instances (one per backend and device).
+    _CHECKPOINTS: dict[tuple[str, str], Any] = {}
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        n_estimators: int = 8,
+        tabfm_backend: str = "torch",
+        **backend_kwargs: Any,
+    ) -> None:
+        if tabfm_backend not in ("torch", "jax"):
+            raise ValueError(f"tabfm_backend must be 'torch' or 'jax', got {tabfm_backend!r}.")
         if n_estimators < 2:
             raise ValueError(
                 "TabFMSurrogate needs n_estimators >= 2: its only uncertainty signal is "
                 "the spread across ensemble members, which is identically zero for one."
             )
         super().__init__("tabfm", device=device, **backend_kwargs)
+        self.tabfm_backend = tabfm_backend
         self.n_estimators = int(n_estimators)
         self._model: Any = None
 
@@ -273,11 +291,46 @@ class TabFMSurrogate(ExternalSurrogate):
             y: Observed responses, shape [n].
         """
         backend = require_backend("tabfm")
-        from tabfm.src.classifier_and_regressor import TabFMRegressor  # noqa: PLC0415
-
         del backend
-        self._model = TabFMRegressor(n_estimators=self.n_estimators, **self.backend_kwargs)
+        self._model = self._regressor(self._load_checkpoint())
         self._model.fit(X, y)
+
+    def _load_checkpoint(self) -> Any:
+        """Load the TabFM regression checkpoint once per process and backend.
+
+        Upstream's ``TabFMRegressor`` takes a *loaded model* (``model=``), not a device or a name;
+        reloading it at every BO step would dominate the cost, so it is cached on the class.
+
+        Returns:
+            The upstream model object for ``model_type='regression'``.
+        """
+        key = (self.tabfm_backend, self.device)
+        if key not in TabFMSurrogate._CHECKPOINTS:
+            if self.tabfm_backend == "torch":
+                from tabfm import tabfm_v1_0_0_pytorch as upstream  # noqa: PLC0415 - optional dep
+
+                # Upstream defaults to device='cpu' and bfloat16 compute: on CPU that is ~340 s to
+                # predict 96 sites (measured 2026-09-20), so the configured device must be honoured.
+                model = upstream.load(model_type="regression", device=self.device)
+            else:
+                from tabfm import tabfm_v1_0_0_jax as upstream  # noqa: PLC0415 - optional dep
+
+                model = upstream.load(model_type="regression")
+            TabFMSurrogate._CHECKPOINTS[key] = model
+        return TabFMSurrogate._CHECKPOINTS[key]
+
+    def _regressor(self, model: Any) -> Any:
+        """Build upstream's sklearn-style regressor around a loaded checkpoint.
+
+        Args:
+            model: Object returned by :meth:`_load_checkpoint`.
+
+        Returns:
+            An unfitted ``TabFMRegressor``.
+        """
+        from tabfm import TabFMRegressor  # noqa: PLC0415 - optional dep
+
+        return TabFMRegressor(model=model, n_estimators=self.n_estimators, **self.backend_kwargs)
 
     def _predict_backend(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Return the ensemble mean and the across-member spread.

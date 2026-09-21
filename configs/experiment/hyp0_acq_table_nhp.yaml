@@ -9,16 +9,15 @@
 # (`ucb_k0.5` ... `ucb_k5`, the legacy kappa-ablation grid), so "vanilla TabPFN" can be
 # settled on evidence.
 #
-# PRE-REGISTERED DECISION RULE (fixed before any run): the headline acquisition is the one
-# with the lowest median RECOMMENDED regret on the TRAIN subjects (NHP: 0 and 3;
-# 5d_rat: see hyp0_acq_table_5d_rat.yaml), ties broken by cumulative regret. Held-out
-# subjects are never inspected for this choice (H0-5). If nothing beats gp_mll, report the
+# PRE-REGISTERED DECISION RULE (fixed before any run): with no train/held-out split, the
+# headline acquisition is the one with the lowest median RECOMMENDED regret over ALL subjects
+# and channels of this dataset, ties broken by cumulative regret. Caveat: selecting on the
+# data that is then reported makes the headline optimistic for the chosen acquisition, so the
+# full acquisition table is always reported alongside it. If nothing beats gp_mll, report the
 # best fixed kappa and say so plainly.
 #
-# Selection run (TRAIN subjects; the dataset default is the single held-out subject):
-#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_acq_table_nhp.yaml --set dataset.subjects=[0,3] n_reps=5
-# GP timed on CPU while TabPFN runs on CUDA (P0.12; descriptive only, see guardrail G1):
-#   ... --set model_params.gp_mll.device=cpu model_params.gp_naive.device=cpu
+# GP models are pinned to CPU below (P0.12; guardrail G1: latency is descriptive only).
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_acq_table_nhp.yaml --set n_reps=5
 defaults:
   dataset: nhp
   model: [tabpfn_v2_5, gp_mll, gp_naive, random]
@@ -36,3 +35,9 @@ device: cuda
 seed: 42
 output_root: output
 equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

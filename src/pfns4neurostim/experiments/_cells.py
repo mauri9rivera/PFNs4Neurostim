@@ -13,22 +13,25 @@ from ..models.registry import model_version
 __all__ = ["cell_identity", "row_from_payload", "count_channels"]
 
 
-def count_channels(cfg: ExperimentConfig) -> int:
+def count_channels(cfg: ExperimentConfig, shard: tuple[int, int] | None = None) -> int:
     """Count the (subject, EMG) channels a config selects, for progress reporting.
 
     Args:
         cfg: Resolved experiment configuration.
+        shard: ``(i, n)`` to count only that shard's channels.
 
     Returns:
         Number of channels (an upper bound: preprocessing may skip a channel).
     """
-    from ..data.channels import count_emgs  # noqa: PLC0415 - loads raw data
+    from ..data.channels import count_emgs, shard_size  # noqa: PLC0415 - loads raw data
 
     if cfg.dataset.emgs is not None:
-        return len(cfg.dataset.subjects) * len(cfg.dataset.emgs)
-    return sum(
-        count_emgs(cfg.dataset.name, s, cfg.dataset.data_root) for s in cfg.dataset.subjects
-    )
+        total = len(cfg.dataset.subjects) * len(cfg.dataset.emgs)
+    else:
+        total = sum(
+            count_emgs(cfg.dataset.name, s, cfg.dataset.data_root) for s in cfg.dataset.subjects
+        )
+    return shard_size(total, shard)
 
 
 def cell_identity(

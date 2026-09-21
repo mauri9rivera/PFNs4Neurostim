@@ -10,7 +10,7 @@
 defaults:
   dataset: 5d_rat
   model: [tabpfn_v2_5, gp_mll, gp_naive]
-  acquisition: ei
+  acquisition: ts_marginal   # headline (2026-09-20); EI/UCB compared in hyp0_acq_table_*
 
 experiment: stress_sweep
 family: stress-k2
@@ -20,9 +20,9 @@ knob:
   type: k2_snr
   levels: [ 0.1, 0.25,0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
 
-budget: 150
+budget: 100
 n_init: 5
-n_reps: 15
+n_reps: 10
 gt_mode: full_mean
 device: cuda
 seed: 42
@@ -32,3 +32,9 @@ output_root: output
 # Fixed before inspecting any K2 result; the breakdown point is the first level
 # at which equivalence against GP-MLL fails.
 equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

@@ -1,15 +1,16 @@
 # Hypothesis A - on-par-but-cheaper, NHP held-out subject.
 #
-# One acquisition (EI, the working default since 2026-09-17) across the model
-# ladder. Regrets are range-normalized (P0.9) and the three co-primary outcomes
-# are reported together; latency is measured in the same timed window for every
-# model, so the "cheaper" claim is EI-vs-EI rather than across acquisitions.
+# Headline acquisition: ts_marginal (independent per-site Thompson draws from each model's
+# predictive marginals; symmetric for GP and PFN). EI and UCB are compared later in the
+# formal acquisition experiment (hyp0_acq_table_*). The random-search baseline serves the
+# `random` acquisition only, hence the two-entry list. Regrets are range-normalized (P0.9);
+# latency is descriptive only (guardrail G1).
 #
 #   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml
 defaults:
   dataset: nhp
   model: [tabpfn_v2_5, gp_mll, gp_naive, random]
-  acquisition: ei
+  acquisition: [ts_marginal, random]
 
 experiment: bo_benchmark
 family: hyp-a
@@ -17,9 +18,15 @@ tag: nhp
 
 budget: 96
 n_init: 5
-n_reps: 20
+n_reps: 10
 gt_mode: full_mean
 device: cuda
 seed: 42
 output_root: output
 equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

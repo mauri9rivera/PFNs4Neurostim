@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import ExperimentConfig, load_experiment_config, resolved_dict
-from ..data.channels import ChannelData, iter_channels
+from ..data.channels import parse_shard, ChannelData, iter_channels
 from ..data.stress import KnobNotApplicable, build_knob, calibrate_levels, floor_snr_db
 from ..diagnostics import ClusterDiagnostics, diagnostics_enabled
 from ..evaluation import results as _results
@@ -45,7 +45,7 @@ from ._rows import build_row
 __all__ = ["run_stress_sweep", "build_tidy_rows", "main"]
 
 
-def _channels(cfg: ExperimentConfig) -> Iterable[ChannelData]:
+def _channels(cfg: ExperimentConfig, shard: tuple[int, int] | None = None) -> Iterable[ChannelData]:
     """Yield the channels selected by the config.
 
     Args:
@@ -61,7 +61,13 @@ def _channels(cfg: ExperimentConfig) -> Iterable[ChannelData]:
         data_root=cfg.dataset.data_root,
         gt_mode=cfg.gt_mode,
         normalization=cfg.dataset.normalization,
+        shard=shard,
     )
+
+
+def _shard_suffix(shard: tuple[int, int] | None) -> str:
+    """Run-directory suffix that keeps shards from overwriting each other's outputs."""
+    return "" if shard is None else f"-shard{shard[0]}of{shard[1]}"
 
 
 def _compute_cell(
@@ -138,6 +144,7 @@ def build_tidy_rows(
     *,
     progress: bool = True,
     store: CellStore | None = None,
+    shard: tuple[int, int] | None = None,
 ) -> tuple[list[TidyRow], dict[tuple[Any, ...], dict[str, Any]], list[dict[str, Any]]]:
     """Execute the whole sweep grid.
 
@@ -163,7 +170,7 @@ def build_tidy_rows(
     extras: list[dict[str, Any]] = []
     skipped: list[str] = []
 
-    for channel in _channels(cfg):
+    for channel in _channels(cfg, shard):
         floor_db = floor_snr_db(channel)
         if cfg.knob.targets_db is not None:
             # Solve the ladder against *this channel's* floor SNR, so the same
@@ -279,6 +286,7 @@ def run_stress_sweep(
     use_cache: bool = True,
     only_cached: bool = False,
     on_cell: Callable[[], None] | None = None,
+    shard: tuple[int, int] | None = None,
 ) -> str:
     """Run (or re-plot) one stress sweep.
 
@@ -294,6 +302,9 @@ def run_stress_sweep(
             without computing any.
         on_cell: Called once per cell served (computed or cached); drives the
             cluster-diagnostics throughput counter.
+        shard: ``(i, n)`` runs only every n-th channel starting at ``i``. The default
+            run directory gets a ``-shard{i}of{n}`` suffix; assemble the union with a
+            final ``--only-cached`` run without ``--shard``.
 
     Returns:
         Path to the run directory holding the deliverables.
@@ -305,7 +316,8 @@ def run_stress_sweep(
     """
     cfg = load_experiment_config(config_path, overrides)
     target = run_dir or os.path.join(
-        cfg.output_root, "stress", cfg.knob.type, cfg.dataset.name, f"{cfg.family}-{cfg.tag}"
+        cfg.output_root, "stress", cfg.knob.type, cfg.dataset.name,
+        f"{cfg.family}-{cfg.tag}{_shard_suffix(shard)}",
     )
     os.makedirs(target, exist_ok=True)
     tidy_path = os.path.join(target, "tidy.csv")
@@ -321,7 +333,7 @@ def run_stress_sweep(
         store = CellStore(
             cfg.cell_cache_root, enabled=use_cache, only_cached=only_cached, on_cell=on_cell
         )
-        rows, trajectories, extras = build_tidy_rows(cfg, run_tag, store=store)
+        rows, trajectories, extras = build_tidy_rows(cfg, run_tag, store=store, shard=shard)
         df = _results.rows_to_dataframe(rows, acquisition=cfg.acquisition.as_block())
         # Achieved metrics that are not part of the fixed schema (future knobs
         # may report e.g. amplitude ratio) ride along as extra columns.
@@ -371,6 +383,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-dir", default=None, help="Override the output run directory.")
     parser.add_argument("--no-cache", action="store_true", help="Neither read nor write the cell cache.")
     parser.add_argument(
+        "--shard", type=parse_shard, default=None, metavar="I/N",
+        help="Run only every N-th channel starting at I (multi-process lanes).",
+    )
+    parser.add_argument(
         "--cluster-diag", action="store_true",
         help="Print the SLURM job-efficiency report at the end (or set CLUSTER_DIAG=1).",
     )
@@ -387,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
         build_knob(cfg.knob.type, cfg.knob.levels, **cfg.knob.params).levels
     )
     planned = (
-        count_channels(cfg) * n_levels * len(cfg.models) * cfg.n_reps
+        count_channels(cfg, args.shard) * n_levels * len(cfg.models) * cfg.n_reps
         if diag_on and not args.replot
         else 0
     )
@@ -398,6 +414,6 @@ def main(argv: list[str] | None = None) -> int:
         run_stress_sweep(
             args.config, args.overrides, replot=args.replot, run_dir=args.run_dir,
             use_cache=not args.no_cache, only_cached=args.only_cached,
-            on_cell=diag.record_experiment,
+            on_cell=diag.record_experiment, shard=args.shard,
         )
     return 0
