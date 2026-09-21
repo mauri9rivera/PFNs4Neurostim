@@ -339,6 +339,40 @@ def acquisition_style(model: str, acq_type: str) -> ModelStyle:
     )
 
 
+#: Linestyles cycled when one model carries several acquisition configs that are not registered
+#: acquisition types (e.g. the fixed-kappa UCB grid).
+SERIES_LINESTYLES: tuple[object, ...] = ("-", "--", "-.", ":", (0, (5, 1, 1, 1, 1, 1)))
+
+
+def series_style(model: str, label: str, labels: Sequence[str]) -> ModelStyle:
+    """Style of one (model, acquisition-config) series in a multi-series figure.
+
+    A model with a single series keeps its own style; a model with several is shaded
+    and dashed by acquisition (registered types via :func:`acquisition_style`, other
+    config names such as ``ucb_k2`` by their rank within the model).
+
+    Args:
+        model: Model identifier.
+        label: This series' acquisition config name.
+        labels: Every acquisition config name that this model carries in the figure.
+
+    Returns:
+        The :class:`ModelStyle` for the series.
+    """
+    if len(labels) <= 1:
+        return model_style(model)
+    if label in ACQUISITION_ORDER:
+        return acquisition_style(model, label)
+    ordered = sorted(labels)
+    idx = ordered.index(label)
+    base = model_style(model)
+    color = base.color if idx == 0 else derive_shade(base.color, idx - 1, len(ordered) - 1)
+    return ModelStyle(
+        f"{base.label} ({label})", color, SERIES_LINESTYLES[idx % len(SERIES_LINESTYLES)],
+        base.marker, base.family, base.zorder,
+    )
+
+
 def model_palette(
     models: Iterable[str] | None = None,
     *,
@@ -390,6 +424,8 @@ def plot_kwargs(model: str, **overrides: object) -> dict[str, object]:
 AXIS_LABELS: dict[str, str] = {
     "r2": r"$R^2$ of surrogate",
     "spearman": r"Spearman $\rho$",
+    "simple_regret": "Simple regret (0-1)",
+    "exploration_score": "Exploration score",
     "final_regret": "Final regret (norm. GT range)",
     "recommended_regret": "Recommended-site regret (norm. GT range)",
     "best_queried_regret": "Best-queried regret (norm. GT range)",

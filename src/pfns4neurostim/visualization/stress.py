@@ -29,12 +29,14 @@ from ..evaluation.robustness import (
     relative_robustness,
 )
 from . import style as S
+from . import traces as T
 
 __all__ = [
     "plot_degradation_curves",
-    "plot_calibration_row",
+    "plot_outcome_panels",
     "build_robustness_table",
-    "plot_robustness_forest",
+    "breakdown_vs_budget",
+    "plot_breakdown_vs_budget",
     "render_all",
 ]
 
@@ -233,17 +235,17 @@ def plot_degradation_curves(
     return S.save_figure(fig, out_dir, f"degradation_{'invivo' if demo == 'demo2' else 'synthetic'}")
 
 
-def plot_calibration_row(
+def plot_outcome_panels(
     df: pd.DataFrame,
     out_dir: str,
     *,
     knob: str,
     dataset: str,
 ) -> list[str]:
-    """Calibration panels: 90% interval coverage and ECE vs the knob axis.
+    """Final-run outcomes vs the knob axis: (a) simple regret, (b) exploration score, (c) R^2.
 
-    A horizontal reference line marks nominal 90% coverage; a well-calibrated
-    model tracks it as stress rises, an overconfident one falls below it.
+    Replaces the 90%-coverage calibration figure (2026-09-21). Lines and 95% CI bands over
+    channels, one line per model; no bars.
 
     Args:
         df: Tidy sweep frame.
@@ -252,41 +254,49 @@ def plot_calibration_row(
         dataset: Dataset name.
 
     Returns:
-        Paths written (empty when the sweep carries no calibration columns).
+        Paths written (empty when the frame has none of the outcome columns).
     """
-    if not {"coverage_90", "ece"} <= set(df.columns) or df["coverage_90"].isna().all():
+    panels = [
+        (col, key)
+        for col, key in (
+            ("recommended_regret", "simple_regret"),
+            ("exploration_score", "exploration_score"),
+            ("r2", "r2"),
+        )
+        if col in df.columns and df[col].notna().any()
+    ]
+    if not panels:
         return []
 
     x_col = _knob_axis(df, knob)
     demo = str(df["demo"].iloc[0]) if "demo" in df.columns else "demo2"
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
 
-    fig, axes = S.figure("onehalf", nrows=1, ncols=2, aspect=1.0)
+    fig, axes = S.figure("double", nrows=1, ncols=len(panels), aspect=1.0)
     axes = np.atleast_1d(axes)
-
-    for ax, metric in zip(axes, ("coverage_90", "ece")):
+    for ax, (col, key) in zip(axes, panels):
         for model in models:
             sub = df[df["model"] == model]
-            if sub.empty:
+            if sub.empty or sub[col].isna().all():
                 continue
-            x, mean, ci = _model_curve(sub, x_col, metric)
+            x, mean, ci = _model_curve(sub, x_col, col)
             ax.plot(x, mean, **S.plot_kwargs(model))
-            ax.fill_between(
-                x, mean - ci, mean + ci, color=S.model_color(model), alpha=S.BAND_ALPHA, linewidth=0
-            )
-        if metric == "coverage_90":
-            ax.axhline(0.9, color="black", linestyle="--", linewidth=0.6, alpha=0.6)
-            ax.set_ylim(0.0, 1.0)
-        ax.set_ylabel(S.axis_label(metric))
+            ax.fill_between(x, mean - ci, mean + ci, color=S.model_color(model), alpha=S.BAND_ALPHA, linewidth=0)
+        ax.set_ylabel(S.axis_label(key))
         ax.set_xlabel(S.axis_label(x_col))
         if x_col == "achieved_snr_db":
             ax.invert_xaxis()
-
     axes[0].legend(loc="best")
-    axes[0].set_title(f"{S.DATASET_LABELS.get(dataset, dataset)} - calibration", loc="left")
+    n_reps = int(df["rep"].nunique()) if "rep" in df.columns else 0
+    n_chan = int(df[["subject", "emg"]].drop_duplicates().shape[0])
+    axes[0].set_title(
+        f"{S.DATASET_LABELS.get(dataset, dataset)} - {S.KNOB_LABELS.get(knob, knob)} "
+        f"(n={n_reps} reps, {n_chan} channels)",
+        loc="left",
+    )
     S.panel_letters(axes, x=-0.22)
     fig.tight_layout()
-    return S.save_figure(fig, out_dir, f"calibration_{'invivo' if demo == 'demo2' else 'synthetic'}")
+    return S.save_figure(fig, out_dir, f"outcomes_{'invivo' if demo == 'demo2' else 'synthetic'}")
 
 
 def build_robustness_table(
@@ -398,50 +408,122 @@ def build_robustness_table(
     return table, path
 
 
-def plot_robustness_forest(
+#: Fractions of the run's budget at which the breakdown point is re-evaluated.
+BREAKDOWN_BUDGET_FRACTIONS: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0)
+
+
+def breakdown_vs_budget(
+    frame: pd.DataFrame,
+    df: pd.DataFrame,
+    *,
+    knob: str,
+    margin: float,
+    reference: str = REFERENCE_MODEL,
+    fractions: Sequence[float] = BREAKDOWN_BUDGET_FRACTIONS,
+) -> pd.DataFrame:
+    """Breakdown point of every model as a function of the BO budget.
+
+    At each budget t the recommended-site regret after t observations (read from the stored
+    per-step trace, so no re-run) is fed to the same paired-TOST breakdown rule as the
+    robustness table.
+
+    Args:
+        frame: Trace frame from :func:`traces.load_trace_frame`.
+        df: Tidy sweep frame (supplies the knob level -> plotted-axis mapping).
+        knob: Knob name.
+        margin: Pre-registered TOST margin.
+        reference: Reference model.
+        fractions: Budget fractions at which to evaluate.
+
+    Returns:
+        Long frame with ``model``, ``budget``, ``breakdown_level``, ``breakdown_x``, ``reason``.
+    """
+    x_col = _knob_axis(df, knob)
+    ascending = _severity_ascending(x_col)
+    level_x = _level_to_x(df, x_col)
+    field = "recommended_regret_per_step"
+    frame = frame[frame[field].notna()].sort_values(["level", "subject", "emg", "rep"])
+    if frame.empty:
+        return pd.DataFrame(columns=["model", "budget", "breakdown_level", "breakdown_x", "reason"])
+    n_init = int(frame["n_init"].iloc[0])
+    total = int(frame[field].iloc[0].shape[0]) - 1 + n_init
+    budgets = sorted({int(round(f * total)) for f in fractions if n_init < round(f * total) <= total})
+
+    def per_level(model: str, t: int) -> dict[float, np.ndarray]:
+        sub = frame[frame["model"] == model]
+        return {
+            float(level): np.array([trace[t - n_init] for trace in grp[field]], dtype=float)
+            for level, grp in sub.groupby("level", dropna=False)
+        }
+
+    records: list[dict[str, Any]] = []
+    for model in [m for m in S.MODEL_ORDER if m in set(frame["model"]) and m != reference]:
+        for t in budgets:
+            bp = breakdown_point(
+                per_level(model, t), per_level(reference, t), margin=margin, severity_ascending=ascending
+            )
+            level = bp["breakdown_level"]
+            records.append(
+                {
+                    "model": model,
+                    "budget": t,
+                    "breakdown_level": level,
+                    "breakdown_x": level_x.get(level, float("nan")) if np.isfinite(level) else float("nan"),
+                    "reason": bp["breakdown_reason"],
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
+
+def plot_breakdown_vs_budget(
     table: pd.DataFrame,
+    df: pd.DataFrame,
     out_dir: str,
     *,
     knob: str,
+    dataset: str,
 ) -> list[str]:
-    """Forest plot of breakdown points with bootstrap CIs, one row per model.
+    """Breakdown point (y) vs BO budget (x), coloured by model.
+
+    A filled marker is a breakdown at that budget; an open marker at the most severe tested level
+    means the model never broke down within the ladder.
 
     Args:
-        table: Output of :func:`build_robustness_table`.
+        table: Output of :func:`breakdown_vs_budget`.
+        df: Tidy sweep frame.
         out_dir: Destination directory.
-        knob: Knob name, for the axis label.
+        knob: Knob name.
+        dataset: Dataset name.
 
     Returns:
-        Paths written (empty when no model has a finite breakdown point).
+        Paths written (empty when the table is empty).
     """
-    plottable = table[np.isfinite(table.get("breakdown_x", pd.Series(dtype=float)))]
-    if plottable.empty:
+    if table.empty:
         return []
+    x_col = _knob_axis(df, knob)
+    ascending = _severity_ascending(x_col)
+    level_x = _level_to_x(df, x_col)
+    xs = sorted(level_x.values())
+    harshest = max(xs) if ascending else min(xs)
 
-    x_col = str(table["x_axis"].iloc[0])
-    fig, ax = S.figure("single", aspect=0.55)
-    ys = np.arange(len(plottable))
-    for y, (_, row) in zip(ys, plottable.iterrows()):
-        color = S.model_color(str(row["model"]))
-        lo = row.get("breakdown_ci_lo", np.nan)
-        hi = row.get("breakdown_ci_hi", np.nan)
-        if np.isfinite(lo) and np.isfinite(hi):
-            ax.plot([lo, hi], [y, y], color=color, linewidth=1.2, solid_capstyle="butt")
-        ax.plot(
-            [row["breakdown_x"]],
-            [y],
-            marker=S.model_style(str(row["model"])).marker,
-            color=color,
-            markersize=S.MARKER_SIZE + 1,
-            linestyle="none",
-        )
-    ax.set_yticks(ys)
-    ax.set_yticklabels([S.model_label(m) for m in plottable["model"]])
-    ax.set_xlabel(f"Breakdown point ({S.axis_label(x_col)})")
-    ax.set_title(f"{S.KNOB_LABELS.get(knob, knob)} breakdown", loc="left")
-    ax.invert_yaxis()
+    table.to_csv(os.path.join(out_dir, "breakdown_vs_budget.csv"), index=False)
+    fig, ax = S.figure("single", aspect=0.75)
+    for model, grp in table.groupby("model"):
+        grp = grp.sort_values("budget")
+        y = grp["breakdown_x"].fillna(harshest).to_numpy(dtype=float)
+        broken = grp["breakdown_x"].notna().to_numpy()
+        color = S.model_color(str(model))
+        ax.plot(grp["budget"], y, color=color, linewidth=S.LINE_WIDTH, label=S.model_label(str(model)))
+        ax.plot(grp["budget"][broken], y[broken], linestyle="none", marker=S.model_style(str(model)).marker,
+                color=color, markersize=S.MARKER_SIZE + 1)
+        ax.plot(grp["budget"][~broken], y[~broken], linestyle="none", marker=S.model_style(str(model)).marker,
+                markerfacecolor="white", color=color, markersize=S.MARKER_SIZE + 1)
+    ax.set_xlabel(S.axis_label("budget"))
+    ax.set_ylabel(f"Breakdown point ({S.axis_label(x_col)})")
+    ax.set_title(f"{S.DATASET_LABELS.get(dataset, dataset)} - {S.KNOB_LABELS.get(knob, knob)} breakdown", loc="left")
+    ax.legend(loc="best")
     fig.tight_layout()
-    return S.save_figure(fig, out_dir, "robustness_forest")
+    return S.save_figure(fig, out_dir, "breakdown_vs_budget")
 
 
 def plot_regime_heatmap(*args: Any, **kwargs: Any) -> list[str]:
@@ -483,6 +565,9 @@ def render_all(
     written += plot_degradation_curves(
         df, out_dir, knob=knob, dataset=dataset, breakdowns=breakdowns
     )
-    written += plot_calibration_row(df, out_dir, knob=knob, dataset=dataset)
-    written += plot_robustness_forest(table, out_dir, knob=knob)
+    written += plot_outcome_panels(df, out_dir, knob=knob, dataset=dataset)
+    frame = T.load_trace_frame(out_dir)
+    if frame is not None and not frame.empty and knob != "k6_budget":
+        bd = breakdown_vs_budget(frame, df, knob=knob, margin=margin)
+        written += plot_breakdown_vs_budget(bd, df, out_dir, knob=knob, dataset=dataset)
     return written

@@ -24,6 +24,8 @@ from typing import Any, Optional, Sequence, Union
 import pandas as pd
 import yaml
 
+from . import pickle_compat as _pickle_compat
+
 __all__ = [
     "KEY_COLUMNS",
     "METRIC_COLUMNS",
@@ -529,7 +531,7 @@ def read_trajectories(path: str) -> dict[tuple[Any, ...], dict[str, Any]]:
             the current :data:`KEY_COLUMNS` (schema-drift guard).
     """
     with open(path, "rb") as f:
-        payload = pickle.load(f)
+        payload = _pickle_compat.load(f)
     if tuple(payload["key_columns"]) != KEY_COLUMNS:
         raise ValueError(
             f"Trajectory pickle at {path!r} was written with key columns "

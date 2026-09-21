@@ -1,15 +1,17 @@
 #!/bin/bash
-# Local extra-work queue (run unattended). Phases run one after another so the single GPU is not oversubscribed; GP-only work
+# Local queue (run unattended on the RTX 3060). Phases run one after another so the single GPU is not oversubscribed; GP-only work
 # overlaps the GPU work on the CPU; a failed phase never blocks the next; every phase ends by assembling its unit from the cache.
 #
 #   nohup bash scripts/local_queue.sh > output/logs/local_queue.log 2>&1 &
 #
-# Priority order (TabFM, the slowest PFN, is deliberately LAST). Env: PY (main env python), PYB (bench env python).
+# Re-written 2026-09-21 for the meeting deadline, after the re-query fix (cache_version 2). Priority order, all at the config's
+# default 10 reps. Deliberately NOT here: D3 NHP (the cluster runs it: TabPFN-2.5, TabICL, GP-MLL) and TabFM (3 h 17 min for 10 reps).
+# A phase that has not finished when you need the numbers can still be assembled from whatever cells exist:
+#   python -m pfns4neurostim <experiment> --config <config.yaml> --only-cached
+# Env: PY (python of the main env).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PY="${PY:-python}"
-PYB="${PYB:-python}"
-BENCH_CFG=configs/experiment/hyp0_pfn_bench_nhp.yaml
 
 stamp() { echo "[queue] $1: $(date)"; }
 assemble() { local py="$1" exp="$2" cfg="$3"; "${py}" -m pfns4neurostim "${exp}" --config "${cfg}" --only-cached > "output/logs/assemble_$(basename "${cfg}" .yaml).log" 2>&1 || echo "[queue] ASSEMBLY FAILED for ${cfg} (see output/logs)"; }
@@ -25,16 +27,15 @@ phase() {
   stamp "DONE ${label}"
 }
 
-# Wait for the K6-budget chain (D1 assembly + K6 lanes) started earlier.
-until grep -q "K6 assembled" output/logs/local_chain.log 2>/dev/null; do sleep 30; done
-stamp "K6-budget chain finished; starting the queue"
-
-phase d3-tabicl    "${PYB}" bo_benchmark  "${BENCH_CFG}"                                   tabicl      3  -                  0
-phase acq-core     "${PY}"  bo_benchmark  configs/experiment/hyp0_acq_core_nhp.yaml        tabpfn_v2_5 3  gp_mll,gp_naive,random 4
-phase k6-dropout   "${PY}"  stress_sweep  configs/experiment/stress_k6_dropout_nhp.yaml    tabpfn_v2_5 3  gp_mll,gp_naive    3
-phase ucb-kappa    "${PY}"  bo_benchmark  configs/experiment/hyp0_ucb_kappa_nhp.yaml       tabpfn_v2_5 3  -                  0
-phase k5-nhp-synth "${PY}"  stress_sweep  configs/experiment/stress_k5_nhp.yaml            tabpfn_v2_5 3  gp_mll,gp_naive    3
-phase d3-tabfm     "${PYB}" bo_benchmark  "${BENCH_CFG}"                                   tabfm       2  -                  0
-# The D3 unit also pulls TabPFN and GP-MLL from the D1 cache: assemble once more with everything present.
-assemble "${PYB}" bo_benchmark "${BENCH_CFG}"
+mkdir -p output/logs
+# 1. Deliverable 1, NHP (not in the cluster portfolio). ~40 min at 10 reps.
+phase d1-nhp       "${PY}" bo_benchmark  configs/experiment/hyp_a_nhp.yaml                 tabpfn_v2_5 3  gp_mll,gp_naive,random 4
+# 2. Acquisition table (ei, ucb, ts_marginal, random) - the input to the headline-acquisition decision. ~50 min.
+phase acq-core     "${PY}" bo_benchmark  configs/experiment/hyp0_acq_core_nhp.yaml         tabpfn_v2_5 3  gp_mll,gp_naive,random 4
+# 3. K6 electrode dropout, 6 levels at budget 96 (the heaviest local phase: ~3 h for TabPFN alone).
+phase k6-dropout   "${PY}" stress_sweep  configs/experiment/stress_k6_dropout_nhp.yaml    tabpfn_v2_5 3  gp_mll,gp_naive        3
+# 4. UCB fixed-kappa grid (TabPFN only).
+phase ucb-kappa    "${PY}" bo_benchmark  configs/experiment/hyp0_ucb_kappa_nhp.yaml       tabpfn_v2_5 3  -                      0
+# 5. K5 outliers on NHP (synthetic heavy-tail: caption it as such).
+phase k5-nhp-synth "${PY}" stress_sweep  configs/experiment/stress_k5_nhp.yaml            tabpfn_v2_5 3  gp_mll,gp_naive        3
 stamp "QUEUE FINISHED"

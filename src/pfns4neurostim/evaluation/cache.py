@@ -27,6 +27,8 @@ import pickle
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Mapping
 
+from . import pickle_compat as _pickle_compat
+
 __all__ = [
     "cell_key",
     "cell_path",
@@ -150,7 +152,7 @@ def load_cell(
         with open(json_path, encoding="utf-8") as fh:
             stored = json.load(fh)
         with open(pkl_path, "rb") as fh:
-            trajectory = pickle.load(fh)
+            trajectory = _pickle_compat.load(fh)
     except (OSError, ValueError, pickle.UnpicklingError, EOFError):
         return None
     if stored.get("identity") != json.loads(_canonical(identity)):

@@ -194,9 +194,25 @@ class TestDeliverables:
         names = {os.path.basename(p) for p in written}
         assert "robustness.csv" in names
         assert "degradation_invivo.svg" in names
-        assert "calibration_invivo.svg" in names
+        assert "outcomes_invivo.svg" in names
         for path in written:
             assert os.path.getsize(path) > 0
+
+    def test_breakdown_vs_budget_from_traces(self, sweep: pd.DataFrame) -> None:
+        """Breakdown points are recomputed at several budgets from the per-step regret traces."""
+        rng = np.random.default_rng(0)
+        n_steps = BUDGET - N_INIT + 1
+        rows = []
+        for model, offset in (("gp_mll", 0.0), ("tabpfn_v2_5", 0.4)):
+            for level in LEVELS:
+                for rep in range(N_REPS + 2):
+                    trace = np.clip(offset * level + 0.05 * rng.normal(size=n_steps) + 0.1, 0.0, 1.0)
+                    rows.append({"model": model, "level": float(level), "subject": 1, "emg": 0, "rep": rep,
+                                 "n_init": N_INIT, "recommended_regret_per_step": trace})
+        table = stress_figs.breakdown_vs_budget(pd.DataFrame(rows), sweep, knob="k2_snr", margin=0.05)
+        assert set(table["model"]) == {"tabpfn_v2_5"}
+        assert table["budget"].nunique() > 1
+        assert table["breakdown_x"].notna().any(), "a clearly worse model must break down somewhere"
 
     def test_robustness_table_has_one_row_per_model(self, sweep: pd.DataFrame, tmp_path) -> None:
         table, path = stress_figs.build_robustness_table(sweep, str(tmp_path), knob="k2_snr")
