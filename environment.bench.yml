@@ -49,6 +49,7 @@ dependencies:
       # --- TabICL v2 (vendored at libs/tabicl @ v2.2.0; these are its deps) ---
       - einops==0.8.2
       - huggingface-hub==1.32.0
+      - psutil==7.2.2   # TabICL memory estimate at inference; declared upstream but the submodule is used without pip deps
       # --- TabFM (vendored at libs/tabfm; TORCH backend on GPU; the jax/flax backend is not used or validated) ---
       - safetensors==0.8.0     # weight loading; not declared upstream (found 2026-09-20)
       - absl-py==2.5.0
