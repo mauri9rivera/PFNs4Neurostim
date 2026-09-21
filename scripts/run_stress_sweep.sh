@@ -15,7 +15,7 @@
 #SBATCH --error=logs/stress_%j.err
 #SBATCH --partition=main
 #SBATCH --requeue
-#SBATCH --signal=B:TERM@300
+#SBATCH --signal=B:USR1@300
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1

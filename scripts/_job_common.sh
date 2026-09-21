@@ -6,7 +6,9 @@
 #   job_stage_data "${CONFIG}"         # copies the dataset to $SLURM_TMPDIR, sets STAGED_ROOT
 #   job_dispatch bo_benchmark "${CONFIG}" "${OVERRIDES[@]}"    # LANES=N (default 1) processes
 #
-# Preemption/timeouts: sbatch sends TERM 300 s before the limit (--signal=B:TERM@300).
+# Signals: sbatch sends USR1 300 s before the time limit (--signal=B:USR1@300) -> stop and REQUEUE (resumes from the cell cache).
+# TERM is what `scancel` and preemption send -> stop and EXIT, never requeue (an earlier version trapped TERM to requeue, so
+# cancelling a job silently restarted it; found 2026-09-20 with job 10871694).
 # `job_run` forwards it to the experiment, then requeues the job. Every finished cell is
 # already in the cell cache (output/cells), so the requeued job resumes where this one stopped.
 
@@ -40,7 +42,8 @@ job_run() {
   export CLUSTER_DIAG="${CLUSTER_DIAG:-1}"
   srun python -m pfns4neurostim "${experiment}" --config "${config}" --set "dataset.data_root=${STAGED_ROOT}" "$@" &
   local pid=$!
-  trap 'echo "[job] TERM received: stopping and requeueing"; kill -TERM ${pid} 2>/dev/null || true; wait ${pid} || true; scontrol requeue "${SLURM_JOB_ID}"; exit 0' TERM
+  trap 'echo "[job] time-limit warning (USR1): stopping and requeueing"; kill -TERM ${pid} 2>/dev/null || true; wait ${pid} || true; scontrol requeue "${SLURM_JOB_ID}"; exit 0' USR1
+  trap 'echo "[job] TERM (scancel or preemption): stopping, NOT requeueing"; kill -TERM ${pid} 2>/dev/null || true; wait ${pid} || true; exit 143' TERM
   wait "${pid}"
 }
 
@@ -62,7 +65,8 @@ job_run_lanes() {
     LANE_PIDS+=($!)
   done
   echo "[job] started ${lanes} lanes: logs/lane*_${SLURM_JOB_ID:-local}.out"
-  trap 'echo "[job] TERM received: stopping lanes and requeueing"; kill -TERM "${LANE_PIDS[@]}" 2>/dev/null || true; wait || true; scontrol requeue "${SLURM_JOB_ID}"; exit 0' TERM
+  trap 'echo "[job] time-limit warning (USR1): stopping lanes and requeueing"; kill -TERM "${LANE_PIDS[@]}" 2>/dev/null || true; wait || true; scontrol requeue "${SLURM_JOB_ID}"; exit 0' USR1
+  trap 'echo "[job] TERM (scancel or preemption): stopping lanes, NOT requeueing"; kill -TERM "${LANE_PIDS[@]}" 2>/dev/null || true; wait || true; exit 143' TERM
   local failed=0 pid
   for pid in "${LANE_PIDS[@]}"; do
     wait "${pid}" || failed=1

@@ -16,7 +16,7 @@
 #SBATCH --error=logs/cpu_%j.err
 #SBATCH --partition=main-cpu
 #SBATCH --requeue
-#SBATCH --signal=B:TERM@300
+#SBATCH --signal=B:USR1@300
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
