@@ -8,10 +8,10 @@ Deliverables:
     ``degradation_{demo}.svg``  regret and R-squared vs the knob axis, per model,
                                with 95% CI bands, faint per-channel lines and
                                breakdown points marked.
-    ``calibration_{demo}.svg``  90% coverage and ECE vs the knob axis.
+    ``outcomes_{demo}.svg``     simple regret, exploration score and R-squared vs the knob axis.
     ``robustness.csv``          breakdown point, degradation AUC, CVaR-10%,
                                 relative robustness, per model.
-    ``robustness_forest.svg``   breakdown points with bootstrap CIs.
+    ``breakdown_vs_budget.svg`` breakdown point (TOST vs GP-MLL) against the BO budget, one line per model.
 """
 from __future__ import annotations
 
@@ -61,6 +61,27 @@ def _knob_axis(df: pd.DataFrame, knob: str) -> str:
     if preferred in df.columns and df[preferred].notna().any():
         return preferred
     return "level"
+
+
+#: Knobs whose *level* gets more severe as it decreases (the level is a budget). Every other knob (K2 alpha,
+#: K5 contamination, K6 dropout) gets more severe as the level increases, whatever the plotted x-axis does.
+LEVEL_SEVERITY_DESCENDING: frozenset[str] = frozenset({"k6_budget"})
+
+
+def _level_severity_ascending(knob: str) -> bool:
+    """Whether a larger knob *level* means more stress (the order in which breakdown walks the ladder).
+
+    This is about the level, not the plotted axis: K2 is plotted against achieved SNR, which falls with
+    stress, but its level (alpha) rises with stress. Passing the axis direction here made the walk start at
+    the harshest level and report a breakdown there for every model.
+
+    Args:
+        knob: Knob name.
+
+    Returns:
+        True when larger levels are more severe.
+    """
+    return knob not in LEVEL_SEVERITY_DESCENDING
 
 
 def _severity_ascending(x_col: str) -> bool:
@@ -323,6 +344,7 @@ def build_robustness_table(
     """
     x_col = _knob_axis(df, knob)
     ascending = _severity_ascending(x_col)
+    level_ascending = _level_severity_ascending(knob)
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
     ref_sub = df[df["model"] == reference]
     level_x = _level_to_x(df, x_col)
@@ -355,7 +377,7 @@ def build_robustness_table(
                 _per_level_values(sub, metric),
                 _per_level_values(ref_sub, metric),
                 margin=margin,
-                severity_ascending=ascending,
+                severity_ascending=level_ascending,
             )
             rec["breakdown_level"] = bp["breakdown_level"]
             rec["breakdown_x"] = level_x.get(bp["breakdown_level"], float("nan"))
@@ -372,7 +394,7 @@ def build_robustness_table(
                         _per_level_values(grp, metric),
                         _per_level_values(ref_grp, metric),
                         margin=margin,
-                        severity_ascending=ascending,
+                        severity_ascending=level_ascending,
                     )
                 except ValueError:
                     continue
@@ -439,7 +461,7 @@ def breakdown_vs_budget(
         Long frame with ``model``, ``budget``, ``breakdown_level``, ``breakdown_x``, ``reason``.
     """
     x_col = _knob_axis(df, knob)
-    ascending = _severity_ascending(x_col)
+    level_ascending = _level_severity_ascending(knob)
     level_x = _level_to_x(df, x_col)
     field = "recommended_regret_per_step"
     frame = frame[frame[field].notna()].sort_values(["level", "subject", "emg", "rep"])
@@ -461,7 +483,7 @@ def breakdown_vs_budget(
     for model in [m for m in S.MODEL_ORDER if m in set(frame["model"]) and m != reference]:
         for t in budgets:
             bp = breakdown_point(
-                per_level(model, t), per_level(reference, t), margin=margin, severity_ascending=ascending
+                per_level(model, t), per_level(reference, t), margin=margin, severity_ascending=level_ascending
             )
             level = bp["breakdown_level"]
             records.append(
