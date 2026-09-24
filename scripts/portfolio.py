@@ -215,7 +215,9 @@ def emit_bash(group: str) -> None:
     print("")
     if group == "stress":
         print("# The K2-channel units reuse the pre-restructure k2_snr cells: relabel them first (idempotent, copies only).")
-        print("python scripts/relabel_knob_cells.py --apply")
+        print("# The login node has no python on PATH: load conda and run inside the main env (the script imports the package).")
+        print("if ! command -v conda >/dev/null 2>&1; then set +u; module load anaconda/3; set -u; fi")
+        print("conda run -n pfns4neurostim python scripts/relabel_knob_cells.py --apply")
         print("")
     for unit in _selected(group):
         if unit.experiment in SINGLE_PROCESS:

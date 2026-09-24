@@ -36,7 +36,9 @@ submit_single() {
 }
 
 # The K2-channel units reuse the pre-restructure k2_snr cells: relabel them first (idempotent, copies only).
-python scripts/relabel_knob_cells.py --apply
+# The login node has no python on PATH: load conda and run inside the main env (the script imports the package).
+if ! command -v conda >/dev/null 2>&1; then set +u; module load anaconda/3; set -u; fi
+conda run -n pfns4neurostim python scripts/relabel_knob_cells.py --apply
 
 submit_unit "S1a. K2-channel, NHP (alpha = 8 top-up)" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "S1b. K2-channel, 5d_rat (alpha = 8 top-up)" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
