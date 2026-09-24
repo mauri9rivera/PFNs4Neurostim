@@ -1,0 +1,33 @@
+# Task #9 - update-rule alignment + implicit kernel (roadmap M10), the primary Hyp C analysis.
+#
+# Grid: channel x K2 level x context size t x context draw; engines share one context, one
+# stratified anchor set (12) and one frozen MLL-GP reference per cell. Validation gates
+# (positive control on a known GP, coordinate-shuffle negative control, x10-seed floor,
+# linear-regime check) are written to gates.json; per research_design no real-data figure is
+# interpreted unless they pass.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_update_rule_nhp.yaml
+defaults:
+  dataset: nhp
+
+analysis: update_rule
+tag: nhp
+device: cuda
+seed: 42
+output_root: output
+
+update_rule:
+  engines: [tabpfn_v2_5, gp_mll_frozen, gp_mll_refit]
+  context_sizes: [10, 25, 50]
+  stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
+  n_context_draws: 3
+  n_anchors: 12
+  surprises: [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0]
+  refit_surprises: [-1.0, -0.5, 0.5, 1.0]
+  gp_params: {n_opt_steps: 100, lr: 0.1}
+  inference_seed: 0
+  gates: {positive_r: 0.7, lengthscale_tol: 0.25, icc_min: 0.75, linear_regime_tol: 0.25, null_quantile: 0.95, context_t: 25}
+  positive_control: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10}
+  seed_floor: {n_seeds: 10, n_channels: 2}
+  link: {tidy_csv: null, model: tabpfn_v2_5, outcomes: [recommended_regret, cumulative_regret], predictors: [saturation_index_median, ell_adaptivity, rho_shape_median], n_boot: 2000}
+  layer_arm: {enabled: true, context_t: 25, level: 1.0, ridge: 1.0}

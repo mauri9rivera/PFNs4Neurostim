@@ -6,8 +6,8 @@
 # addition to the GPU jobs. One lane per core, each single-threaded.
 #
 # Usage (the USER runs sbatch):
-#   sbatch scripts/run_cpu.sh bo_benchmark configs/experiment/hyp_a_5d_rat.yaml "models=[gp_mll,gp_naive,random]" tag=cpu
-#   sbatch scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_nhp.yaml "models=[gp_mll,gp_naive]" tag=cpu
+#   sbatch scripts/run_cpu.sh bo_benchmark configs/experiment/hyp_a_5d_rat.yaml "models=[gp_mll,gp_naive,random]"
+#   sbatch scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_channel_nhp.yaml "models=[gp_mll,gp_naive]"
 #
 # Everything after the config path is forwarded to `--set`. Cells are cached in output/cells and shared
 # with the GPU jobs of the same config; assemble the union with a final `--only-cached` run.

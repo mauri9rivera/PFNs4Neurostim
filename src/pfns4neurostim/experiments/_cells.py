@@ -1,4 +1,4 @@
-"""Cell identity and (de)serialization shared by the cache-backed runners."""
+"""Cell identity, (de)serialization and ground-truth expansion shared by the cache-backed runners."""
 from __future__ import annotations
 
 from dataclasses import fields, replace
@@ -7,10 +7,12 @@ from typing import Any
 from ..acquisition.registry import build_acquisition
 from ..config import AcquisitionConfig, ExperimentConfig
 from ..data.channels import ChannelData
+from ..data.ground_truth import ground_truth_instances, split_half_reliability
 from ..evaluation.results import TidyRow
 from ..models.registry import model_version
+from ..seeding import rng_for
 
-__all__ = ["cell_identity", "row_from_payload", "count_channels"]
+__all__ = ["cell_identity", "row_from_payload", "count_channels", "gt_instances"]
 
 
 def count_channels(cfg: ExperimentConfig, shard: tuple[int, int] | None = None) -> int:
@@ -67,7 +69,7 @@ def cell_identity(
         A JSON-serializable identity dict.
     """
     _, resolved = build_acquisition(acq.type, acq.params, acq.schedules)
-    return {
+    identity = {
         "experiment": experiment,
         "dataset": channel.dataset,
         "subject": channel.subject,
@@ -93,6 +95,12 @@ def cell_identity(
         "seed": seed,
         "cache_version": cfg.cache_version,
     }
+    # Split-half cells only: added conditionally so every full-mean identity (and hence
+    # every existing cached cell) is unchanged.
+    if channel.split_id is not None:
+        identity["split_id"] = channel.split_id
+        identity["gt_n_splits"] = cfg.gt_n_splits
+    return identity
 
 
 def row_from_payload(payload: dict[str, Any], run_tag: str) -> TidyRow:
@@ -109,3 +117,34 @@ def row_from_payload(payload: dict[str, Any], run_tag: str) -> TidyRow:
         The tidy row.
     """
     return replace(TidyRow(**payload["row"]), run_tag=run_tag)
+
+
+def gt_instances(cfg: ExperimentConfig, channel: ChannelData) -> list[ChannelData]:
+    """Expand a full-mean channel into the ground-truth instances of ``cfg.gt_mode``.
+
+    ``full_mean`` returns ``[channel]`` unchanged. ``split_half`` (task #7, P0.7) returns
+    ``2 * cfg.gt_n_splits`` cross-fitted instances drawn from a stream keyed by the
+    channel label, each carrying the channel's split-half reliability in ``meta`` so
+    the tidy row can report the R² noise ceiling.
+
+    Args:
+        cfg: Resolved experiment configuration.
+        channel: A full-mean channel.
+
+    Returns:
+        The instances; repetition ``i`` uses ``instances[i mod len]``.
+    """
+    if cfg.gt_mode == "full_mean":
+        return [channel]
+    instances = ground_truth_instances(
+        channel, cfg.gt_mode, rng=rng_for(channel.label, "gt_split", base_seed=cfg.seed),
+        n_splits=cfg.gt_n_splits,
+    )
+    rel = split_half_reliability(
+        channel.Y_trials, rng_for(channel.label, "gt_reliability", base_seed=cfg.seed),
+        n_splits=cfg.gt_n_splits,
+    )
+    for inst in instances:
+        inst.meta["gt_r_half"] = rel["r_half"]
+        inst.meta["gt_reliability"] = rel["spearman_brown"]
+    return instances

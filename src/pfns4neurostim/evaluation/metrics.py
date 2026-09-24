@@ -36,13 +36,22 @@ def regret_metrics(
     y_gt: np.ndarray,
     observed_indices: list[int] | np.ndarray,
     recommended_index: int,
+    *,
+    reference: np.ndarray | None = None,
+    queried_values: list[float] | np.ndarray | None = None,
 ) -> dict[str, float]:
     """Compute the three co-primary regrets in units of the GT range.
 
     Args:
-        y_gt: Ground-truth response per site, shape [N].
+        y_gt: Ground-truth response per site at the end of the run, shape [N].
         observed_indices: Site indices queried during the run, in order.
         recommended_index: Site the surrogate recommends after the last step.
+        reference: Boolean mask of the sites the optimum and the range are taken
+            over, shape [N] (the surviving electrodes under K6 failure). ``None``
+            means every site.
+        queried_values: True value of each query at the time it was made, when it
+            differs from ``y_gt`` (an electrode that failed later). Defaults to
+            ``y_gt[observed_indices]``.
 
     Returns:
         ``recommended_regret``, ``best_queried_regret``, ``cumulative_regret``.
@@ -52,15 +61,17 @@ def regret_metrics(
     """
     y_gt = np.asarray(y_gt, dtype=np.float64)                 # [N]
     idx = np.asarray(observed_indices, dtype=int)             # [T]
-    gt_range = float(np.max(y_gt) - np.min(y_gt))
+    ref = y_gt if reference is None else y_gt[np.asarray(reference, dtype=bool)]
+    gt_range = float(np.max(ref) - np.min(ref))
     if not np.isfinite(gt_range) or gt_range <= 0.0:
         raise RuntimeError(f"regret_metrics: degenerate ground-truth range {gt_range}.")
-    y_star = float(np.max(y_gt))
+    y_star = float(np.max(ref))
+    queried = y_gt[idx] if queried_values is None else np.asarray(queried_values, dtype=np.float64)  # [T]
 
     out = {
         "recommended_regret": (y_star - float(y_gt[int(recommended_index)])) / gt_range,
-        "best_queried_regret": (y_star - float(np.max(y_gt[idx]))) / gt_range,
-        "cumulative_regret": float(np.sum(y_star - y_gt[idx])) / gt_range,
+        "best_queried_regret": (y_star - float(np.max(queried))) / gt_range,
+        "cumulative_regret": float(np.sum(y_star - queried)) / gt_range,
     }
     for key, value in out.items():
         if not np.isfinite(value):
@@ -90,7 +101,12 @@ def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
 
-def exploration_score(y_raw: np.ndarray, recommended_index: int) -> float:
+def exploration_score(
+    y_raw: np.ndarray,
+    recommended_index: int,
+    *,
+    reference: np.ndarray | None = None,
+) -> float:
     """Exploration score: true response at the recommended site over the true maximum.
 
     Follows the exploration performance of the autonomous-optimization work of
@@ -103,6 +119,8 @@ def exploration_score(y_raw: np.ndarray, recommended_index: int) -> float:
     Args:
         y_raw: Ground-truth response per site in raw (unstandardized) units, shape [N].
         recommended_index: Recommended site.
+        reference: Boolean mask of the sites the maximum is taken over (survivors
+            under K6 failure); ``None`` means every site.
 
     Returns:
         The score, in [0, 1] for a non-negative response.
@@ -111,7 +129,7 @@ def exploration_score(y_raw: np.ndarray, recommended_index: int) -> float:
         RuntimeError: If the raw maximum is not positive.
     """
     y_raw = np.asarray(y_raw, dtype=np.float64)   # [N]
-    y_max = float(np.max(y_raw))
+    y_max = float(np.max(y_raw if reference is None else y_raw[np.asarray(reference, dtype=bool)]))
     if not np.isfinite(y_max) or y_max <= 0.0:
         raise RuntimeError(
             f"exploration_score: the raw response maximum is {y_max}; the score needs raw, "

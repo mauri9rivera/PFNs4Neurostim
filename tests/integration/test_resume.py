@@ -13,7 +13,7 @@ from pfns4neurostim.experiments import stress_sweep
 
 OVERRIDES = [
     "models=[gp_mll,gp_naive]", "n_reps=1", "budget=8", "n_init=3", "device=cpu",
-    "knob.levels=[1.0,2.0]",
+    "knob.levels=[0.0,0.5]",
 ]
 
 
@@ -32,7 +32,7 @@ def channel() -> ChannelData:
 def cfg(tmp_path: Any, monkeypatch: pytest.MonkeyPatch, channel: ChannelData) -> Any:
     monkeypatch.setattr(stress_sweep, "_channels", lambda _cfg, _shard=None: [channel])
     return load_experiment_config(
-        "configs/experiment/stress_k2_nhp.yaml", OVERRIDES + [f"output_root={tmp_path}"]
+        "configs/experiment/stress_k2_global_nhp.yaml", OVERRIDES + [f"output_root={tmp_path}"]
     )
 
 
@@ -121,7 +121,7 @@ def test_count_channels_uses_explicit_emgs(tmp_path: Any) -> None:
     from pfns4neurostim.experiments._cells import count_channels
 
     cfg2 = load_experiment_config(
-        "configs/experiment/stress_k2_nhp.yaml",
+        "configs/experiment/stress_k2_global_nhp.yaml",
         ["dataset.subjects=[0,3]", "dataset.emgs=[0,1,2]", f"output_root={tmp_path}"],
     )
     assert count_channels(cfg2) == 6
@@ -138,27 +138,50 @@ def test_random_acquisition_is_served_only_by_the_random_baseline() -> None:
     assert _supported("gp_mll", "ts_joint") and not _supported("tabpfn_v2_5", "ts_joint")
 
 
-def test_shard_runs_get_distinct_run_dirs_and_share_the_cache(
+def test_shards_share_one_run_dir_with_a_provenance_registry(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch, channel: ChannelData
 ) -> None:
-    """Two shards of one config write to different run dirs; a final --only-cached merges them."""
+    """Shards write only a record into the one run dir; the assembly embeds the registry and host columns."""
+    import os
+
+    import pandas as pd
+
+    from pfns4neurostim.evaluation import shards as _shards
+    from pfns4neurostim.evaluation.results import read_config
     from pfns4neurostim.experiments import bo_benchmark
 
-    calls: list[Any] = []
-
-    def fake_iter(*a: Any, **k: Any) -> list[ChannelData]:
-        calls.append(k.get("shard"))
-        return [channel] if k.get("shard") in (None, (0, 2)) else []
-
-    monkeypatch.setattr(bo_benchmark, "iter_channels", fake_iter)
+    monkeypatch.setattr(
+        bo_benchmark, "iter_channels",
+        lambda *a, **k: [channel] if k.get("shard") in (None, (0, 2)) else [],
+    )
     args = ["models=[gp_naive]", "n_reps=1", "budget=6", "n_init=3", "device=cpu", f"output_root={tmp_path}"]
     d0 = bo_benchmark.run_bo_benchmark("configs/experiment/hyp_a_nhp.yaml", args, shard=(0, 2))
-    assert d0.replace("\\", "/").endswith("hyp-a-nhp-shard0of2")
-    merged = bo_benchmark.run_bo_benchmark(
-        "configs/experiment/hyp_a_nhp.yaml", args, only_cached=True
-    )
-    assert merged.replace("\\", "/").endswith("hyp-a-nhp")
-    assert (0, 2) in calls and None in calls
+    d1 = bo_benchmark.run_bo_benchmark("configs/experiment/hyp_a_nhp.yaml", args, shard=(1, 2))
+    assert d0 == d1 and d0.replace("\\", "/").endswith("hyp-a-nhp")
+    assert not os.path.exists(os.path.join(d0, "tidy.csv")), "a shard must not write deliverables"
+    assert len(_shards.read_shard_records(d0)) == 2
+
+    merged = bo_benchmark.run_bo_benchmark("configs/experiment/hyp_a_nhp.yaml", args, only_cached=True)
+    assert merged == d0
+    registry = read_config(merged)["shards"]
+    assert {r["shard"] for r in registry} == {"0of2", "1of2"}
+    assert all(r["node"] and "cpu" in r for r in registry)
+    tidy = pd.read_csv(os.path.join(merged, "tidy.csv"))
+    assert {"host_node", "host_gpu", "host_cpu"} <= set(tidy.columns)
+    assert (tidy["host_node"] != _shards.UNKNOWN_HOST).all()
+
+
+def test_compute_only_flag_writes_no_deliverables(tmp_path: Any, monkeypatch: pytest.MonkeyPatch, channel: ChannelData) -> None:
+    """Unsharded compute-only jobs (single-process cluster jobs) also leave the assembly to the final job."""
+    import os
+
+    from pfns4neurostim.experiments import bo_benchmark
+
+    monkeypatch.setattr(bo_benchmark, "iter_channels", lambda *a, **k: [channel])
+    args = ["models=[gp_naive]", "n_reps=1", "budget=6", "n_init=3", "device=cpu", f"output_root={tmp_path}"]
+    run = bo_benchmark.run_bo_benchmark("configs/experiment/hyp_a_nhp.yaml", args, compute_only=True)
+    assert not os.path.exists(os.path.join(run, "tidy.csv"))
+    assert os.path.isdir(os.path.join(run, "shards"))
 
 
 def test_empty_shard_is_a_clean_noop(
@@ -181,7 +204,7 @@ def test_empty_shard_noop_in_stress_sweep(
 ) -> None:
     monkeypatch.setattr(stress_sweep, "_channels", lambda _cfg, _shard=None: [])
     stress_sweep.run_stress_sweep(
-        "configs/experiment/stress_k2_nhp.yaml",
+        "configs/experiment/stress_k2_global_nhp.yaml",
         OVERRIDES + [f"output_root={tmp_path}"], shard=(5, 8),
     )
     assert "owns no channels" in capsys.readouterr().out

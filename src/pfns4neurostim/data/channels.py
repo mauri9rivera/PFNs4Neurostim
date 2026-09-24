@@ -65,19 +65,19 @@ class ChannelData:
         demo: ``'demo2'`` for in-vivo channels, ``'demo1'`` for synthetic ones.
         normalization: Preprocessing mode that produced the arrays (a key of
             :data:`pfns4neurostim.data.preprocessing.NORMALIZATIONS`).
-        Y_invalid: The trials the lab flagged invalid, standardized in the same
-            space as ``Y_trials``, NaN where the trial *was* valid. Shape [N, R].
-            Preprocessing drops these, but the K5 knob needs them: contaminating
-            with real artefacts is more faithful than synthesising heavy tails.
-            ``None`` when the dataset carries no validity flags.
-        queryable: Boolean mask over sites the optimizer is allowed to query,
-            shape [N]. ``None`` means every site. The K6 dropout knob sets this
-            rather than deleting rows, so regret stays measured against the full
-            ground-truth map: losing electrodes must not make the task look
-            easier by shrinking the optimum out of the comparison.
+        failure_time: When each electrode fails, as a fraction of the run in
+            [0, 1); ``inf`` for electrodes that never fail. Shape [N]. ``None``
+            means no electrode fails. Set by the K6 failure knob: from that moment
+            a query of the electrode returns ``failure_value`` instead of a trial,
+            and metrics are scored on the surviving electrodes.
+        failure_value: Response of a failed electrode, in the standardized space
+            (0.0 = the channel's mean response).
         stress: Provenance of any applied stress knob
             (``{'knob': ..., 'level': ...}``); empty for a nominal channel.
         meta: Free-form provenance (scaler, subject file, generator params).
+        split_id: Split-half instance index in ``[0, 2R)`` when
+            ``gt_mode='split_half'`` (see :mod:`pfns4neurostim.data.ground_truth`);
+            ``None`` for a full-mean channel.
     """
 
     dataset: str
@@ -91,10 +91,11 @@ class ChannelData:
     gt_mode: str = "full_mean"
     demo: str = "demo2"
     normalization: str = DEFAULT_NORMALIZATION
-    Y_invalid: np.ndarray | None = None     # [N, R], NaN where the trial was valid
-    queryable: np.ndarray | None = None     # [N] bool
+    failure_time: np.ndarray | None = None  # [N], run fraction; inf = never fails
+    failure_value: float = 0.0
     stress: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
+    split_id: int | None = None
 
     def __post_init__(self) -> None:
         """Validate shapes and reject non-finite ground truth (fail fast)."""
@@ -119,18 +120,13 @@ class ChannelData:
             )
         if not np.isfinite(self.X_pool).all():
             raise RuntimeError(f"ChannelData({self.label}): X_pool contains non-finite values.")
-        if self.Y_invalid is not None and self.Y_invalid.shape != self.Y_trials.shape:
-            raise ValueError(
-                f"ChannelData: Y_invalid has shape {self.Y_invalid.shape}, expected "
-                f"{self.Y_trials.shape}."
-            )
-        if self.queryable is not None:
-            if self.queryable.shape != (n,):
+        if self.failure_time is not None:
+            if self.failure_time.shape != (n,):
                 raise ValueError(
-                    f"ChannelData: queryable has shape {self.queryable.shape}, expected ({n},)."
+                    f"ChannelData: failure_time has shape {self.failure_time.shape}, expected ({n},)."
                 )
-            if not self.queryable.any():
-                raise ValueError("ChannelData: queryable mask excludes every site.")
+            if not np.isinf(self.failure_time).any():
+                raise ValueError("ChannelData: every electrode fails; nothing would survive.")
         if np.isnan(self.Y_trials).all(axis=1).any():
             bad = int(np.isnan(self.Y_trials).all(axis=1).sum())
             raise RuntimeError(
@@ -171,45 +167,56 @@ class ChannelData:
         return int(np.argmax(self.y_gt))
 
     @property
-    def queryable_indices(self) -> np.ndarray:
-        """Indices the optimizer may query, shape [n_queryable]."""
-        if self.queryable is None:
-            return np.arange(self.n_sites)
-        return np.flatnonzero(self.queryable)
+    def survivors(self) -> np.ndarray:
+        """Electrodes still alive at the end of the run, bool shape [N]."""
+        if self.failure_time is None:
+            return np.ones(self.n_sites, dtype=bool)
+        return np.isinf(self.failure_time)
 
-    @property
-    def n_queryable(self) -> int:
-        """How many sites the optimizer may query."""
-        return int(self.queryable_indices.size)
+    def is_failed(self, index: int, progress: float) -> bool:
+        """Whether an electrode has failed at a given point of the run.
 
-    @property
-    def n_invalid_trials(self) -> int:
-        """Number of lab-flagged invalid trials available for K5 contamination."""
-        if self.Y_invalid is None:
-            return 0
-        return int(np.isfinite(self.Y_invalid).sum())
+        Args:
+            index: Site index.
+            progress: Fraction of the run elapsed, in [0, 1).
+
+        Returns:
+            True once ``progress`` reaches the electrode's failure time.
+        """
+        return self.failure_time is not None and bool(progress >= self.failure_time[index])
 
     @property
     def label(self) -> str:
         """Short identifier, e.g. ``'nhp-s1-e0'``."""
         return f"{self.dataset}-s{self.subject}-e{self.emg}"
 
-    @property
-    def y_gt_raw(self) -> np.ndarray | None:
-        """Ground truth in raw response units, or ``None`` if no scaler is recorded.
+    def to_raw(self, y: np.ndarray) -> np.ndarray | None:
+        """Map standardized responses back to raw units, or ``None`` without a scaler.
 
         The exploration score is a ratio and needs raw (non-negative) units, so it
         is undefined for a channel that carries no ``scaler_y`` (only hand-built
         test channels; every loaded channel records one).
 
+        Args:
+            y: Responses in the standardized space, shape [N].
+
         Returns:
-            The unscaled ground truth, shape [N], or ``None``.
+            The same responses in raw units, shape [N], or ``None``.
         """
         scaler = self.meta.get("scaler_y")
         if scaler is None:
             return None
-        raw = scaler.inverse_transform(self.y_gt.reshape(-1, 1))  # [N, 1]
-        return np.asarray(raw, dtype=np.float64).reshape(-1)      # [N]
+        raw = scaler.inverse_transform(np.asarray(y, dtype=np.float64).reshape(-1, 1))  # [N, 1]
+        return np.asarray(raw, dtype=np.float64).reshape(-1)                         # [N]
+
+    @property
+    def y_end(self) -> np.ndarray:
+        """Ground truth as it stands at the end of the run, shape [N].
+
+        Failed electrodes read ``failure_value``; everything else is ``y_gt``.
+        Equal to ``y_gt`` when no electrode fails.
+        """
+        return np.where(self.survivors, self.y_gt, self.failure_value)
 
     def with_trials(self, Y_trials: np.ndarray, **updates: Any) -> "ChannelData":
         """Return a copy carrying a new trial bank (the knob-application path).
@@ -277,8 +284,10 @@ def load_channel(
         emg: EMG index.
         data_root: Directory holding the raw ``.mat`` trees. Point this at
             ``$SLURM_TMPDIR/data`` inside a cluster job.
-        gt_mode: ``'full_mean'`` (primary). ``'split_half'`` arrives with
-            task #7 and raises until then.
+        gt_mode: ``'full_mean'`` only. Split-half channels are several instances
+            per channel, built per repetition by
+            :func:`pfns4neurostim.data.ground_truth.ground_truth_instances` from the
+            full-mean channel, so ``'split_half'`` raises here with that pointer.
         normalization: Preprocessing mode, a key of
             :data:`pfns4neurostim.data.preprocessing.NORMALIZATIONS`.
         subject_data: Pre-loaded legacy dict, to avoid re-reading the ``.mat``
@@ -288,15 +297,17 @@ def load_channel(
         The channel, with shared-unit preprocessing applied.
 
     Raises:
-        NotImplementedError: For ``gt_mode='split_half'`` (task #7 Step 0).
+        NotImplementedError: For ``gt_mode='split_half'`` (expand instead, see above).
         ValueError: For an unknown ``normalization``.
     """
     if gt_mode not in ("full_mean", "split_half"):
         raise ValueError(f"load_channel: unknown gt_mode {gt_mode!r}.")
     if gt_mode == "split_half":
         raise NotImplementedError(
-            "gt_mode='split_half' lands with task #7 (data/ground_truth.py). "
-            "Use gt_mode='full_mean' until then."
+            "gt_mode='split_half' is not a load-time mode: load with gt_mode='full_mean' and "
+            "expand with pfns4neurostim.data.ground_truth.ground_truth_instances (one instance "
+            "per repetition, rep i -> instance i mod 2R). bo_benchmark does this; a runner that "
+            "passes split_half here has not been wired for it yet."
         )
 
     data = subject_data if subject_data is not None else _load_legacy_subject(
@@ -323,7 +334,6 @@ def load_channel(
         gt_mode=gt_mode,
         demo="demo2",
         normalization=pre.normalization,
-        Y_invalid=pre.Y_invalid,
         meta={"scaler_y": pre.scaler_y, "data_root": data_root},
     )
 

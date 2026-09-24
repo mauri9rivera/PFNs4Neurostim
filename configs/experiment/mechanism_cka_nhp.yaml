@@ -1,0 +1,31 @@
+# Task #5 - CKA redesign (P0.5), secondary to the update-rule analysis (#9).
+#
+# (a) debiased linear CKA between TabPFN-2.5 layer embeddings of all N sites (query rows,
+# feature-token mean) and target kernels on the same sites: K_X (geometry, a control), K_GT
+# (RBF on the standardized response), K_GT_linear (sensitivity), K_GP (MLL-GP posterior
+# covariance on the same context); site-permutation null. Controls: known-kernel map exceeds
+# the null, a pure-noise map does not, x10 inference seeds ICC >= 0.75.
+# (b) placement: row-by-row CKA against on-grid prior maps at the same context sites.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml
+defaults:
+  dataset: nhp
+
+analysis: cka
+tag: nhp
+device: cuda
+seed: 42
+output_root: output
+
+cka:
+  layers: null                 # all 18
+  readouts: [feature_mean]
+  targets: [K_X, K_GT, K_GT_linear, K_GP]
+  context_sizes: [5, 10, 20, 40]
+  stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
+  n_context_draws: 3
+  n_perm: 1000
+  inference_seed: 0
+  gp_params: {n_opt_steps: 100, lr: 0.1}
+  controls: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10, t: 25, alpha: 0.05, n_seeds: 10, icc_min: 0.75, n_seed_channels: 1}
+  placement: {enabled: true, t: 25, n_prior: 30, n_prior_holdout: 10, n_noise: 10, k_nearest: 5, n_dense: 1024, holdout_frac: 0.1, rmse_threshold: 0.5, prior_type: prior_bag}

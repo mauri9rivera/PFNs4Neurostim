@@ -15,7 +15,9 @@ TabICL v2     py>=3.10   ``libs/tabicl`` @ v2.2.0. **Native regressor** with a q
                          predictive distribution — not a classification-head adaptation.
 TabFM         py>=3.11   ``libs/tabfm``. Native regressor, but ``predict`` returns point
                          predictions only; uncertainty comes from ensemble spread.
-PFNs4BO       pending    Backend installed; needs our layout mapped onto its input.
+PFNs4BO       **yes**    Vendored checkpoint. An end-to-end BO model: it owns the query decision
+                         (its acquisition criterion, computed inside the network), exposed as
+                         a *native policy* that the ``native`` acquisition type delegates to.
 TabPFN v1     pending    Needs ``tabpfn<2``, which cannot coexist with the pinned 6.3.2.
 Mitra         pending    Needs AutoGluon; predictive-distribution access unconfirmed.
 ============  =========  ==============================================================
@@ -25,6 +27,10 @@ interpreter; they are blocked by the environment, not by missing code.
 """
 from __future__ import annotations
 
+import gzip
+import io
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -352,39 +358,144 @@ class TabFMSurrogate(ExternalSurrogate):
         return mean, np.maximum(std, floor)
 
 
+#: Vendored HEBO+ checkpoint (the authors' main model), relative to the repository root. The pip
+#: package ships no weights, and unzipping into ``libs/`` would modify a read-only submodule, so the
+#: gzip archive is decompressed in memory.
+PFNS4BO_DEFAULT_CHECKPOINT: str = "libs/PFNs4BO/pfns4bo/final_models/model_hebo_morebudget_9_unused_features_3.pt.gz"
+_REPO_ROOT: Path = Path(__file__).resolve().parents[4]   # src/pfns4neurostim/models/pfn/wrappers.py -> repo
+
+
+@lru_cache(maxsize=2)
+def _load_pfns4bo_model(path: str) -> Any:
+    """Load a PFNs4BO transformer once per process (about 100 MB, pickled whole).
+
+    Args:
+        path: Absolute path of a ``.pt`` or ``.pt.gz`` checkpoint.
+
+    Returns:
+        The transformer in eval mode, on CPU.
+
+    Raises:
+        FileNotFoundError: If the checkpoint is missing (submodule not initialised).
+    """
+    import torch  # noqa: PLC0415 - heavy import, load on demand
+
+    ckpt = Path(path)
+    if not ckpt.is_file():
+        raise FileNotFoundError(
+            f"PFNs4BO checkpoint not found: {ckpt}. Initialise the submodule "
+            "(`bash scripts/mila_setup.sh submodules`) or set `checkpoint` in the model params."
+        )
+    if ckpt.suffix == ".gz":
+        with gzip.open(ckpt, "rb") as fh:
+            source: Any = io.BytesIO(fh.read())
+    else:
+        source = ckpt
+    model = torch.load(source, map_location="cpu", weights_only=False)
+    return model.eval()
+
+
 class PFNs4BOSurrogate(ExternalSurrogate):
-    """PFNs4BO (HEBO prior) surrogate over a discrete candidate pool.
+    """PFNs4BO (HEBO prior): an end-to-end BO model with a **native policy**.
+
+    PFNs4BO is a PFN *and* an acquisition rule: its transformer scores every candidate
+    with its own criterion (EI by default, the authors' HPO-B setting) computed inside
+    the pipeline. That surface is exposed as :meth:`policy_scores`, which the ``native``
+    acquisition type delegates to, so the shared BO loop selects the query (random
+    tie-break, re-querying) exactly as for any other model.
+
+    The predictive summary (:meth:`_predict_backend`) reads the same network's bar
+    distribution on the same context. It is taken on the z-scored response *without*
+    the authors' internal power transform, so mean and std live in the response scale
+    that R-squared and the calibration metrics assume; the policy itself keeps the
+    authors' default pipeline.
 
     Args:
         device: Torch device string.
-        model_name: Which vendored checkpoint to load.
-        **backend_kwargs: Forwarded to the backend.
+        checkpoint: Checkpoint path (``.pt`` or ``.pt.gz``); relative paths resolve
+            against the repository root.
+        acq_function: PFNs4BO criterion (``'ei'``, ``'pi'``, ``'ucb'``, ``'mean'``).
+        **acq_kwargs: Further keyword arguments of
+            ``pfns4bo.scripts.acquisition_functions.general_acq_function``.
     """
 
     def __init__(
         self,
         device: str = "cpu",
-        model_name: str = "hebo_morebudget_9_unused_features_3",
-        **backend_kwargs: Any,
+        checkpoint: str = PFNS4BO_DEFAULT_CHECKPOINT,
+        acq_function: str = "ei",
+        **acq_kwargs: Any,
     ) -> None:
-        super().__init__("pfns4bo", device=device, **backend_kwargs)
-        self.model_name = model_name
+        super().__init__("pfns4bo", device=device, **acq_kwargs)
+        from pfns4bo.scripts.acquisition_functions import TransformerBOMethod  # noqa: PLC0415
+
+        path = Path(checkpoint)
+        self.checkpoint = str(path if path.is_absolute() else _REPO_ROOT / path)
+        self.acq_function = acq_function
+        self._model = _load_pfns4bo_model(self.checkpoint)
+        self._method = TransformerBOMethod(
+            self._model, device=device, acq_function=acq_function, **acq_kwargs
+        )
+        self._X: np.ndarray | None = None
+        self._y: np.ndarray | None = None
 
     def _fit_backend(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Store the context for the PFN forward pass. **Not implemented.**
+        """Store the context; the transformer is conditioned at query time.
 
         Args:
-            X: Observed coordinates, shape [n, D].
-            y: Observed responses, shape [n].
+            X: Observed coordinates in [0, 1]^D, shape [n, D].
+            y: Observed responses (z-scored), shape [n].
+        """
+        self._X, self._y = X, y
+
+    def policy_scores(self, X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        """Score every candidate with PFNs4BO's own acquisition criterion.
+
+        Uses the official ``observe_and_suggest(..., return_actual_ei=True)`` and keeps
+        the *surface*, discarding its internally drawn index so that tie-breaking stays
+        with the shared loop. (The official call draws that discarded
+        index from the global torch RNG, which the runner seeds per repetition.)
+
+        Args:
+            X: Candidate coordinates in [0, 1]^D, shape [N, D].
+            rng: Unused; the criterion is deterministic given the context.
+
+        Returns:
+            Criterion value per candidate, shape [N]; higher is preferred.
 
         Raises:
-            NotImplementedError: Task #8 Step 3.
+            RuntimeError: If called before :meth:`fit`, or on non-finite scores.
         """
-        raise NotImplementedError(
-            "PFNs4BOSurrogate is not implemented yet (task #8 Step 3). The backend is "
-            "installed; what remains is mapping our (X_pool, observations) layout onto "
-            "pfns4bo's transformer input and reading back its bar distribution."
-        )
+        if not self._fitted:
+            raise RuntimeError("pfns4bo.policy_scores called before fit().")
+        _, scores = self._method.observe_and_suggest(self._X, self._y, X, return_actual_ei=True)
+        scores = np.asarray(scores.numpy(), dtype=np.float64).reshape(-1)   # [N]
+        if not np.isfinite(scores).all():
+            raise RuntimeError("pfns4bo.policy_scores produced non-finite values.")
+        return scores
+
+    def _predict_backend(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Predictive mean and std from the bar distribution at each candidate.
+
+        Args:
+            X: Candidate coordinates in [0, 1]^D, shape [N, D].
+
+        Returns:
+            ``(mean, std)``, each shape [N].
+        """
+        import torch  # noqa: PLC0415 - heavy import, load on demand
+
+        device = torch.device(self.device)
+        self._model.to(device)
+        x_given = torch.as_tensor(self._X, dtype=torch.float32, device=device).unsqueeze(1)   # [n, 1, D]
+        y_given = torch.as_tensor(self._y, dtype=torch.float32, device=device).unsqueeze(1)   # [n, 1]
+        x_eval = torch.as_tensor(X, dtype=torch.float32, device=device).unsqueeze(1)          # [N, 1, D]
+        with torch.no_grad():
+            logits = self._model(x_given, y_given, x_eval)                                    # [N, 1, n_bins]
+            criterion = self._model.criterion
+            mean = criterion.mean(logits).reshape(-1)                                         # [N]
+            var = criterion.variance(logits).reshape(-1)                                      # [N]
+        return mean.cpu().numpy(), var.clamp_min(1e-12).sqrt().cpu().numpy()
 
 
 class TabPFNv1Surrogate(BucketizedClassifierSurrogate):

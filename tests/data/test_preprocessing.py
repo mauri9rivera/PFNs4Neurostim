@@ -59,20 +59,18 @@ class TestPreprocessChannel:
         assert pre.X_pool.shape[0] == int(pre.site_mask.sum()) == pre.y_gt.shape[0]
         np.testing.assert_array_equal(pre.site_mask, valid_site_mask(data, 0))
 
-    def test_invalid_trials_nan_in_trials_finite_in_bank(self) -> None:
-        pre = preprocess_channel(_subject(), emg=0)
-        assert pre.Y_invalid is not None
-        # Every trial slot is exactly one of: valid (finite in Y_trials) or flagged (finite in bank).
-        both = np.isfinite(pre.Y_trials) & np.isfinite(pre.Y_invalid)
-        neither = ~np.isfinite(pre.Y_trials) & ~np.isfinite(pre.Y_invalid)
-        assert not both.any() and not neither.any()
-        assert int(np.isfinite(pre.Y_invalid).sum()) == 2
+    def test_flagged_trials_are_nan(self) -> None:
+        data = _subject()
+        pre = preprocess_channel(data, emg=0)
+        flagged = (data["sorted_isvalid"][:, 0, :] == 0)[pre.site_mask]
+        assert np.isnan(pre.Y_trials[flagged]).all()
+        assert np.isfinite(pre.Y_trials[~flagged]).all()
 
     def test_no_validity_flags(self) -> None:
         data = _subject()
         del data["sorted_isvalid"]
         pre = preprocess_channel(data, emg=0)
-        assert pre.Y_invalid is None and pre.site_mask.all()
+        assert pre.site_mask.all()
 
     def test_all_invalid_raises(self) -> None:
         data = _subject()

@@ -14,14 +14,14 @@ We address two key research questions:
 ```bash
 pip install -e .
 python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml
-python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml
 ```
 
 Every runner writes a tidy `tidy.csv`, a trajectory pickle, the resolved `config.yaml` and its
 figures into `output/<experiment>/<dataset>/`. Figures regenerate from the CSV alone:
 
 ```bash
-python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml --replot
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml --replot
 ```
 
 On the Mila cluster, `scripts/mila_setup.sh` creates the storage layout (code on `$HOME`, data
@@ -29,7 +29,7 @@ master on `$ARCHIVE`, working copies on `$SCRATCH`) and `scripts/run_stress_swee
 sweep, staging the dataset to `$SLURM_TMPDIR` first.
 
 ```bash
-sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_nhp.yaml
+sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_nhp.yaml
 ```
 
 ## Repository layout

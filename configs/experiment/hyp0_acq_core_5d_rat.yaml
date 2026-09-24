@@ -1,0 +1,30 @@
+# Core acquisition experiment, 5d_rat: ts_marginal (headline) vs EI vs UCB (auto_dim kappa schedule) for the model ladder.
+#
+# Mirror of hyp0_acq_core_nhp.yaml (same acquisition ladder, reps, seeds), at the 5d_rat budget. The ts_marginal and random
+# cells are IDENTICAL to Deliverable 1's (hyp_a_5d_rat), so they come from the shared cell cache; only EI and UCB are new compute.
+#
+# PRE-REGISTERED DECISION RULE (fixed before running, identical to NHP): the acquisition with the lowest median RECOMMENDED
+# regret over all 5d_rat channels, ties broken by cumulative regret; the full table is always reported next to the choice.
+# The headline acquisition is decided per dataset from this table; if the two datasets disagree, both are reported.
+defaults:
+  dataset: 5d_rat
+  model: [tabpfn_v2_5, gp_mll, gp_naive, random]
+  acquisition: [ts_marginal, ei, ucb, random]
+
+experiment: bo_benchmark
+family: hyp0-acq-core
+tag: 5d_rat
+
+budget: 100
+n_init: 5
+n_reps: 10
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05
+
+# GP models run on CPU (measured 2.2x faster than CUDA for this Adam GP; P0.12).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

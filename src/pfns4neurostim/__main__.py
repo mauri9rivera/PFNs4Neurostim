@@ -3,8 +3,8 @@
 Experiments are dispatched by name so a SLURM script never imports a module path::
 
     python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml
-    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml
-    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml --replot
+    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml
+    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml --replot
 
 Each runner owns its own argument parser; unknown experiment names list what is
 available rather than failing obscurely.
@@ -45,10 +45,40 @@ def _bo_benchmark(argv: list[str]) -> int:
     return runner(argv)
 
 
+def _gt_sensitivity(argv: list[str]) -> int:
+    """Dispatch to the full-mean vs split-half ground-truth check (task #7).
+
+    Args:
+        argv: Remaining CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+    from .experiments.gt_sensitivity import main as runner  # noqa: PLC0415 - lazy
+
+    return runner(argv)
+
+
+def _mechanism(argv: list[str]) -> int:
+    """Dispatch to the Hyp C mechanism analyses (update rule, placement, CKA).
+
+    Args:
+        argv: Remaining CLI arguments.
+
+    Returns:
+        Process exit code.
+    """
+    from .experiments.mechanism import main as runner  # noqa: PLC0415 - lazy
+
+    return runner(argv)
+
+
 #: Registered experiment runners, keyed by CLI name.
 EXPERIMENTS: dict[str, Callable[[list[str]], int]] = {
     "bo_benchmark": _bo_benchmark,
     "stress_sweep": _stress_sweep,
+    "gt_sensitivity": _gt_sensitivity,
+    "mechanism": _mechanism,
 }
 
 

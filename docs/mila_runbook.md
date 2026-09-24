@@ -38,13 +38,14 @@ bash scripts/mila_setup.sh submodules                   # libs/tabicl + libs/tab
 # 3. smoke-test the bench env on a login node (no GPU needed for the import checks)
 module load anaconda/3 && conda run -n pfns4neurostim-bench python -c "from pfns4neurostim.models.pfn.external import availability; print(availability())"
 # 4. calibrate TabFM (unmeasured, GPU only): 2 reps of one channel
-CONDA_ENV=pfns4neurostim-bench sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabfm]" dataset.subjects=[1] dataset.emgs=[0] n_reps=2 tag=calib
-# 5. submit EVERYTHING in priority order (one command; jobs then run unattended)
+CONDA_ENV=pfns4neurostim-bench sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabfm]" dataset.subjects=[1] dataset.emgs=[0] n_reps=2
+# 5. submit every deliverable but spinal (core), then the externals when you choose (TabICL, TabFM, PFNs4BO)
 bash scripts/submit_portfolio.sh
+bash scripts/submit_externals.sh
 ```
 
-`python scripts/portfolio.py --machine mila` prints the same plan with wall-time estimates. `submit_portfolio.sh` is generated from it
-(`python scripts/portfolio.py --emit-bash > scripts/submit_portfolio.sh`); edit `scripts/portfolio.py`, not the generated file.
+`python scripts/portfolio.py` prints the same plan with wall-time estimates. The two submit scripts are generated from it
+(`--emit-bash` for `core`, `--emit-bash --group externals`); edit `scripts/portfolio.py`, not the generated files.
 
 ## 3. Which environment runs what
 
@@ -59,7 +60,7 @@ bash scripts/submit_portfolio.sh
 
 ## 4. Submitting (you run these)
 
-`python scripts/portfolio.py --machine mila` prints every job in priority order with wall-time estimates; it only prints.
+`python scripts/portfolio.py` prints every job in priority order with wall-time estimates; it only prints.
 
 **Multi-process lanes.** Per-user caps on Mila are 2 GPUs + 8 CPUs + 48 GB on `main`, and a separate 8 CPUs + 64 GB on
 `main-cpu`. TabPFN uses ~5% of a GPU and ~1.3 GB of RAM, so one job runs several processes ("lanes"), each owning every
@@ -68,18 +69,21 @@ N-th channel (`--shard i/N`); the GP models need no GPU and run on `main-cpu`, o
 ```bash
 cd ~/projects/PFNs4Neurostim
 # GPU job: 4 lanes share one GPU (4 CPUs, 10 GB)
-LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp_a_5d_rat.yaml "models=[tabpfn_v2_5]" tag=gpu
-LANES=4 sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_nhp.yaml "models=[tabpfn_v2_5]" tag=gpu
+LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp_a_5d_rat.yaml "models=[tabpfn_v2_5]"
+LANES=4 sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_nhp.yaml "models=[tabpfn_v2_5]"
 # CPU job: GP models + random on main-cpu, 8 single-thread lanes (device=cpu is forced)
-sbatch scripts/run_cpu.sh bo_benchmark configs/experiment/hyp_a_5d_rat.yaml "models=[gp_mll,gp_naive,random]" tag=cpu
-sbatch scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_nhp.yaml "models=[gp_mll,gp_naive]" tag=cpu
+sbatch scripts/run_cpu.sh bo_benchmark configs/experiment/hyp_a_5d_rat.yaml "models=[gp_mll,gp_naive,random]"
+sbatch scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_channel_nhp.yaml "models=[gp_mll,gp_naive]"
 # bench env (TabICL / TabFlex): select it with CONDA_ENV
-CONDA_ENV=pfns4neurostim-bench LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v2_5,tabicl,tabflex]" tag=gpu
+CONDA_ENV=pfns4neurostim-bench LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v2_5,tabicl,tabflex]"
 ```
 
-Lane logs are `logs/lane<i>_<jobid>.out` (`bash scripts/mila.sh logs <jobid>` reads them together with the job log). Each lane
-writes its own run dir `<family>-<tag>-shard<i>of<N>`; **all cells go to the shared cache**, so GPU jobs, CPU jobs and shards of
-one config never conflict. When the jobs of a unit finish, assemble the union with NO compute (login node or locally):
+Lane logs are `logs/lane<i>_<jobid>.out` (`bash scripts/mila.sh logs <jobid>` reads them together with the job log). All jobs and lanes of an
+experiment share ONE run dir `<family>-<tag>`: they run `--compute-only`, so each writes only its cells (to the shared cache) and a
+provenance record `shards/<node>-job<id>-shard<i>of<N>-<models>.json` (node, GPU model, CPU model, models, devices, cell counts).
+The assemble job (`scripts/run_assemble.sh`, submitted automatically with `--dependency=afterany`) writes `tidy.csv`, tables and
+figures from the union and embeds the compact registry in `config.yaml` under `shards:`; every tidy row also carries
+`host_node`, `host_gpu`, `host_cpu`. To assemble by hand (login node or locally):
 
 ```bash
 python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_5d_rat.yaml --only-cached
@@ -97,8 +101,9 @@ cells without computing.
 ## 5. Collecting results (run locally)
 
 ```bash
-bash scripts/export_results.sh <mila_username>            # benchmark/, stress/, cells/
-python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml --replot
+wsl -e bash -lc 'cd /mnt/c/workspace/PFNs4Neurostim && bash scripts/export_results.sh'   # benchmark/, stress/, cells/ into the SAME output/ tree
+# never overwrites local data: cells use --ignore-existing; other files only if newer, the replaced file goes to output/.pull_backup/
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml --replot
 ```
 
 Run directories are `output/benchmark/<dataset>/<family>-<tag>/` and

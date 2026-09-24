@@ -94,8 +94,6 @@ class PreprocessedChannel:
         X_pool: Candidate coordinates after X scaling. Shape [N, D].
         Y_trials: Standardized single-trial responses, NaN at invalid trials. Shape [N, R].
         y_gt: Per-site ground-truth mean in the same space as ``Y_trials``. Shape [N].
-        Y_invalid: Lab-flagged invalid trials in the same space, NaN where the trial
-            was valid; ``None`` when the dataset has no validity flags. Shape [N, R].
         site_mask: Which raw sites survived (>= 1 valid trial). Shape [N_raw].
         scaler_y: Fitted y scaler, for inverse transforms.
         normalization: Name of the mode that produced these arrays.
@@ -104,7 +102,6 @@ class PreprocessedChannel:
     X_pool: np.ndarray
     Y_trials: np.ndarray
     y_gt: np.ndarray
-    Y_invalid: np.ndarray | None
     site_mask: np.ndarray
     scaler_y: Any
     normalization: str
@@ -159,11 +156,8 @@ def preprocess_channel(
     resp_mean_raw = np.asarray(subject_data["sorted_respMean"])[:, emg]                # [N_raw]
 
     site_mask = valid_site_mask(subject_data, emg)                                     # [N_raw]
-    invalid_raw: np.ndarray | None = None
     if "sorted_isvalid" in subject_data:
         flagged = np.asarray(subject_data["sorted_isvalid"])[:, emg, :] == 0           # [N_raw, R]
-        invalid_raw = np.asarray(subject_data["sorted_resp"])[:, emg, :].astype(np.float64)
-        invalid_raw = np.where(flagged, invalid_raw, np.nan)                           # [N_raw, R]
         resp_raw = np.where(flagged, np.nan, resp_raw)
 
     coords = coords_raw[site_mask]                                                     # [N, D]
@@ -184,14 +178,6 @@ def preprocess_channel(
     Y_trials = scaler_y.transform(resp.reshape(-1, 1)).reshape(n, r)                   # [N, R]
     y_gt = scaler_y.transform(resp_mean.reshape(-1, 1)).ravel()                        # [N]
 
-    Y_invalid: np.ndarray | None = None
-    if invalid_raw is not None:
-        inv = invalid_raw[site_mask]                                                   # [N, R]
-        Y_invalid = np.full(inv.shape, np.nan, dtype=np.float64)
-        has = np.isfinite(inv)
-        if has.any():
-            Y_invalid[has] = scaler_y.transform(inv[has].reshape(-1, 1)).ravel()
-
     for name, arr in (("X_pool", X_pool), ("y_gt", y_gt)):
         if not np.isfinite(arr).all():
             raise RuntimeError(f"preprocess_channel: {name} is non-finite for emg={emg}.")
@@ -200,7 +186,6 @@ def preprocess_channel(
         X_pool=np.asarray(X_pool, dtype=np.float64),
         Y_trials=np.asarray(Y_trials, dtype=np.float64),
         y_gt=np.asarray(y_gt, dtype=np.float64),
-        Y_invalid=Y_invalid,
         site_mask=site_mask,
         scaler_y=scaler_y,
         normalization=normalization,

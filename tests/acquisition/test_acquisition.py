@@ -64,7 +64,7 @@ class TestRegistrySchema:
 
     def test_expected_types_are_registered(self) -> None:
         assert set(available_acquisitions()) == {
-            "ei", "pi", "ucb", "ts_marginal", "ts_joint", "greedy", "random"
+            "ei", "pi", "ucb", "ts_marginal", "ts_joint", "greedy", "random", "native"
         }
 
     def test_unknown_type_raises_with_options(self) -> None:
@@ -188,7 +188,7 @@ class TestThompson:
 
 
 class TestSelection:
-    """Randomly tie-broken argmax over every selectable site (defect D6)."""
+    """Randomly tie-broken argmax over every site (defect D6)."""
 
     def test_best_site_is_selected_even_if_already_observed(self) -> None:
         """Re-querying is allowed: noise averaging is how the optimizer exploits."""
@@ -196,11 +196,6 @@ class TestSelection:
         surrogate = _FakeSurrogate(np.array([10.0, 9.0, 8.0]), np.ones(3))
         res = acquire(spec.score_fn, surrogate, np.zeros((3, 2)), _state((0,)), np.random.default_rng(0), params)
         assert res.index == 0
-
-    def test_allowed_mask_still_restricts_selection(self) -> None:
-        values = np.array([10.0, 9.0, 8.0])
-        allowed = np.array([False, True, True])
-        assert select_argmax(values, np.random.default_rng(0), allowed=allowed) == 1
 
     def test_ties_are_broken_at_random_not_by_index(self) -> None:
         values = np.ones(6)
@@ -210,10 +205,6 @@ class TestSelection:
     def test_non_finite_surface_raises(self) -> None:
         with pytest.raises(RuntimeError, match="non-finite"):
             select_argmax(np.array([np.nan, np.inf * -1, np.nan]), np.random.default_rng(0))
-
-    def test_no_selectable_site_raises(self) -> None:
-        with pytest.raises(RuntimeError, match="no site is selectable"):
-            select_argmax(np.zeros(2), np.random.default_rng(0), allowed=np.zeros(2, dtype=bool))
 
     def test_acquire_returns_index_values_and_params(self) -> None:
         spec, params = build_acquisition("ucb", {"kappa": 1.0})

@@ -41,6 +41,10 @@ class ModelSpec:
             predictive distribution. False for random search, whose "std" is a
             placeholder: calibration metrics are then reported as not computed
             rather than as a meaningless zero-variance posterior.
+        native_policy: True for an end-to-end BO model that owns its query decision
+            (it exposes ``policy_scores``): it serves only the ``native`` acquisition
+            and that acquisition serves only such models. The runners read this flag,
+            never a model name.
         notes: Short provenance note for tables and captions.
     """
 
@@ -50,6 +54,7 @@ class ModelSpec:
     factory: Callable[..., Any]
     supports: tuple[str, ...] = ("ei", "ucb", "ts_marginal")
     has_predictive_distribution: bool = True
+    native_policy: bool = False
     notes: str = ""
 
 
@@ -208,11 +213,15 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     # adaptation" must appear in every table row for the two bucketized models.
     "pfns4bo": ModelSpec(
         key="pfns4bo",
-        version="PFNs4BO (HEBO prior, vendored checkpoint)",
+        version="PFNs4BO (HEBO+ prior, vendored checkpoint, native EI policy)",
         family="pfn",
         factory=_build_external("pfns4bo"),
-        supports=("ei", "ucb", "ts_marginal"),
-        notes="Native BO-specific bar distribution; backend installed, wrapper pending.",
+        supports=("native",),
+        native_policy=True,
+        notes=(
+            "End-to-end BO model: the transformer scores the pool with its own criterion "
+            "(acquisition 'native'). Predictive summary from its bar distribution."
+        ),
     ),
     "tabpfn_v1": ModelSpec(
         key="tabpfn_v1",

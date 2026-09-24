@@ -1,0 +1,40 @@
+# Hypothesis B - K2-global SNR: one absolute noise level for every channel.
+# Dataset: 5D rat (Demo 2, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
+#
+# Knob:   y~[s,r] = y[s,r] + alpha * e,  e ~ N(0, 1), on every valid trial of every channel.
+#         alpha is a noise SD in z-scored response units, identical across channels, so it is
+#         NOT proportional to a channel's floor: clean channels lose more dB than noisy ones.
+# x-axis: achieved SNR (dB), which reaches SNR < 0 dB at the upper levels (restructure 2026-09-23).
+# Budget: total queries INCLUDING n_init (P0.3).
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_global_5d_rat.yaml
+defaults:
+  dataset: 5d_rat
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ts_marginal   # headline (2026-09-20); EI/UCB compared in hyp0_acq_table_*
+
+experiment: stress_sweep
+family: stress-k2-global
+tag: 5drat
+
+knob:
+  type: k2_global
+  levels: [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0]   # added noise SD (z-scored units)
+
+budget: 100
+n_init: 5
+n_reps: 10
+gt_mode: full_mean     # or split_half (task #7): rep i runs on cross-fitted instance i mod 2*gt_n_splits
+gt_n_splits: 10
+device: cuda
+seed: 42
+output_root: output
+
+# Pre-registered TOST/non-inferiority margin, in range-normalized regret units.
+equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

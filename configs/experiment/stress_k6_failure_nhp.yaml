@@ -1,0 +1,43 @@
+# Hypothesis B - K6 sparsity via electrode failure during the run.
+# Dataset: NHP (Demo 2, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
+#
+# Knob:   a fraction epsilon of the electrodes fails, each at its own uniformly random moment
+#         of the run; afterwards it returns 0.0 (z-scored, = channel mean) and stays queryable,
+#         so the optimizer must notice. Regret, exploration, R^2 and calibration are scored on
+#         the SURVIVING electrodes (restructure 2026-09-23).
+# x-axis: epsilon.
+# Budget: total queries INCLUDING n_init (P0.3).
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k6_failure_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ts_marginal   # headline (2026-09-20); EI/UCB compared in hyp0_acq_table_*
+
+experiment: stress_sweep
+family: stress-k6-failure
+tag: nhp
+
+knob:
+  type: k6_failure
+  levels: [0.0, 0.1, 0.25, 0.5, 0.75]
+  params:
+    dead_value: 0.0   # response of a failed electrode, z-scored units
+
+budget: 96
+n_init: 5
+n_reps: 10
+gt_mode: full_mean     # or split_half (task #7): rep i runs on cross-fitted instance i mod 2*gt_n_splits
+gt_n_splits: 10
+device: cuda
+seed: 42
+output_root: output
+
+# Pre-registered TOST/non-inferiority margin, in range-normalized regret units.
+equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

@@ -31,16 +31,19 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
+from ..acquisition.registry import ACQUISITION_REGISTRY
 from ..config import ExperimentConfig, load_experiment_config, resolved_dict
 from ..data.channels import parse_shard, iter_channels
+from ..data.ground_truth import instance_for_rep
 from ..diagnostics import ClusterDiagnostics, diagnostics_enabled
 from ..evaluation import results as _results
+from ..evaluation import shards as _shards
 from ..evaluation.cache import CellStore, row_payload
 from ..evaluation.bo_runner import run_channel_bo
 from ..evaluation.results import TidyRow
 from ..models.registry import MODEL_REGISTRY
 from ..seeding import seed_for
-from ._cells import cell_identity, count_channels, row_from_payload
+from ._cells import cell_identity, count_channels, gt_instances, row_from_payload
 from ._rows import build_row
 
 __all__ = ["run_bo_benchmark", "build_acquisition_table", "main"]
@@ -68,6 +71,10 @@ def _supported(model: str, acq_type: str) -> bool:
     spec = MODEL_REGISTRY.get(model)
     if spec is None:
         return False
+    # End-to-end BO models own their query decision: they serve only the acquisition that
+    # delegates to it, and that acquisition serves only them (capability flags, no names).
+    if spec.native_policy or ACQUISITION_REGISTRY[acq_type].needs_native_policy:
+        return spec.native_policy and ACQUISITION_REGISTRY[acq_type].needs_native_policy
     if acq_type == "ts_joint":
         return spec.family == "gp"
     # The random acquisition is served only by the random-search baseline: any other model
@@ -108,11 +115,6 @@ def build_acquisition_table(df: pd.DataFrame, out_dir: str) -> tuple[pd.DataFram
     path = os.path.join(out_dir, "acquisition_table.csv")
     table.to_csv(path, index=False)
     return table, path
-
-
-def _shard_suffix(shard: tuple[int, int] | None) -> str:
-    """Run-directory suffix that keeps shards from overwriting each other's outputs."""
-    return "" if shard is None else f"-shard{shard[0]}of{shard[1]}"
 
 
 def _compute_cell(
@@ -175,6 +177,7 @@ def run_bo_benchmark(
     only_cached: bool = False,
     on_cell: Callable[[], None] | None = None,
     shard: tuple[int, int] | None = None,
+    compute_only: bool = False,
 ) -> str:
     """Run (or re-summarize) a models x acquisitions benchmark.
 
@@ -190,12 +193,14 @@ def run_bo_benchmark(
             without computing any.
         on_cell: Called once per cell served (computed or cached); drives the
             cluster-diagnostics throughput counter.
-        shard: ``(i, n)`` runs only every n-th channel starting at ``i``. The default
-            run directory gets a ``-shard{i}of{n}`` suffix; assemble the union with a
-            final ``--only-cached`` run without ``--shard``.
+        shard: ``(i, n)`` runs only every n-th channel starting at ``i``. A shard is compute-only.
+        compute_only: Compute (and cache) cells but write no ``tidy.csv``, tables or figures: only a
+            provenance record in ``{run_dir}/shards/`` (machine, GPU, models, cell counts). Every
+            job of an experiment therefore shares one run directory; assemble the union with a final
+            ``--only-cached`` run without ``--shard``.
 
     Returns:
-        Path to the run directory.
+        Path to the (single, merged) run directory.
 
     Raises:
         FileNotFoundError: With ``replot=True`` and no ``tidy.csv``.
@@ -203,9 +208,9 @@ def run_bo_benchmark(
             cell failed (raised after every completed cell is written and cached).
     """
     cfg = load_experiment_config(config_path, overrides)
-    target = run_dir or os.path.join(
-        cfg.output_root, "benchmark", cfg.dataset.name, f"{cfg.family}-{cfg.tag}{_shard_suffix(shard)}"
-    )
+    compute_only = compute_only or shard is not None
+    started = time.time()
+    target = run_dir or os.path.join(cfg.output_root, "benchmark", cfg.dataset.name, f"{cfg.family}-{cfg.tag}")
     os.makedirs(target, exist_ok=True)
     tidy_path = os.path.join(target, "tidy.csv")
 
@@ -217,21 +222,23 @@ def run_bo_benchmark(
         run_tag = f"{cfg.dataset.name}-benchmark-{cfg.tag}"
         acquisitions = cfg.acquisitions
         rows: list[TidyRow] = []
+        payloads: list[dict[str, Any]] = []
         trajectories: dict[tuple[Any, ...], dict[str, Any]] = {}
         skipped: list[str] = []
         store = CellStore(
             cfg.cell_cache_root, enabled=use_cache, only_cached=only_cached, on_cell=on_cell
         )
 
-        for channel in iter_channels(
+        for base_channel in iter_channels(
             cfg.dataset.name,
             cfg.dataset.subjects,
             cfg.dataset.emgs,
             data_root=cfg.dataset.data_root,
-            gt_mode=cfg.gt_mode,
+            gt_mode="full_mean",  # split-half instances are expanded below (task #7)
             normalization=cfg.dataset.normalization,
             shard=shard,
         ):
+            instances = gt_instances(cfg, base_channel)
             for model in cfg.models:
                 for acq in acquisitions:
                     if not _supported(model, acq.type):
@@ -240,6 +247,7 @@ def run_bo_benchmark(
                             skipped.append(note)
                         continue
                     for rep in range(cfg.n_reps):
+                        channel = instances[instance_for_rep(rep, len(instances))]
                         seed = seed_for(channel.label, acq.type, model, rep, base_seed=cfg.seed)
                         label = f"{channel.label} {model} {acq.type} rep{rep}"
                         identity = cell_identity(
@@ -256,12 +264,26 @@ def run_bo_benchmark(
                             continue
                         row = row_from_payload(cell[0], run_tag)
                         rows.append(row)
+                        payloads.append(cell[0])
                         trajectories[_results.make_trajectory_key(row)] = cell[1]
         print(
             f"[bo_benchmark] cells: {store.hits} cached, {store.computed} computed, "
             f"{len(store.failures)} failed",
             flush=True,
         )
+        if compute_only:
+            if not rows and shard is not None and not store.failures and not skipped:
+                # An empty shard (more lanes than channels) is a clean no-op, not an error.
+                print(f"[bo_benchmark] shard {shard[0]}/{shard[1]} owns no channels; nothing to do.", flush=True)
+            record = _shards.write_shard_record(
+                target, shard=shard, host=store.host, models=cfg.models, device=cfg.device,
+                model_devices={m: p["device"] for m, p in cfg.model_params.items() if p.get("device")},
+                cells_computed=store.computed, cells_cached=store.hits, cells_failed=len(store.failures),
+                started=started, status="failed" if store.failures else "ok",
+            )
+            print(f"[bo_benchmark] compute-only: shard record -> {record}", flush=True)
+            store.raise_if_failed()
+            return target
         if not rows and shard is not None and not store.failures and not skipped:
             # An empty shard (more lanes than channels) is a clean no-op, not an error.
             print(f"[bo_benchmark] shard {shard[0]}/{shard[1]} owns no channels; nothing to do.", flush=True)
@@ -275,17 +297,18 @@ def run_bo_benchmark(
             print(f"[bo_benchmark] skipped unsupported combinations: {', '.join(skipped)}")
 
         # One acquisition block per row: flatten per-acquisition rather than globally.
-        frames = [
-            _results.rows_to_dataframe(
-                [r for r in rows if r.acq_label == acq.name], acquisition=acq.as_block()
-            )
-            for acq in acquisitions
-            if any(r.acq_label == acq.name for r in rows)
-        ]
+        frames = []
+        for acq in acquisitions:
+            idx = [i for i, r in enumerate(rows) if r.acq_label == acq.name]
+            if not idx:
+                continue
+            frame = _results.rows_to_dataframe([rows[i] for i in idx], acquisition=acq.as_block())
+            hosts = _shards.host_columns([payloads[i] for i in idx])
+            frames.append(pd.concat([frame.reset_index(drop=True), hosts], axis=1))
         df = pd.concat(frames, ignore_index=True, sort=False)
         df.to_csv(tidy_path, index=False)
         _results.write_trajectories(target, trajectories)
-        _results.write_config(target, resolved_dict(cfg))
+        _results.write_config(target, {**resolved_dict(cfg), "shards": _shards.shard_registry(target)})
         print(f"[bo_benchmark] wrote {len(df)} rows -> {tidy_path}")
         store.raise_if_failed()
 
@@ -332,6 +355,10 @@ def main(argv: list[str] | None = None) -> int:
         "--only-cached", action="store_true",
         help="Assemble outputs from cached cells only; compute nothing.",
     )
+    parser.add_argument(
+        "--compute-only", action="store_true",
+        help="Compute and cache cells; write only a shard provenance record (implied by --shard).",
+    )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     cfg = load_experiment_config(args.config, args.overrides)
@@ -350,6 +377,6 @@ def main(argv: list[str] | None = None) -> int:
         run_bo_benchmark(
             args.config, args.overrides, replot=args.replot, run_dir=args.run_dir,
             use_cache=not args.no_cache, only_cached=args.only_cached,
-            on_cell=diag.record_experiment, shard=args.shard,
+            on_cell=diag.record_experiment, shard=args.shard, compute_only=args.compute_only,
         )
     return 0

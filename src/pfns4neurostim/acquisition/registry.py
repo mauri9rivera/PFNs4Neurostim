@@ -3,7 +3,7 @@
 Implements the **P0.2** config schema::
 
     acquisition:
-      type: ucb                 # ts_marginal | ts_joint | ucb | ei | pi | greedy | random
+      type: ucb                 # ts_marginal | ts_joint | ucb | ei | pi | greedy | random | native
       params: {kappa: 2.0}      # only this type's parameters; unknown keys raise
       schedules:                # optional; each key must be a param of this type
         kappa: {kind: cosine, start: 7.5, end: 0.6}
@@ -41,6 +41,7 @@ __all__ = [
     "TSJointParams",
     "GreedyParams",
     "RandomParams",
+    "NativeParams",
 ]
 
 
@@ -131,6 +132,15 @@ class GreedyParams(AcqParams):
 @dataclass(frozen=True)
 class RandomParams(AcqParams):
     """Uniform random acquisition: no parameters."""
+
+
+@dataclass(frozen=True)
+class NativeParams(AcqParams):
+    """The model's own acquisition rule (end-to-end BO models): no parameters here.
+
+    The rule's settings (e.g. PFNs4BO's criterion) belong to the model, are set in its
+    ``model_params`` and enter the cache identity there.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +307,27 @@ def _score_random(
     return rng.random(X_pool.shape[0])
 
 
+def _score_native(
+    surrogate: Any, X_pool: np.ndarray, state: BOState, rng: np.random.Generator, params: NativeParams
+) -> np.ndarray:
+    """Delegate to the model's own acquisition surface (end-to-end BO models).
+
+    Args:
+        surrogate: Fitted model that owns its query decision.
+        X_pool: Candidates, shape [N, D].
+        state: Unused.
+        rng: Seeded generator, forwarded to the model.
+        params: Unused.
+
+    Returns:
+        The model's preference per candidate, shape [N].
+
+    Raises:
+        NotImplementedError: For a plain surrogate with no native policy.
+    """
+    return surrogate.policy_scores(X_pool, rng)
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -310,6 +341,9 @@ class AcquisitionSpec:
         score_fn: Scoring function.
         needs_joint: Whether it requires a surrogate with a joint posterior.
         needs_surrogate: Whether the surrogate is consulted at all.
+        needs_native_policy: Whether the model must own its query decision
+            (:class:`~pfns4neurostim.models.protocol.NativePolicy`); such a model serves
+            only this type, and this type only such models.
         description: One line for help output and captions.
     """
 
@@ -318,6 +352,7 @@ class AcquisitionSpec:
     score_fn: Callable[..., np.ndarray]
     needs_joint: bool = False
     needs_surrogate: bool = True
+    needs_native_policy: bool = False
     description: str = ""
 
 
@@ -345,6 +380,13 @@ ACQUISITION_REGISTRY: dict[str, AcquisitionSpec] = {
         _score_random,
         needs_surrogate=False,
         description="Uniform random acquisition",
+    ),
+    "native": AcquisitionSpec(
+        "native",
+        NativeParams,
+        _score_native,
+        needs_native_policy=True,
+        description="The model's own acquisition rule (end-to-end BO models, e.g. PFNs4BO)",
     ),
 }
 

@@ -1,15 +1,23 @@
-"""The deployment portfolio: every job in priority order, with wall-time estimates.
+"""The deployment portfolio: every Mila job still to run, in priority order, with wall-time estimates.
 
-The agent never submits jobs. This script PRINTS the plan, or with ``--emit-bash`` writes the
-one-command submission script (``scripts/submit_portfolio.sh``) that the USER runs on the login node.
+The agent never submits jobs. This script PRINTS the plan, or with ``--emit-bash`` writes a one-command
+submission script that the USER runs on the login node:
 
-Estimates use per-repetition costs measured on 2026-09-20 (see the sprint file): TabPFN 15.7 s (NHP) /
-17.6 s (5d_rat) at budget 96/100, GP-MLL 19.5 s on one CPU thread, GP-fixed ~1 s, Random ~0.3 s; a GPU job
-with several lanes gains ~1.7x aggregate throughput. TabICL and TabFM costs are UNMEASURED.
+    python scripts/portfolio.py                                                    # the plan (all groups)
+    python scripts/portfolio.py --emit-bash --group stress > scripts/submit_portfolio.sh     # Hyp B (restructured knobs, Demo 1)
+    python scripts/portfolio.py --emit-bash --group bench > scripts/submit_bench.sh          # Hyp 0/A leftovers + GT sensitivity
+    python scripts/portfolio.py --emit-bash --group hypc > scripts/submit_hypc.sh            # Hyp C mechanism analyses
+    python scripts/portfolio.py --emit-bash --group externals > scripts/submit_externals.sh  # TabFM, PFNs4BO
 
-    python scripts/portfolio.py                       # everything
-    python scripts/portfolio.py --machine mila        # only the cluster jobs
-    python scripts/portfolio.py --emit-bash > scripts/submit_portfolio.sh
+Groups (updated 2026-09-23; units whose results already exist were removed — see task_plan.md "Your Mila portfolio"):
+    stress     restructured K2 (channel, global), K5, K6 (failure, budget) on NHP and 5d_rat; Demo 1 K2 + K1; split-half K2.
+    bench      the 5d_rat acquisition tables and the split-half GT sensitivity run (task #7).
+    hypc       M10 update rule, placement (MMD / W2) and CKA on NHP (one process each, no assembly).
+    externals  TabFM (bench env, 24 GB, <= 2 lanes, plus a 5d_rat calibration job) and PFNs4BO (main env).
+
+Sharded experiments (``bo_benchmark``, ``stress_sweep``) write every job's cells to the shared cache and one assemble job
+builds tidy.csv, tables and figures. ``mechanism`` and ``gt_sensitivity`` run as ONE process (``scripts/run_single.sh``) and
+write their own outputs. Estimates use per-repetition costs measured on 2026-09-20/23.
 """
 from __future__ import annotations
 
@@ -18,16 +26,19 @@ from dataclasses import dataclass
 
 #: Seconds per repetition at the deliverable budget (96 NHP / 100 5d_rat), per model. Absent = unmeasured.
 REP_SECONDS: dict[str, dict[str, float]] = {
-    "nhp": {"tabpfn_v2_5": 15.7, "gp_mll": 19.5, "gp_naive": 0.8, "random": 0.2, "tabicl": 16.0},
-    "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 19.5, "gp_naive": 1.0, "random": 0.4, "tabicl": 18.0},
+    "nhp": {"tabpfn_v2_5": 15.7, "gp_mll": 19.5, "gp_naive": 0.8, "random": 0.2, "tabicl": 30.0, "tabfm": 99.0},
+    "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 19.5, "gp_naive": 1.0, "random": 0.4, "tabicl": 33.0},
 }
-GUESSED: frozenset[str] = frozenset({"tabicl"})   # assumed equal to TabPFN until calibrated
+GUESSED: frozenset[str] = frozenset()   # every listed cost is measured (TabICL from the D3 runs: 0.43-0.52 s/step)
 CHANNELS = 18
 REPS = 10
 GPU_LANE_GAIN = 1.7      # aggregate speed-up of several lanes on one GPU (measured with 3 lanes)
 GPU_LANES = 4
 CPU_LANES = 8
 BENCH_ENV = "pfns4neurostim-bench"
+MAIN_ENV = "pfns4neurostim"
+#: Runners that run as one process and write their own deliverables (no lanes, no cell assembly).
+SINGLE_PROCESS: frozenset[str] = frozenset({"mechanism", "gt_sensitivity"})
 
 
 @dataclass(frozen=True)
@@ -36,64 +47,105 @@ class Unit:
 
     Attributes:
         name: Label.
-        experiment: ``bo_benchmark`` or ``stress_sweep``.
+        group: ``stress``, ``bench``, ``hypc`` or ``externals``.
+        experiment: ``bo_benchmark``, ``stress_sweep``, ``mechanism`` or ``gt_sensitivity``.
         config: Experiment YAML.
         dataset: ``nhp`` or ``5d_rat`` (keys of :data:`REP_SECONDS`).
         gpu_models: Models needing a GPU (may be empty).
         cpu_models: Models run on the CPU partition (may be empty).
         multiplier: Cells per repetition per model (knob levels, or a budget-scaling factor).
-        machine: ``mila``, ``local`` or ``deferred`` (planned but not scheduled).
         env: Conda env for the cluster jobs.
+        lanes: Lanes of the GPU job.
+        mem: ``--mem`` of the GPU job (empty keeps the script's default).
+        overrides: Extra ``key=value`` overrides passed to every job of the unit (e.g. a calibration subset).
         note: Free-text remark.
+        hours: Wall-hour estimate of a single-process unit (sharded units are estimated from :data:`REP_SECONDS`).
     """
 
     name: str
+    group: str
     experiment: str
     config: str
     dataset: str
     gpu_models: tuple[str, ...]
     cpu_models: tuple[str, ...]
-    multiplier: float
-    machine: str
-    env: str = "pfns4neurostim"
+    multiplier: float = 1.0
+    env: str = MAIN_ENV
+    lanes: int = GPU_LANES
+    mem: str = ""
+    overrides: tuple[str, ...] = ()
     note: str = ""
+    hours: float | None = None
 
+
+def _u(name: str, exp: str, cfg: str, ds: str, gpu: tuple[str, ...], cpu: tuple[str, ...], mult: float = 1.0, **kw: object) -> Unit:
+    """Shorthand constructor for a unit (group defaults to ``stress``)."""
+    return Unit(name, str(kw.pop("group", "stress")), exp, f"configs/experiment/{cfg}.yaml", ds, gpu, cpu, mult, **kw)  # type: ignore[arg-type]
+
+
+_TP, _GP = ("tabpfn_v2_5",), ("gp_mll", "gp_naive")
+_BASE_CPU = ("gp_mll", "gp_naive", "random")
 
 UNITS: tuple[Unit, ...] = (
-    Unit("1. D1 5d_rat", "bo_benchmark", "configs/experiment/hyp_a_5d_rat.yaml", "5d_rat",
-         ("tabpfn_v2_5",), ("gp_mll", "gp_naive", "random"), 1, "mila"),
-    Unit("2a. K2 noise amplification NHP", "stress_sweep", "configs/experiment/stress_k2_nhp.yaml", "nhp",
-         ("tabpfn_v2_5",), ("gp_mll", "gp_naive"), 8, "mila"),
-    Unit("2b. K2 noise amplification 5d_rat", "stress_sweep", "configs/experiment/stress_k2_5d_rat.yaml", "5d_rat",
-         ("tabpfn_v2_5",), ("gp_mll", "gp_naive"), 8, "mila"),
-    Unit("3a. D3 PFN benchmark NHP (TabPFN-2.5, TabICL, GP-MLL)", "bo_benchmark",
-         "configs/experiment/hyp0_pfn_bench_nhp.yaml", "nhp", ("tabpfn_v2_5", "tabicl"), ("gp_mll",), 1, "mila", BENCH_ENV,
-         "bench env (py3.11); TabICL cost assumed = TabPFN until calibrated"),
-    Unit("3b. D3 PFN benchmark 5d_rat (TabPFN-2.5, TabICL, GP-MLL)", "bo_benchmark",
-         "configs/experiment/hyp0_pfn_bench_5d_rat.yaml", "5d_rat", ("tabpfn_v2_5", "tabicl"), ("gp_mll",), 1, "mila", BENCH_ENV,
-         "bench env (py3.11); TabICL cost assumed = TabPFN until calibrated"),
-    Unit("4. K5 outliers 5d_rat", "stress_sweep", "configs/experiment/stress_k5_5d_rat.yaml", "5d_rat",
-         ("tabpfn_v2_5",), ("gp_mll", "gp_naive"), 5, "mila", note="real lab artefacts; 5 calibrated levels"),
-    Unit("L3b. D3 TabFM NHP", "bo_benchmark", "configs/experiment/hyp0_pfn_bench_nhp.yaml", "nhp",
-         ("tabfm",), (), 1, "local", BENCH_ENV,
-         "MEASURED on Mila (job 10871697, RTX 8000): 99 s/rep = ~5 h serial, ~9.9 GB RAM per process (needs --mem=24G and <=2 lanes "
-         "if ever run on the cluster); run locally on the RTX 3060 (bf16) with 1-2 lanes"),
-    Unit("D. D3 TabFM 5d_rat (DEFERRED)", "bo_benchmark", "configs/experiment/hyp0_pfn_bench_5d_rat.yaml", "5d_rat",
-         ("tabfm",), (), 1, "deferred", BENCH_ENV,
-         "UNMEASURED and probably infeasible: TabFM predict cost grows with query rows (2048 sites vs 96 on NHP); calibrate on 5d_rat first"),
-    Unit("L1. D1 NHP (RUNNING locally)", "bo_benchmark", "configs/experiment/hyp_a_nhp.yaml", "nhp",
-         ("tabpfn_v2_5",), ("gp_mll", "gp_naive", "random"), 1, "local"),
-    Unit("L2. K6-budget NHP", "stress_sweep", "configs/experiment/stress_k6_budget_nhp.yaml", "nhp",
-         ("tabpfn_v2_5",), ("gp_mll", "gp_naive"), 2.15, "local", note="levels 10,20,30,50,96 = 2.15x one full budget"),
+    # ---- stress: restructured knobs (2026-09-23), main env ----
+    # BEFORE the K2-channel units: run `python scripts/relabel_knob_cells.py --apply` once on the login node, so the 8,640
+    # pre-restructure k2_snr cells are served as k2_channel cache hits (only alpha = 8 is new compute).
+    _u("S1a. K2-channel, NHP (alpha = 8 top-up)", "stress_sweep", "stress_k2_channel_nhp", "nhp", _TP, _GP, 1,
+       note="8 of 9 levels are cache hits after the relabel"),
+    _u("S1b. K2-channel, 5d_rat (alpha = 8 top-up)", "stress_sweep", "stress_k2_channel_5d_rat", "5d_rat", _TP, _GP, 1,
+       note="8 of 9 levels are cache hits after the relabel"),
+    _u("S2a. K2-global, NHP", "stress_sweep", "stress_k2_global_nhp", "nhp", _TP, _GP, 8),
+    _u("S2b. K2-global, 5d_rat", "stress_sweep", "stress_k2_global_5d_rat", "5d_rat", _TP, _GP, 8),
+    _u("S3a. K5 slot-fraction heavy tail, NHP", "stress_sweep", "stress_k5_nhp", "nhp", _TP, _GP, 6),
+    _u("S3b. K5 slot-fraction heavy tail, 5d_rat", "stress_sweep", "stress_k5_5d_rat", "5d_rat", _TP, _GP, 6),
+    _u("S4a. K6 electrode failure, NHP", "stress_sweep", "stress_k6_failure_nhp", "nhp", _TP, _GP, 5),
+    _u("S4b. K6 electrode failure, 5d_rat", "stress_sweep", "stress_k6_failure_5d_rat", "5d_rat", _TP, _GP, 5),
+    _u("S4c. K6 budget, NHP", "stress_sweep", "stress_k6_budget_nhp", "nhp", _TP, _GP, 2.15,
+       note="levels 10,20,30,50,96 = 2.15x one full budget"),
+    _u("S5a. Demo 1 K2-channel, NHP twins", "stress_sweep", "stress_k2_channel_demo1_nhp", "nhp", _TP, _GP, 9,
+       note="synthetic twins fitted per channel (S0); feeds the S10 bridge"),
+    _u("S5b. Demo 1 K2-channel, 5d_rat twins", "stress_sweep", "stress_k2_channel_demo1_5d_rat", "5d_rat", _TP, _GP, 9),
+    _u("S5c. Demo 1 K1 decoy, NHP twins", "stress_sweep", "stress_k1_decoy_nhp", "nhp", _TP, _GP, 5),
+    _u("S6. Split-half GT, K2-channel NHP", "stress_sweep", "stress_k2_channel_nhp", "nhp", _TP, _GP, 9,
+       overrides=("gt_mode=split_half", "tag=nhp-sh"), note="S6 sensitivity arm; rep i on split instance i mod 20"),
+    # ---- bench: Hyp 0/A leftovers, main env ----
+    _u("B1. Acquisition core (ts/ei/ucb), 5d_rat", "bo_benchmark", "hyp0_acq_core_5d_rat", "5d_rat", _TP, _BASE_CPU, 2,
+       group="bench", note="ts_marginal + random cells are cache hits from D1"),
+    _u("B2. UCB kappa grid, 5d_rat", "bo_benchmark", "hyp0_ucb_kappa_5d_rat", "5d_rat", _TP, (), 5, group="bench"),
+    _u("B3. GT sensitivity (full-mean vs split-half), NHP", "gt_sensitivity", "gt_sensitivity_nhp", "nhp", _TP, ("gp_mll",),
+       group="bench", hours=1.0, note="task #7 Step 6; spinal twin (gt_sensitivity_spinal) needs data/spinal on the cluster"),
+    # ---- hypc: mechanism analyses, one GPU process each ----
+    _u("C1. M10 update rule, NHP", "mechanism", "mechanism_update_rule_nhp", "nhp", _TP, (), group="hypc", hours=3.0,
+       note="~7-8 min per channel on a 3060 (GP-refit arm dominates) + gates; set update_rule.link.tidy_csv afterwards"),
+    _u("C2. Placement (MMD / sliced W2), NHP", "mechanism", "mechanism_placement_nhp", "nhp", _TP, (), group="hypc", hours=1.0,
+       note="~1 s per prior dataset; rank_pairs features (validated rho = 1.0 on NHP); needs libs/tabpfn-v1-prior (bash scripts/mila_setup.sh submodules)"),
+    _u("C3. CKA, NHP", "mechanism", "mechanism_cka_nhp", "nhp", _TP, (), group="hypc", hours=None,
+       note="cost UNMEASURED; n_perm must reach the Bonferroni threshold (runner refuses otherwise)"),
+    # ---- externals ----
+    _u("E3. TabFM, NHP", "bo_benchmark", "hyp0_pfn_bench_nhp", "nhp", ("tabfm",), (), group="externals", env=BENCH_ENV,
+       lanes=2, mem="24G",
+       note="MEASURED on Mila (job 10871697): 99 s/rep, 9.9 GB RSS per process -> 24 GB and <=2 lanes; sigma is ensemble spread (G3)"),
+    _u("E4. TabFM 5d_rat CALIBRATION (1 channel, 2 reps)", "bo_benchmark", "hyp0_pfn_bench_5d_rat", "5d_rat", ("tabfm",), (),
+       group="externals", env=BENCH_ENV, lanes=1, mem="24G",
+       overrides=("dataset.subjects=[1]", "dataset.emgs=[0]", "n_reps=2"),
+       note="UNMEASURED: read its per-rep time from the log before submitting a full 5d_rat TabFM run"),
+    _u("E5. PFNs4BO (native policy), NHP", "bo_benchmark", "hyp0_pfns4bo_nhp", "nhp", ("pfns4bo",), (), group="externals",
+       lanes=2, note="main env; end-to-end BO model (acquisition: native); cost UNMEASURED"),
+    _u("E6. PFNs4BO (native policy), 5d_rat", "bo_benchmark", "hyp0_pfns4bo_5d_rat", "5d_rat", ("pfns4bo",), (), group="externals",
+       lanes=2, note="main env; end-to-end BO model (acquisition: native); cost UNMEASURED"),
 )
 
 
 def _script(experiment: str) -> str:
+    if experiment in SINGLE_PROCESS:
+        return "scripts/run_single.sh"
     return "scripts/run_bo_benchmark.sh" if experiment == "bo_benchmark" else "scripts/run_stress_sweep.sh"
 
 
 def _hours(unit: Unit, models: tuple[str, ...], speedup: float) -> float | None:
     """Estimated wall hours, or ``None`` if any model's per-rep cost is unmeasured."""
+    if unit.experiment in SINGLE_PROCESS:
+        return unit.hours if models is unit.gpu_models else 0.0
     if not models:
         return 0.0
     costs = [REP_SECONDS[unit.dataset].get(m) for m in models]
@@ -106,75 +158,76 @@ def _fmt(hours: float | None) -> str:
     return "?" if hours is None else f"{hours:.1f}"
 
 
-def print_plan(machine: str) -> None:
+def _selected(group: str) -> list[Unit]:
+    return [u for u in UNITS if group == "all" or u.group == group]
+
+
+def print_plan(group: str) -> None:
     """Print the human-readable plan."""
-    for unit in UNITS:
-        if machine != "all" and unit.machine != machine:
-            continue
-        gpu_h = _hours(unit, unit.gpu_models, GPU_LANE_GAIN)
+    for unit in _selected(group):
+        gpu_h = _hours(unit, unit.gpu_models, GPU_LANE_GAIN if unit.lanes > 1 else 1.0)
         cpu_h = _hours(unit, unit.cpu_models, CPU_LANES)
-        guessed = sorted(set(unit.gpu_models) & GUESSED)
-        print(f"\n### {unit.name}   [{unit.machine}]   est. wall: GPU ~{_fmt(gpu_h)} h, CPU ~{_fmt(cpu_h)} h"
-              + (f"  (assumed cost: {', '.join(guessed)})" if guessed else ""))
+        print(f"\n### {unit.name}   [{unit.group}, env {unit.env}]   est. wall: GPU ~{_fmt(gpu_h)} h, CPU ~{_fmt(cpu_h)} h")
         if unit.note:
             print(f"# {unit.note}")
-        gm, cm = ",".join(unit.gpu_models), ",".join(unit.cpu_models)
-        env = "" if unit.env == "pfns4neurostim" else f"CONDA_ENV={unit.env} "
-        if unit.machine == "mila":
-            if gm:
-                print(f"{env}LANES={GPU_LANES} sbatch {_script(unit.experiment)} {unit.config} \"models=[{gm}]\" tag=gpu")
-            if cm:
-                print(f"{env}sbatch scripts/run_cpu.sh {unit.experiment} {unit.config} \"models=[{cm}]\" tag=cpu")
-            if "tabfm" in unit.gpu_models:
-                print(f"# calibrate first: {env}sbatch scripts/run_bo_benchmark.sh {unit.config} \"models=[tabfm]\" "
-                      "dataset.subjects=[1] dataset.emgs=[0] n_reps=2 tag=calib")
-        elif unit.machine == "local":
-            py = "python" if unit.env == "pfns4neurostim" else f"conda run -n {unit.env} python"
-            if gm:
-                print(f"{py} -m pfns4neurostim {unit.experiment} --config {unit.config} --set \"models=[{gm}]\" tag=local-gpu")
-            if cm:
-                print(f"{py} -m pfns4neurostim {unit.experiment} --config {unit.config} --set \"models=[{cm}]\" tag=local-cpu")
-            print(f"{py} -m pfns4neurostim {unit.experiment} --config {unit.config} --only-cached")
-        else:
-            print("# deferred: not scheduled")
     print("\n# Mila caps: 2 GPUs on `main` (extra GPU jobs queue), 8 CPUs on `main-cpu`. Watch: bash scripts/mila.sh queue")
-    print("# One command submits everything with dependencies: bash scripts/submit_portfolio.sh")
+    print("# Submit: bash scripts/submit_portfolio.sh (stress) | submit_bench.sh | submit_hypc.sh | submit_externals.sh")
 
 
-def emit_bash() -> None:
-    """Write the one-command submission script to stdout (Mila units only, priority order)."""
+def emit_bash(group: str) -> None:
+    """Write the one-command submission script for ``group`` to stdout."""
     print("#!/bin/bash")
-    print("# GENERATED by `python scripts/portfolio.py --emit-bash` - edit scripts/portfolio.py, not this file.")
+    print(f"# GENERATED by `python scripts/portfolio.py --emit-bash --group {group}` - edit scripts/portfolio.py, not this file.")
     print("#")
-    print("# Submits every cluster job in priority order, with one auto-assemble job per unit that runs after its GPU")
-    print("# and CPU jobs finish (--dependency=afterany, so a partial unit still assembles). Run it ONCE on the login")
-    print("# node; jobs then run unattended (requeue on preemption, cached cells resume), so you can go to sleep.")
-    print("# The agent never submits: you run this. Jobs beyond the per-user caps (2 GPUs on `main`, 8 CPUs on")
-    print("# `main-cpu`) simply wait in the queue. Watch with `squeue --me`.")
+    print("# Submits every job of the group in priority order, with one assemble job per unit that runs after its GPU and CPU")
+    print("# jobs (--dependency=afterany, so a partial unit still assembles). All jobs of an experiment share ONE run directory:")
+    print("# they compute cells (--compute-only) and leave a provenance record in <run_dir>/shards/; the assemble job writes")
+    print("# tidy.csv, tables and figures. The agent never submits: you run this ONCE on the login node. Jobs beyond the")
+    print("# per-user caps (2 GPUs on `main`, 8 CPUs on `main-cpu`) wait in the queue. Watch with `squeue --me`.")
     print("set -euo pipefail")
     print('cd "${SLURM_SUBMIT_DIR:-$PWD}"')
     print("")
-    print("# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|->")
+    print("# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> [overrides...]")
     print("submit_unit() {")
-    print('  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" deps="" id')
+    print('  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" deps="" id')
+    print("  shift 9")
+    print('  local extra=("$@") memflag=()')
+    print('  if [ "$mem" != "-" ]; then memflag=(--mem="$mem"); fi')
     print('  if [ "$gpu" != "-" ]; then')
-    print(f'    id=$(CONDA_ENV="$env" LANES={GPU_LANES} sbatch --parsable "$script" "$cfg" "models=[$gpu]" tag=gpu)')
+    print('    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})')
     print('    deps="$deps:${id%%;*}"')
     print("  fi")
     print('  if [ "$cpu" != "-" ]; then')
-    print('    id=$(CONDA_ENV="$env" sbatch --parsable scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" tag=cpu)')
+    print('    id=$(CONDA_ENV="$env" sbatch --parsable scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})')
     print('    deps="$deps:${id%%;*}"')
     print("  fi")
-    print('  id=$(CONDA_ENV="$env" sbatch --parsable --dependency="afterany$deps" scripts/run_assemble.sh "$exp" "$cfg")')
+    print('  id=$(CONDA_ENV="$env" sbatch --parsable --dependency="afterany$deps" scripts/run_assemble.sh "$exp" "$cfg" ${extra[@]+"${extra[@]}"})')
     print('  echo "submitted: $name  (assemble job ${id%%;*} runs after$deps)"')
     print("}")
     print("")
-    for unit in UNITS:
-        if unit.machine != "mila":
+    print("# submit_single <name> <experiment> <config> <env> [overrides...]   (one process, writes its own outputs)")
+    print("submit_single() {")
+    print('  local name="$1" exp="$2" cfg="$3" env="$4" id')
+    print("  shift 4")
+    print('  id=$(CONDA_ENV="$env" sbatch --parsable scripts/run_single.sh "$exp" "$cfg" "$@")')
+    print('  echo "submitted: $name  (job ${id%%;*})"')
+    print("}")
+    print("")
+    if group == "stress":
+        print("# The K2-channel units reuse the pre-restructure k2_snr cells: relabel them first (idempotent, copies only).")
+        print("python scripts/relabel_knob_cells.py --apply")
+        print("")
+    for unit in _selected(group):
+        if unit.experiment in SINGLE_PROCESS:
+            extra = " ".join(f'"{o}"' for o in unit.overrides)
+            print(f'submit_single "{unit.name}" {unit.experiment} {unit.config} {unit.env} {extra}'.rstrip())
             continue
         gm = ",".join(unit.gpu_models) or "-"
         cm = ",".join(unit.cpu_models) or "-"
-        print(f'submit_unit "{unit.name}" {unit.experiment} {_script(unit.experiment)} {unit.config} {unit.env} "{gm}" "{cm}"')
+        mem = unit.mem or "-"
+        extra = " ".join(f'"{o}"' for o in unit.overrides)
+        print(f'submit_unit "{unit.name}" {unit.experiment} {_script(unit.experiment)} {unit.config} {unit.env} "{gm}" "{cm}" '
+              f'{unit.lanes} "{mem}" {extra}'.rstrip())
     print("")
     print('echo "Done. Check with: squeue --me"')
 
@@ -182,13 +235,15 @@ def emit_bash() -> None:
 def main() -> None:
     """Entry point."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--machine", choices=["mila", "local", "deferred", "all"], default="all")
-    parser.add_argument("--emit-bash", action="store_true", help="Write scripts/submit_portfolio.sh to stdout.")
+    parser.add_argument("--group", choices=["stress", "bench", "hypc", "externals", "all"], default="all")
+    parser.add_argument("--emit-bash", action="store_true", help="Write a submission script to stdout.")
     args = parser.parse_args()
     if args.emit_bash:
-        emit_bash()
+        if args.group == "all":
+            parser.error("--emit-bash needs one --group (stress, bench, hypc or externals).")
+        emit_bash(args.group)
     else:
-        print_plan(args.machine)
+        print_plan(args.group)
 
 
 if __name__ == "__main__":

@@ -4,8 +4,9 @@ Every BO repetition stores, per step, the recommended-site simple regret, the ex
 (true response at the recommended site over the true maximum, raw units), the surrogate's R^2 over
 the pool and the step latency. This module turns those into figures without re-running anything.
 
-Averaging: repetitions are averaged within a channel first, then channels are summarized (mean and a
-95% CI over channels), so a subject with many EMGs cannot dominate.
+Averaging: repetitions are reduced within a channel first, then channels are summarized, so a subject with
+many EMGs cannot dominate. Bounded traces (regret, exploration) give the mean with a 95% CI over channels;
+heavy-tailed traces (R^2, latency) give the median with the interquartile range (:data:`HEAVY_TAILED_FIELDS`).
 
 x-axis convention: the recommendation ``i`` is made after ``n_init + i`` observations, and the step
 latency ``i`` is the time of the fit and acquisition on ``n_init + i`` observations.
@@ -38,8 +39,9 @@ TRACE_PANELS: tuple[tuple[str, str], ...] = (
     ("r2_per_step", "r2"),
 )
 
-#: Lower limit of the R^2 panel; early GP predictions can be far below it.
-R2_AXIS_FLOOR: float = -1.0
+#: Trace fields that are heavy-tailed (early GP predictions reach R^2 far below -1; latency has weight-load
+#: outliers), so they are summarized by the median over channels with an interquartile band.
+HEAVY_TAILED_FIELDS: frozenset[str] = frozenset({"r2_per_step", "latency"})
 
 #: Columns per row of the shared legend.
 LEGEND_COLUMNS: int = 4
@@ -77,19 +79,27 @@ def load_trace_frame(run_dir: str) -> pd.DataFrame | None:
     return pd.DataFrame.from_records(records)
 
 
-def _channel_band(sub: pd.DataFrame, field: str) -> tuple[np.ndarray, np.ndarray, int] | None:
-    """Mean curve over channels (repetitions averaged within a channel first).
+def _channel_band(
+    sub: pd.DataFrame, field: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
+    """Curve over channels with its band (repetitions reduced within a channel first).
+
+    Bounded fields give the mean over channels with a 95% CI; heavy-tailed fields
+    (:data:`HEAVY_TAILED_FIELDS`) give the median of per-channel medians with the interquartile range over
+    channels.
 
     Args:
         sub: Rows of one series.
         field: Array column.
 
     Returns:
-        ``(mean, ci_half_width, n_channels)`` or ``None`` if no row has the field.
+        ``(centre, lower, upper, n_channels)``, each curve ``[L]``, or ``None`` if no row has the field.
 
     Raises:
         ValueError: If the rows of one series have curves of different lengths.
     """
+    robust = field in HEAVY_TAILED_FIELDS
+    reduce_reps = np.nanmedian if robust else np.nanmean
     curves: list[np.ndarray] = []
     for _, grp in sub.groupby(["subject", "emg"], dropna=False):
         arrays = [a for a in grp[field] if a is not None]
@@ -97,14 +107,18 @@ def _channel_band(sub: pd.DataFrame, field: str) -> tuple[np.ndarray, np.ndarray
             continue
         if len({a.shape[0] for a in arrays}) != 1:
             raise ValueError(f"Curves of {field!r} in one series have different lengths.")
-        curves.append(np.nanmean(np.vstack(arrays), axis=0))            # [L]
+        curves.append(reduce_reps(np.vstack(arrays), axis=0))            # [L]
     if not curves:
         return None
     stack = np.vstack(curves)                                            # [n_channels, L]
     n = stack.shape[0]
+    if robust:
+        return (np.nanmedian(stack, axis=0), np.nanpercentile(stack, 25, axis=0),
+                np.nanpercentile(stack, 75, axis=0), n)
     mean = np.nanmean(stack, axis=0)                                     # [L]
     ci = 1.96 * np.nanstd(stack, axis=0, ddof=1) / math.sqrt(n) if n > 1 else np.zeros_like(mean)
-    return mean, np.nan_to_num(ci, nan=0.0), n
+    ci = np.nan_to_num(ci, nan=0.0)
+    return mean, mean - ci, mean + ci, n
 
 
 def _series(frame: pd.DataFrame) -> list[tuple[str, str, pd.DataFrame, S.ModelStyle]]:
@@ -132,27 +146,24 @@ def _title(frame: pd.DataFrame, dataset: str, what: str) -> str:
     return f"{S.DATASET_LABELS.get(dataset, dataset)} - {what} (n={int(frame['rep'].nunique())} reps, {n_chan} channels)"
 
 
-def _legend_below(fig, axes, n_series: int, y0: float = 0.0) -> float:
-    """Place one shared legend under the axes.
+def _legend_below(fig, axes, n_series: int) -> None:
+    """Place one shared legend under the axes (the constrained layout reserves the room for it).
 
     Args:
-        fig: Figure.
+        fig: Figure created with ``layout=S.LAYOUT_ENGINE``.
         axes: Axes whose handles are used.
         n_series: Number of legend entries.
-        y0: Height of the legend's bottom edge in figure coordinates.
-
-    Returns:
-        The bottom margin to hand to ``tight_layout`` so the axes clear the legend.
     """
     handles, labels = axes[0].get_legend_handles_labels()
-    rows = math.ceil(n_series / LEGEND_COLUMNS)
-    fig.legend(handles, labels, loc="lower center", ncol=LEGEND_COLUMNS, frameon=False,
-               fontsize=S.FONT_SIZES["legend"], bbox_to_anchor=(0.5, y0))
-    return y0 + 0.07 * rows + 0.02
+    fig.legend(handles, labels, loc="outside lower center", ncol=min(LEGEND_COLUMNS, n_series), frameon=False,
+               fontsize=S.FONT_SIZES["legend"])
 
 
 def plot_trace_panels(frame: pd.DataFrame, out_dir: str, *, dataset: str, name: str = "trajectories") -> list[str]:
     """(a) simple regret, (b) exploration score, (c) R^2 against BO iteration.
+
+    Regret and exploration show the mean over channels with a 95% CI; R^2 (heavy-tailed) the median with an
+    interquartile band over channels, its axis clipped at :data:`style.R2_AXIS_FLOOR` for display only.
 
     Args:
         frame: Trace frame from :func:`load_trace_frame`.
@@ -167,35 +178,34 @@ def plot_trace_panels(frame: pd.DataFrame, out_dir: str, *, dataset: str, name: 
     if not panels:
         return []
     series = _series(frame)
-    fig, axes = S.figure("double", nrows=1, ncols=len(panels), aspect=1.0)
+    fig, axes = S.figure("double", nrows=1, ncols=len(panels), aspect=S.MULTIPANEL_ASPECT, layout=S.LAYOUT_ENGINE)
     axes = np.atleast_1d(axes)
     for ax, (field, key) in zip(axes, panels):
         for model, label, rows, st in series:
             band = _channel_band(rows, field)
             if band is None:
                 continue
-            mean, ci, _ = band
-            x = int(rows["n_init"].iloc[0]) + np.arange(mean.shape[0])
-            ax.plot(x, mean, color=st.color, linestyle=st.linestyle, linewidth=S.LINE_WIDTH, label=st.label,
+            centre, lower, upper, _ = band
+            x = int(rows["n_init"].iloc[0]) + np.arange(centre.shape[0])
+            ax.plot(x, centre, color=st.color, linestyle=st.linestyle, linewidth=S.LINE_WIDTH, label=st.label,
                     zorder=st.zorder)
-            ax.fill_between(x, mean - ci, mean + ci, color=st.color, alpha=S.BAND_ALPHA, linewidth=0)
+            ax.fill_between(x, lower, upper, color=st.color, alpha=S.BAND_ALPHA, linewidth=0)
         ax.set_xlabel(S.axis_label("budget"))
-        ax.set_ylabel(S.axis_label(key))
+        ax.set_ylabel(S.axis_label(f"{key}_median" if field in HEAVY_TAILED_FIELDS else key))
         if key in ("simple_regret", "exploration_score"):
             ax.set_ylim(0.0, 1.0)
         if key == "r2":
-            ax.set_ylim(bottom=R2_AXIS_FLOOR, top=1.0)
-            ax.text(0.98, 0.02, f"axis clipped at {R2_AXIS_FLOOR:g}", transform=ax.transAxes, ha="right",
+            ax.set_ylim(bottom=S.R2_AXIS_FLOOR, top=1.0)
+            ax.text(0.98, 0.02, f"axis clipped at {S.R2_AXIS_FLOOR:g}", transform=ax.transAxes, ha="right",
                     va="bottom", fontsize=S.FONT_SIZES["annotation"], alpha=0.7)
     fig.suptitle(_title(frame, dataset, "BO trajectories"), x=0.01, ha="left", fontsize=S.FONT_SIZES["title"])
-    S.panel_letters(axes, x=-0.3)
-    bottom = _legend_below(fig, axes, len(series))
-    fig.tight_layout(rect=(0, bottom, 1, 0.94))
+    S.panel_letters(axes, x=0.0)
+    _legend_below(fig, axes, len(series))
     return S.save_figure(fig, out_dir, name)
 
 
 def plot_latency_curves(frame: pd.DataFrame, out_dir: str, *, dataset: str, name: str = "latency") -> list[str]:
-    """Per-step latency along the BO run (mean over repetitions and channels), log scale.
+    """Per-step latency along the BO run (median over channels, interquartile band), log scale.
 
     Args:
         frame: Trace frame.
@@ -211,34 +221,34 @@ def plot_latency_curves(frame: pd.DataFrame, out_dir: str, *, dataset: str, name
         return []
     frame = frame.assign(latency=frame["latency"].map(lambda a: a if len(a) else None))
     series = _series(frame)
-    fig, ax = S.figure("onehalf", aspect=0.7)
+    fig, ax = S.figure("onehalf", aspect=S.SINGLE_PANEL_ASPECT, layout=S.LAYOUT_ENGINE)
     for model, label, rows, st in series:
         band = _channel_band(rows, "latency")
         if band is None:
             continue
-        mean, ci, _ = band
-        x = int(rows["n_init"].iloc[0]) + np.arange(mean.shape[0])
-        ax.plot(x, mean, color=st.color, linestyle=st.linestyle, linewidth=S.LINE_WIDTH, label=st.label,
+        centre, lower, upper, _ = band
+        x = int(rows["n_init"].iloc[0]) + np.arange(centre.shape[0])
+        ax.plot(x, centre, color=st.color, linestyle=st.linestyle, linewidth=S.LINE_WIDTH, label=st.label,
                 zorder=st.zorder)
-        ax.fill_between(x, np.maximum(mean - ci, np.finfo(float).tiny), mean + ci, color=st.color,
+        ax.fill_between(x, np.maximum(lower, np.finfo(float).tiny), upper, color=st.color,
                         alpha=S.BAND_ALPHA, linewidth=0)
     ax.set_yscale("log")
     ax.set_xlabel(S.axis_label("budget"))
-    ax.set_ylabel(S.axis_label("mean_query_latency_s"))
-    ax.set_title(_title(frame, dataset, "per-step cost"), loc="left")
-    note_height = 0.05
-    bottom = _legend_below(fig, [ax], len(series), y0=note_height)
-    fig.text(0.01, 0.005, LATENCY_NOTE, fontsize=S.FONT_SIZES["annotation"], alpha=0.75, va="bottom")
-    fig.tight_layout(rect=(0, bottom, 1, 1))
+    ax.set_ylabel(S.axis_label("mean_query_latency_s_median"))
+    fig.suptitle(_title(frame, dataset, "per-step cost"), x=0.01, ha="left", fontsize=S.FONT_SIZES["title"])
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="outside right center", frameon=False, fontsize=S.FONT_SIZES["legend"])
+    fig.supxlabel(LATENCY_NOTE, x=0.01, ha="left", fontsize=S.FONT_SIZES["annotation"], alpha=0.75)
     return S.save_figure(fig, out_dir, name)
 
 
 def comparison_table(frame: pd.DataFrame, out_dir: str) -> tuple[pd.DataFrame, str]:
     """Final values per model x acquisition, for choosing a headline acquisition.
 
-    Each entry is the mean over channels (repetitions averaged within a channel first) with its 95% CI
-    half-width: final simple regret, regret AUC (mean over the run), final exploration score, final R^2
-    and the mean per-step latency.
+    Repetitions are reduced within a channel first. Bounded quantities (final simple regret, regret AUC,
+    final exploration score) are the mean over channels with a 95% CI half-width (``*_ci``); heavy-tailed ones
+    (final R^2, per-step latency averaged over the run) are the median over channels with the interquartile
+    range (``*_q25``, ``*_q75``), so one badly fitted channel cannot dominate.
 
     Args:
         frame: Trace frame.
@@ -259,11 +269,18 @@ def comparison_table(frame: pd.DataFrame, out_dir: str) -> tuple[pd.DataFrame, s
             band = _channel_band(rows, field) if rows[field].notna().any() else None
             if band is None:
                 continue
-            mean, ci, _ = band
-            rec[f"{key}_final" if field != "latency" else "latency_s_mean"] = float(mean[-1] if field != "latency" else mean.mean())
-            rec[f"{key}_final_ci" if field != "latency" else "latency_s_mean_ci"] = float(ci[-1] if field != "latency" else ci.mean())
+            centre, lower, upper, _ = band
+            summary = np.nanmean if field == "latency" else (lambda v: v[-1])  # latency: mean over the run
+            if field in HEAVY_TAILED_FIELDS:
+                stem = "latency_s_median" if field == "latency" else f"{key}_final"
+                rec[stem] = float(summary(centre))
+                rec[f"{stem}_q25"] = float(summary(lower))
+                rec[f"{stem}_q75"] = float(summary(upper))
+            else:
+                rec[f"{key}_final"] = float(summary(centre))
+                rec[f"{key}_final_ci"] = float(summary(upper) - summary(centre))
             if field == "recommended_regret_per_step":
-                rec["simple_regret_auc"] = float(mean.mean())
+                rec["simple_regret_auc"] = float(centre.mean())
         records.append(rec)
     table = pd.DataFrame.from_records(records)
     path = os.path.join(out_dir, "comparison_table.csv")

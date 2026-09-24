@@ -32,7 +32,7 @@ if _SRC_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 
 def _import_linear_cka():
-    from pfns4neurostim.analysis.cka import linear_cka
+    from pfns4neurostim.analysis.cka import biased_linear_cka as linear_cka
     return linear_cka
 
 

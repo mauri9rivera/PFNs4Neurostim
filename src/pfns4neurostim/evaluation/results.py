@@ -89,6 +89,7 @@ METRIC_COLUMNS: tuple[str, ...] = (
     "top1_hit",
     "top3_hit",
     "opt_distance",
+    "decoy_capture",
     "coverage_50",
     "coverage_90",
     "ece",
@@ -98,6 +99,9 @@ METRIC_COLUMNS: tuple[str, ...] = (
     "median_query_latency_s",
     "total_time_s",
     "achieved_snr_db",
+    "split_id",
+    "gt_r_half",
+    "gt_reliability",
     "n_sites",
     "budget",
     "n_init",
@@ -162,6 +166,11 @@ class TidyRow:
         median_query_latency_s: Median per-query wall-clock latency, in seconds.
         achieved_snr_db: Achieved SNR of the (possibly stressed) channel, in dB.
             The canonical x-axis of every K2 figure (roadmap S2).
+        split_id: Split-half instance index (``gt_mode='split_half'``), else ``None``.
+        gt_r_half: Channel split-half correlation of site means (the R² noise
+            ceiling of a split-half-scored run, P0.7), or ``None``.
+        gt_reliability: Channel Spearman-Brown reliability of the full-trial site
+            means (the R² noise ceiling of a full-mean-scored run), or ``None``.
         n_sites: Number of candidate electrode sites in the pool.
         total_time_s: Total wall-clock time for the run, in seconds.
         budget: Total BO iteration count, including ``n_init`` (P0.3).
@@ -202,6 +211,7 @@ class TidyRow:
     top1_hit: Optional[float] = None
     top3_hit: Optional[float] = None
     opt_distance: Optional[float] = None
+    decoy_capture: Optional[float] = None
     coverage_50: Optional[float] = None
     coverage_90: Optional[float] = None
     ece: Optional[float] = None
@@ -211,6 +221,9 @@ class TidyRow:
     median_query_latency_s: Optional[float] = None
     total_time_s: Optional[float] = None
     achieved_snr_db: Optional[float] = None
+    split_id: Optional[int] = None
+    gt_r_half: Optional[float] = None
+    gt_reliability: Optional[float] = None
     n_sites: Optional[int] = None
     budget: Optional[int] = None
     n_init: Optional[int] = None

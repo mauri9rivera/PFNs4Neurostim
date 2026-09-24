@@ -139,7 +139,7 @@ class TestExternalRegistration:
             build_surrogate(key)
 
     #: Models whose wrapper body is still outstanding (task #8 Step 3).
-    PENDING = ("pfns4bo", "tabpfn_v1", "mitra")
+    PENDING = ("tabpfn_v1", "mitra")
 
     @pytest.mark.parametrize("key", PENDING)
     def test_pending_wrapper_explains_what_is_outstanding(self, key: str) -> None:
@@ -150,8 +150,8 @@ class TestExternalRegistration:
             surrogate.fit(np.zeros((4, 2)), np.arange(4.0))
 
     def test_implemented_wrappers_are_not_in_the_pending_list(self) -> None:
-        """TabFlex, TabICL and TabFM have real bodies as of 2026-09-20."""
-        assert set(self.PENDING).isdisjoint({"tabflex", "tabicl", "tabfm"})
+        """TabFlex, TabICL and TabFM have real bodies as of 2026-09-20; PFNs4BO (native policy) since 2026-09-23."""
+        assert set(self.PENDING).isdisjoint({"tabflex", "tabicl", "tabfm", "pfns4bo"})
 
     def test_tabfm_refuses_a_single_ensemble_member(self) -> None:
         """Its only uncertainty signal is ensemble spread, which is zero for one member."""

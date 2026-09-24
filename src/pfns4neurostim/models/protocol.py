@@ -11,6 +11,11 @@ The acquisition layer talks to exactly three capabilities:
   a PFN's query rows do not attend to each other, so it exposes marginals only
   (task #4 decision, 2026-09-17). ``supports_joint`` says which is which, and
   ``ts_joint`` raises a clear error rather than silently degrading to marginals.
+* ``policy_scores(X, rng) -> [N]`` — **optional**, for *end-to-end BO models* that own
+  their query decision (PFNs4BO): the model's own acquisition surface over the pool.
+  ``has_native_policy`` says which models have it, and the ``native`` acquisition type
+  delegates to it, so such a model runs through the same loop, mask, tie-break and
+  bookkeeping as any surrogate + acquisition pair, with no model-specific branch.
 
 :class:`SurrogateAdapter` wraps the legacy classes in ``src/models/regressors.py``
 and presents this interface. It is the single seam between the new acquisition
@@ -23,7 +28,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
-__all__ = ["SurrogateModel", "LegacySurrogateModel", "SurrogateAdapter", "marginals"]
+__all__ = ["SurrogateModel", "NativePolicy", "LegacySurrogateModel", "SurrogateAdapter", "marginals"]
 
 
 @runtime_checkable
@@ -53,6 +58,25 @@ class SurrogateModel(Protocol):
     @property
     def supports_joint(self) -> bool:
         """Whether :meth:`sample_joint` is available."""
+        ...
+
+
+@runtime_checkable
+class NativePolicy(Protocol):
+    """Optional capability of an end-to-end BO model: it scores the pool itself."""
+
+    def policy_scores(self, X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        """Score every candidate with the model's own acquisition rule.
+
+        Called after :meth:`SurrogateModel.fit`, so the model already holds the context.
+
+        Args:
+            X: Candidate coordinates, shape [N, D].
+            rng: Seeded generator, for models whose rule is stochastic.
+
+        Returns:
+            One value per candidate, shape [N]; higher is preferred.
+        """
         ...
 
 
@@ -108,6 +132,39 @@ class SurrogateAdapter:
     def supports_joint(self) -> bool:
         """True for the GP family, whose posterior has a tractable joint draw."""
         return self.family == "gp" and hasattr(self._model, "predict_ts")
+
+    # --- native policy (end-to-end BO models) --------------------------------
+    @property
+    def has_native_policy(self) -> bool:
+        """True when the wrapped model owns its query decision (:class:`NativePolicy`)."""
+        return isinstance(self._model, NativePolicy)
+
+    def policy_scores(self, X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        """Score every candidate with the wrapped model's own acquisition rule.
+
+        Args:
+            X: Candidate coordinates, shape [N, D].
+            rng: Seeded generator.
+
+        Returns:
+            One value per candidate, shape [N]; higher is preferred.
+
+        Raises:
+            NotImplementedError: If the model has no native policy.
+            RuntimeError: If the scores are non-finite or of the wrong length.
+        """
+        if not self.has_native_policy:
+            raise NotImplementedError(
+                f"Acquisition 'native' needs a model that owns its query decision; "
+                f"{self.key!r} is a plain surrogate. Pair it with ei, ucb or ts_marginal."
+            )
+        scores = np.asarray(self._model.policy_scores(X, rng), dtype=np.float64)   # [N]
+        if scores.shape != (X.shape[0],) or not np.isfinite(scores).all():
+            raise RuntimeError(
+                f"{self.key}.policy_scores must return {X.shape[0]} finite values, "
+                f"got shape {scores.shape} with {int((~np.isfinite(scores)).sum())} non-finite."
+            )
+        return scores
 
     # --- Thompson sampling --------------------------------------------------
     def sample_marginal(self, X: np.ndarray, rng: np.random.Generator, temperature: float = 1.0) -> np.ndarray:

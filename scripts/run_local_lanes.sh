@@ -21,7 +21,7 @@ mkdir -p output/logs
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 pids=()
 for ((i = 0; i < LANES; i++)); do
-  "${PY}" -u -m pfns4neurostim "${EXPERIMENT}" --config "${CONFIG}" --set "models=[${MODELS}]" "tag=${LABEL}-${MODELS//,/-}" "$@" --shard "${i}/${LANES}" > "output/logs/${LABEL}_${MODELS//,/-}_lane${i}.log" 2>&1 &
+  "${PY}" -u -m pfns4neurostim "${EXPERIMENT}" --config "${CONFIG}" --set "models=[${MODELS}]" "$@" --shard "${i}/${LANES}" > "output/logs/${LABEL}_${MODELS//,/-}_lane${i}.log" 2>&1 &
   pids+=($!)
 done
 echo "[run_local_lanes] ${LANES} lanes of ${EXPERIMENT} (${MODELS}); logs: output/logs/${LABEL}_${MODELS//,/-}_lane*.log"

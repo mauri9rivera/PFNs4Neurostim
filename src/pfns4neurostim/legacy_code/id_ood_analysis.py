@@ -16,11 +16,9 @@ import numpy as np
 import yaml
 
 from pfns4neurostim.analysis.id_ood import run_id_ood_analysis, compute_procrustes_auc
-from pfns4neurostim.analysis.id_ood import compute_cohens_d_per_metric
-from pfns4neurostim.visualization.mechanism import (
+from pfns4neurostim.legacy_code.visualization_id_ood import (
     plot_entropy_distribution, plot_entropy_heatmap,
-    plot_mmd_heatmap, plot_mahalanobis_distribution,
-    plot_cka_heatmap, plot_cka_layerwise_heatmap,
+    plot_mahalanobis_distribution,
     plot_gradient_norm_barplot,
     plot_rsa_layerwise,
     plot_procrustes_trajectory,
@@ -29,7 +27,6 @@ from pfns4neurostim.visualization.mechanism import (
     plot_cross_distribution_disparity,
     plot_summary_dashboard,
     plot_metric_consensus,
-    plot_synthetic_validation,
     plot_id_ood_heterogeneity_heatmap,
 )
 
@@ -104,10 +101,11 @@ def main():
                         help='Dataset types to analyze (default: rat nhp)')
     parser.add_argument('--analyses', nargs='+',
                         default=None,
-                        choices=['entropy', 'mmd', 'mahalanobis',
-                                 'cka', 'wasserstein', 'gradient_norm',
+                        choices=['entropy', 'mahalanobis', 'gradient_norm',
                                  'rsa', 'procrustes'],
-                        help='Which analyses to run (default: entropy mmd mahalanobis)')
+                        help='Which analyses to run (default: entropy mahalanobis). MMD, '
+                             'Wasserstein and CKA were removed: use `python -m pfns4neurostim '
+                             'mechanism` (analysis: placement / cka).')
     parser.add_argument('--prior_source', default=None,
                         choices=['noise', 'gp_bag', 'scm_bag', 'prior_bag',
                                  'tabpfn_prior', 'both', 'all'],
@@ -166,7 +164,7 @@ def main():
     # Apply built-in defaults for any remaining None values
     _defaults: dict[str, Any] = {
         'datasets': ['rat', 'nhp'],
-        'analyses': ['entropy', 'mmd', 'mahalanobis'],
+        'analyses': ['entropy', 'mahalanobis'],
         'prior_source': 'noise',
         'device': 'cpu',
         'n_synthetic': 500,
@@ -237,29 +235,9 @@ def main():
             plot_entropy_heatmap(entropy_results, dt, save=args.save,
                                 output_dir=output_dir)
 
-    if 'mmd' in all_results:
-        plot_mmd_heatmap(
-            all_results['mmd'],
-            wasserstein_results=all_results.get('wasserstein'),
-            save=args.save, output_dir=output_dir,
-        )
-
-    if 'wasserstein' in all_results and 'mmd' not in all_results:
-        plot_mmd_heatmap(
-            None,
-            wasserstein_results=all_results['wasserstein'],
-            save=args.save, output_dir=output_dir,
-        )
-
     if 'mahalanobis' in all_results:
         plot_mahalanobis_distribution(all_results['mahalanobis'],
                                       save=args.save, output_dir=output_dir)
-
-    if 'cka' in all_results:
-        plot_cka_heatmap(all_results['cka'], save=args.save,
-                         output_dir=output_dir)
-        plot_cka_layerwise_heatmap(all_results['cka'], save=args.save,
-                                   output_dir=output_dir)
 
     if 'gradient_norm' in all_results:
         plot_gradient_norm_barplot(all_results['gradient_norm'],
@@ -300,10 +278,6 @@ def main():
                                'mahalanobis', 'cka', 'rsa')]
     if len(_tier1_metrics) >= 2:
         plot_metric_consensus(all_results, save=args.save, output_dir=output_dir)
-        cohens_d = compute_cohens_d_per_metric(all_results)
-        if cohens_d:
-            plot_synthetic_validation(cohens_d, save=args.save,
-                                      output_dir=output_dir)
         for dt in args.datasets:
             plot_id_ood_heterogeneity_heatmap(
                 all_results, dt, save=args.save, output_dir=output_dir,

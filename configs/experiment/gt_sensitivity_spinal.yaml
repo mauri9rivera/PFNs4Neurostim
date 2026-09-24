@@ -1,0 +1,29 @@
+# Task #7 Step 6 - split-half ground-truth sensitivity check, spinal cord (P0.7, audit F8).
+#
+# The same benchmark is run with gt_mode=full_mean (primary) and gt_mode=split_half
+# (observed trials and GT disjoint; rep i uses split instance i mod 2*gt_n_splits), then
+# paired per channel in an identity scatter to size the leakage bias. Budget 32 < the
+# 64-site grid (P0.3). Spinal carries 7 trials per site, so the halves hold 3 and 4 trials.
+#
+#   python -m pfns4neurostim gt_sensitivity --config configs/experiment/gt_sensitivity_spinal.yaml
+defaults:
+  dataset: spinal
+  model: [tabpfn_v2_5, gp_mll]
+  acquisition: ts_marginal
+
+experiment: bo_benchmark
+family: gt-sensitivity
+tag: spinal
+
+budget: 32
+n_init: 5
+n_reps: 5
+gt_mode: full_mean      # overridden per arm by the gt_sensitivity runner
+gt_n_splits: 10
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05
+
+model_params:
+  gp_mll: {device: cpu}

@@ -19,7 +19,7 @@
 #   bash scripts/mila_setup.sh env bench          # creates pfns4neurostim-bench from this file + installs the package
 #   bash scripts/mila_setup.sh submodules         # libs/tabicl and libs/tabfm are used from the submodules (no pip install)
 #
-# pfns4bo==0.1.5 is deliberately NOT installed here: it pins scikit-learn<1.2. PFNs4BO is deferred (sprint Task 7.3).
+# pfns4bo==0.1.5 is deliberately NOT installed here (it pins scikit-learn<1.2); PFNs4BO runs in the MAIN env (configs/experiment/hyp0_pfns4bo_*.yaml).
 name: pfns4neurostim-bench
 channels:
   - conda-forge

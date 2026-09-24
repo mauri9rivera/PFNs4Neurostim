@@ -191,6 +191,14 @@ class CellStore:
     hits: int = 0
     computed: int = 0
     failures: list[CellFailure] = field(default_factory=list)
+    host: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Record the machine once; cells computed here carry it in their payload."""
+        if not self.host and not self.only_cached:
+            from ..config import _host_info  # noqa: PLC0415 - config imports evaluation-free modules only
+
+            self.host = _host_info()
 
     def run(
         self,
@@ -230,6 +238,7 @@ class CellStore:
             print(f"[cache] FAILED {label}: {type(exc).__name__}: {exc}", flush=True)
             return None
         self.computed += 1
+        payload = {**payload, "host": self.host}  # provenance only; never part of the cell identity
         if self.enabled:
             save_cell(self.root, dataset, experiment, key, identity, payload, trajectory)
         self._served()

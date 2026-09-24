@@ -28,12 +28,13 @@ __all__ = [
     "cvar",
     "degradation_auc",
     "breakdown_point",
+    "noninferiority",
     "relative_robustness",
     "bootstrap_ci",
 ]
 
 
-def _noninferiority(a: np.ndarray, b: np.ndarray, margin: float, alpha: float = 0.05) -> dict[str, Any]:
+def noninferiority(a: np.ndarray, b: np.ndarray, margin: float, alpha: float = 0.05) -> dict[str, Any]:
     """One-sided paired non-inferiority test for a lower-is-better metric.
 
     H0: mean(a - b) >= margin (the model is worse than the reference by at least ``margin``);
@@ -246,7 +247,7 @@ def breakdown_point(
             tost_p.append(float(res["tost_p"]))
             is_equiv = bool(res["equivalent"])
         else:
-            res = _noninferiority(a[:n], b[:n], margin=margin, alpha=alpha)
+            res = noninferiority(a[:n], b[:n], margin=margin, alpha=alpha)
             tost_p.append(float(res["p"]))
             is_equiv = bool(res["ok"])
         equivalent.append(is_equiv)

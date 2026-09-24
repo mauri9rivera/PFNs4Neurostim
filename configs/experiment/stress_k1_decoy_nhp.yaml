@@ -1,0 +1,47 @@
+# Hypothesis B - K1 decoy peak on Demo 1 (synthetic twins of every NHP channel, exact ground truth).
+# Dataset: NHP geometry and fitted maps (roadmap S0/S1). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
+#
+# Knob:   a second hotspot, a copy of the primary at `separation` electrode pitches in a random in-array
+#         direction, with amplitude ratio a2/a1 = level (0 = no decoy). The map is redrawn from the
+#         generator, so the ground truth stays exact. decoy_capture = the final recommendation lies on the
+#         decoy's side of the map (closer to the decoy centre than to the primary).
+# x-axis: amplitude ratio. A second separation is a second run: --set knob.params.separation=2.0 tag=nhp-d2
+# Budget: total queries INCLUDING n_init (P0.3).
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k1_decoy_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ts_marginal   # headline (2026-09-20); EI/UCB compared in hyp0_acq_table_*
+
+experiment: stress_sweep
+family: stress-k1-decoy
+tag: nhp
+
+dataset:
+  demo: demo1
+  generator_hotspots: 2
+
+knob:
+  type: k1_decoy
+  levels: [0.0, 0.5, 0.7, 0.85, 0.95]
+  params:
+    separation: 3.0   # electrode pitches between the primary and the decoy centre
+
+budget: 96
+n_init: 5
+n_reps: 10
+gt_mode: full_mean     # or split_half (task #7): rep i runs on cross-fitted instance i mod 2*gt_n_splits
+gt_n_splits: 10
+device: cuda
+seed: 42
+output_root: output
+
+# Pre-registered TOST/non-inferiority margin, in range-normalized regret units.
+equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

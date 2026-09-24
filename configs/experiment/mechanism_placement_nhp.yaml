@@ -1,0 +1,38 @@
+# Task #6 - placement of every NHP channel between the TabPFN v1 prior bag and noise (P0.6).
+#
+# Formulation B (per channel, k nearest on-grid prior maps) with both floors (held-out prior;
+# split-half self) and both ceilings (noise; coordinate-shuffled self); formulation C (random
+# size-t noisy contexts along K2); formulation A (pooled marginal, appendix). Maps are compared
+# as neighbour-pair distributions of rank normal scores (spatial dependence only); raw pairs and
+# joint (x, y) points fail the M0 known-shift ladder. rmse_threshold is pre-declared here.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_placement_nhp.yaml
+defaults:
+  dataset: nhp
+
+analysis: placement
+tag: nhp
+device: cpu
+seed: 42
+output_root: output
+
+placement:
+  metrics: [mmd, w2]
+  representation: rank_pairs   # pairs / joint fail the M0 ladder on real NHP channels (rho = -0.9)
+  n_neighbors: 4
+  n_prior: 200
+  n_prior_holdout: 50
+  n_noise: 50
+  n_dense: 1024
+  holdout_frac: 0.1
+  rmse_threshold: 0.5          # pre-declared max standardized hold-out interpolation RMSE
+  prior_type: prior_bag
+  k_nearest: 10                # pre-declared
+  n_projections: 200
+  w2_repeats: 20
+  n_splits: 5
+  n_shuffles: 10
+  n_boot: 1000
+  ladder_lambdas: [0.0, 0.25, 0.5, 0.75, 1.0]
+  ladder_min_spearman: 0.9
+  context: {sizes: [5, 10, 20, 40], n_draws: 10, stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}}

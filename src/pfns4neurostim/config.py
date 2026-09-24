@@ -8,7 +8,7 @@ override any resolved key inline::
       model: [tabpfn_v2_5, gp_mll, gp_naive]
       acquisition: ei
     knob:
-      type: k2_snr
+      type: k2_channel
       levels: [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
     budget: 50
 
@@ -40,6 +40,9 @@ __all__ = [
     "ExperimentConfig",
     "load_experiment_config",
     "resolved_dict",
+    "compose",
+    "apply_overrides",
+    "dataset_config_from_raw",
     "CONFIG_ROOT",
 ]
 
@@ -62,6 +65,10 @@ class DatasetConfig:
         normalization: Preprocessing mode, a key of
             :data:`pfns4neurostim.data.preprocessing.NORMALIZATIONS`. Logged in
             the resolved config and in every tidy row.
+        demo: ``'demo2'`` runs on the recorded channels; ``'demo1'`` fits the
+            synthetic generator to each selected channel and runs on the fitted
+            synthetic maps instead (exact ground truth; roadmap S0).
+        generator_hotspots: Hotspots per fitted synthetic map (``demo1`` only).
     """
 
     name: str
@@ -69,14 +76,21 @@ class DatasetConfig:
     emgs: tuple[int, ...] | None = None
     data_root: str = "./data"
     normalization: str = DEFAULT_NORMALIZATION
+    demo: str = "demo2"
+    generator_hotspots: int = 2
 
     def __post_init__(self) -> None:
-        """Reject an unregistered normalization at load time.
+        """Reject an unregistered normalization or demo at load time.
 
         Raises:
-            ValueError: If ``normalization`` is not registered.
+            ValueError: If ``normalization`` is not registered, ``demo`` is unknown, or
+                ``generator_hotspots < 1``.
         """
         get_normalization(self.normalization)
+        if self.demo not in ("demo1", "demo2"):
+            raise ValueError(f"dataset.demo must be 'demo1' or 'demo2', got {self.demo!r}.")
+        if self.generator_hotspots < 1:
+            raise ValueError(f"dataset.generator_hotspots must be >= 1, got {self.generator_hotspots}.")
 
 
 @dataclass(frozen=True)
@@ -126,13 +140,12 @@ class KnobConfig:
     """Stress-knob selection.
 
     Attributes:
-        type: Registered knob name (``'k2_snr'``, ...).
+        type: Registered knob name (``'k2_channel'``, ``'k2_global'``, ...).
         levels: Explicit level ladder, or ``None`` for the knob's default.
-        targets_db: SNR-degradation targets in dB (e.g. ``[0, -1, -2, -4]``). When
-            given, the level achieving each target is solved **per channel**, so a
-            sweep is comparable across datasets whose floor SNRs differ. Mutually
-            exclusive with an explicit ``levels`` ladder.
-        params: Knob-specific parameters, e.g. ``{source: heavy_tail}`` for K5.
+        targets_db: SNR changes in dB relative to each channel's floor (e.g.
+            ``[6, 0, -6, -12]``), solved exactly **per channel** by knobs that can
+            invert them (K2-channel). Mutually exclusive with ``levels``.
+        params: Knob-specific parameters, e.g. ``{df: 3, scale: 5}`` for K5.
     """
 
     type: str
@@ -144,18 +157,12 @@ class KnobConfig:
         """Reject a ladder specified two ways at once.
 
         Raises:
-            ValueError: If both ``levels`` and ``targets_db`` are given, or a
-                target is positive.
+            ValueError: If both ``levels`` and ``targets_db`` are given.
         """
         if self.levels is not None and self.targets_db is not None:
             raise ValueError(
                 "knob.levels and knob.targets_db are mutually exclusive: a ladder is "
                 "either explicit levels or SNR-degradation targets solved per channel."
-            )
-        if self.targets_db is not None and any(t > 0 for t in self.targets_db):
-            raise ValueError(
-                f"knob.targets_db entries are SNR degradations and must be <= 0 dB, "
-                f"got {list(self.targets_db)}."
             )
 
 
@@ -176,6 +183,8 @@ class ExperimentConfig:
         n_init: Random initial queries.
         n_reps: BO repetitions per cell.
         gt_mode: ``'full_mean'`` or ``'split_half'`` (P0.7).
+        gt_n_splits: Split draws R for ``gt_mode='split_half'``; each draw gives two
+            cross-fitted instances and repetition ``i`` uses instance ``i mod 2R``.
         device: Torch device string.
         seed: Base seed; every cell derives its own seed from it.
         output_root: Root for outputs, normally ``output``.
@@ -200,6 +209,7 @@ class ExperimentConfig:
     n_init: int = 5
     n_reps: int = 5
     gt_mode: str = "full_mean"
+    gt_n_splits: int = 10
     device: str = "cpu"
     seed: int = 42
     output_root: str = "output"
@@ -233,6 +243,12 @@ class ExperimentConfig:
             )
         if self.n_reps < 1:
             raise ValueError(f"n_reps must be >= 1, got {self.n_reps}.")
+        if self.gt_mode not in ("full_mean", "split_half"):
+            raise ValueError(
+                f"gt_mode must be 'full_mean' or 'split_half', got {self.gt_mode!r}."
+            )
+        if self.gt_n_splits < 1:
+            raise ValueError(f"gt_n_splits must be >= 1, got {self.gt_n_splits}.")
         if not self.models:
             raise ValueError("models is empty; nothing to compare.")
         if self.equivalence_margin <= 0:
@@ -317,7 +333,7 @@ def _parse_override(token: str) -> tuple[list[str], Any]:
     return key.strip().split("."), yaml.safe_load(raw)
 
 
-def _apply_overrides(cfg: dict[str, Any], overrides: Sequence[str]) -> dict[str, Any]:
+def apply_overrides(cfg: dict[str, Any], overrides: Sequence[str]) -> dict[str, Any]:
     """Apply dotted-key overrides to a resolved mapping.
 
     Args:
@@ -344,7 +360,37 @@ def _apply_overrides(cfg: dict[str, Any], overrides: Sequence[str]) -> dict[str,
     return out
 
 
-def _compose(path: str) -> dict[str, Any]:
+def dataset_config_from_raw(raw: dict[str, Any]) -> DatasetConfig:
+    """Build and validate a :class:`DatasetConfig` from a resolved ``dataset`` block.
+
+    The single parser of the dataset block, shared by every runner's config loader.
+
+    Args:
+        raw: The resolved ``dataset`` mapping (not mutated).
+
+    Returns:
+        The dataset configuration.
+
+    Raises:
+        ValueError: On an unknown key or an invalid value.
+    """
+    ds = dict(raw)
+    emgs = ds.pop("emgs", None)
+    dataset = DatasetConfig(
+        name=ds.pop("name"),
+        subjects=tuple(int(s) for s in ds.pop("subjects")),
+        emgs=None if emgs in (None, "all") else tuple(int(e) for e in emgs),
+        data_root=os.path.expandvars(str(ds.pop("data_root", "./data"))),
+        normalization=str(ds.pop("normalization", DEFAULT_NORMALIZATION)),
+        demo=str(ds.pop("demo", "demo2")),
+        generator_hotspots=int(ds.pop("generator_hotspots", 2)),
+    )
+    if ds:
+        raise ValueError(f"Unknown dataset config key(s): {sorted(ds)}.")
+    return dataset
+
+
+def compose(path: str) -> dict[str, Any]:
     """Compose an experiment YAML with its ``defaults:`` groups.
 
     Args:
@@ -404,28 +450,15 @@ def load_experiment_config(
     Raises:
         ValueError: On unknown keys or invalid values.
     """
-    merged = _compose(path)
+    merged = compose(path)
     if overrides:
-        merged = _apply_overrides(merged, list(overrides))
+        merged = apply_overrides(merged, list(overrides))
 
     ds_raw = dict(merged.pop("dataset", {}))
     acq_raw = dict(merged.pop("acquisition", {}))
     knob_raw = dict(merged.pop("knob", {}))
 
-    dataset = DatasetConfig(
-        name=ds_raw.pop("name"),
-        subjects=tuple(int(s) for s in ds_raw.pop("subjects")),
-        emgs=(
-            None
-            if ds_raw.get("emgs") in (None, "all")
-            else tuple(int(e) for e in ds_raw.pop("emgs"))
-        ),
-        data_root=os.path.expandvars(str(ds_raw.pop("data_root", "./data"))),
-        normalization=str(ds_raw.pop("normalization", DEFAULT_NORMALIZATION)),
-    )
-    ds_raw.pop("emgs", None)
-    if ds_raw:
-        raise ValueError(f"Unknown dataset config key(s): {sorted(ds_raw)}.")
+    dataset = dataset_config_from_raw(ds_raw)
 
     def _acq(block: dict[str, Any]) -> AcquisitionConfig:
         """Build and validate one acquisition block."""
@@ -471,6 +504,7 @@ def load_experiment_config(
         "n_init",
         "n_reps",
         "gt_mode",
+        "gt_n_splits",
         "device",
         "seed",
         "output_root",
@@ -520,8 +554,25 @@ def _host_info() -> dict[str, Any]:
     return {
         "node": platform.node(),
         "cuda_device": device,
+        "cpu": _cpu_model(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
     }
+
+
+def _cpu_model() -> str:
+    """Name of the host CPU (``/proc/cpuinfo`` on Linux, ``platform.processor()`` elsewhere).
+
+    Returns:
+        A human-readable CPU model, or ``'unknown'`` if it cannot be read.
+    """
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or "unknown"
 
 
 def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
@@ -550,6 +601,8 @@ def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
             "emgs": None if cfg.dataset.emgs is None else list(cfg.dataset.emgs),
             "data_root": cfg.dataset.data_root,
             "normalization": cfg.dataset.normalization,
+            "demo": cfg.dataset.demo,
+            "generator_hotspots": cfg.dataset.generator_hotspots,
         },
         "models": list(cfg.models),
         "model_version": {name: model_version(name) for name in cfg.models},
@@ -566,6 +619,7 @@ def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
         "n_init": cfg.n_init,
         "n_reps": cfg.n_reps,
         "gt_mode": cfg.gt_mode,
+        "gt_n_splits": cfg.gt_n_splits,
         "device": cfg.device,
         "seed": cfg.seed,
         "output_root": cfg.output_root,

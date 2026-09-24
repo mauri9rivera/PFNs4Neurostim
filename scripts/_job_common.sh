@@ -40,7 +40,7 @@ job_run() {
   local experiment="${1:?experiment}" config="${2:?config}"
   shift 2
   export CLUSTER_DIAG="${CLUSTER_DIAG:-1}"
-  srun python -m pfns4neurostim "${experiment}" --config "${config}" --set "dataset.data_root=${STAGED_ROOT}" "$@" &
+  srun python -m pfns4neurostim "${experiment}" --config "${config}" --compute-only --set "dataset.data_root=${STAGED_ROOT}" "$@" &
   local pid=$!
   trap 'echo "[job] time-limit warning (USR1): stopping and requeueing"; kill -TERM ${pid} 2>/dev/null || true; wait ${pid} || true; scontrol requeue "${SLURM_JOB_ID}"; exit 0' USR1
   trap 'echo "[job] TERM (scancel or preemption): stopping, NOT requeueing"; kill -TERM ${pid} 2>/dev/null || true; wait ${pid} || true; exit 143' TERM

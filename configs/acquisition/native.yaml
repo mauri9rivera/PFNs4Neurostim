@@ -1,0 +1,4 @@
+# The model's own acquisition rule, for end-to-end BO models (PFNs4BO). Served only by models
+# registered with native_policy=True; the rule's settings live in that model's params.
+type: native
+params: {}

@@ -1,5 +1,8 @@
-# PFNs4BO (HEBO prior): a full BO policy, integrated as a native policy. DEFERRED - the
-# wrapper body still raises (see .claude/sprint_2026-09-20_meeting_deliverables.md, Task 7.3).
+# PFNs4BO (HEBO+ prior, vendored checkpoint): an END-TO-END BO model. It owns the query decision
+# (its EI criterion, computed inside the network), so it runs only with `acquisition: native`.
+# Main env (py3.9): pfns4bo imports fine next to scikit-learn 1.6 despite its stale <1.2 pin.
+# The checkpoint is read from the read-only libs/ submodule (gzip, decompressed in memory).
 name: pfns4bo
 params:
   device: null   # per-model override of the experiment `device`
+  acq_function: ei   # PFNs4BO criterion: ei | pi | ucb | mean (authors' HPO-B setting: ei)

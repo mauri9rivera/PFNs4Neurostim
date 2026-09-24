@@ -2,8 +2,8 @@
 # SLURM dispatcher for the Hypothesis B stress sweeps (task #10, roadmap Phase 2).
 #
 # Usage (from a Mila login node, repo root; the USER runs sbatch):
-#   sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_nhp.yaml
-#   sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_5d_rat.yaml n_reps=10
+#   sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_nhp.yaml
+#   sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_5d_rat.yaml n_reps=10
 #
 # Everything after the config path is forwarded to `--set`. LANES=4 runs 4 sharded processes in the job. The dataset is staged to
 # $SLURM_TMPDIR (node-local SSD). Finished cells are cached in output/cells, so a

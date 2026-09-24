@@ -22,7 +22,8 @@ knob:
 budget: 96          # overridden per level by the knob
 n_init: 5
 n_reps: 10
-gt_mode: full_mean
+gt_mode: full_mean     # or split_half (task #7): rep i runs on cross-fitted instance i mod 2*gt_n_splits
+gt_n_splits: 10
 device: cuda
 seed: 42
 output_root: output

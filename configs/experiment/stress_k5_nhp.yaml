@@ -1,15 +1,13 @@
-# Hypothesis B - K5 outlier contamination, NHP (Demo 2, SYNTHETIC artefacts).
+# Hypothesis B - K5 outlier contamination (Huber epsilon-contamination).
+# Dataset: NHP (Demo 2, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
 #
-# NHP channels carry almost no lab-flagged trials (0.41% of trial slots, many
-# channels zero), and those that exist are so large that replacing a single trial
-# costs more than 12 dB - a step function, not a ladder. This arm therefore uses
-# the heavy-tail source, whose magnitude is continuous, and every resulting row
-# must be captioned as a *synthetic* outlier result, not a real-artefact one.
-# The real-artefact arm is stress_k5_5d_rat.yaml.
-#
-# Calibrated ladder on nhp-s1-e0 (floor +1.75 dB): eps 0.025/0.050/0.060 reach
-# -1.2/-2.0/-4.0 dB; -6 dB sits just outside the bracket and is reported as
-# unresolved rather than silently mislabelled.
+# Knob:   a fraction epsilon of ALL valid trial slots (sites x repetitions) is replaced by
+#         y_gt[s] + scale * sigma_noise * t,  t ~ Student-t(df), sigma_noise = channel trial SD.
+#         The same epsilon and the same heavy-tailed source on every dataset (restructure
+#         2026-09-23); real lab-flagged artefacts are no longer used (0.41% of NHP slots vs
+#         6.60% of 5d_rat made the old ladder measure artefact supply, not the models).
+# x-axis: epsilon.
+# Budget: total queries INCLUDING n_init (P0.3).
 #
 #   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k5_nhp.yaml
 defaults:
@@ -18,24 +16,26 @@ defaults:
   acquisition: ts_marginal   # headline (2026-09-20); EI/UCB compared in hyp0_acq_table_*
 
 experiment: stress_sweep
-family: stress-k5-synthetic
+family: stress-k5
 tag: nhp
 
 knob:
   type: k5_outliers
-  targets_db: [0, -1, -2, -4]
+  levels: [0.0, 0.01, 0.02, 0.05, 0.1, 0.2]
   params:
-    source: heavy_tail     # Student-t artefacts; magnitude is continuous
-    df: 2.0
-    scale: 3.0
+    df: 3.0       # Student-t degrees of freedom (user decision 2026-09-23)
+    scale: 5.0    # k: contaminant scale in multiples of the channel's trial SD
 
 budget: 96
 n_init: 5
 n_reps: 10
-gt_mode: full_mean
+gt_mode: full_mean     # or split_half (task #7): rep i runs on cross-fitted instance i mod 2*gt_n_splits
+gt_n_splits: 10
 device: cuda
 seed: 42
 output_root: output
+
+# Pre-registered TOST/non-inferiority margin, in range-normalized regret units.
 equivalence_margin: 0.05
 
 # GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays

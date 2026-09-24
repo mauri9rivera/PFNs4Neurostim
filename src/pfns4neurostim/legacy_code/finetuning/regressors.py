@@ -19,6 +19,7 @@ from tabpfn import TabPFNRegressor
 from tabpfn.base import RegressorModelSpecs
 from tabpfn.finetuning.finetuned_regressor import FinetunedTabPFNRegressor
 
+from ...analysis.cka import biased_linear_cka
 from .lora import (
     apply_lora, merge_lora, count_params, save_lora_checkpoint,
     load_lora_checkpoint,
@@ -295,7 +296,7 @@ class GradientMonitoredRegressor(FinetunedTabPFNRegressor):
                 current_acts = self._capture_activations(model)
                 for hook_name in self._cka_hook_names_:
                     if hook_name in self._pretrained_acts_ and hook_name in current_acts:
-                        cka_scores[hook_name] = linear_cka(
+                        cka_scores[hook_name] = biased_linear_cka(
                             self._pretrained_acts_[hook_name],
                             current_acts[hook_name],
                         )

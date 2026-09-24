@@ -7,9 +7,8 @@ Every acquisition type is a function
 and :func:`acquire` turns scores into a query. **Every site stays selectable at
 every step, including sites already observed** (decision 2026-09-21): neural
 responses are noisy, so re-querying a promising configuration is how the
-optimizer narrows its posterior there and exploits. The only restriction is the
-optional ``allowed`` mask (electrodes that physically cannot be queried, K6
-dropout). The argmax is taken with a **random tie-break** (defect D6 of the
+optimizer narrows its posterior there and exploits (a failed electrode under
+the K6 knob is no exception: the optimizer must notice it from the data). The argmax is taken with a **random tie-break** (defect D6 of the
 2026-09-16 TS review — the old code always took the lowest index, which biases
 every model toward low-numbered electrodes on flat acquisition surfaces), and
 non-finite surfaces raise instead of silently selecting index 0.
@@ -66,7 +65,6 @@ class AcqResult:
 def select_argmax(
     values: np.ndarray,
     rng: np.random.Generator,
-    allowed: np.ndarray | None = None,
 ) -> int:
     """Pick the best selectable candidate, breaking ties at random.
 
@@ -76,29 +74,19 @@ def select_argmax(
     Args:
         values: Acquisition surface, shape [N].
         rng: Seeded generator used for the tie-break.
-        allowed: Optional boolean mask of selectable sites, shape [N]. Used by the
-            K6 dropout knob, where the ground-truth map still spans every site but
-            the optimizer may only query the surviving electrodes.
 
     Returns:
         The selected index.
 
     Raises:
-        RuntimeError: If no site is selectable, or the surface is entirely
-            non-finite over the selectable sites.
+        RuntimeError: If the surface is non-finite everywhere.
     """
     values = np.asarray(values, dtype=np.float64)          # [N]
-    mask = np.ones(values.shape[0], dtype=bool)            # [N]
-    if allowed is not None:
-        mask &= np.asarray(allowed, dtype=bool)
-    if not mask.any():
-        raise RuntimeError("select_argmax: no site is selectable.")
-
-    candidates = np.flatnonzero(mask & np.isfinite(values))
+    candidates = np.flatnonzero(np.isfinite(values))
     if candidates.size == 0:
         raise RuntimeError(
             "select_argmax: the acquisition surface is non-finite at every "
-            "selectable candidate; refusing to select a site by accident."
+            "candidate; refusing to select a site by accident."
         )
     best = values[candidates].max()
     # Random tie-break (D6): the legacy argmax always took the lowest index,
@@ -114,7 +102,6 @@ def acquire(
     state: BOState,
     rng: np.random.Generator,
     params: Any,
-    allowed: np.ndarray | None = None,
 ) -> AcqResult:
     """Score every candidate and select the next query.
 
@@ -125,7 +112,6 @@ def acquire(
         state: Loop state at this step.
         rng: Seeded generator.
         params: The acquisition type's params dataclass instance.
-        allowed: Optional boolean mask of selectable sites, shape [N].
 
     Returns:
         The :class:`AcqResult` for this step.
@@ -135,5 +121,5 @@ def acquire(
         raise RuntimeError(
             f"Acquisition returned {values.shape[0]} values for {X_pool.shape[0]} candidates."
         )
-    index = select_argmax(values, rng, allowed=allowed)
+    index = select_argmax(values, rng)
     return AcqResult(index=index, values=values, params=params.resolved(state))

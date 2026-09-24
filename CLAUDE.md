@@ -187,10 +187,11 @@ PFNs4Neurostim/
     ├── data/
     │   ├── channels.py          ← ChannelData (the one object every experiment consumes)
     │   ├── splits.py            ← HELD_OUT / TRAIN / ALL subjects
-    │   ├── stress.py            ← StressKnob ABC + registry; K2 live, K1/K5/K6/K7 declared
+    │   ├── stress.py            ← StressKnob ABC + registry: K1, K2-channel, K2-global, K5, K6-budget, K6-failure live; K7 declared
     │   ├── snr.py               ← achieved SNR (dB) — the canonical K2 x-axis
-    │   ├── synthetic_neurostim.py ← Demo 1 generator (placeholder)
-    │   ├── references/          ← prior bag + noise banks for the Hyp C placement analysis
+    │   ├── synthetic_neurostim.py ← Demo 1 generator: fitted, SNR-matched synthetic twins (S0)
+    │   ├── ground_truth.py      ← full_mean | split_half GT instances + reliability (P0.7)
+    │   ├── references/          ← prior bag + noise banks, on-grid interpolation (grid.py) for placement
     │   └── legacy_io.py         ← pre-restructure loader; being carved into loaders/preprocessing
     ├── models/
     │   ├── protocol.py          ← SurrogateModel + SurrogateAdapter (+ LegacySurrogateModel)
@@ -206,8 +207,8 @@ PFNs4Neurostim/
     │   ├── robustness.py        ← breakdown point, degradation AUC, CVaR, relative robustness
     │   ├── stats.py             ← TOST, equivalence margins, bootstrap
     │   └── results.py           ← tidy schema + run-dir I/O
-    ├── experiments/             ← bo_benchmark.py (Hyp 0/A) · stress_sweep.py (Hyp B)
-    ├── analysis/                ← cka.py · id_ood.py · surface_geometry.py  (Hyp C)
+    ├── experiments/             ← bo_benchmark.py (Hyp 0/A) · stress_sweep.py (Hyp B) · mechanism.py (Hyp C) · gt_sensitivity.py
+    ├── analysis/                ← update_rule.py (M10) · placement.py · cka.py · embeddings.py · predictive_link.py (Hyp C)
     ├── visualization/           ← style.py (single source of style) · bo · stress · mechanism
     └── legacy_code/             ← superseded CLIs, finetuning/LoRA, old loop and plotting
 ```
@@ -258,8 +259,8 @@ defaults:
   acquisition: ei          # or a list, to sweep types (bo_benchmark)
 
 knob:                      # stress sweeps only
-  type: k2_snr
-  levels: [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
+  type: k2_channel         # k2_channel | k2_global | k5_outliers | k6_budget | k6_failure
+  targets_db: [6, 0, -6, -12]   # or levels: [...]; k2_channel solves dB targets per channel
 
 budget: 50                 # TOTAL queries including n_init (P0.3)
 n_init: 5
@@ -279,9 +280,9 @@ settings that produced it.
 
 ```bash
 pip install -e .
-python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml
 python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml --set n_reps=2
-python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_nhp.yaml --replot
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml --replot
 pytest tests -m "not slow and not gpu and not legacy" -q
 ```
 

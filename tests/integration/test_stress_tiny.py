@@ -43,7 +43,7 @@ def channel() -> ChannelData:
 @pytest.fixture(scope="module")
 def sweep(channel: ChannelData) -> pd.DataFrame:
     """Run the tiny sweep grid and return the tidy frame."""
-    knob = build_knob("k2_snr", LEVELS)
+    knob = build_knob("k2_channel", LEVELS)
     rows: list[TidyRow] = []
     extras: list[dict[str, float]] = []
     for level in knob.levels:
@@ -51,7 +51,7 @@ def sweep(channel: ChannelData) -> pd.DataFrame:
         achieved = knob.achieved(stressed)
         for model in MODELS:
             for rep in range(N_REPS):
-                seed = seed_for(channel.label, "k2_snr", level, model, rep)
+                seed = seed_for(channel.label, "k2_channel", level, model, rep)
                 res = run_channel_bo(
                     model,
                     stressed,
@@ -72,7 +72,7 @@ def sweep(channel: ChannelData) -> pd.DataFrame:
                         model=model,
                         model_version=res.row["model_version"],
                         acq_type="ei",
-                        knob="k2_snr",
+                        knob="k2_channel",
                         level=float(level),
                         gt_mode="full_mean",
                         rep=rep,
@@ -153,11 +153,11 @@ class TestDeterminism:
         assert a.row["recommended_regret"] == pytest.approx(b.row["recommended_regret"])
 
     def test_seed_derivation_is_stable_and_distinct(self) -> None:
-        assert seed_for("nhp-s1-e0", "k2_snr", 2.0, "gp_mll", 0) == seed_for(
-            "nhp-s1-e0", "k2_snr", 2.0, "gp_mll", 0
+        assert seed_for("nhp-s1-e0", "k2_channel", 2.0, "gp_mll", 0) == seed_for(
+            "nhp-s1-e0", "k2_channel", 2.0, "gp_mll", 0
         )
-        assert seed_for("nhp-s1-e0", "k2_snr", 2.0, "gp_mll", 0) != seed_for(
-            "nhp-s1-e0", "k2_snr", 2.0, "gp_mll", 1
+        assert seed_for("nhp-s1-e0", "k2_channel", 2.0, "gp_mll", 0) != seed_for(
+            "nhp-s1-e0", "k2_channel", 2.0, "gp_mll", 1
         )
 
 
@@ -190,7 +190,7 @@ class TestDeliverables:
     """Figures and tables regenerate from the tidy frame alone."""
 
     def test_render_all_writes_every_deliverable(self, sweep: pd.DataFrame, tmp_path) -> None:
-        written = stress_figs.render_all(sweep, str(tmp_path), knob="k2_snr", dataset="nhp")
+        written = stress_figs.render_all(sweep, str(tmp_path), knob="k2_channel", dataset="nhp", min_snr_db=None)
         names = {os.path.basename(p) for p in written}
         assert "robustness.csv" in names
         assert "degradation_invivo.svg" in names
@@ -209,7 +209,7 @@ class TestDeliverables:
                     trace = np.clip(offset * level + 0.05 * rng.normal(size=n_steps) + 0.1, 0.0, 1.0)
                     rows.append({"model": model, "level": float(level), "subject": 1, "emg": 0, "rep": rep,
                                  "n_init": N_INIT, "recommended_regret_per_step": trace})
-        table = stress_figs.breakdown_vs_budget(pd.DataFrame(rows), sweep, knob="k2_snr", margin=0.05)
+        table = stress_figs.breakdown_vs_budget(pd.DataFrame(rows), sweep, knob="k2_channel", margin=0.05)
         assert set(table["model"]) == {"tabpfn_v2_5"}
         assert table["budget"].nunique() > 1
         assert table["breakdown_x"].notna().any(), "a clearly worse model must break down somewhere"
@@ -219,11 +219,21 @@ class TestDeliverables:
         n_steps = BUDGET - N_INIT + 1
         rows = [{"model": "tabpfn_v2_5", "level": float(lv), "subject": 1, "emg": 0, "rep": r, "n_init": N_INIT,
                  "recommended_regret_per_step": np.full(n_steps, 0.2)} for lv in LEVELS for r in range(N_REPS)]
-        table = stress_figs.breakdown_vs_budget(pd.DataFrame(rows), sweep, knob="k2_snr", margin=0.05)
+        table = stress_figs.breakdown_vs_budget(pd.DataFrame(rows), sweep, knob="k2_channel", margin=0.05)
         assert table.empty
 
+    def test_render_all_on_shard_without_reference_model(self, sweep: pd.DataFrame, tmp_path) -> None:
+        """A GPU-only shard (no GP-MLL reference) renders every figure and reports no breakdown, never raises."""
+        shard = sweep[sweep["model"] != stress_figs.REFERENCE_MODEL].copy()
+        assert not shard.empty and stress_figs.REFERENCE_MODEL not in set(shard["model"])
+        written = stress_figs.render_all(shard, str(tmp_path), knob="k2_channel", dataset="nhp", min_snr_db=None)
+        names = {os.path.basename(p) for p in written}
+        assert {"robustness.csv", "degradation_invivo.svg", "outcomes_invivo.svg"} <= names
+        table = pd.read_csv(os.path.join(str(tmp_path), "robustness.csv"))
+        assert table["breakdown_level"].isna().all(), "no reference means no breakdown to report"
+
     def test_robustness_table_has_one_row_per_model(self, sweep: pd.DataFrame, tmp_path) -> None:
-        table, path = stress_figs.build_robustness_table(sweep, str(tmp_path), knob="k2_snr")
+        table, path = stress_figs.build_robustness_table(sweep, str(tmp_path), knob="k2_channel")
         assert set(table["model"]) == set(MODELS)
         assert {"degradation_auc", "cvar10_regret", "breakdown_level", "breakdown_x"} <= set(
             table.columns
@@ -231,6 +241,6 @@ class TestDeliverables:
         assert os.path.exists(path)
 
     def test_reference_model_has_no_breakdown(self, sweep: pd.DataFrame, tmp_path) -> None:
-        table, _ = stress_figs.build_robustness_table(sweep, str(tmp_path), knob="k2_snr")
+        table, _ = stress_figs.build_robustness_table(sweep, str(tmp_path), knob="k2_channel")
         ref = table[table["model"] == stress_figs.REFERENCE_MODEL].iloc[0]
         assert ref["breakdown_reason"] == "reference"

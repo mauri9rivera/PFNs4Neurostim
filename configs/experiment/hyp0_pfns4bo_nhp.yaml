@@ -1,0 +1,20 @@
+# PFNs4BO (end-to-end BO model, HEBO+ prior) on nhp. It owns its query decision (`acquisition: native`), so it runs alone in
+# this config, in the MAIN env (py3.9). Its rows join the D3 PFN-benchmark tables through the shared figures, not the same run dir.
+# Regret and R2 are comparable with the other models (same channels, seeds, budget); latency is descriptive only (guardrail G1).
+defaults:
+  dataset: nhp
+  model: [pfns4bo]
+  acquisition: native
+
+experiment: bo_benchmark
+family: hyp0-pfns4bo
+tag: nhp
+
+budget: 96
+n_init: 5
+n_reps: 10
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05

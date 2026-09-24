@@ -61,7 +61,7 @@ def run_channel_bo(
         model: Registered model key (e.g. ``'tabpfn_v2_5'``).
         channel: The channel to optimize over, already stressed if applicable.
         acq_fn: Registered acquisition type (``ei``, ``ucb``, ``pi``,
-            ``ts_marginal``, ``ts_joint``, ``greedy``, ``random``).
+            ``ts_marginal``, ``ts_joint``, ``greedy``, ``random``, ``native``).
         acq_params: Parameters for that type; unknown keys raise (P0.2).
         acq_schedules: Optional per-parameter schedules.
         budget: Total queries including ``n_init`` (P0.3).
@@ -115,18 +115,36 @@ def run_channel_bo(
         "mean_query_latency_s": float(np.mean(step_times)) if step_times else float("nan"),
         "median_query_latency_s": float(np.median(step_times)) if step_times else float("nan"),
     }
-    row.update(_metrics.regret_metrics(channel.y_gt, traj.observed_indices, recommended))
-    row.update(_metrics.surrogate_accuracy(channel.y_gt, traj.y_pred))
-    row.update(_metrics.identification_metrics(channel.y_gt, recommended, channel.ch2xy))
+    # Every score is taken over the electrodes alive at the end of the run (all of
+    # them unless the K6 failure knob is active); a failed electrode reads
+    # ``failure_value``, so recommending it costs regret like any poor site.
+    alive = channel.survivors                                                       # [N] bool
+    y_end = channel.y_end                                                           # [N]
+    row.update(
+        _metrics.regret_metrics(
+            y_end, traj.observed_indices, recommended,
+            reference=alive, queried_values=traj.real_values,
+        )
+    )
+    row.update(_metrics.surrogate_accuracy(y_end[alive], traj.y_pred[alive]))
+    row.update(
+        _metrics.identification_metrics(np.where(alive, y_end, -np.inf), recommended, channel.ch2xy)
+    )
+    if "decoy_basin" in channel.meta:
+        # K1: did the final recommendation land on the decoy's side of the map?
+        row["decoy_capture"] = float(channel.meta["decoy_basin"][recommended])
 
     # Per-step curves along the BO run (post-processing reads these, never re-runs).
-    y_star = float(np.max(channel.y_gt))
+    y_star = float(np.max(y_end[alive]))
+    y_range = float(np.ptp(y_end[alive]))
     recs = np.asarray(traj.recommendations, dtype=int)                              # [T+1]
-    regret_per_step = (y_star - channel.y_gt[recs]) / channel.gt_range              # [T+1], simple regret in [0, 1]
-    y_raw = channel.y_gt_raw
+    regret_per_step = (y_star - y_end[recs]) / y_range                              # [T+1]
+    y_raw = channel.to_raw(y_end)
     exploration_per_step = None
     if y_raw is not None:
-        exploration_per_step = [_metrics.exploration_score(y_raw, int(i)) for i in recs]  # [T+1]
+        exploration_per_step = [
+            _metrics.exploration_score(y_raw, int(i), reference=alive) for i in recs
+        ]                                                                           # [T+1]
         row["exploration_score"] = float(exploration_per_step[-1])
 
     # Random search has no predictive distribution, so coverage/ECE/NLL/CRPS are
@@ -134,10 +152,7 @@ def run_channel_bo(
     if with_calibration and MODEL_REGISTRY[model].has_predictive_distribution:
         row.update(
             _metrics.calibration_metrics(
-                channel.y_gt,
-                traj.y_pred,
-                traj.y_std,
-                gt_range=channel.gt_range,
+                y_end[alive], traj.y_pred[alive], traj.y_std[alive], gt_range=y_range
             )
         )
 
@@ -153,7 +168,8 @@ def run_channel_bo(
         "acq_params": list(traj.acq_params),
         "y_pred": np.asarray(traj.y_pred, dtype=np.float64),
         "y_std": np.asarray(traj.y_std, dtype=np.float64),
-        "y_gt": np.asarray(channel.y_gt, dtype=np.float64),
-        "gt_range": channel.gt_range,
+        "y_gt": np.asarray(y_end, dtype=np.float64),
+        "survivors": alive,
+        "gt_range": y_range,
     }
     return BOResult(row=row, trajectory=trajectory)

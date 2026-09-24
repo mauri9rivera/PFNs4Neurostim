@@ -24,9 +24,10 @@ Differences from the legacy loop, all deliberate:
 * Acquisition parameters actually used at each step are recorded (P0.2), so a
   schedule is visible in the output rather than inferred from the config.
 * A site whose trials are all NaN raises instead of silently contributing a zero.
-* ``channel.queryable`` restricts the initial design, the acquisition and the
-  recommendation (the K6 dropout knob), while every metric still reads the full
-  ground-truth map: losing electrodes must not redefine the target.
+* ``channel.failure_time`` (the K6 failure knob) makes an electrode return
+  ``channel.failure_value`` once the run has progressed past its failure time.
+  The electrode stays queryable and recommendable: the optimizer is not told and
+  must notice from the data. Per-step R-squared is scored on survivors.
 """
 from __future__ import annotations
 
@@ -52,7 +53,8 @@ class BOTrajectory:
     Attributes:
         observed_indices: Queried site indices, in order, length ``budget``.
         observed_values: The noisy value observed at each query.
-        real_values: The ground-truth value of each queried site (for regret).
+        real_values: The true value of each query at the time it was made (the
+            ground truth, or the failure value once the electrode had failed).
         recommendations: Pure-exploitation recommendation after each acquisition
             step (argmax of the predictive mean over the whole pool).
         r2_per_step: R-squared of the surrogate's predictive mean over the whole
@@ -137,38 +139,51 @@ def run_bo_loop(
 
     Raises:
         ValueError: If the budget is inconsistent with ``n_init`` or ``n_init`` exceeds the pool.
-        NotImplementedError: If the acquisition needs a joint posterior the
-            surrogate does not have (``ts_joint`` with a PFN).
+        NotImplementedError: If the acquisition needs a capability the model does
+            not have: a joint posterior (``ts_joint`` with a PFN) or a native policy
+            (``native`` with a plain surrogate).
     """
     n_sites = channel.n_sites
-    queryable = channel.queryable_indices              # [n_queryable]
-    n_queryable = int(queryable.size)
     if budget <= n_init:
         raise ValueError(
             f"budget ({budget}) must exceed n_init ({n_init}); budget counts total "
             "queries including the initial design (P0.3)."
         )
-    if n_init > n_queryable:
+    if n_init > n_sites:
         raise ValueError(
-            f"n_init ({n_init}) exceeds the {n_queryable} queryable site(s) of "
-            f"{channel.label} (of {n_sites} total); the initial design is drawn "
-            "without replacement."
+            f"n_init ({n_init}) exceeds the {n_sites} site(s) of {channel.label}; "
+            "the initial design is drawn without replacement."
         )
     if spec.needs_joint and not getattr(surrogate, "supports_joint", False):
         raise NotImplementedError(
             f"Acquisition {spec.name!r} needs a joint posterior, which "
             f"{getattr(surrogate, 'key', surrogate)!r} does not provide."
         )
+    if spec.needs_native_policy and not getattr(surrogate, "has_native_policy", False):
+        raise NotImplementedError(
+            f"Acquisition {spec.name!r} needs a model that owns its query decision, which "
+            f"{getattr(surrogate, 'key', surrogate)!r} does not."
+        )
 
     traj = BOTrajectory()
     X_pool = channel.X_pool                                  # [N, D]
+    survivors = channel.survivors                            # [N] bool
+
+    def observe(index: int) -> None:
+        """Query ``index`` as the next of the ``budget`` queries and record it."""
+        progress = len(traj.observed_indices) / budget
+        if channel.is_failed(index, progress):
+            observed = real = channel.failure_value
+        else:
+            observed = draw_trial(channel.Y_trials, index, rng)
+            real = float(channel.y_gt[index])
+        traj.observed_indices.append(index)
+        traj.observed_values.append(observed)
+        traj.real_values.append(real)
 
     # --- initial design: uniform random sites without replacement ------------
-    initial = rng.choice(queryable, size=n_init, replace=False)
-    for index in initial:
-        traj.observed_indices.append(int(index))
-        traj.observed_values.append(draw_trial(channel.Y_trials, int(index), rng))
-        traj.real_values.append(float(channel.y_gt[int(index)]))
+    for index in rng.choice(n_sites, size=n_init, replace=False):
+        observe(int(index))
 
     n_steps = budget - n_init
     for step in range(n_steps):
@@ -181,20 +196,14 @@ def run_bo_loop(
             n_dims=channel.n_dims,
         )
         surrogate.fit(X_pool[np.asarray(traj.observed_indices, dtype=int)], np.asarray(traj.observed_values))
-        result = acquire(
-            spec.score_fn, surrogate, X_pool, state, rng, params, allowed=channel.queryable
-        )
+        result = acquire(spec.score_fn, surrogate, X_pool, state, rng, params)
 
-        # Pure-exploitation recommendation: the best site the operator could
-        # actually act on, so unqueryable electrodes are not recommendable either.
+        # Pure-exploitation recommendation over the whole pool.
         pool_mean, _ = marginals(surrogate, X_pool)           # [N]
-        traj.recommendations.append(int(queryable[np.argmax(pool_mean[queryable])]))
-        traj.r2_per_step.append(r2_score(channel.y_gt, pool_mean))
+        traj.recommendations.append(int(np.argmax(pool_mean)))
+        traj.r2_per_step.append(r2_score(channel.y_gt[survivors], pool_mean[survivors]))
 
-        index = result.index
-        traj.observed_indices.append(index)
-        traj.observed_values.append(draw_trial(channel.Y_trials, index, rng))
-        traj.real_values.append(float(channel.y_gt[index]))
+        observe(result.index)
         traj.acq_params.append(result.params)
         traj.step_times_s.append(time.time() - t0)
 
@@ -203,6 +212,6 @@ def run_bo_loop(
     mean, std = marginals(surrogate, X_pool)                  # [N], [N]
     traj.y_pred = np.asarray(mean, dtype=np.float64)
     traj.y_std = np.asarray(std, dtype=np.float64)
-    traj.recommendations.append(int(queryable[np.argmax(traj.y_pred[queryable])]))
-    traj.r2_per_step.append(r2_score(channel.y_gt, traj.y_pred))
+    traj.recommendations.append(int(np.argmax(traj.y_pred)))
+    traj.r2_per_step.append(r2_score(channel.y_gt[survivors], traj.y_pred[survivors]))
     return traj
