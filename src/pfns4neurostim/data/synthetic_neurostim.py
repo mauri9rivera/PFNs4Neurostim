@@ -25,7 +25,7 @@ inputs whichever demo a channel comes from.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 import numpy as np
 from scipy import optimize, stats
@@ -212,11 +212,27 @@ def _raw_trials_and_gt(channel: ChannelData) -> tuple[np.ndarray, np.ndarray]:
     return flat.reshape(channel.Y_trials.shape), gt                        # [N, R], [N]
 
 
+def _is_collapsed(theta: np.ndarray, unpack: Callable[[np.ndarray], GeneratorParams]) -> bool:
+    """Whether fitted parameters give no usable map.
+
+    Args:
+        theta: Fitted parameter vector (last entry is log-saturation).
+        unpack: Maps ``theta`` to :class:`GeneratorParams`.
+
+    Returns:
+        True if the saturation underflows to 0 or the mean map is constant.
+    """
+    if not np.exp(theta[-1]) > 0.0:
+        return True
+    return not np.var(mean_map(unpack(theta))) > 0.0
+
+
 def fit_generator_to_channel(
     channel: ChannelData,
     *,
     n_hotspots: int = 1,
     min_lengthscale: float = 0.3,
+    min_saturation_frac: float = 0.5,
 ) -> GeneratorParams:
     """Fit generator parameters to a real channel (the Demo 1 nominal anchor).
 
@@ -232,12 +248,17 @@ def fit_generator_to_channel(
         n_hotspots: Number of hotspots K.
         min_lengthscale: Lower bound on a lengthscale, in electrode pitch, so a hotspot
             cannot collapse onto a single noisy site.
+        min_saturation_frac: Lower bound on the saturation ceiling, as a fraction of the
+            ground-truth range (peak - floor), applied only in a refit when the unbounded
+            fit collapses: as ``s -> 0``, ``s * tanh(drive / s)`` vanishes and the map is
+            constant (seen on 5d_rat s4-e2 with two hotspots).
 
     Returns:
         Fitted :class:`GeneratorParams` on the channel's own electrode coordinates.
 
     Raises:
         ValueError: If ``n_hotspots < 1`` or the channel has no raw scale.
+        RuntimeError: If the fitted map is constant (no signal to match an SNR to).
     """
     if n_hotspots < 1:
         raise ValueError(f"fit_generator_to_channel: n_hotspots must be >= 1, got {n_hotspots}.")
@@ -288,6 +309,17 @@ def fit_generator_to_channel(
     )
     theta = np.clip(theta, lower + 1e-9, upper - 1e-9)
     fit = optimize.least_squares(residual, theta, bounds=(lower, upper))
+
+    if _is_collapsed(fit.x, unpack):
+        # Fallback only: a finite bound changes the solver's variable scaling, so bounding
+        # every fit would move every twin (and orphan the cells cached against them).
+        lower[-1] = np.log(min_saturation_frac * max(peak - floor, 1e-6))
+        fit = optimize.least_squares(residual, np.clip(theta, lower + 1e-9, upper - 1e-9), bounds=(lower, upper))
+        if _is_collapsed(fit.x, unpack):
+            raise RuntimeError(
+                f"fit_generator_to_channel({channel.label}, n_hotspots={n_hotspots}): fitted map is "
+                f"constant even with the saturation floor (log s = {fit.x[-1]:.3g})."
+            )
 
     params = unpack(fit.x)
     mu = mean_map(params)                                                  # [N]

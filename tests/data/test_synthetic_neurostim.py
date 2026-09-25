@@ -101,6 +101,39 @@ class TestFit:
         assert (twin.dataset, twin.subject, twin.emg) == ("synthetic_nhp", 3, 2)
         assert twin.meta["source_label"] == ch.label
 
+    def test_collapsed_fit_is_refit_with_a_saturation_floor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Regression (5d_rat s4-e2, K = 2): the unbounded fit drove s -> 0, a constant map.
+        ch = sn.generate_neurostim_map(_params(noise_cv=0.3, n_trials=20), np.random.default_rng(0))
+        real = sn.optimize.least_squares
+        floors: list[float] = []
+
+        def collapse_first(fun, x0, bounds):  # noqa: ANN001, ANN202 - scipy's signature
+            floors.append(float(bounds[0][-1]))
+            fit = real(fun, x0, bounds=bounds)
+            if len(floors) == 1:
+                fit.x = fit.x.copy()
+                fit.x[-1] = -800.0                                         # exp underflows to 0
+            return fit
+
+        monkeypatch.setattr(sn.optimize, "least_squares", collapse_first)
+        fitted = sn.fit_generator_to_channel(ch, n_hotspots=2, min_saturation_frac=0.5)
+        assert floors[0] == -np.inf and np.isfinite(floors[1])
+        assert np.var(sn.mean_map(fitted)) > 0.0 and fitted.noise_cv > 0.0
+
+    def test_fit_that_stays_collapsed_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ch = sn.generate_neurostim_map(_params(), np.random.default_rng(0))
+        real = sn.optimize.least_squares
+
+        def always_collapse(fun, x0, bounds):  # noqa: ANN001, ANN202 - scipy's signature
+            fit = real(fun, x0, bounds=bounds)
+            fit.x = fit.x.copy()
+            fit.x[-1] = -800.0
+            return fit
+
+        monkeypatch.setattr(sn.optimize, "least_squares", always_collapse)
+        with pytest.raises(RuntimeError, match="constant"):
+            sn.fit_generator_to_channel(ch, n_hotspots=2)
+
     def test_fit_needs_raw_units(self) -> None:
         ch = sn.generate_neurostim_map(_params(), np.random.default_rng(0))
         bare = ChannelData(ch.dataset, 0, 0, ch.X_pool, ch.Y_trials, ch.y_gt, ch.ch2xy, ch.grid_shape)
