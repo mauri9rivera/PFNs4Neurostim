@@ -5,6 +5,7 @@ __pycache__/
 .claude/
 *.egg-info/
 .pytest_cache/
+.research_assistant/
 
 # Fixed 2026-09-18: './data' and './output' were never valid gitignore patterns,
 # so both trees were untracked-but-committable (4.5 GB / 285 MB).

@@ -117,6 +117,25 @@ class TestExternalRegistration:
                 with pytest.raises(ImportError, match="needs Python >="):
                     external.require_backend(key)
 
+    @pytest.mark.parametrize(
+        "key, env",
+        (("pfns4bo", "main"), ("tabpfn_v1", "v1"), ("tabfm", "bench"), ("tabicl", "bench"),
+         ("tabflex", "main"), ("mitra", "mitra")),
+    )
+    def test_every_model_declares_the_environment_it_runs_in(self, key: str, env: str) -> None:
+        """Model -> env is data in one place, so no script has to name an env by hand."""
+        spec = external.EXTERNAL_SPECS[key]
+        assert spec.env == env
+        expected = "pfns4neurostim" if env == "main" else f"pfns4neurostim-{env}"
+        assert spec.conda_env == expected == external.conda_env_for(key)
+
+    def test_wrong_environment_names_the_environment_to_activate(self) -> None:
+        """A model that cannot run here must say where it does run, not just that it failed."""
+        for key in ("tabpfn_v1", "tabfm", "tabicl"):
+            ok, reason = external._backend_ok(external.EXTERNAL_SPECS[key])
+            if not ok and "not installed" not in reason:
+                assert external.EXTERNAL_SPECS[key].conda_env in reason
+
     def test_availability_reports_every_model(self) -> None:
         avail = external.availability()
         assert set(avail) == set(EXTERNAL_KEYS)
@@ -139,7 +158,7 @@ class TestExternalRegistration:
             build_surrogate(key)
 
     #: Models whose wrapper body is still outstanding (task #8 Step 3).
-    PENDING = ("tabpfn_v1", "mitra")
+    PENDING = ("mitra",)
 
     @pytest.mark.parametrize("key", PENDING)
     def test_pending_wrapper_explains_what_is_outstanding(self, key: str) -> None:
@@ -150,8 +169,8 @@ class TestExternalRegistration:
             surrogate.fit(np.zeros((4, 2)), np.arange(4.0))
 
     def test_implemented_wrappers_are_not_in_the_pending_list(self) -> None:
-        """TabFlex, TabICL and TabFM have real bodies as of 2026-09-20; PFNs4BO (native policy) since 2026-09-23."""
-        assert set(self.PENDING).isdisjoint({"tabflex", "tabicl", "tabfm", "pfns4bo"})
+        """TabFlex, TabICL and TabFM since 2026-09-20; PFNs4BO 2026-09-23; TabPFN v1 2026-09-25."""
+        assert set(self.PENDING).isdisjoint({"tabflex", "tabicl", "tabfm", "pfns4bo", "tabpfn_v1"})
 
     def test_tabfm_refuses_a_single_ensemble_member(self) -> None:
         """Its only uncertainty signal is ensemble spread, which is zero for one member."""
@@ -159,6 +178,69 @@ class TestExternalRegistration:
 
         with pytest.raises((ValueError, ImportError), match="n_estimators >= 2|needs Python"):
             TabFMSurrogate(n_estimators=1)
+
+
+class _StubTabFM:
+    """Stand-in for upstream ``TabFMRegressor`` after ``fit``: members live in a z-scale of the context.
+
+    Mirrors upstream exactly where the wrapper depends on it: ``_predict_internal`` returns [E, N] in the
+    internal scale, ``_combine_predictions`` averages then inverse-transforms, ``_compute_oof_preds_scaled``
+    returns ([E, n], val_idx).
+    """
+
+    def __init__(self, y: np.ndarray, members_scaled: np.ndarray, oof_scaled: np.ndarray) -> None:
+        self.mu, self.sd = float(np.mean(y)), float(np.std(y))
+        self.members_scaled, self.oof_scaled = members_scaled, oof_scaled
+
+    def _inverse_transform_y(self, y_scaled: np.ndarray) -> np.ndarray:
+        return np.asarray(y_scaled) * self.sd + self.mu
+
+    def _combine_predictions(self, scaled: np.ndarray) -> np.ndarray:
+        return self._inverse_transform_y(np.mean(scaled, axis=0))
+
+    def _predict_internal(self, X: np.ndarray) -> np.ndarray:
+        return self.members_scaled
+
+    def _compute_oof_preds_scaled(self, cv: int = 5) -> tuple[np.ndarray, None]:
+        return self.oof_scaled, None
+
+
+class TestTabFMPredictiveOutputs:
+    """The TabFM wrapper returns upstream's raw-scale prediction and a spread + out-of-fold SD (2026-09-25)."""
+
+    @staticmethod
+    def _wrapper(predictive_sd: str, y: np.ndarray, members: np.ndarray, oof: np.ndarray):
+        from pfns4neurostim.models.pfn.wrappers import TabFMSurrogate
+
+        w = TabFMSurrogate.__new__(TabFMSurrogate)       # skip the backend check: the stub stands in for it
+        w.predictive_sd, w.oof_folds = predictive_sd, 5
+        w._model = _StubTabFM(y, members, oof)
+        w._oof_sd = w._oof_residual_sd(y) if predictive_sd == "spread_oof" else 0.0
+        return w
+
+    def test_mean_is_upstreams_raw_scale_prediction(self) -> None:
+        y = np.array([10.0, 12.0, 14.0, 20.0])
+        members = np.array([[0.0, 1.0], [0.2, 1.2]])        # [E=2, N=2] in the internal z-scale
+        w = self._wrapper("spread", y, members, np.zeros((2, 4)))
+        mean, std = w._predict_backend(np.zeros((2, 1)))
+        np.testing.assert_allclose(mean, w._model._combine_predictions(members))
+        assert mean[0] > 10.0                             # raw scale, not the internal z-scale
+        np.testing.assert_allclose(std, np.std(members * w._model.sd, axis=0, ddof=1))
+
+    def test_oof_residual_widens_the_sd(self) -> None:
+        y = np.array([0.0, 1.0, 2.0, 3.0])
+        members = np.array([[0.0, 0.0], [0.0, 0.0]])        # no spread at all
+        oof_scaled = np.tile(((y - y.mean()) / y.std() + 0.5)[None, :], (2, 1))   # OOF off by 0.5 internal sd
+        w = self._wrapper("spread_oof", y, members, oof_scaled)
+        _, std = w._predict_backend(np.zeros((2, 1)))
+        np.testing.assert_allclose(std, 0.5 * y.std())    # RMSE of the OOF residual, in the raw scale
+
+    @pytest.mark.parametrize("bad", [{"predictive_sd": "bogus"}, {"oof_folds": 1}])
+    def test_invalid_options_raise(self, bad: dict) -> None:
+        from pfns4neurostim.models.pfn.wrappers import TabFMSurrogate
+
+        with pytest.raises((ValueError, ImportError), match="predictive_sd|oof_folds|needs Python"):
+            TabFMSurrogate(**bad)
 
 
 class TestQuantileMoments:
@@ -216,6 +298,50 @@ class TestTabFlexRuns:
         mean, std = surrogate.predict_marginals(X)
         assert mean.shape == (40,) and std.shape == (40,)
         assert np.isfinite(mean).all() and (std > 0).all()
+
+class TestTabPFNv1Adaptation:
+    """The v1 classification-head adaptation, which is testable without the v1 backend."""
+
+    def test_bin_count_is_capped_at_the_architectural_class_ceiling(self) -> None:
+        """v1 emits at most 10 classes; asking for more must fail at construction."""
+        from pfns4neurostim.models.pfn.wrappers import TabPFNv1Surrogate
+
+        assert TabPFNv1Surrogate.MAX_CLASSES == 10
+        with pytest.raises(ValueError, match="exceeds the backend's ceiling of 10"):
+            TabPFNv1Surrogate(n_bins=32)
+
+    def test_default_bin_count_is_ten(self) -> None:
+        """The default must be v1's ceiling, not the 32 used for backends without one."""
+        import inspect
+
+        from pfns4neurostim.models.pfn.wrappers import TabPFNv1Surrogate
+
+        assert inspect.signature(TabPFNv1Surrogate.__init__).parameters["n_bins"].default == 10
+
+    def test_fit_hook_passes_v1_overwrite_warning(self) -> None:
+        """v1 refuses a context over its soft limit unless the flag is set."""
+        from pfns4neurostim.models.pfn.wrappers import TabPFNv1Surrogate
+
+        recorded: dict[str, object] = {}
+
+        class _Classifier:
+            def fit(self, X, y, overwrite_warning=False):  # noqa: ANN001, N803 - mirrors the v1 API
+                recorded["overwrite_warning"] = overwrite_warning
+
+        TabPFNv1Surrogate._fit_classifier(
+            object.__new__(TabPFNv1Surrogate), _Classifier(), np.zeros((4, 2)), np.arange(4)
+        )
+        assert recorded["overwrite_warning"] is True
+
+    def test_version_string_states_the_adaptation_and_its_resolution(self) -> None:
+        """Guardrail G3: the bin count travels with every v1 row."""
+        version = MODEL_REGISTRY["tabpfn_v1"].version
+        assert "classification-head adaptation" in version
+        assert "10" in version
+
+
+class TestExternalErrors:
+    """Failures of the external layer itself."""
 
     def test_unknown_external_key_raises(self) -> None:
         with pytest.raises(KeyError, match="Unknown external model"):

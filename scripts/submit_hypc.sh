@@ -35,8 +35,5 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-submit_single "C1. M10 update rule, NHP" mechanism configs/experiment/mechanism_update_rule_nhp.yaml pfns4neurostim
-submit_single "C2. Placement (MMD / sliced W2), NHP" mechanism configs/experiment/mechanism_placement_nhp.yaml pfns4neurostim
-submit_single "C3. CKA, NHP" mechanism configs/experiment/mechanism_cka_nhp.yaml pfns4neurostim
 
 echo "Done. Check with: squeue --me"

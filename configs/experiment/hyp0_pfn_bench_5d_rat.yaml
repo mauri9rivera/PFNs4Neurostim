@@ -1,19 +1,29 @@
-# Hypothesis 0 - PFN benchmark, 5d_rat: TabPFN-2.5 vs TabICL v2.2.0 vs TabFM vs GP-MLL, ts_marginal.
+# Hypothesis 0 - PFN benchmark, 5d_rat: TabPFN-2.5 vs TabICL v2.2.0 vs TabFM vs PFNs4BO vs TabPFN v1 vs GP-MLL.
 #
-# Runs in the Python 3.11 bench env (CONDA_ENV=pfns4neurostim-bench).
+# Every model runs its own policy: `_supported` pairs PFNs4BO (an end-to-end BO model) with `native` only and
+# every other model with `ts_marginal` only, so the acquisition list below adds no cross-product cells.
 #  - TabICL: native quantile predictive distribution (Thompson draws invert its quantile function).
-#  - TabFM: point predictions only; sigma is the across-ensemble-member spread, a PROXY and not a calibrated
-#    distribution (guardrail G3: say so in every table and caption). It is by far the slowest model, so it is
-#    submitted as its own LAST job (see scripts/portfolio.py).
+#  - TabFM: a POINT regressor upstream. Mean = upstream's own prediction (raw scale); sigma is CONSTRUCTED as
+#    sqrt(ensemble spread^2 + out-of-fold residual RMSE^2) (2026-09-25; before that the spread alone, which
+#    collapsed Thompson sampling to greedy). Guardrail G3: say "constructed sigma" in every table and caption.
+#  - PFNs4BO: HEBO+ prior, its own acquisition (`native`); runs in the MAIN env (py3.9, pins scikit-learn<1.2).
+#  - TabPFN v1: a CLASSIFIER. The wrapper bins the response into 10 equal-mass quantile bins and reads its
+#    class probabilities as a bar distribution, so its predictive SD cannot fall below ~range/(10*sqrt(12)).
+#    Label every v1 row "classification-head adaptation" and report its calibration next to the bin count,
+#    never ranked against v2.5's native bar distribution (docs/tabpfn_v1_adaptation.md). Runs in the V1 env:
+#    tabpfn<2 and tabpfn 6.3.2 own the same module name, so they cannot share one interpreter.
 #  - TabFlex is dropped: upstream's weight host no longer resolves (microsoft/ticl issue #27).
-#  - PFNs4BO is deferred (native-policy integration not implemented).
-# Latency is descriptive only (guardrail G1).
+# Environments: TabICL and TabFM need the bench env (py3.11), PFNs4BO the main env, TabPFN v1 the v1 env. The portfolio submits each
+# model in its env against this ONE config, so every cell lands in this run and one assemble job (main env)
+# builds the tables and figures. Latency is descriptive only (guardrail G1).
 #
-#   CONDA_ENV=pfns4neurostim-bench LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabpfn_v2_5,tabicl]" tag=gpu
+#   CONDA_ENV=pfns4neurostim-bench LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabpfn_v2_5,tabicl]"
+#   CONDA_ENV=pfns4neurostim LANES=2 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[pfns4bo]"
+#   CONDA_ENV=pfns4neurostim-v1 LANES=2 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabpfn_v1]"
 defaults:
   dataset: 5d_rat
-  model: [tabpfn_v2_5, tabicl, tabfm, gp_mll]
-  acquisition: ts_marginal
+  model: [tabpfn_v2_5, tabicl, tabfm, pfns4bo, tabpfn_v1, gp_mll]
+  acquisition: [ts_marginal, native]
 
 experiment: bo_benchmark
 family: hyp0-pfn-bench
@@ -27,9 +37,6 @@ device: cuda
 seed: 42
 output_root: output
 equivalence_margin: 0.05
-
-# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
-# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
 
 # GP-MLL runs on CPU (measured 2.2x faster than CUDA for this Adam GP; P0.12).
 model_params:

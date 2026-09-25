@@ -35,8 +35,8 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
+submit_unit "B0. Hyp A (TabPFN vs GP), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
 submit_unit "B1. Acquisition core (ts/ei/ucb), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
 submit_unit "B2. UCB kappa grid, 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_ucb_kappa_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "-" 4 "-"
-submit_single "B3. GT sensitivity (full-mean vs split-half), NHP" gt_sensitivity configs/experiment/gt_sensitivity_nhp.yaml pfns4neurostim
 
 echo "Done. Check with: squeue --me"

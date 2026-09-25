@@ -9,11 +9,12 @@ submission script that the USER runs on the login node:
     python scripts/portfolio.py --emit-bash --group hypc > scripts/submit_hypc.sh            # Hyp C mechanism analyses
     python scripts/portfolio.py --emit-bash --group externals > scripts/submit_externals.sh  # TabFM, PFNs4BO
 
-Groups (updated 2026-09-23; units whose results already exist were removed — see task_plan.md "Your Mila portfolio"):
-    stress     restructured K2 (channel, global), K5, K6 (failure, budget) on NHP and 5d_rat; Demo 1 K2 + K1; split-half K2.
-    bench      the 5d_rat acquisition tables and the split-half GT sensitivity run (task #7).
-    hypc       M10 update rule, placement (MMD / W2) and CKA on NHP (one process each, no assembly).
-    externals  TabFM (bench env, 24 GB, <= 2 lanes, plus a 5d_rat calibration job) and PFNs4BO (main env).
+Groups (updated 2026-09-25; units whose results already exist were removed — see task_plan.md "Your Mila portfolio"):
+    stress     the 5d_rat stress sweeps on the noOutliers cohort (K2 channel/global, K5, K6 failure, Demo 1 K2).
+    bench      Hyp A and the Hyp 0 acquisition tables on 5d_rat.
+    hypc       none left (C1-C3 ran locally 2026-09-24/25).
+    externals  the PFN benchmark: base models on 5d_rat (bench env), TabFM (bench env, 24 GB, <= 2 lanes, NHP rerun plus a
+               5d_rat calibration job), PFNs4BO 5d_rat (main env) and TabPFN v1 (v1 env, tabpfn<2).
 
 Sharded experiments (``bo_benchmark``, ``stress_sweep``) write every job's cells to the shared cache and one assemble job
 builds tidy.csv, tables and figures. ``mechanism`` and ``gt_sensitivity`` run as ONE process (``scripts/run_single.sh``) and
@@ -26,17 +27,22 @@ from dataclasses import dataclass
 
 #: Seconds per repetition at the deliverable budget (96 NHP / 100 5d_rat), per model. Absent = unmeasured.
 REP_SECONDS: dict[str, dict[str, float]] = {
-    "nhp": {"tabpfn_v2_5": 15.7, "gp_mll": 19.5, "gp_naive": 0.8, "random": 0.2, "tabicl": 30.0, "tabfm": 99.0},
-    "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 19.5, "gp_naive": 1.0, "random": 0.4, "tabicl": 33.0},
+    "nhp": {"tabpfn_v2_5": 15.7, "gp_mll": 19.5, "gp_naive": 0.8, "random": 0.2, "tabicl": 30.0, "tabfm": 99.0,
+            "pfns4bo": 5.3},
+    "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 19.5, "gp_naive": 1.0, "random": 0.4, "tabicl": 33.0, "pfns4bo": 6.7},
 }
 GUESSED: frozenset[str] = frozenset()   # every listed cost is measured (TabICL from the D3 runs: 0.43-0.52 s/step)
-CHANNELS = 18
+#: Channels (subject x EMG) per dataset. 5d_rat dropped from 18 to 17 with the
+#: noOutliers cohort (2026-09-25): rData03 left and flag_valid_emg replaced the
+#: hand-maintained EMG lists.
+CHANNELS = {"nhp": 18, "5d_rat": 17}
 REPS = 10
 GPU_LANE_GAIN = 1.7      # aggregate speed-up of several lanes on one GPU (measured with 3 lanes)
 GPU_LANES = 4
 CPU_LANES = 8
 BENCH_ENV = "pfns4neurostim-bench"
 MAIN_ENV = "pfns4neurostim"
+V1_ENV = "pfns4neurostim-v1"    # tabpfn<2; cannot share an interpreter with the pinned 6.3.2
 #: Runners that run as one process and write their own deliverables (no lanes, no cell assembly).
 SINGLE_PROCESS: frozenset[str] = frozenset({"mechanism", "gt_sensitivity"})
 
@@ -87,52 +93,46 @@ _TP, _GP = ("tabpfn_v2_5",), ("gp_mll", "gp_naive")
 _BASE_CPU = ("gp_mll", "gp_naive", "random")
 
 UNITS: tuple[Unit, ...] = (
-    # ---- stress: restructured knobs (2026-09-23), main env ----
-    # BEFORE the K2-channel units: run `python scripts/relabel_knob_cells.py --apply` once on the login node, so the 8,640
-    # pre-restructure k2_snr cells are served as k2_channel cache hits (only alpha = 8 is new compute).
-    _u("S1a. K2-channel, NHP (alpha = 8 top-up)", "stress_sweep", "stress_k2_channel_nhp", "nhp", _TP, _GP, 1,
-       note="8 of 9 levels are cache hits after the relabel"),
-    _u("S1b. K2-channel, 5d_rat (alpha = 8 top-up)", "stress_sweep", "stress_k2_channel_5d_rat", "5d_rat", _TP, _GP, 1,
-       note="8 of 9 levels are cache hits after the relabel"),
-    _u("S2a. K2-global, NHP", "stress_sweep", "stress_k2_global_nhp", "nhp", _TP, _GP, 8),
+    # Rebuilt 2026-09-25. Finished units were removed (NHP stress S1a-S6, B3, E5 on 09-24; Hyp C C1-C3 run locally).
+    # EVERY 5d_rat unit is a full recompute: the noOutliers cohort (2026-09-25) is part of each 5d_rat cell's
+    # identity, so no 5d_rat cell of the old cohort can be reused. Clean the cluster first (runbook 3b).
+    # ---- stress: 5d_rat on the new cohort, main env ----
+    _u("S1b. K2-channel, 5d_rat", "stress_sweep", "stress_k2_channel_5d_rat", "5d_rat", _TP, _GP, 9),
     _u("S2b. K2-global, 5d_rat", "stress_sweep", "stress_k2_global_5d_rat", "5d_rat", _TP, _GP, 8),
-    _u("S3a. K5 slot-fraction heavy tail, NHP", "stress_sweep", "stress_k5_nhp", "nhp", _TP, _GP, 6),
     _u("S3b. K5 slot-fraction heavy tail, 5d_rat", "stress_sweep", "stress_k5_5d_rat", "5d_rat", _TP, _GP, 6),
-    _u("S4a. K6 electrode failure, NHP", "stress_sweep", "stress_k6_failure_nhp", "nhp", _TP, _GP, 5),
     _u("S4b. K6 electrode failure, 5d_rat", "stress_sweep", "stress_k6_failure_5d_rat", "5d_rat", _TP, _GP, 5),
-    _u("S4c. K6 budget, NHP", "stress_sweep", "stress_k6_budget_nhp", "nhp", _TP, _GP, 2.15,
-       note="levels 10,20,30,50,96 = 2.15x one full budget"),
-    _u("S5a. Demo 1 K2-channel, NHP twins", "stress_sweep", "stress_k2_channel_demo1_nhp", "nhp", _TP, _GP, 9,
-       note="synthetic twins fitted per channel (S0); feeds the S10 bridge"),
-    _u("S5b. Demo 1 K2-channel, 5d_rat twins", "stress_sweep", "stress_k2_channel_demo1_5d_rat", "5d_rat", _TP, _GP, 9),
-    _u("S5c. Demo 1 K1 decoy, NHP twins", "stress_sweep", "stress_k1_decoy_nhp", "nhp", _TP, _GP, 5),
-    _u("S6. Split-half GT, K2-channel NHP", "stress_sweep", "stress_k2_channel_nhp", "nhp", _TP, _GP, 9,
-       overrides=("gt_mode=split_half", "tag=nhp-sh"), note="S6 sensitivity arm; rep i on split instance i mod 20"),
-    # ---- bench: Hyp 0/A leftovers, main env ----
-    _u("B1. Acquisition core (ts/ei/ucb), 5d_rat", "bo_benchmark", "hyp0_acq_core_5d_rat", "5d_rat", _TP, _BASE_CPU, 2,
-       group="bench", note="ts_marginal + random cells are cache hits from D1"),
+    _u("S5b. Demo 1 K2-channel, 5d_rat twins", "stress_sweep", "stress_k2_channel_demo1_5d_rat", "5d_rat", _TP, _GP, 9,
+       note="twins inherit the source cohort; the s4-e2 collapse (2026-09-24) must be re-checked on the new cohort"),
+    # ---- bench: Hyp 0 / A on 5d_rat, main env ----
+    _u("B0. Hyp A (TabPFN vs GP), 5d_rat", "bo_benchmark", "hyp_a_5d_rat", "5d_rat", _TP, _BASE_CPU, 1, group="bench"),
+    _u("B1. Acquisition core (ts/ei/ucb), 5d_rat", "bo_benchmark", "hyp0_acq_core_5d_rat", "5d_rat", _TP, _BASE_CPU, 3,
+       group="bench", note="ts_marginal cells are shared with B0 (same identity): whichever runs second hits them"),
     _u("B2. UCB kappa grid, 5d_rat", "bo_benchmark", "hyp0_ucb_kappa_5d_rat", "5d_rat", _TP, (), 5, group="bench"),
-    _u("B3. GT sensitivity (full-mean vs split-half), NHP", "gt_sensitivity", "gt_sensitivity_nhp", "nhp", _TP, ("gp_mll",),
-       group="bench", hours=1.0, note="task #7 Step 6; spinal twin (gt_sensitivity_spinal) needs data/spinal on the cluster"),
-    # ---- hypc: mechanism analyses, one GPU process each ----
-    _u("C1. M10 update rule, NHP", "mechanism", "mechanism_update_rule_nhp", "nhp", _TP, (), group="hypc", hours=3.0,
-       note="~7-8 min per channel on a 3060 (GP-refit arm dominates) + gates; set update_rule.link.tidy_csv afterwards"),
-    _u("C2. Placement (MMD / sliced W2), NHP", "mechanism", "mechanism_placement_nhp", "nhp", _TP, (), group="hypc", hours=1.0,
-       note="~1 s per prior dataset; rank_pairs features (validated rho = 1.0 on NHP); needs libs/tabpfn-v1-prior (bash scripts/mila_setup.sh submodules)"),
-    _u("C3. CKA, NHP", "mechanism", "mechanism_cka_nhp", "nhp", _TP, (), group="hypc", hours=None,
-       note="cost UNMEASURED; n_perm must reach the Bonferroni threshold (runner refuses otherwise)"),
-    # ---- externals ----
-    _u("E3. TabFM, NHP", "bo_benchmark", "hyp0_pfn_bench_nhp", "nhp", ("tabfm",), (), group="externals", env=BENCH_ENV,
-       lanes=2, mem="24G",
-       note="MEASURED on Mila (job 10871697): 99 s/rep, 9.9 GB RSS per process -> 24 GB and <=2 lanes; sigma is ensemble spread (G3)"),
+    # ---- externals: the PFN benchmark (one run per dataset, cells from three environments) ----
+    _u("E1. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), 5d_rat", "bo_benchmark", "hyp0_pfn_bench_5d_rat", "5d_rat",
+       ("tabpfn_v2_5", "tabicl"), ("gp_mll",), group="externals", env=BENCH_ENV,
+       note="bench env (TabICL needs py3.11); TabPFN-2.5 / GP-MLL cells are shared with B0 and hit if B0 ran first"),
+    _u("E3. TabFM, NHP (fixed wrapper)", "bo_benchmark", "hyp0_pfn_bench_nhp", "nhp", ("tabfm",), (), group="externals",
+       env=BENCH_ENV, lanes=2, mem="24G",
+       note="rerun: raw-scale mean + spread/out-of-fold sigma, batched members (2026-09-25; ~1.3 s/step locally); "
+            "24 GB, <=2 lanes; sigma is constructed (G3)"),
+    # A subset run (calibration, smoke) ALWAYS gets its own tag: a unit shares its run directory with every
+    # other unit of the same config and tag, and its assemble job would overwrite the full run's tidy.csv with
+    # the subset (happened to hyp0-pfn-bench-5d_rat on 2026-09-24).
     _u("E4. TabFM 5d_rat CALIBRATION (1 channel, 2 reps)", "bo_benchmark", "hyp0_pfn_bench_5d_rat", "5d_rat", ("tabfm",), (),
        group="externals", env=BENCH_ENV, lanes=1, mem="24G",
-       overrides=("dataset.subjects=[1]", "dataset.emgs=[0]", "n_reps=2"),
-       note="UNMEASURED: read its per-rep time from the log before submitting a full 5d_rat TabFM run"),
-    _u("E5. PFNs4BO (native policy), NHP", "bo_benchmark", "hyp0_pfns4bo_nhp", "nhp", ("pfns4bo",), (), group="externals",
-       lanes=2, note="main env; end-to-end BO model (acquisition: native); cost UNMEASURED"),
-    _u("E6. PFNs4BO (native policy), 5d_rat", "bo_benchmark", "hyp0_pfns4bo_5d_rat", "5d_rat", ("pfns4bo",), (), group="externals",
-       lanes=2, note="main env; end-to-end BO model (acquisition: native); cost UNMEASURED"),
+       overrides=("dataset.subjects=[1]", "dataset.emgs=[0]", "n_reps=2", "tag=5d_rat-tabfm-calibration"),
+       note="re-measure with the fixed wrapper (old: ~18 min/rep, 12.8 GB RSS) before planning the full 5d_rat TabFM run"),
+    _u("E6. PFNs4BO (native policy), 5d_rat", "bo_benchmark", "hyp0_pfn_bench_5d_rat", "5d_rat", ("pfns4bo",), (),
+       group="externals", lanes=2,
+       note="main env; cells land in the hyp0-pfn-bench run; ~10 min for 180 reps on 2 lanes (2026-09-24)"),
+    # TabPFN v1 joins the same PFN benchmark run from its own environment (2026-09-25).
+    _u("E7. TabPFN v1 (classification-head adaptation), NHP", "bo_benchmark", "hyp0_pfn_bench_nhp", "nhp",
+       ("tabpfn_v1",), (), group="externals", env=V1_ENV, lanes=2, hours=None,
+       note="cost UNMEASURED; v1 API unexecuted until the v1 env exists: build it and run ONE cell before submitting"),
+    _u("E8. TabPFN v1 (classification-head adaptation), 5d_rat", "bo_benchmark", "hyp0_pfn_bench_5d_rat", "5d_rat",
+       ("tabpfn_v1",), (), group="externals", env=V1_ENV, lanes=2, hours=None,
+       note="cost UNMEASURED; after E7"),
 )
 
 
@@ -151,7 +151,7 @@ def _hours(unit: Unit, models: tuple[str, ...], speedup: float) -> float | None:
     costs = [REP_SECONDS[unit.dataset].get(m) for m in models]
     if any(c is None for c in costs):
         return None
-    return sum(costs) * unit.multiplier * CHANNELS * REPS / 3600.0 / speedup
+    return sum(costs) * unit.multiplier * CHANNELS[unit.dataset] * REPS / 3600.0 / speedup
 
 
 def _fmt(hours: float | None) -> str:
@@ -213,12 +213,6 @@ def emit_bash(group: str) -> None:
     print('  echo "submitted: $name  (job ${id%%;*})"')
     print("}")
     print("")
-    if group == "stress":
-        print("# The K2-channel units reuse the pre-restructure k2_snr cells: relabel them first (idempotent, copies only).")
-        print("# The login node has no python on PATH: load conda and run inside the main env (the script imports the package).")
-        print("if ! command -v conda >/dev/null 2>&1; then set +u; module load anaconda/3; set -u; fi")
-        print("conda run -n pfns4neurostim python scripts/relabel_knob_cells.py --apply")
-        print("")
     for unit in _selected(group):
         if unit.experiment in SINGLE_PROCESS:
             extra = " ".join(f'"{o}"' for o in unit.overrides)

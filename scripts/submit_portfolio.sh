@@ -35,23 +35,10 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-# The K2-channel units reuse the pre-restructure k2_snr cells: relabel them first (idempotent, copies only).
-# The login node has no python on PATH: load conda and run inside the main env (the script imports the package).
-if ! command -v conda >/dev/null 2>&1; then set +u; module load anaconda/3; set -u; fi
-conda run -n pfns4neurostim python scripts/relabel_knob_cells.py --apply
-
-submit_unit "S1a. K2-channel, NHP (alpha = 8 top-up)" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "S1b. K2-channel, 5d_rat (alpha = 8 top-up)" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "S2a. K2-global, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
+submit_unit "S1b. K2-channel, 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "S2b. K2-global, 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "S3a. K5 slot-fraction heavy tail, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "S3b. K5 slot-fraction heavy tail, 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "S4a. K6 electrode failure, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_failure_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "S4b. K6 electrode failure, 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_failure_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "S4c. K6 budget, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "S5a. Demo 1 K2-channel, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_demo1_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "S5b. Demo 1 K2-channel, 5d_rat twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_demo1_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "S5c. Demo 1 K1 decoy, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "S6. Split-half GT, K2-channel NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "gt_mode=split_half" "tag=nhp-sh"
 
 echo "Done. Check with: squeue --me"

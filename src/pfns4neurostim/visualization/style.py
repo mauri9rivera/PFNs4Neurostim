@@ -38,9 +38,8 @@ __all__ = [
     "knob_x_label",
     "KNOB_X_LABELS",
     "R2_AXIS_FLOOR",
-    "MULTIPANEL_ASPECT",
-    "STACKED_ASPECT",
-    "SINGLE_PANEL_ASPECT",
+    "PANEL_ASPECT",
+    "DECORATION_HEIGHT",
     "SEQUENTIAL_CMAP",
     "DIVERGING_CMAP",
     "OUTLINE_COLOR",
@@ -84,14 +83,12 @@ FIG_WIDTHS: dict[str, float] = {
 }
 
 DEFAULT_WIDTH: str = "single"
-DEFAULT_ASPECT: float = 0.72  # height / width for a single un-faceted panel
-#: Height / width of ONE panel in a row of side-by-side panels (``figure`` divides by ``ncols``). Taller than
-#: square so tick labels, two-line axis labels and a shared legend do not collide (2026-09-23).
-MULTIPANEL_ASPECT: float = 1.45
-#: Height / width of one panel in a vertical stack sharing an x-axis.
-STACKED_ASPECT: float = 0.6
-#: Height / width of a lone panel that carries a legend and a two-line axis label (taller than the 0.72 default).
-SINGLE_PANEL_ASPECT: float = 0.85
+#: Height / width of EVERY panel, whatever the panel count (settled 2026-09-25): a row of many panels no
+#: longer flattens into a strip, so trajectories stay separable and panel titles have room.
+PANEL_ASPECT: float = 1.5
+#: Extra figure height (inches) for the suptitle and a legend placed outside the axes, so the constrained
+#: layout takes that room from here rather than from the panels.
+DECORATION_HEIGHT: float = 0.6
 #: Lower display limit of every R^2 axis. The data are never clipped, only the view: a poorly fitted
 #: surrogate reaches R^2 far below it (GP-fixed reaches -55), which would flatten every other curve.
 R2_AXIS_FLOOR: float = -1.0
@@ -748,19 +745,18 @@ def figure(
     *,
     nrows: int = 1,
     ncols: int = 1,
-    aspect: float = DEFAULT_ASPECT,
-    height: float | None = None,
     **subplots_kwargs: object,
 ):
     """Create a correctly sized figure for the JNE column grid.
+
+    Every panel is :data:`PANEL_ASPECT` times taller than it is wide, whatever ``nrows`` and ``ncols``:
+    the width is fixed by the journal column, so the height follows the panel width
+    (``width / ncols * PANEL_ASPECT`` per row) plus :data:`DECORATION_HEIGHT` for titles and legends.
 
     Args:
         width: Width token (``'single'``/``'onehalf'``/``'double'``) or inches.
         nrows: Subplot rows.
         ncols: Subplot columns.
-        aspect: Height/width ratio of a *single panel*; total height scales
-            with ``nrows`` and shrinks with ``ncols``.
-        height: Explicit total height in inches, overriding ``aspect``.
         **subplots_kwargs: Forwarded to :func:`matplotlib.pyplot.subplots`.
 
     Returns:
@@ -768,8 +764,7 @@ def figure(
     """
     apply_style()
     w = FIG_WIDTHS[width] if isinstance(width, str) else float(width)
-    if height is None:
-        height = w * aspect * nrows / max(ncols, 1)
+    height = w / max(ncols, 1) * PANEL_ASPECT * nrows + DECORATION_HEIGHT
     return plt.subplots(nrows, ncols, figsize=(w, height), **subplots_kwargs)
 
 

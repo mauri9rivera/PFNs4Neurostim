@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import math
 import os
+import textwrap
 from typing import Any
 
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
 from ..evaluation import results as _results
+from ..models.registry import MODEL_REGISTRY
 from . import style as S
 
 __all__ = [
@@ -48,9 +51,19 @@ LEGEND_COLUMNS: int = 4
 
 #: Models left out of the latency figure: random search is trivially the fastest, and GP-fixed (no
 #: hyperparameter fitting) is not a like-for-like cost comparison with the fitted models.
-LATENCY_EXCLUDED_MODELS: tuple[str, ...] = ("random", "gp_naive")
+#: The latency figure compares the PFN family with the GP it is meant to replace (GP-MLL) and nothing else:
+#: an include rule, so a new baseline or GP variant never slips in (2026-09-25).
+LATENCY_GP_REFERENCE: str = "gp_mll"
+
+
+def _in_latency_figure(model: str) -> bool:
+    """Whether a model belongs in the latency figure: any PFN, plus the GP-MLL reference."""
+    spec = MODEL_REGISTRY.get(model)
+    return model == LATENCY_GP_REFERENCE or (spec is not None and spec.family == "pfn")
 
 LATENCY_NOTE: str = "Latency comparison pending the converged-GP fix (P0.10); not evidence of a speed advantage."
+#: Characters per line of the latency figure's title and caveat (single-column width).
+LATENCY_WRAP: int = 55
 
 
 def load_trace_frame(run_dir: str) -> pd.DataFrame | None:
@@ -178,7 +191,7 @@ def plot_trace_panels(frame: pd.DataFrame, out_dir: str, *, dataset: str, name: 
     if not panels:
         return []
     series = _series(frame)
-    fig, axes = S.figure("double", nrows=1, ncols=len(panels), aspect=S.MULTIPANEL_ASPECT, layout=S.LAYOUT_ENGINE)
+    fig, axes = S.figure("double", nrows=1, ncols=len(panels), layout=S.LAYOUT_ENGINE)
     axes = np.atleast_1d(axes)
     for ax, (field, key) in zip(axes, panels):
         for model, label, rows, st in series:
@@ -205,7 +218,7 @@ def plot_trace_panels(frame: pd.DataFrame, out_dir: str, *, dataset: str, name: 
 
 
 def plot_latency_curves(frame: pd.DataFrame, out_dir: str, *, dataset: str, name: str = "latency") -> list[str]:
-    """Per-step latency along the BO run (median over channels, interquartile band), log scale.
+    """Per-step latency along the BO run for the PFNs and GP-MLL only (median over channels, IQR band), log scale.
 
     Args:
         frame: Trace frame.
@@ -216,12 +229,13 @@ def plot_latency_curves(frame: pd.DataFrame, out_dir: str, *, dataset: str, name
     Returns:
         Paths written (empty when no latency was recorded).
     """
-    frame = frame[(frame["latency"].map(len) > 0) & ~frame["model"].isin(LATENCY_EXCLUDED_MODELS)]
+    frame = frame[(frame["latency"].map(len) > 0) & frame["model"].map(_in_latency_figure)]
     if frame.empty:
         return []
     frame = frame.assign(latency=frame["latency"].map(lambda a: a if len(a) else None))
     series = _series(frame)
-    fig, ax = S.figure("onehalf", aspect=S.SINGLE_PANEL_ASPECT, layout=S.LAYOUT_ENGINE)
+    # A lone panel takes the single-column width, so PANEL_ASPECT does not turn it into a tall strip.
+    fig, ax = S.figure("single", layout=S.LAYOUT_ENGINE)
     for model, label, rows, st in series:
         band = _channel_band(rows, "latency")
         if band is None:
@@ -233,12 +247,20 @@ def plot_latency_curves(frame: pd.DataFrame, out_dir: str, *, dataset: str, name
         ax.fill_between(x, np.maximum(lower, np.finfo(float).tiny), upper, color=st.color,
                         alpha=S.BAND_ALPHA, linewidth=0)
     ax.set_yscale("log")
+    # Label 1-2-5 steps in plain seconds: a log axis spanning less than a decade otherwise shows one tick label.
+    ax.yaxis.set_major_locator(mticker.LogLocator(base=10.0, subs=(1.0, 2.0, 5.0)))
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:g}"))
+    ax.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax.set_xlabel(S.axis_label("budget"))
     ax.set_ylabel(S.axis_label("mean_query_latency_s_median"))
-    fig.suptitle(_title(frame, dataset, "per-step cost"), x=0.01, ha="left", fontsize=S.FONT_SIZES["title"])
+    # Single-column figure: wrap the title, and carry the G1 caveat as the legend's title so the constrained
+    # layout reserves room for both (a separate supxlabel collided with the legend below the axes).
+    fig.suptitle(textwrap.fill(_title(frame, dataset, "per-step cost"), LATENCY_WRAP), x=0.01, ha="left",
+                 fontsize=S.FONT_SIZES["title"])
     handles, labels = ax.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside right center", frameon=False, fontsize=S.FONT_SIZES["legend"])
-    fig.supxlabel(LATENCY_NOTE, x=0.01, ha="left", fontsize=S.FONT_SIZES["annotation"], alpha=0.75)
+    fig.legend(handles, labels, loc="outside lower center", ncol=min(2, len(series)), frameon=False,
+               fontsize=S.FONT_SIZES["legend"], title=textwrap.fill(LATENCY_NOTE, LATENCY_WRAP),
+               title_fontsize=S.FONT_SIZES["annotation"])
     return S.save_figure(fig, out_dir, name)
 
 

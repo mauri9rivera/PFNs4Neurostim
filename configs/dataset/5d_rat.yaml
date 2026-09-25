@@ -1,9 +1,19 @@
-# 5D rat motor-cortex stimulation dataset (4x4x3x32x8-style condition grids).
-# Larger candidate pool (~2048 conditions) than the 2D grids; used for the
-# scalability arm of Hyp A and as the second in-vivo arm of the Hyp B sweeps.
-# All six valid subjects are evaluated (no train/held-out split; subject 6 is a loader placeholder).
+# 5D rat motor-cortex stimulation dataset: 2048 conditions over
+# [pulse width, frequency, train duration, x_ch, y_ch]. A far larger candidate pool
+# than the 2D grids, so this is the scalability arm of Hyp A and the second in-vivo
+# arm of the Hyp B sweeps.
+#
+# COHORT noOutliers-2026-09-25 (data/loaders/rat_5d.py). Five animals, indexed in
+# loader order: 0 rCer1.5, 1 BCI00, 2 rCer1.12, 3 rCer1.14, 4 rCer1.15 — 17 channels
+# in total. The previous cohort had six animals including rData03, so every index
+# below it shifted down by one and results from before this date are NOT comparable.
+# Validity now comes from the recording lab: valid_own per repetition and
+# flag_valid_emg per EMG channel, instead of our own 2-SD outlier rule and the
+# hand-maintained valid_emg_idx lists.
+#
+# All five subjects are evaluated (no train/held-out split; see splits.py).
 name: 5d_rat
-subjects: [0, 1, 2, 3, 4, 5]
+subjects: [0, 1, 2, 3, 4]
 emgs: all
 data_root: ./data
 normalization: pfn   # data/preprocessing.py NORMALIZATIONS; pfn = MinMax X, z-scored y

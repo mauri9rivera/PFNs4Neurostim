@@ -6,9 +6,14 @@ per site. Every experiment in the package consumes :class:`ChannelData` and
 nothing else, so a stressed channel, a synthetic channel and a real channel are
 interchangeable.
 
-**Migration seam.** ``_load_legacy_subject`` is the only caller of
-:mod:`pfns4neurostim.data.legacy_io` (raw ``.mat`` loading); preprocessing is native
-(:mod:`pfns4neurostim.data.preprocessing`).
+**Loading seam.** Raw ``.mat`` access goes through
+:func:`pfns4neurostim.data.loaders.load_subject`, which serves ``5d_rat`` from its own
+native module and the remaining datasets from the frozen
+:mod:`pfns4neurostim.data.legacy_io`. Preprocessing is native
+(:mod:`pfns4neurostim.data.preprocessing`). A loader that versions its raw files reports
+a **data cohort**, which this module puts in ``ChannelData.meta['data_cohort']``; the
+runners fold it into the cell-cache identity, so replacing a dataset's raw files
+invalidates that dataset's cached results and nothing else.
 
 **Preprocessing contract (P0.9).** Every model sees the *same* preprocessing —
 MinMax-scaled coordinates in [0, 1]^D and per-channel z-scored responses
@@ -24,7 +29,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -234,8 +239,8 @@ class ChannelData:
 # ---------------------------------------------------------------------------
 # Legacy seam: pfns4neurostim.data.legacy_io (native split pending, task #1 Step 2)
 # ---------------------------------------------------------------------------
-def _load_legacy_subject(dataset: str, subject: int, data_root: str) -> dict[str, Any]:
-    """Load one subject's raw data dict through the legacy loader.
+def _load_subject(dataset: str, subject: int, data_root: str) -> dict[str, Any]:
+    """Load one subject's raw data dict through the dataset's loader.
 
     Args:
         dataset: Dataset name.
@@ -243,12 +248,12 @@ def _load_legacy_subject(dataset: str, subject: int, data_root: str) -> dict[str
         data_root: Directory holding the raw ``.mat`` trees.
 
     Returns:
-        The legacy data dictionary (keys ``sorted_resp``, ``sorted_respMean``,
+        The raw data dictionary (keys ``sorted_resp``, ``sorted_respMean``,
         ``sorted_isvalid``, ``ch2xy``, ``grid_shape``, ...).
     """
-    from .legacy_io import load_data  # noqa: PLC0415 - seam, intentional
+    from .loaders import load_subject  # noqa: PLC0415 - seam, intentional
 
-    return load_data(dataset, subject, data_root=data_root)
+    return load_subject(dataset, subject, data_root=data_root)
 
 
 def count_emgs(dataset: str, subject: int, data_root: str = DEFAULT_DATA_ROOT) -> int:
@@ -262,7 +267,7 @@ def count_emgs(dataset: str, subject: int, data_root: str = DEFAULT_DATA_ROOT) -
     Returns:
         Number of EMG channels.
     """
-    data = _load_legacy_subject(dataset, subject, data_root)
+    data = _load_subject(dataset, subject, data_root)
     return int(np.asarray(data["sorted_resp"]).shape[1])
 
 
@@ -290,7 +295,7 @@ def load_channel(
             full-mean channel, so ``'split_half'`` raises here with that pointer.
         normalization: Preprocessing mode, a key of
             :data:`pfns4neurostim.data.preprocessing.NORMALIZATIONS`.
-        subject_data: Pre-loaded legacy dict, to avoid re-reading the ``.mat``
+        subject_data: Pre-loaded raw dict, to avoid re-reading the ``.mat``
             file once per EMG.
 
     Returns:
@@ -310,7 +315,7 @@ def load_channel(
             "passes split_half here has not been wired for it yet."
         )
 
-    data = subject_data if subject_data is not None else _load_legacy_subject(
+    data = subject_data if subject_data is not None else _load_subject(
         dataset, subject, data_root
     )
     pre = preprocess_channel(data, emg, normalization)
@@ -334,8 +339,28 @@ def load_channel(
         gt_mode=gt_mode,
         demo="demo2",
         normalization=pre.normalization,
-        meta={"scaler_y": pre.scaler_y, "data_root": data_root},
+        meta=_channel_meta(data, pre.scaler_y, data_root),
     )
+
+
+def _channel_meta(data: Mapping[str, Any], scaler_y: Any, data_root: str) -> dict[str, Any]:
+    """Assemble a channel's provenance, including the raw files' cohort stamp.
+
+    Args:
+        data: The raw subject dictionary.
+        scaler_y: Fitted response scaler.
+        data_root: Directory the raw files were read from.
+
+    Returns:
+        The ``ChannelData.meta`` mapping. ``data_cohort`` and ``subject_key`` appear
+        only for datasets whose loader versions its raw files, so a channel of any
+        other dataset keeps exactly the provenance it had before.
+    """
+    meta: dict[str, Any] = {"scaler_y": scaler_y, "data_root": data_root}
+    for key in ("data_cohort", "subject_key"):
+        if key in data:
+            meta[key] = data[key]
+    return meta
 
 
 def parse_shard(spec: str) -> tuple[int, int]:
@@ -406,7 +431,7 @@ def iter_channels(
     """
     position = 0
     for subject in subjects:
-        data = _load_legacy_subject(dataset, subject, data_root)
+        data = _load_subject(dataset, subject, data_root)
         emg_indices = (
             list(emgs) if emgs is not None else list(range(int(np.asarray(data["sorted_resp"]).shape[1])))
         )

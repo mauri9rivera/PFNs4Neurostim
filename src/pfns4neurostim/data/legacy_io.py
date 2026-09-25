@@ -68,36 +68,6 @@ def _topographic_metadata(ch2xy: np.ndarray, maps: np.ndarray) -> tuple:
     return ch2xy_int, grid_shape
 
 
-def _sort_valid_5drat_reps(resp: np.ndarray) -> np.ndarray:
-    """Flag outlier repetitions for the 5-D rat dataset.
-
-    For each (condition, EMG) pair, a repetition is valid if it is finite and
-    within 2 standard deviations of the per-pair mean across repetitions.
-    Mathematically equivalent to the reference ``sort_valid_5drats`` helper —
-    that implementation re-buckets responses through a ``dim_sizes``-derived
-    grid before applying the same per-condition threshold, but since each row
-    of ``stim_combinations`` is unique, the bucketing is an identity remap and
-    can be skipped entirely.
-
-    Args:
-        resp: Per-repetition responses, shape ``[n_cond, n_emgs, n_reps]``.
-
-    Returns:
-        Binary validity mask, shape ``[n_cond, n_emgs, n_reps]``, dtype int64.
-    """
-    mean = np.nanmean(resp, axis=-1, keepdims=True)  # [n_cond, n_emgs, 1]
-    std = np.nanstd(resp, axis=-1, keepdims=True)  # [n_cond, n_emgs, 1]
-    valid = (~np.isnan(resp)) & (np.abs(resp - mean) <= 2 * std)  # [n_cond, n_emgs, n_reps]
-    sorted_isvalid = valid.astype(np.int64)
-
-    all_invalid = ~sorted_isvalid.any(axis=-1)  # [n_cond, n_emgs]
-    n_all_invalid = int(all_invalid.sum())
-    if n_all_invalid > 0:
-        print(f"[_sort_valid_5drat_reps] {n_all_invalid} (condition, EMG) pairs have all repetitions flagged invalid.")
-
-    return sorted_isvalid
-
-
 def load_data(dataset_type, m_i, data_root: str = './data'):
     '''
     Input:
@@ -395,76 +365,24 @@ def load_data(dataset_type, m_i, data_root: str = './data'):
         }
 
         return subject
-    elif dataset_type == '5d_rat':
-        # 5-D rat motor-cortex stimulation: search space is
-        # (pulse-width, frequency, duration, x-channel, y-channel) — no 2D
-        # electrode grid, so ch2xy holds raw physical coordinates and
-        # grid_shape is None.
-        # Each entry: (filename, emgs_raw, valid_emg_idx). `emgs_raw` lists EMG
-        # channels in the order documented by each subject's README (rCer1.12/
-        # 1.14/1.15: ECR, FCU, Biceps, Triceps, Deltoid). `valid_emg_idx` selects
-        # the channels to keep — excludes channels flagged as artifact-prone in
-        # the README (e.g. rCer1.15 drops Triceps/Deltoid) or undocumented
-        # (BCI00's 5th "unknown" channel). rCer1.14 keeps all 5 despite the
-        # README's blanket recommendation, per user override.
-        subject_map = {
-            0: ('rData03_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left triceps', 'left pectoralis'], [1]),
-            1: ('rCer1.5_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left triceps', 'left biceps'], [0]),
-            2: ('BCI00_5D.mat', ['left extensor carpi radialis', 'biceps', 'triceps', 'left flexor carpi ulnaris', 'unknown'], [0, 1, 2, 3]),
-            3: ('rCer1.12_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left biceps', 'left triceps', 'deltoid'], [0, 1, 3, 4]),
-            4: ('rCer1.14_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left biceps', 'left triceps', 'deltoid'], [0, 1, 2, 3, 4]),
-            5: ('rCer1.15_5D.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left biceps', 'left triceps', 'deltoid'], [0, 1, 2]),
-            # Subject 6: placeholder, intentionally excluded from ALL_SUBJECTS.
-            6: ('5D_step4_noartrej.mat', ['left extensor carpi radialis', 'left flexor carpi ulnaris', 'left biceps', 'left triceps', 'deltoid'], [0, 1, 2, 3, 4]),
-        }
-        filename, emgs_raw, valid_emg_idx = subject_map[m_i]
-        data = scipy.io.loadmat(f'{path_to_dataset}/5d_rat/{filename}')
-
-        resp = data['emg_response']  # [8 reps, n_emgs_raw, n_cond, 4 metrics]
-        resp = resp[:, valid_emg_idx, :, :]  # [8 reps, n_emgs, n_cond, 4 metrics]
-        emgs = [emgs_raw[i] for i in valid_emg_idx]
-        param = data['stim_combinations']  # [n_cond, 7] = [PW, freq, dur, count, chan, x_ch, y_ch]
-
-        # [PW, freq, duration, x_ch, y_ch] in raw physical units.
-        ch2xy = param[:, [0, 1, 2, 5, 6]].astype(np.float64)  # [n_cond, 5]
-
-        peak_resp = resp[:, :, :, 0]  # [8 reps, n_emgs, n_cond] — peak-EMG metric
-        sorted_resp = peak_resp.transpose(2, 1, 0)  # [n_cond, n_emgs, n_reps]
-
-        sorted_isvalid = _sort_valid_5drat_reps(sorted_resp)
-
-        masked_resp = np.ma.masked_where(sorted_isvalid == 0, sorted_resp)
-        sorted_respMean = masked_resp.mean(axis=-1)
-        sorted_respSD = masked_resp.std(axis=-1)
-        sorted_respSD = np.ma.filled(sorted_respSD, fill_value=0.0)
-        sorted_respMean = np.ma.filled(sorted_respMean, fill_value=0.0)
-
-        n_cond = sorted_resp.shape[0]
-
-        return {
-            'emgs': emgs,
-            'nChan': n_cond,
-            'sorted_isvalid': sorted_isvalid,
-            'sorted_resp': sorted_resp,
-            'sorted_respMean': sorted_respMean,
-            'sorted_respSD': sorted_respSD,
-            'ch2xy': ch2xy,
-            'grid_shape': None,
-            'DimSearchSpace': n_cond,
-        }
     else:
-        raise ValueError('The dataset type should be 5d_rat, nhp, rat or spinal' )
+        raise ValueError(
+            f'legacy_io.load_data does not serve {dataset_type!r}; it serves nhp, rat and '
+            'spinal. 5d_rat moved to data/loaders/rat_5d.py with the noOutliers cohort '
+            '(2026-09-25). Load any dataset through data.loaders.load_subject.'
+        )
 
 
 # ============================================
 #      Held-Out / Train Subject Splits
 # ============================================
 
-# 5d_rat: TRAIN = rData03, BCI00, rCer1.12 (0, 2, 3); HELD_OUT = rCer1.5, rCer1.14,
-# rCer1.15 (1, 4, 5). Subject 6 (5D_step4_noartrej) remains a placeholder, excluded.
-HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [1], 'spinal': [0, 2, 5, 9], '5d_rat': [1, 4, 5]}
-TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 3], 'spinal': [1, 3, 4, 6, 7, 8, 10], '5d_rat': [0, 2, 3]}
-ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 3], 'spinal': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], '5d_rat': [0, 1, 2, 3, 4, 5]}
+# 5d_rat indices follow data.loaders.rat_5d.SUBJECTS (cohort noOutliers-2026-09-25):
+# 0 rCer1.5, 1 BCI00, 2 rCer1.12, 3 rCer1.14, 4 rCer1.15. rData03 left the cohort, so
+# every index below it shifted down by one. TRAIN = BCI00, rCer1.12; HELD_OUT = the rest.
+HELD_OUT_SUBJECTS = {'rat': [0, 5], 'nhp': [1], 'spinal': [0, 2, 5, 9], '5d_rat': [0, 3, 4]}
+TRAIN_SUBJECTS = {'rat': [1, 2, 3, 4], 'nhp': [0, 3], 'spinal': [1, 3, 4, 6, 7, 8, 10], '5d_rat': [1, 2]}
+ALL_SUBJECTS = {'rat': [0, 1, 2, 3, 4, 5], 'nhp': [0, 1, 3], 'spinal': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], '5d_rat': [0, 1, 2, 3, 4]}
 
 
 def generate_experiment_tag(

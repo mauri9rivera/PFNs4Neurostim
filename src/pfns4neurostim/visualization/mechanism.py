@@ -67,7 +67,7 @@ def _f1_exemplar(run_dir: str) -> list[str]:
         grid[ch2xy[:, 0], ch2xy[:, 1]] = vec / np.max(np.abs(vec))
         maps.append(grid)
     maps.append(maps[0] - maps[1])
-    fig, axes = style.figure("double", ncols=3, aspect=style.SINGLE_PANEL_ASPECT)
+    fig, axes = style.figure("double", ncols=3)
     titles = (arm_style(str(ex["engine"])).label, style.model_label("gp_mll"), "Difference")
     a = int(ex["anchor"])
     for ax, grid, title in zip(axes, maps, titles):
@@ -111,7 +111,7 @@ def _f2_shape_vs_context(cell: pd.DataFrame, run_dir: str, gates: list[dict[str,
 def _f3_surprise(surprise: pd.DataFrame, run_dir: str) -> list[str]:
     """F3: update at the anchor vs surprise, one panel per stress level (H10.2)."""
     levels = sorted(surprise["level"].unique())
-    fig, axes = style.figure("double", ncols=len(levels), aspect=style.SINGLE_PANEL_ASPECT, sharey=True)
+    fig, axes = style.figure("double", ncols=len(levels), sharey=True)
     axes = np.atleast_1d(axes)
     df = surprise.assign(
         d_norm=surprise["d_anchor"] / surprise["base_sd_anchor"],
@@ -151,7 +151,7 @@ def _f4_lengthscale(anchor: pd.DataFrame, run_dir: str) -> list[str]:
 def _f5_kernel_properties(cell: pd.DataFrame, run_dir: str) -> list[str]:
     """F5: implied-kernel properties per engine (symmetry, PSD, stationarity)."""
     metrics = [m for m in ("sym_err", "psd_neg_mass", "ell_cv_anchor") if m in cell]
-    fig, axes = style.figure("double", ncols=len(metrics), aspect=style.SINGLE_PANEL_ASPECT)
+    fig, axes = style.figure("double", ncols=len(metrics))
     axes = np.atleast_1d(axes)
     engines = sorted(cell["engine"].unique())
     for ax, metric in zip(axes, metrics):
@@ -197,7 +197,7 @@ def render_update_rule(run_dir: str) -> list[str]:
 
 def _f6_layer_alignment(layers: pd.DataFrame, run_dir: str) -> list[str]:
     """F6 (secondary): layer alignment curve and the distribution of ``layer_peak``."""
-    fig, axes = style.figure("onehalf", ncols=2, aspect=style.SINGLE_PANEL_ASPECT)
+    fig, axes = style.figure("onehalf", ncols=2)
     st = arm_style("tabpfn_v2_5")
     for ax, col in zip(axes, ("layer_corr", "layer_probe_r2")):
         agg = layers.groupby("layer")[col]
@@ -239,7 +239,7 @@ def render_placement(run_dir: str) -> list[str]:
     df = pd.read_csv(path_b)
     metrics = sorted(df["metric"].unique())
     pairs = [(k, lbl) for k, lbl in PLACEMENT_PAIRS if f"p_{k}" in df]
-    fig, axes = style.figure("double", nrows=len(metrics), ncols=len(pairs), aspect=style.STACKED_ASPECT,
+    fig, axes = style.figure("double", nrows=len(metrics), ncols=len(pairs),
                              squeeze=False, sharex=True)
     rng = np.random.default_rng(0)
     for r, metric in enumerate(metrics):
@@ -271,7 +271,7 @@ def render_placement(run_dir: str) -> list[str]:
         if not ctx.empty:
             ctx = ctx[~ctx["is_full"].astype(bool)]
             levels = sorted(ctx["level"].unique())
-            fig, axes = style.figure("onehalf", ncols=len(metrics), aspect=style.SINGLE_PANEL_ASPECT, squeeze=False)
+            fig, axes = style.figure("onehalf", ncols=len(metrics), squeeze=False)
             for ax, metric in zip(axes[0], metrics):
                 sub = ctx[ctx["metric"] == metric]
                 for i, level in enumerate(levels):
@@ -304,7 +304,7 @@ def render_cka(run_dir: str) -> list[str]:
         df = pd.read_csv(path_a)
         targets = [t for t in ("K_GT", "K_GP", "K_GT_linear", "K_X") if t in set(df["target"])]
         levels = sorted(df["level"].unique())
-        fig, axes = style.figure("double", ncols=len(targets), aspect=style.SINGLE_PANEL_ASPECT,
+        fig, axes = style.figure("double", ncols=len(targets),
                                  sharey=True, squeeze=False)
         base = style.model_color("tabpfn_v2_5")
         for ax, target in zip(axes[0], targets):

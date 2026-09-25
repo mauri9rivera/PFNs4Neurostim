@@ -3,6 +3,7 @@
 # by the login node's per-process memory limit (observed 2026-09-20: "Killed" while collecting repodata).
 #
 #   sbatch scripts/setup_env_job.sh bench     # builds pfns4neurostim-bench from environment.bench.yml (default)
+#   sbatch scripts/setup_env_job.sh v1        # builds pfns4neurostim-v1 from environment.v1.yml (TabPFN v1, tabpfn<2)
 #   sbatch scripts/setup_env_job.sh main      # (re)builds the main env from environment.yml
 #
 # Submodules are cloned separately on the login node (git is light): bash scripts/mila_setup.sh submodules

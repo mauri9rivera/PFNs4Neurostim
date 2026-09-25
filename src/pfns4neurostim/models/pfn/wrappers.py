@@ -18,7 +18,8 @@ TabFM         py>=3.11   ``libs/tabfm``. Native regressor, but ``predict`` retur
 PFNs4BO       **yes**    Vendored checkpoint. An end-to-end BO model: it owns the query decision
                          (its acquisition criterion, computed inside the network), exposed as
                          a *native policy* that the ``native`` acquisition type delegates to.
-TabPFN v1     pending    Needs ``tabpfn<2``, which cannot coexist with the pinned 6.3.2.
+TabPFN v1     env v1     ``tabpfn<2``; classification-head adaptation capped at 10 bins.
+                         Own env (``environment.v1.yml``): v1 and 6.3.2 share the module name.
 Mitra         pending    Needs AutoGluon; predictive-distribution access unconfirmed.
 ============  =========  ==============================================================
 
@@ -244,15 +245,32 @@ class TabFlexSurrogate(BucketizedClassifierSurrogate):
         )
 
 
-class TabFMSurrogate(ExternalSurrogate):
-    """Google TabFM surrogate — native regression, uncertainty from ensemble spread.
+#: Predictive-SD constructions of :class:`TabFMSurrogate` (TabFM itself emits a point prediction only).
+TABFM_PREDICTIVE_SD: tuple[str, ...] = ("spread_oof", "spread")
 
-    ``TabFMRegressor.predict`` returns point predictions only. The wrapper therefore
-    derives a standard deviation from the spread across ensemble members
-    (``_predict_internal`` returns one row per member). **This is a proxy, not a
-    calibrated predictive distribution**, and must be labelled as such wherever
-    TabFM's calibration metrics appear; with ``n_estimators=1`` there is no spread
-    at all, so the wrapper requires at least two members.
+
+class TabFMSurrogate(ExternalSurrogate):
+    """Google TabFM surrogate — native point regression with a constructed predictive SD.
+
+    TabFM's regression head emits **one value per row** (``_check_regressor_output_dim``): it is a
+    point regressor, trained and ranked (TabArena) on point accuracy, with no predictive distribution.
+    BO needs one, so the wrapper builds a Gaussian marginal around upstream's own point prediction:
+
+    * **mean** = ``TabFMRegressor._combine_predictions`` of the members, i.e. exactly what
+      ``predict`` returns, in the caller's response scale. Upstream standardizes ``y`` on the
+      context internally; the members of ``_predict_internal`` live in that internal scale and must
+      be inverse-transformed (before 2026-09-25 they were not, so R^2 / NLL / CRPS / coverage were
+      computed on the wrong scale; the argmax-based BO choices were unaffected).
+    * **std** (``predictive_sd``):
+
+      - ``'spread'``: disagreement across ensemble members only. The members are deterministic
+        views of the same context (feature order x ``none``/``power`` normalization), so with two
+        features there are at most four distinct views and the spread is near zero: Thompson
+        sampling then collapses to greedy exploitation (90% coverage 0.04 on NHP, 2026-09-24).
+      - ``'spread_oof'`` (default): ``sqrt(spread^2 + s_oof^2)``, where ``s_oof`` is the RMSE of
+        upstream's out-of-fold predictions of the context (``_compute_oof_preds_scaled``, k-fold,
+        k = min(``oof_folds``, n)). A homoscedastic residual scale, the same idea as split-conformal
+        intervals; still a constructed SD, not the model's own, and must be labelled so (G3).
 
     Requires Python >= 3.11 (upstream declaration), so it cannot run in the
     project's pinned 3.9 environment.
@@ -261,10 +279,15 @@ class TabFMSurrogate(ExternalSurrogate):
         device: Torch device string (TabFM also has a JAX backend).
         n_estimators: Ensemble members; must be >= 2 for a usable spread.
         tabfm_backend: ``'torch'`` (default) or ``'jax'`` upstream checkpoint implementation.
+        predictive_sd: ``'spread_oof'`` (default) or ``'spread'``.
+        oof_folds: Folds of the out-of-fold residual estimate (capped at the context size).
+        batch_size: Ensemble members per forward pass, passed to ``TabFMRegressor``; ``0`` = all at
+            once. Upstream's default of 1 runs the members one by one: measured 2026-09-25 on NHP,
+            0 is 2.7x faster per BO step and makes the 5-fold OOF estimate cost ~30% over the old step.
         **backend_kwargs: Forwarded to ``TabFMRegressor``.
 
     Raises:
-        ValueError: If ``n_estimators`` < 2.
+        ValueError: If ``n_estimators`` < 2, ``oof_folds`` < 2 or ``predictive_sd`` is unknown.
     """
 
     #: Loaded checkpoints, shared across instances (one per backend and device).
@@ -275,19 +298,29 @@ class TabFMSurrogate(ExternalSurrogate):
         device: str = "cpu",
         n_estimators: int = 8,
         tabfm_backend: str = "torch",
+        predictive_sd: str = "spread_oof",
+        oof_folds: int = 5,
+        batch_size: int = 0,
         **backend_kwargs: Any,
     ) -> None:
         if tabfm_backend not in ("torch", "jax"):
             raise ValueError(f"tabfm_backend must be 'torch' or 'jax', got {tabfm_backend!r}.")
+        if predictive_sd not in TABFM_PREDICTIVE_SD:
+            raise ValueError(f"predictive_sd must be one of {TABFM_PREDICTIVE_SD}, got {predictive_sd!r}.")
+        if oof_folds < 2:
+            raise ValueError(f"oof_folds must be >= 2, got {oof_folds}.")
         if n_estimators < 2:
             raise ValueError(
                 "TabFMSurrogate needs n_estimators >= 2: its only uncertainty signal is "
                 "the spread across ensemble members, which is identically zero for one."
             )
-        super().__init__("tabfm", device=device, **backend_kwargs)
+        super().__init__("tabfm", device=device, batch_size=int(batch_size), **backend_kwargs)
         self.tabfm_backend = tabfm_backend
         self.n_estimators = int(n_estimators)
+        self.predictive_sd = predictive_sd
+        self.oof_folds = int(oof_folds)
         self._model: Any = None
+        self._oof_sd: float = 0.0
 
     def _fit_backend(self, X: np.ndarray, y: np.ndarray) -> None:
         """Fit a fresh TabFM regressor on the observed context.
@@ -300,6 +333,30 @@ class TabFMSurrogate(ExternalSurrogate):
         del backend
         self._model = self._regressor(self._load_checkpoint())
         self._model.fit(X, y)
+        self._oof_sd = self._oof_residual_sd(y) if self.predictive_sd == "spread_oof" else 0.0
+
+    def _oof_residual_sd(self, y: np.ndarray) -> float:
+        """RMSE of upstream's out-of-fold predictions of the context, in the response scale.
+
+        Args:
+            y: Observed responses, shape [n].
+
+        Returns:
+            The residual scale ``s_oof`` (0.0 for a context too small to split).
+
+        Raises:
+            RuntimeError: If the out-of-fold predictions are non-finite.
+        """
+        n = int(y.shape[0])
+        if n < 2:
+            return 0.0
+        scaled, val_idx = self._model._compute_oof_preds_scaled(cv=min(self.oof_folds, n))   # [E, n]
+        pred = np.asarray(self._model._combine_predictions(np.asarray(scaled, dtype=np.float64)))  # [n]
+        idx = np.arange(n) if val_idx is None else np.asarray(val_idx)
+        resid = np.asarray(y, dtype=np.float64)[idx] - pred[idx]                             # [n_val]
+        if not np.isfinite(resid).all():
+            raise RuntimeError(f"TabFM out-of-fold predictions are non-finite (n={n}).")
+        return float(np.sqrt(np.mean(resid ** 2)))
 
     def _load_checkpoint(self) -> Any:
         """Load the TabFM regression checkpoint once per process and backend.
@@ -339,20 +396,22 @@ class TabFMSurrogate(ExternalSurrogate):
         return TabFMRegressor(model=model, n_estimators=self.n_estimators, **self.backend_kwargs)
 
     def _predict_backend(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return the ensemble mean and the across-member spread.
+        """Return upstream's point prediction and the constructed predictive SD.
 
         Args:
             X: Candidate coordinates, shape [N, D].
 
         Returns:
-            ``(mean, std)``, each shape [N]; ``std`` is ensemble disagreement.
+            ``(mean, std)``, each shape [N], in the response scale passed to ``fit``.
         """
-        members = np.asarray(self._model._predict_internal(X), dtype=np.float64)   # [E, N]
-        if members.ndim == 1:
-            members = members[None, :]
-        mean = members.mean(axis=0)                                                # [N]
-        std = members.std(axis=0, ddof=1) if members.shape[0] > 1 else np.zeros_like(mean)
-        # A zero spread would make EI and TS degenerate, so floor it at a small
+        scaled = np.asarray(self._model._predict_internal(X), dtype=np.float64)    # [E, N], upstream's z-scale
+        if scaled.ndim == 1:
+            scaled = scaled[None, :]
+        mean = np.asarray(self._model._combine_predictions(scaled), dtype=np.float64)  # [N], == predict(X)
+        members = np.stack([self._model._inverse_transform_y(m) for m in scaled])      # [E, N], response scale
+        spread = members.std(axis=0, ddof=1) if members.shape[0] > 1 else np.zeros_like(mean)  # [N]
+        std = np.sqrt(spread ** 2 + self._oof_sd ** 2)                                  # [N]
+        # A zero SD would make EI and TS degenerate, so floor it at a small
         # fraction of the response scale rather than returning a fake certainty.
         floor = 1e-6 * max(float(np.ptp(mean)), 1.0)
         return mean, np.maximum(std, floor)
@@ -501,36 +560,87 @@ class PFNs4BOSurrogate(ExternalSurrogate):
 class TabPFNv1Surrogate(BucketizedClassifierSurrogate):
     """TabPFN v1 as a bucketized regressor (classification-head adaptation).
 
-    The adaptation is specified in ``docs/tabpfn_v1_adaptation.md``; what blocks it
-    is packaging, not design: v1 needs ``tabpfn<2``, which cannot coexist with the
-    pinned ``tabpfn==6.3.2`` used for TabPFN v2.5, so it requires its own
-    environment.
+    v1 is a **classifier**: no regression head and no bar distribution — those arrive
+    in v2. The standardized response is therefore binned into ``n_bins`` equal-mass
+    quantile bins, ``TabPFNClassifier`` is fitted on the bin labels, and its class
+    probabilities are read back as a piecewise-uniform density over the response axis
+    (:mod:`~pfns4neurostim.models.pfn.bar_distribution`). Full spec:
+    ``docs/tabpfn_v1_adaptation.md``.
+
+    **Every v1 row must be labelled "classification-head adaptation".** v1's
+    architecture emits at most :attr:`MAX_CLASSES` = 10 classes, so no prediction can
+    be sharper than one bin: on a standardized response the predictive SD cannot fall
+    below roughly ``range / (10 * sqrt(12)) ~ 0.03 * range``. That floor is a property
+    of ``n_bins``, not of the model, so v1's ECE and coverage are reported next to the
+    bin count and are **not** ranked against TabPFN v2.5's native bar distribution.
+    EI/UCB/Thompson need only a mean and an SD, both of which survive binning, so the
+    *optimization* comparison is the one to lead with.
+
+    **Environment.** v1 needs ``tabpfn<2``, which cannot coexist with the pinned
+    ``tabpfn==6.3.2``: both own the module name ``tabpfn``. It runs in
+    ``pfns4neurostim-v1`` (``environment.v1.yml``); ``external._backend_ok`` compares the
+    installed major version, so a v1 run launched in the wrong environment fails
+    immediately instead of silently benchmarking v2.5 twice.
+
+    Upstream keeps loaded checkpoints in a class-level ``models_in_memory`` cache keyed
+    by ``(model_index, device)``, so constructing one classifier per BO step re-reads
+    nothing from disk after the first.
 
     Args:
         device: Torch device string.
-        n_bins: Number of response bins (v1 supports at most 10 classes, so this
-            is capped at 10 by the adaptation spec).
-        **backend_kwargs: Forwarded to ``TabPFNClassifier``.
+        n_bins: Number of response bins K; at most :attr:`MAX_CLASSES`. Defaults to 10
+            (v1's ceiling) rather than the 32 used for backends without one.
+        n_ensemble_configurations: Upstream's ``N_ensemble_configurations`` — how many
+            feature/class permutations v1 averages over per prediction.
+        seed: Upstream's ``seed``, which drives those permutations. Fixed by default so
+            a repetition is reproducible.
+        **backend_kwargs: Forwarded verbatim to ``TabPFNClassifier``.
     """
 
-    def __init__(self, device: str = "cpu", n_bins: int = 10, **backend_kwargs: Any) -> None:
+    #: v1's architectural class ceiling (100 features, 1024 context rows, 10 classes).
+    MAX_CLASSES: int = 10
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        n_bins: int = 10,
+        n_ensemble_configurations: int = 3,
+        seed: int = 0,
+        **backend_kwargs: Any,
+    ) -> None:
         super().__init__("tabpfn_v1", device=device, n_bins=n_bins, **backend_kwargs)
+        self.n_ensemble_configurations = int(n_ensemble_configurations)
+        self.seed = int(seed)
 
     def _make_classifier(self) -> Any:
-        """Construct the v1 classifier. **Not implemented.**
+        """Construct the v1 classifier.
 
         Returns:
-            A ``tabpfn.TabPFNClassifier`` (v1 API) once the isolated env exists.
-
-        Raises:
-            NotImplementedError: Needs the ``tabpfn<2`` environment; see
-                ``docs/tabpfn_v1_adaptation.md``.
+            A ``tabpfn.TabPFNClassifier`` (the v1 API; v2+ has no such class, which is
+            why the version gate in :mod:`~pfns4neurostim.models.pfn.external` runs first).
         """
-        raise NotImplementedError(
-            "TabPFNv1Surrogate needs an environment with tabpfn<2, which cannot coexist "
-            "with the pinned tabpfn 6.3.2. The adaptation itself is specified in "
-            "docs/tabpfn_v1_adaptation.md; only the packaging is outstanding."
+        from tabpfn import TabPFNClassifier  # noqa: PLC0415 - the v1 API, isolated env
+
+        return TabPFNClassifier(
+            device=self.device,
+            N_ensemble_configurations=self.n_ensemble_configurations,
+            seed=self.seed,
+            **self.backend_kwargs,
         )
+
+    def _fit_classifier(self, classifier: Any, X: np.ndarray, labels: np.ndarray) -> None:
+        """Fit v1 on the bin labels, silencing its soft context-size warning.
+
+        v1 refuses a context of more than 1024 rows unless ``overwrite_warning`` is set.
+        Our budgets are far below that, but the flag is passed explicitly so a larger
+        budget does not turn into a late failure inside a BO loop.
+
+        Args:
+            classifier: The ``TabPFNClassifier``.
+            X: Observed coordinates, shape [n, D].
+            labels: Bin indices, shape [n].
+        """
+        classifier.fit(X, labels, overwrite_warning=True)
 
 
 class MitraSurrogate(ExternalSurrogate):

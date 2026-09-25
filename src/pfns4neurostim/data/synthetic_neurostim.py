@@ -348,7 +348,9 @@ def synthetic_channels(
         normalization: Preprocessing mode.
 
     Yields:
-        Synthetic :class:`ChannelData` with ``meta['source_label']`` set.
+        Synthetic :class:`ChannelData` with ``meta['source_label']`` set, and the source
+        channel's ``data_cohort`` when it has one: a twin is a fit to recorded data, so
+        replacing those raw files must invalidate the twin's cached cells too.
     """
     for real in real_channels:
         params = fit_generator_to_channel(real, n_hotspots=n_hotspots)
@@ -360,7 +362,10 @@ def synthetic_channels(
             emg=real.emg,
             normalization=normalization,
         )
-        yield replace(synth, meta={**synth.meta, "source_label": real.label})
+        meta = {**synth.meta, "source_label": real.label}
+        if "data_cohort" in real.meta:
+            meta["data_cohort"] = real.meta["data_cohort"]
+        yield replace(synth, meta=meta)
 
 
 def morans_i(values: np.ndarray, coords: np.ndarray) -> float:

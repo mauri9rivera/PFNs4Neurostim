@@ -34,9 +34,13 @@ git checkout scripts/mila_setup.sh && git pull          # drop the hand-copied f
 bash scripts/mila_setup.sh install                      # editable install into the MAIN env
 # 2. bench env (Python 3.11: TabICL, TabFM) - ~10-20 min, only needed for the D3 PFN benchmark
 sbatch scripts/setup_env_job.sh bench                 # NOT on the login node: conda is killed there (memory limit)
+# 2b. v1 env (tabpfn<2: TabPFN v1) - only needed for portfolio units E7/E8
+sbatch scripts/setup_env_job.sh v1
 bash scripts/mila_setup.sh submodules                   # libs/tabicl + libs/tabfm are used from the submodules via sys.path
 # 3. smoke-test the bench env on a login node (no GPU needed for the import checks)
 module load anaconda/3 && conda run -n pfns4neurostim-bench python -c "from pfns4neurostim.models.pfn.external import availability; print(availability())"
+#    the v1 env must report tabpfn_v1 True and tabpfn_v2_5's backend absent - if it reports the opposite, tabpfn 6.3.2 leaked in
+module load anaconda/3 && conda run -n pfns4neurostim-v1 python -c "from pfns4neurostim.models.pfn.external import availability; print(availability())"
 # 4. calibrate TabFM (unmeasured, GPU only): 2 reps of one channel
 CONDA_ENV=pfns4neurostim-bench sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabfm]" dataset.subjects=[1] dataset.emgs=[0] n_reps=2
 # 5. submit every deliverable but spinal (core), then the externals when you choose (TabICL, TabFM, PFNs4BO)
@@ -54,9 +58,42 @@ bash scripts/submit_externals.sh
 | `bo_benchmark` with TabPFN-2.5 / GP / Random (`hyp_a_*`, `hyp0_acq_table_*`) | `pfns4neurostim` (3.9) | pinned stack |
 | `stress_sweep` (K2, K5, K6) | `pfns4neurostim` (3.9) | pinned stack |
 | `bo_benchmark` with TabICL v2 / TabFM (`hyp0_pfn_bench_*`) | `pfns4neurostim-bench` (3.11) | TabICL needs >= 3.10, TabFM >= 3.11 (TabFlex dropped: dead weight host) |
-| TabPFN v1, Mitra | not yet | deferred (own env / AutoGluon) |
+| `bo_benchmark` with TabPFN v1 (`hyp0_pfn_bench_*`, units E7/E8) | `pfns4neurostim-v1` | `tabpfn<2` and the pinned `tabpfn` 6.3.2 own the same module name |
+| Mitra | not yet | deferred (AutoGluon) |
 
-`scripts/run_*.sh` select the env with `CONDA_ENV` (default `pfns4neurostim`).
+`scripts/run_*.sh` select the env with `CONDA_ENV` (default `pfns4neurostim`). The authoritative
+record of model -> env is `ExternalSpec.env` in `models/pfn/external.py`, not this table; an
+availability failure names the env to activate.
+
+## 3b. Replacing a dataset cohort (5d_rat, 2026-09-25)
+
+`data/5d_rat` moved to the `noOutliers` cohort: one directory per animal, validity from the lab's
+own `valid_own` / `flag_valid_emg`, `rData03` dropped (so **every subject index below it shifted
+down by one**). Every 5d_rat number computed before that date is stale.
+
+As of 2026-09-25 the `$ARCHIVE` master holds no `data/` at all and `$SCRATCH/pfns4neurostim/data/5d_rat`
+holds the OLD flat files, so the new cohort is uploaded from your machine (WSL, reusing the control socket),
+to the ARCHIVE master and to the working copy:
+
+```bash
+wsl -e bash -lc 'cd /mnt/c/workspace/PFNs4Neurostim && rsync -a -e "ssh -S $HOME/.ssh/cm-mila.sock" data/5d_rat/ mila:/network/archive/m/mauricio.rivera/pfns4neurostim/data/5d_rat/'
+wsl -e bash -lc 'cd /mnt/c/workspace/PFNs4Neurostim && rsync -a -e "ssh -S $HOME/.ssh/cm-mila.sock" data/5d_rat/ mila:/network/scratch/m/mauricio.rivera/pfns4neurostim/data/5d_rat/'
+```
+
+Then on the login node, from the repo root, after `git pull`:
+
+```bash
+bash scripts/clean_mila_results.sh
+bash scripts/clean_mila_results.sh --apply
+```
+
+`clean_mila_results.sh` checks that this checkout carries the cohort stamp and that every animal directory
+of the new cohort is present (it refuses `--apply` otherwise), then (1) moves the old flat files out of
+`data/5d_rat` into `data/_retired/`, (2) runs `retire_dataset_cohort.py` (stale cells deleted, run data
+quarantined, figures left as a proxy) and (3) runs `prune_results.py` (results the code can no longer
+request, archived under `output/archive/<stamp>-pruned/`). Steps 2-3 are cleanup, not correctness: the
+cohort stamp is part of every 5d_rat cell's identity, so a stale cell can never be returned as a hit.
+Every step is idempotent, and the dry run comes first on purpose.
 
 ## 4. Submitting (you run these)
 
@@ -122,7 +159,8 @@ Run directories are `output/benchmark/<dataset>/<family>-<tag>/` and
 
 Other state observed on the cluster: the checkout is at commit `1bf4a0a` (stale); the main env
 `pfns4neurostim` exists (torch 2.5.1+cu118); **`pfns4neurostim-bench` does not exist yet**; data
-present: `monkeys/` (4 subjects) and `5d_rat/` (6 subjects), no `rat/` or `spinal/`; `$SCRATCH` holds
+present: `monkeys/` (4 subjects) and `5d_rat/` (the pre-2026-09-25 cohort, 6 subjects — restage it for the
+5-subject `noOutliers` cohort), no `rat/` or `spinal/`; `$SCRATCH` holds
 only 372 MB. A stray `slurm-10848085.out` in the repo root is from an interactive allocation that
 hit its 30-minute limit, not from a sweep.
 

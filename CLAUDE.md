@@ -5,9 +5,10 @@
 @.claude/task_plan.md
 
 The following files are loaded on demand:
-- `.claude/roadmap.md` — load when ultrathink is specified
-- `.claude/research_design.md` — load when the user explicitly requests it
-- `.claude/research_design_log.md` — dated design decisions (formerly research_design.md §4); load alongside research_design.md when decision history matters
+
+- `.research_assistant/roadmap.md` — load when ultrathink is specified
+- `.research_assistant/research_design.md` — load when the user explicitly requests it
+- `.research_assistant/research_design_log.md` — dated design decisions (formerly research_design.md §4); load alongside research_design.md when decision history matters
 
 ---
 
@@ -66,7 +67,11 @@ metrics.
 | Matplotlib | 3.9.2 |
 | Seaborn | 0.13.2 |
 
-**Environment:** `conda activate pfns4neurostim` (see `environment.yml`)
+**Environment:** `conda activate pfns4neurostim` (see `environment.yml`). Two more exist for
+benchmark models whose pins cannot coexist with the main ones: `pfns4neurostim-bench`
+(`environment.bench.yml`, Python 3.11 — TabICL, TabFM) and `pfns4neurostim-v1`
+(`environment.v1.yml`, `tabpfn<2` — TabPFN v1). `ExternalSpec.env` in
+`models/pfn/external.py` is the single record of which model runs where.
 
 **Experiment tracking:** Local CSV + pickle files under `output/runs/<tag>/`. No W&B or MLflow.
 
@@ -192,7 +197,7 @@ PFNs4Neurostim/
     │   ├── synthetic_neurostim.py ← Demo 1 generator: fitted, SNR-matched synthetic twins (S0)
     │   ├── ground_truth.py      ← full_mean | split_half GT instances + reliability (P0.7)
     │   ├── references/          ← prior bag + noise banks, on-grid interpolation (grid.py) for placement
-    │   └── legacy_io.py         ← pre-restructure loader; being carved into loaders/preprocessing
+    │   └── legacy_io.py         ← frozen pre-restructure loader (nhp · rat · spinal); 5d_rat carved out 2026-09-25
     ├── models/
     │   ├── protocol.py          ← SurrogateModel + SurrogateAdapter (+ LegacySurrogateModel)
     │   ├── registry.py          ← name → constructor + version string (P0.1)
@@ -232,14 +237,17 @@ package, so it can never introduce a cycle.
 ### Split Constants (`data/splits.py`)
 
 ```python
-HELD_OUT_SUBJECTS = {'rat': (0, 5), 'nhp': (1,), 'spinal': (0, 2, 5, 9), '5d_rat': (1, 4, 5)}
-TRAIN_SUBJECTS    = {'rat': (1, 2, 3, 4), 'nhp': (0, 3), ...}
-ALL_SUBJECTS      = {'rat': (0, 1, 2, 3, 4, 5), 'nhp': (0, 1, 3), ...}
+HELD_OUT_SUBJECTS = {'rat': (0, 5), 'nhp': (1,), 'spinal': (0, 2, 5, 9), '5d_rat': (0, 3, 4)}
+TRAIN_SUBJECTS    = {'rat': (1, 2, 3, 4), 'nhp': (0, 3), ..., '5d_rat': (1, 2)}
+ALL_SUBJECTS      = {'rat': (0, 1, 2, 3, 4, 5), 'nhp': (0, 1, 3), ..., '5d_rat': (0, 1, 2, 3, 4)}
 # NHP subject 2 excluded — pure noise signal
+# 5d_rat indices are positions in data/loaders/rat_5d.py::SUBJECTS (cohort noOutliers-2026-09-25):
+# 0 rCer1.5, 1 BCI00, 2 rCer1.12, 3 rCer1.14, 4 rCer1.15 — 17 channels. rData03 left the cohort
+# on 2026-09-25, so every index below it shifted down by one.
 ```
 
 **Policy change (2026-09-20): there is no train/held-out split any more.** Every valid subject
-(`ALL_SUBJECTS`: NHP without subject 2, `5d_rat` without the subject-6 placeholder) is evaluated and the
+(`ALL_SUBJECTS`: NHP without subject 2, and the five `5d_rat` animals of the current cohort) is evaluated and the
 dataset configs list them all. Because choices made by looking at results (primary acquisition, knob
 ranges, equivalence margins) are then made on the data that is reported, pre-register the decision rule
 in the config header and always report the full comparison table next to the chosen setting. The

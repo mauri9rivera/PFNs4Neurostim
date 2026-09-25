@@ -379,7 +379,7 @@ def plot_degradation_curves(
     show_channels: bool = True,
     counts: pd.DataFrame | None = None,
 ) -> list[str]:
-    """Degradation curves: one row per metric, one line per model.
+    """Degradation curves: one panel per metric, one line per model.
 
     Bounded metrics show the mean over channels with a 95% CI; heavy-tailed ones (R^2) the median with an
     interquartile band (see :func:`_model_band`), and the R^2 axis is clipped for display only.
@@ -389,11 +389,11 @@ def plot_degradation_curves(
         out_dir: Destination directory.
         knob: Knob name (selects the x-axis and its label).
         dataset: Dataset name, for the title.
-        metrics: Metric columns, one panel row each.
+        metrics: Metric columns, one panel each.
         breakdowns: Optional model -> breakdown point **in x-axis units**
-            (``breakdown_x`` of the robustness table), marked on the regret row.
+            (``breakdown_x`` of the robustness table), marked on the first (regret) panel.
         show_channels: Draw faint per-channel traces behind the model means.
-        counts: Output of :func:`clip_low_snr`; the channels kept per level are written above the top row.
+        counts: Output of :func:`clip_low_snr`; the channels kept per level are written above the first panel.
 
     Returns:
         Paths written.
@@ -402,13 +402,12 @@ def plot_degradation_curves(
     demo = str(df["demo"].iloc[0]) if "demo" in df.columns else "demo2"
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
 
-    fig, axes = S.figure(
-        "onehalf", nrows=len(metrics), ncols=1, aspect=S.STACKED_ASPECT, sharex=True, layout=S.LAYOUT_ENGINE
-    )
+    # One panel per metric side by side (a vertical stack of 1.5-aspect panels would be too tall).
+    fig, axes = S.figure("double", nrows=1, ncols=len(metrics), sharex=True, layout=S.LAYOUT_ENGINE)
     axes = np.atleast_1d(axes)
 
-    for row_idx, metric in enumerate(metrics):
-        ax = axes[row_idx]
+    for idx, metric in enumerate(metrics):
+        ax = axes[idx]
         for model in models:
             sub = df[df["model"] == model]
             if sub.empty or metric not in sub.columns:
@@ -456,14 +455,15 @@ def plot_degradation_curves(
             ax.set_ylim(bottom=S.R2_AXIS_FLOOR, top=1.0)
             ax.text(0.98, 0.02, f"axis clipped at {S.R2_AXIS_FLOOR:g}", transform=ax.transAxes, ha="right",
                     va="bottom", fontsize=S.FONT_SIZES["annotation"], alpha=0.7)
-        if row_idx == 0:
+        if idx == 0:
             _annotate_counts(ax, df, x_col, counts)
 
     # Achieved SNR decreases with stress: plot it decreasing left to right so the
     # x-axis always reads "more stress to the right" (roadmap S2).
     if x_col in X_DESCENDS_WITH_STRESS:
         axes[0].invert_xaxis()
-    axes[-1].set_xlabel(S.knob_x_label(knob, x_col))
+    for ax in axes:
+        ax.set_xlabel(S.knob_x_label(knob, x_col))
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="outside lower center", ncol=len(labels), frameon=False,
                fontsize=S.FONT_SIZES["legend"])
@@ -517,7 +517,7 @@ def plot_outcome_panels(
     demo = str(df["demo"].iloc[0]) if "demo" in df.columns else "demo2"
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
 
-    fig, axes = S.figure("double", nrows=1, ncols=len(panels), aspect=S.MULTIPANEL_ASPECT, layout=S.LAYOUT_ENGINE)
+    fig, axes = S.figure("double", nrows=1, ncols=len(panels), layout=S.LAYOUT_ENGINE)
     axes = np.atleast_1d(axes)
     for ax, (col, key) in zip(axes, panels):
         for model in models:
@@ -764,7 +764,7 @@ def plot_breakdown_vs_budget(
     harshest = max(xs) if ascending else min(xs)
 
     table.to_csv(os.path.join(out_dir, "breakdown_vs_budget.csv"), index=False)
-    fig, ax = S.figure("onehalf", aspect=S.SINGLE_PANEL_ASPECT, layout=S.LAYOUT_ENGINE)
+    fig, ax = S.figure("single", layout=S.LAYOUT_ENGINE)   # lone panel: single column (PANEL_ASPECT)
     for model, grp in table.groupby("model"):
         grp = grp.sort_values("budget")
         y = grp["breakdown_x"].fillna(harshest).to_numpy(dtype=float)
@@ -949,7 +949,7 @@ def plot_regime_heatmap(
     pd.DataFrame.from_records(records).to_csv(csv_path, index=False)
 
     nrows = 2 if diffs else 1
-    fig, axes = S.figure("double", nrows=nrows, ncols=len(models), aspect=S.SINGLE_PANEL_ASPECT,
+    fig, axes = S.figure("double", nrows=nrows, ncols=len(models),
                          layout=S.LAYOUT_ENGINE, squeeze=False)
     y_label = S.knob_x_label(knob, _knob_axis(df, knob))
     top = max(float(np.nanmax(s["value"])) for s in surfaces.values())
@@ -1021,7 +1021,7 @@ def plot_bridge(
     order = np.argsort(surf["x"])
     ys = np.interp(points["snr"], surf["x"][order], np.arange(surf["x"].size)[order])
 
-    fig, ax = S.figure("onehalf", aspect=S.SINGLE_PANEL_ASPECT, layout=S.LAYOUT_ENGINE)
+    fig, ax = S.figure("onehalf", layout=S.LAYOUT_ENGINE)
     span = float(np.nanmax(np.abs(surf["value"]))) or 1.0
     im = _draw_surface(ax, surf, cmap=S.DIVERGING_CMAP, vmin=-span, vmax=span)
     for ds in points["dataset"].unique():
@@ -1052,7 +1052,7 @@ def plot_generator_validation(features: pd.DataFrame, out_dir: str) -> list[str]
         Paths written (figure and ``generator_validation.csv``).
     """
     names = ["morans_i", "skewness", "cv", "mean_sd_corr"]
-    fig, axes = S.figure("double", ncols=len(names), aspect=S.MULTIPANEL_ASPECT, layout=S.LAYOUT_ENGINE)
+    fig, axes = S.figure("double", ncols=len(names), layout=S.LAYOUT_ENGINE)
     demos = [d for d in ("demo2", "demo1") if d in set(features["demo"])]
     for ax, name in zip(axes, names):
         data = [features.loc[features["demo"] == d, name].dropna().to_numpy() for d in demos]

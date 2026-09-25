@@ -95,6 +95,12 @@ def cell_identity(
         "seed": seed,
         "cache_version": cfg.cache_version,
     }
+    # The raw files' cohort stamp, for datasets whose loader versions them (5d_rat).
+    # Added conditionally, so replacing one dataset's raw data invalidates that
+    # dataset's cached cells and leaves every other dataset's identity untouched.
+    cohort = channel.meta.get("data_cohort")
+    if cohort is not None:
+        identity["data_cohort"] = cohort
     # Split-half cells only: added conditionally so every full-mean identity (and hence
     # every existing cached cell) is unchanged.
     if channel.split_id is not None:

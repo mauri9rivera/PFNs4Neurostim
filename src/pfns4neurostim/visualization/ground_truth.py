@@ -40,7 +40,7 @@ def plot_gt_identity(
     metrics = [m for m in metrics if f"{m}_full_mean" in paired and f"{m}_split_half" in paired]
     if not metrics:
         return []
-    fig, axes = style.figure("onehalf", ncols=len(metrics), aspect=style.SINGLE_PANEL_ASPECT)
+    fig, axes = style.figure("onehalf", ncols=len(metrics))
     axes = np.atleast_1d(axes)
     for ax, metric in zip(axes, metrics):
         x_col, y_col = f"{metric}_full_mean", f"{metric}_split_half"

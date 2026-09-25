@@ -225,21 +225,27 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "tabpfn_v1": ModelSpec(
         key="tabpfn_v1",
-        version="TabPFN v1 (classification-head adaptation)",
+        version="TabPFN v1 (classification-head adaptation, 10 quantile bins)",
         family="pfn",
         factory=_build_external("tabpfn_v1"),
         supports=("ei", "ucb", "ts_marginal"),
-        notes="Classifier binned into a bar distribution; needs an isolated tabpfn<2 env.",
+        notes=(
+            "Classifier binned into a bar distribution (docs/tabpfn_v1_adaptation.md). v1 emits "
+            "at most 10 classes, so its predictive resolution is bounded by the bin width: report "
+            "calibration next to the bin count, never ranked against v2.5's native bar "
+            "distribution. Runs in pfns4neurostim-v1 (environment.v1.yml); tabpfn<2 cannot "
+            "coexist with the pinned 6.3.2."
+        ),
     ),
     "tabfm": ModelSpec(
         key="tabfm",
-        version="Google TabFM (uncertainty from ensemble spread)",
+        version="Google TabFM v1.0.0 (raw-scale point prediction; sd = ensemble spread + out-of-fold residual)",
         family="pfn",
         factory=_build_external("tabfm"),
         supports=("ei", "ucb", "ts_marginal"),
         notes=(
-            "Native point prediction; the std is ensemble disagreement, not a "
-            "calibrated predictive distribution. Needs Python >= 3.11 (py311 env)."
+            "Native point prediction; the std is constructed (ensemble spread + out-of-fold "
+            "residual RMSE), not a model predictive distribution (G3). Needs Python >= 3.11 (bench env)."
         ),
     ),
     "mitra": ModelSpec(

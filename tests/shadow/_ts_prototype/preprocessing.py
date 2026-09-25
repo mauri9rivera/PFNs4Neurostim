@@ -70,7 +70,7 @@ def shared_preprocess(
 
 
 def load_neurostim(dataset: str, subject: int, emg: int) -> SharedData:
-    """Load a real neurostim problem via the (read-only) ``src`` loader, in shared units.
+    """Load a real neurostim problem via the package's loader dispatch, in shared units.
 
     Args:
         dataset: ``'nhp'``, ``'rat'``, ``'spinal'`` or ``'5d_rat'``.
@@ -82,12 +82,14 @@ def load_neurostim(dataset: str, subject: int, emg: int) -> SharedData:
     """
     if SRC_DIR not in sys.path:
         sys.path.insert(0, SRC_DIR)
-    from pfns4neurostim.data.legacy_io import load_data  # noqa: WPS433  (read-only import)
+    # The dispatcher, not legacy_io directly: 5d_rat moved to data/loaders/rat_5d.py
+    # with the noOutliers cohort (2026-09-25).
+    from pfns4neurostim.data.loaders import load_subject  # noqa: WPS433  (read-only import)
 
     cwd = os.getcwd()
     os.chdir(PROJECT_ROOT)  # src loader uses './data'
     try:
-        data = load_data(dataset, subject)
+        data = load_subject(dataset, subject)
     finally:
         os.chdir(cwd)
     trials = data["sorted_resp"][:, emg, :].astype(np.float64)

@@ -19,6 +19,7 @@
 #   bash scripts/mila_setup.sh stage      # restore $ARCHIVE master -> $SCRATCH
 #   bash scripts/mila_setup.sh env        # create/update the MAIN conda env (Python 3.9) + install the package
 #   bash scripts/mila_setup.sh env bench  # same for pfns4neurostim-bench (Python 3.11) from environment.bench.yml
+#   bash scripts/mila_setup.sh env v1     # same for pfns4neurostim-v1 (tabpfn<2) from environment.v1.yml
 #   bash scripts/mila_setup.sh install    # only pip install -e . (reuse an existing env)
 #   bash scripts/mila_setup.sh deps       # report which declared dependencies import
 #   bash scripts/mila_setup.sh verify     # print the whole layout + import check
@@ -87,12 +88,13 @@ cmd_stage() {
 
 cmd_env() {
   load_conda
-  # Optional argument: `main` (default) or `bench`.
+  # Optional argument: which environment of the matrix in environment*.yml.
   local which="${1:-main}" env_file="environment.yml"
   case "${which}" in
     main) ;;
     bench) CONDA_ENV="pfns4neurostim-bench"; env_file="environment.bench.yml" ;;
-    *) log "usage: env [main|bench]"; exit 1 ;;
+    v1) CONDA_ENV="pfns4neurostim-v1"; env_file="environment.v1.yml" ;;
+    *) log "usage: env [main|bench|v1]"; exit 1 ;;
   esac
   cd "${CODE_DIR}"
   if conda env list | grep -qE "^${CONDA_ENV}\s"; then

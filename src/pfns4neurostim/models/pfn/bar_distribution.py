@@ -194,10 +194,23 @@ class BarDistribution:
 
         Returns:
             Probabilities over all bins, shape [N, K].
+
+        Raises:
+            ValueError: If the probability matrix and the class vector disagree in
+                width. A classifier that pads its output to a fixed class count
+                instead of reporting the classes it saw would otherwise be silently
+                misaligned onto the wrong bins.
         """
         probs = np.asarray(probs, dtype=np.float64)
         if probs.ndim == 1:
             probs = probs[None, :]
+        classes = np.asarray(classes, dtype=int)                          # [C]
+        if probs.shape[1] != classes.size:
+            raise ValueError(
+                f"BarDistribution.expand: {probs.shape[1]} probability columns for "
+                f"{classes.size} classes. The backend's predict_proba must return one "
+                "column per class in `classes_`, in that order."
+            )
         full = np.zeros((probs.shape[0], self.n_bins), dtype=np.float64)   # [N, K]
-        full[:, np.asarray(classes, dtype=int)] = probs
+        full[:, classes] = probs
         return full

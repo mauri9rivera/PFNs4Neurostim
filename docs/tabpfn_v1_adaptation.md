@@ -2,13 +2,13 @@
 
 **Question asked (2026-09-20):** *can TabPFN v1's classification head be adapted, and if so how?*
 
-**Answer: yes, and the adaptation is already implemented generically.** What blocks TabPFN v1 is
-packaging, not method: v1 is `tabpfn<2`, which cannot coexist with the pinned `tabpfn==6.3.2` used
-for TabPFN v2.5 because both occupy the module name `tabpfn`. It needs its own environment.
+**Answer: yes. Implemented 2026-09-25** (sections 4-5); sections 1-3 are the specification it follows.
+What blocked v1 was packaging, not method: v1 is `tabpfn<2`, which cannot coexist with the pinned
+`tabpfn==6.3.2` used for TabPFN v2.5 because both occupy the module name `tabpfn`. It now has its own
+environment, `environment.v1.yml`.
 
-This document specifies the adaptation precisely enough to implement in one sitting once that
-environment exists, and states what the adaptation costs, because every v1 number must be reported
-as a **classification-head adaptation** rather than as a like-for-like regression result.
+This document also states what the adaptation costs, because every v1 number must be reported as a
+**classification-head adaptation** rather than as a like-for-like regression result.
 
 ---
 
@@ -61,28 +61,75 @@ adaptation's dominant cost and it must be stated in every caption:
 
 `TabPFNv1Surrogate` therefore defaults to `n_bins=10` rather than the 32 used elsewhere.
 
-## 4. What remains to implement
+## 4. Implementation (done 2026-09-25)
 
-Only `_make_classifier`:
+`TabPFNv1Surrogate` in [`models/pfn/wrappers.py`](../src/pfns4neurostim/models/pfn/wrappers.py) is a
+`BucketizedClassifierSurrogate` with `MAX_CLASSES = 10` and `n_bins=10` by default; binning,
+expansion, moments and sampling are inherited. Two hooks carry everything v1-specific:
 
 ```python
 def _make_classifier(self):
     from tabpfn import TabPFNClassifier        # the v1 API
-    return TabPFNClassifier(device=self.device, N_ensemble_configurations=3)
+    return TabPFNClassifier(
+        device=self.device,
+        N_ensemble_configurations=self.n_ensemble_configurations,
+        seed=self.seed,
+        **self.backend_kwargs,
+    )
+
+def _fit_classifier(self, classifier, X, labels):
+    classifier.fit(X, labels, overwrite_warning=True)
 ```
 
-plus, in v1, `fit(X, y, overwrite_warning=True)` if the context exceeds its soft limits. Everything
-else — binning, expansion, moments, sampling — is inherited.
+`_fit_classifier` is a new hook on the bucketized base (the other bucketized model, TabFlex, takes the
+default `classifier.fit(X, labels)`), so v1's extra `fit` argument did not need a special case in the
+shared fit path.
+
+Checks that come with it:
+
+* `n_bins > MAX_CLASSES` raises **at construction, before the backend import** — a config asking for an
+  impossible resolution is wrong in every environment, so it must not need the right one to say so.
+* `BarDistribution.expand` now raises when the probability matrix and `classes_` disagree in width.
+  v1 truncates `predict_proba` to the classes the context contained and reports them in `classes_`, so
+  the two agree; a backend that padded to a fixed class count would otherwise be silently misaligned
+  onto the wrong bins.
+* `seed` is an explicit constructor argument: it drives v1's feature/class permutation ensemble, so
+  leaving it to upstream's default would make a repetition irreproducible if that default ever changed.
+
+Two upstream properties worth knowing:
+
+* v1 keeps loaded checkpoints in a class-level `models_in_memory` cache keyed by `(model, device)`, so
+  constructing one classifier per BO step re-reads nothing from disk after the first.
+* v1's checkpoint ships inside the wheel (`tabpfn/models_diff/`). There is no weight host that can
+  disappear, unlike TabFlex (microsoft/ticl #27).
 
 ## 5. Environment
 
-v1 cannot share an environment with v2.5. Two options:
+v1 cannot share an environment with v2.5, so it has its own: **`environment.v1.yml`** → the conda env
+`pfns4neurostim-v1`. It mirrors `environment.yml` exactly (Python 3.9, numpy 1.26.4, torch 2.5.1, the GP
+stack) and differs only in `tabpfn<2` replacing `tabpfn==6.3.2`; `pfns4bo` is left out because it pins
+`scikit-learn<1.2`. The comparison must differ in the model, not in numpy.
 
-| Option | Command | Trade-off |
-|---|---|---|
-| **Separate env (recommended)** | `conda create -n pfns4neurostim-v1 python=3.9 && pip install 'tabpfn<2' && pip install -e .` | Clean; v1 rows are produced by a separate run and merged into the tidy CSV by `experiments/aggregate.py` |
-| Vendored fork under `libs/` | submodule `automl/TabPFN` at its v1 tag, imported under a different top-level name | Avoids the env split but needs a rename patch, and `libs/` is read-only by project rule |
+```bash
+bash scripts/mila_setup.sh env v1     # create pfns4neurostim-v1 and install the package
+```
 
-The availability check already refuses to pretend v1 is present when only v2.5 is installed
-(`external._backend_ok` compares the installed major version), so a v1 run in the wrong environment
-fails loudly instead of silently benchmarking v2.5 twice.
+`ExternalSpec.env` records `main` / `bench` / `v1` / `mitra` per model, and `external.conda_env_for(key)`
+resolves it, so no script names an environment by hand. The availability check refuses to pretend v1 is
+present when only v2.5 is installed (`external._backend_ok` compares the installed major version) and its
+message now names the environment to activate, so a v1 run in the wrong environment fails in seconds
+instead of silently benchmarking v2.5 twice.
+
+v1 joins the existing `configs/experiment/hyp0_pfn_bench_{nhp,5d_rat}.yaml` rather than getting its own
+config: that run is already assembled from cells computed in several environments, and cell identity
+carries the model version, not the environment.
+
+```bash
+CONDA_ENV=pfns4neurostim-v1 LANES=2 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v1]"
+```
+
+Portfolio units **E7** (NHP) and **E8** (5d_rat) in `scripts/portfolio.py`; both costs are unmeasured, so
+run E7 first and read its wall time.
+
+The rejected alternative — vendoring `automl/TabPFN` under `libs/` at its v1 tag — needs a rename patch
+to avoid the same module-name collision, and `libs/` is read-only by project rule.

@@ -1,0 +1,60 @@
+# TabPFN v1 environment for the Hypothesis 0 benchmark (Python 3.9).
+#
+# WHY A THIRD ENVIRONMENT.
+# TabPFN v1 ships as the distribution `tabpfn` at version 0.1.x and occupies the SAME
+# top-level module name as the pinned tabpfn 6.3.2 that provides TabPFN-2.5. Installing
+# both in one environment silently leaves whichever was installed last, so a "TabPFN v1"
+# run would benchmark v2.5 twice. `models/pfn/external._backend_ok` compares the installed
+# major version and refuses that situation loudly; this file is the other half of the fix.
+#
+# v1 needs no newer interpreter than the main env (Python 3.9), only an incompatible pin,
+# so everything else below mirrors environment.yml exactly — the comparison must differ in
+# the model, not in numpy or torch.
+#
+# NOT installed here:
+#   - tabpfn==6.3.2  (the collision this environment exists to avoid)
+#   - pfns4bo==0.1.5 (pins scikit-learn<1.2; PFNs4BO runs in the MAIN env)
+#
+# v1 is a CLASSIFIER: the wrapper bins the response into at most 10 quantile bins and reads
+# the class probabilities as a bar distribution. Every v1 row is a "classification-head
+# adaptation" and its calibration numbers are bounded by the bin count — see
+# docs/tabpfn_v1_adaptation.md before reporting any of them.
+#
+#   bash scripts/mila_setup.sh env v1     # create pfns4neurostim-v1 + install the package
+#   conda activate pfns4neurostim-v1
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_tabpfn_v1_nhp.yaml
+name: pfns4neurostim-v1
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  # --- scientific stack (identical to environment.yml, per CLAUDE.md section 3) ---
+  - numpy=1.26.4
+  - scipy=1.13.1
+  - pandas=2.3.3
+  - scikit-learn=1.6.1
+  - matplotlib=3.9.2
+  - seaborn=0.13.2
+  - statsmodels=0.14.*
+  - pyyaml
+  - tqdm
+  - pytest
+  - pip:
+      # --- torch 2.5.1 + CUDA 11.8 ---
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - torch==2.5.1
+      - torchvision==0.20.1
+      - torchaudio==2.5.1
+      # --- GP surrogates, so a GP comparator can run in the same job ---
+      - gpytorch==1.11
+      - linear-operator==0.5.1
+      - botorch==0.10.0
+      - pyro-ppl==1.9.1
+      # --- TabPFN v1. Unpinned within <2 so the newest 0.1.x patch is taken; the exact
+      #     resolved version is recorded per run through ModelSpec.version and pip freeze.
+      #     Its checkpoint ships with the wheel (tabpfn/models_diff/), so there is no
+      #     download step and no weight host that can disappear.
+      - tabpfn<2
+      - einops==0.8.2
+      - xarray==2024.7.0

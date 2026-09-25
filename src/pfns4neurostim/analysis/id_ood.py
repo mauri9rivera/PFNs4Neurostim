@@ -23,7 +23,10 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from tabpfn import TabPFNRegressor
 
 
-from pfns4neurostim.data.legacy_io import load_data, ALL_SUBJECTS
+# The loader dispatch, not legacy_io directly: 5d_rat moved to data/loaders/rat_5d.py
+# with the noOutliers cohort (2026-09-25).
+from pfns4neurostim.data.loaders import load_subject as load_data
+from pfns4neurostim.data.legacy_io import ALL_SUBJECTS
 
 from pfns4neurostim.data.references.noise import generate_noise_bank
 from pfns4neurostim.data.references.prior import generate_tabpfn_prior_bank

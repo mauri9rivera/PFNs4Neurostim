@@ -78,7 +78,7 @@ def run_gt_sensitivity(
         overrides: Extra ``key=value`` overrides applied to both runs.
         run_dir: Output directory; defaults to
             ``{output_root}/gt_sensitivity/{dataset}/{family}-{tag}``.
-        replot: Rebuild the pairing and figure from the two existing ``tidy.csv``.
+        replot: Rebuild the pairing, the identity figure and both arms' figures from the existing ``tidy.csv``.
         use_cache: Read/write the cell cache.
 
     Returns:
@@ -89,11 +89,11 @@ def run_gt_sensitivity(
     frames: dict[str, pd.DataFrame] = {}
     for mode in GT_MODES:
         sub_dir = os.path.join(target, mode)
-        if not replot:
-            run_bo_benchmark(
-                config_path, list(overrides or []) + [f"gt_mode={mode}"], run_dir=sub_dir,
-                use_cache=use_cache,
-            )
+        # With replot, each arm's own figures are rebuilt from its tidy.csv too (no compute).
+        run_bo_benchmark(
+            config_path, list(overrides or []) + [f"gt_mode={mode}"], run_dir=sub_dir,
+            use_cache=use_cache, replot=replot,
+        )
         frames[mode] = pd.read_csv(os.path.join(sub_dir, "tidy.csv"))
     paired = pair_gt_modes(frames["full_mean"], frames["split_half"])
     csv_path = os.path.join(target, "gt_sensitivity.csv")

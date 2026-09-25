@@ -47,6 +47,7 @@ __all__ = [
     "ExternalSpec",
     "EXTERNAL_SPECS",
     "availability",
+    "conda_env_for",
     "require_backend",
 ]
 
@@ -71,6 +72,10 @@ class ExternalSpec:
         repo_subdir: Path under ``libs/`` holding the vendored submodule, and the
             sub-path within it that must go on ``sys.path`` (``'libs/tabicl/src'``).
             Set when the model is used from the submodule rather than from pip.
+        env: Conda environment the model runs in, as a suffix of
+            ``pfns4neurostim-<env>`` (``'main'`` means the plain env). Model -> env
+            is data here and nowhere else, so a failed availability check can name
+            the environment to switch to instead of leaving the caller guessing.
         notes: Constraints worth knowing before installing.
     """
 
@@ -83,7 +88,13 @@ class ExternalSpec:
     major_below: int | None = None
     python_min: tuple[int, int] | None = None
     repo_subdir: str = ""
+    env: str = "main"
     notes: str = ""
+
+    @property
+    def conda_env(self) -> str:
+        """Name of the conda environment this model runs in."""
+        return "pfns4neurostim" if self.env == "main" else f"pfns4neurostim-{self.env}"
 
 
 EXTERNAL_SPECS: dict[str, ExternalSpec] = {
@@ -104,7 +115,12 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         dist="tabpfn",
         major_below=2,
         python_min=(3, 8),
-        notes="Requires tabpfn<2, which conflicts with the installed 6.3.2: use a separate env.",
+        env="v1",
+        notes=(
+            "Requires tabpfn<2, which cannot coexist with the pinned tabpfn 6.3.2 (both own "
+            "the module name 'tabpfn'), so it runs in its own environment built from "
+            "environment.v1.yml. The adaptation is specified in docs/tabpfn_v1_adaptation.md."
+        ),
     ),
     "tabfm": ExternalSpec(
         key="tabfm",
@@ -114,6 +130,7 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         source="https://github.com/google-research/tabfm",
         python_min=(3, 11),
         repo_subdir="tabfm",
+        env="bench",
         notes=(
             "Vendored as libs/tabfm (2026-09-20). Requires Python >= 3.11, so it cannot "
             "run in the pinned 3.9 env. TabFMRegressor.predict returns point predictions "
@@ -127,6 +144,7 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         extra="mitra",
         route="native",
         source="https://huggingface.co/autogluon/mitra-regressor",
+        env="mitra",
         notes="Heavy install (AutoGluon >= 1.4); verify predictive-distribution access.",
     ),
     "tabicl": ExternalSpec(
@@ -137,6 +155,7 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         source="https://github.com/soda-inria/tabicl",
         python_min=(3, 10),
         repo_subdir="tabicl/src",
+        env="bench",
         notes=(
             "Vendored as libs/tabicl at tag v2.2.0 (2026-09-20). **Route corrected**: "
             "v2 ships a native TabICLRegressor whose predict(output_type='quantiles') "
@@ -169,6 +188,23 @@ def availability() -> dict[str, bool]:
         Mapping model key -> whether its backend module can be imported.
     """
     return {key: _backend_ok(spec)[0] for key, spec in EXTERNAL_SPECS.items()}
+
+
+def conda_env_for(key: str) -> str:
+    """Return the conda environment one external model runs in.
+
+    Args:
+        key: Model key in :data:`EXTERNAL_SPECS`.
+
+    Returns:
+        The environment name, e.g. ``'pfns4neurostim-v1'``.
+
+    Raises:
+        KeyError: If the key is unknown.
+    """
+    if key not in EXTERNAL_SPECS:
+        raise KeyError(f"Unknown external model {key!r}. Known: {sorted(EXTERNAL_SPECS)}.")
+    return EXTERNAL_SPECS[key].conda_env
 
 
 def libs_root() -> str:
@@ -213,8 +249,8 @@ def _backend_ok(spec: ExternalSpec) -> tuple[bool, str]:
         need = ".".join(str(v) for v in spec.python_min)
         have = ".".join(str(v) for v in sys.version_info[:3])
         return False, (
-            f"needs Python >= {need} but this environment is {have}; it must run in a "
-            "separate environment (see the environment matrix in the task plan)"
+            f"needs Python >= {need} but this environment is {have}; it runs in "
+            f"{spec.conda_env} (`conda activate {spec.conda_env}`)"
         )
     _ensure_repo_on_path(spec)
     try:
@@ -238,7 +274,8 @@ def _backend_ok(spec: ExternalSpec) -> tuple[bool, str]:
             return False, (
                 f"{dist} {installed} is installed but this model needs major version "
                 f"< {spec.major_below}; the two share the module name, so they cannot "
-                "coexist in one environment"
+                f"coexist in one environment - it runs in {spec.conda_env} "
+                f"(`conda activate {spec.conda_env}`)"
             )
     return True, ""
 
@@ -367,11 +404,33 @@ class BucketizedClassifierSurrogate(ExternalSurrogate):
         device: Torch device string.
         n_bins: Number of response bins K.
         **backend_kwargs: Passed to the backend constructor.
+
+    Raises:
+        ValueError: If ``n_bins`` exceeds the backend's architectural class ceiling
+            (:attr:`MAX_CLASSES`) or is below 2.
     """
 
+    #: Architectural ceiling on the number of classes the backend can emit, when it
+    #: has one (TabPFN v1: 10). ``None`` means the backend imposes no such limit.
+    #: Checked at construction so a config asking for an impossible resolution fails
+    #: at load time rather than inside the first BO step.
+    MAX_CLASSES: int | None = None
+
     def __init__(self, key: str, device: str = "cpu", n_bins: int = 32, **backend_kwargs: Any) -> None:
+        # Validated before the backend import: a config asking for an impossible
+        # resolution is wrong in every environment, so it must not need the right one
+        # to say so.
+        n_bins = int(n_bins)
+        if n_bins < 2:
+            raise ValueError(f"{type(self).__name__}: n_bins must be >= 2, got {n_bins}.")
+        if self.MAX_CLASSES is not None and n_bins > self.MAX_CLASSES:
+            raise ValueError(
+                f"{type(self).__name__}: n_bins={n_bins} exceeds the backend's ceiling of "
+                f"{self.MAX_CLASSES} classes. The bin count bounds the predictive "
+                "resolution, so it must be reported next to every calibration metric."
+            )
         super().__init__(key, device=device, **backend_kwargs)
-        self.n_bins = int(n_bins)
+        self.n_bins = n_bins
         self._bar: BarDistribution | None = None
         self._classifier: Any = None
 
@@ -380,6 +439,19 @@ class BucketizedClassifierSurrogate(ExternalSurrogate):
         raise NotImplementedError(
             f"{type(self).__name__} does not implement _make_classifier yet (task #8 Step 3)."
         )
+
+    def _fit_classifier(self, classifier: Any, X: np.ndarray, labels: np.ndarray) -> None:
+        """Fit the backend classifier on bin labels.
+
+        Overridden where the backend's ``fit`` needs extra arguments (TabPFN v1 takes
+        ``overwrite_warning``).
+
+        Args:
+            classifier: The object returned by :meth:`_make_classifier`.
+            X: Observed coordinates, shape [n, D].
+            labels: Bin indices, shape [n].
+        """
+        classifier.fit(X, labels)
 
     def _fit_backend(self, X: np.ndarray, y: np.ndarray) -> None:
         """Bin the responses and fit the backend classifier on the labels.
@@ -394,7 +466,7 @@ class BucketizedClassifierSurrogate(ExternalSurrogate):
         self._bar = BarDistribution(quantile_borders(y, n_bins))
         labels = self._bar.digitize(y)                      # [n]
         self._classifier = self._make_classifier()
-        self._classifier.fit(X, labels)
+        self._fit_classifier(self._classifier, X, labels)
 
     def _predict_backend(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Read the classifier's class probabilities as a bar distribution.
