@@ -26,8 +26,21 @@ if [ "${1:-}" = "--apply" ]; then APPLY="--apply"; fi
 ENV_NAME="pfns4neurostim"
 DATASET="5d_rat"
 
-if ! command -v conda >/dev/null 2>&1; then set +u; module load anaconda/3; set -u; fi
-py() { conda run --no-capture-output -n "${ENV_NAME}" python "$@"; }
+# Activate the main env unless it is already active. Not `conda run`: the cluster's conda predates
+# `--no-capture-output` (2026-09-25), and activation behaves the same on every conda version.
+# Activation hooks reference unset variables and may return non-zero, so -e and -u are off around it
+# (as in scripts/_job_common.sh); success is checked explicitly afterwards.
+if [ "${CONDA_DEFAULT_ENV:-}" != "${ENV_NAME}" ]; then
+  set +eu
+  if ! command -v conda >/dev/null 2>&1; then module load anaconda/3; fi
+  if [ "$(type -t conda)" != "function" ]; then source "$(conda info --base)/etc/profile.d/conda.sh"; fi
+  conda activate "${ENV_NAME}"
+  set -eu
+  if [ "${CONDA_DEFAULT_ENV:-}" != "${ENV_NAME}" ]; then
+    echo "[clean] could not activate ${ENV_NAME}; run 'conda activate ${ENV_NAME}' first" >&2; exit 1
+  fi
+fi
+py() { python "$@"; }
 
 COHORT=$(py -c "from pfns4neurostim.data.loaders import data_cohort; print(data_cohort('${DATASET}') or '')")
 ANIMALS=$(py -c "from pfns4neurostim.data.loaders.rat_5d import SUBJECTS; print(' '.join(s.key for s in SUBJECTS))")
