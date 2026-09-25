@@ -1,0 +1,26 @@
+# Hyp 0 acquisition core, spinal: ts_marginal / EI / UCB for TabPFN-2.5, GP-MLL, GP-fixed.
+#
+# Derived from the NHP config of the same name (2026-09-25); differences: dataset/tag spinal, budget 64
+# = the 8x8 grid (legacy spinal benchmark; NHP also uses budget = grid).
+defaults:
+  dataset: spinal
+  model: [tabpfn_v2_5, gp_mll, gp_naive, random]
+  acquisition: [ts_marginal, ei, ucb, random]
+
+experiment: bo_benchmark
+family: hyp0-acq-core
+tag: spinal
+
+budget: 64
+n_init: 5
+n_reps: 10
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05
+
+# GP models run on CPU (measured 2.2x faster than CUDA for this Adam GP; P0.12).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

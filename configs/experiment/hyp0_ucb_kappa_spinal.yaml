@@ -1,0 +1,21 @@
+# Hyp 0 UCB kappa grid, spinal: TabPFN-2.5.
+#
+# Derived from the NHP config of the same name (2026-09-25); differences: dataset/tag spinal, budget 64
+# = the 8x8 grid (legacy spinal benchmark; NHP also uses budget = grid).
+defaults:
+  dataset: spinal
+  model: [tabpfn_v2_5]
+  acquisition: [ucb_k0.5, ucb_k1, ucb_k2, ucb_k3, ucb_k5]
+
+experiment: bo_benchmark
+family: hyp0-ucb-kappa
+tag: spinal
+
+budget: 64
+n_init: 5
+n_reps: 10
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05

@@ -1,6 +1,7 @@
-# Google TabFM (vendored at libs/tabfm, torch backend). Point predictions only: sigma is the spread across
-# n_estimators ensemble members (a proxy, must be >= 2). Needs Python >= 3.11 (bench env) and a GPU: on CPU one
-# 96-site predict took ~340 s (bfloat16 compute). Runs as the LAST PFN job of the D3 benchmark.
+# Google TabFM (vendored at libs/tabfm, torch backend). A POINT regressor upstream: the mean is its own
+# prediction (raw scale) and sigma is CONSTRUCTED as sqrt(ensemble spread^2 + out-of-fold residual RMSE^2)
+# (2026-09-25, G3: say "constructed sigma"). Needs Python >= 3.11 (bench env) and a GPU: on CPU one 96-site
+# predict took ~340 s (bfloat16 compute).
 name: tabfm
 params:
   device: null   # per-model override of the experiment `device`

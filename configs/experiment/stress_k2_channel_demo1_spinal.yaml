@@ -1,0 +1,49 @@
+# Hyp B K2-channel noise on the Demo 1 synthetic twins of the spinal channels.
+#
+# Derived from the NHP config of the same name (2026-09-25); differences: dataset/tag spinal, budget 64
+# = the 8x8 grid (legacy spinal benchmark; NHP also uses budget = grid), subject 5 excluded (below).
+defaults:
+  dataset: spinal
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ts_marginal   # headline (2026-09-20); EI/UCB compared in hyp0_acq_table_*
+
+experiment: stress_sweep
+family: stress-k2-channel-demo1
+tag: spinal
+
+# Demo 1: fit the synthetic generator (K hotspots) to each selected channel and sweep the fitted maps.
+# The Demo 2 twin is stress_k2_channel_spinal.yaml; together they feed the S10 bridge:
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_demo1_spinal.yaml --replot --bridge output/stress/k2_channel/spinal/stress-k2-channel-spinal
+dataset:
+  # subject 5 excluded: one trial per site on all its EMGs, so no noise floor -> no achieved SNR,
+  # no K2/K5 noise scale, no Demo 1 SNR match (it stays in the Hyp A / Hyp 0 benchmarks).
+  subjects: [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
+  demo: demo1
+  generator_hotspots: 2
+
+knob:
+  type: k2_channel
+  # alpha shifts every channel's SNR by exactly -20*log10(alpha) dB relative to its own floor:
+  #   alpha  0.1  0.25  0.5   1   1.5    2     3     4     8
+  #   dB   +20  +12   +6    0  -3.5  -6.0  -9.5  -12.0 -18.1
+  # alpha = 8 pushes every channel below 0 dB.
+  # (knob.targets_db: [...] states the same ladder directly in dB instead.)
+  levels: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0]
+
+budget: 64
+n_init: 5
+n_reps: 10
+gt_mode: full_mean     # or split_half (task #7): rep i runs on cross-fitted instance i mod 2*gt_n_splits
+gt_n_splits: 10
+device: cuda
+seed: 42
+output_root: output
+
+# Pre-registered TOST/non-inferiority margin, in range-normalized regret units.
+equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

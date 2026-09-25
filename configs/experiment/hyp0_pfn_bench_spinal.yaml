@@ -1,0 +1,26 @@
+# Hyp 0 PFN benchmark, spinal: TabPFN-2.5, TabICL, TabFM, PFNs4BO, TabPFN v1, GP-MLL.
+# Same design as hyp0_pfn_bench_nhp.yaml (see its header: envs, constructed TabFM sigma, G1/G3).
+#
+# Derived from the NHP config of the same name (2026-09-25); differences: dataset/tag spinal, budget 64
+# = the 8x8 grid (legacy spinal benchmark; NHP also uses budget = grid).
+defaults:
+  dataset: spinal
+  model: [tabpfn_v2_5, tabicl, tabfm, pfns4bo, tabpfn_v1, gp_mll]
+  acquisition: [ts_marginal, native]
+
+experiment: bo_benchmark
+family: hyp0-pfn-bench
+tag: spinal
+
+budget: 64
+n_init: 5
+n_reps: 10
+gt_mode: full_mean
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05
+
+# GP-MLL runs on CPU (measured 2.2x faster than CUDA for this Adam GP; P0.12).
+model_params:
+  gp_mll: {device: cpu}

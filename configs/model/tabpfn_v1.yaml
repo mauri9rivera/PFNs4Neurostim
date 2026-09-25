@@ -1,0 +1,10 @@
+# TabPFN v1 (tabpfn<2): classification-only, adapted as a bucketized regressor ("classification-head
+# adaptation", G3): the standardized response is binned into n_bins equal-mass classes and the class
+# probabilities are read as a bar distribution. v1 emits at most 10 classes, so n_bins <= 10 (checked at
+# construction). Runs only in the pfns4neurostim-v1 env (environment.v1.yml); see docs/tabpfn_v1_adaptation.md.
+name: tabpfn_v1
+params:
+  device: null   # per-model override of the experiment `device`
+  n_bins: 10                      # v1's class ceiling
+  n_ensemble_configurations: 3    # upstream N_ensemble_configurations (feature/class permutations)
+  seed: 0                         # drives those permutations; fixed so a repetition is reproducible

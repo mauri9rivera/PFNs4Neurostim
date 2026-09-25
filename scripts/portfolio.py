@@ -8,6 +8,7 @@ submission script that the USER runs on the login node:
     python scripts/portfolio.py --emit-bash --group bench > scripts/submit_bench.sh          # Hyp 0/A leftovers + GT sensitivity
     python scripts/portfolio.py --emit-bash --group hypc > scripts/submit_hypc.sh            # Hyp C mechanism analyses
     python scripts/portfolio.py --emit-bash --group externals > scripts/submit_externals.sh  # TabFM, PFNs4BO
+    python scripts/portfolio.py --emit-bash --group spinal > scripts/submit_spinal.sh        # every spinal deliverable
 
 Groups (updated 2026-09-25; units whose results already exist were removed — see task_plan.md "Your Mila portfolio"):
     stress     the 5d_rat stress sweeps on the noOutliers cohort (K2 channel/global, K5, K6 failure, Demo 1 K2).
@@ -15,6 +16,9 @@ Groups (updated 2026-09-25; units whose results already exist were removed — s
     hypc       none left (C1-C3 ran locally 2026-09-24/25).
     externals  the PFN benchmark: base models on 5d_rat (bench env), TabFM (bench env, 24 GB, <= 2 lanes, NHP rerun plus a
                5d_rat calibration job), PFNs4BO 5d_rat (main env) and TabPFN v1 (v1 env, tabpfn<2).
+    spinal     every spinal deliverable (Hyp A, Hyp 0, PFN benchmark, all stress knobs, split-half GT); needs data/spinal
+               staged on the cluster first. Hyp C (mechanism) is not included: NHP-scoped, and one non-resumable
+               process per analysis would exceed the 12 h limit on 90 channels.
 
 Sharded experiments (``bo_benchmark``, ``stress_sweep``) write every job's cells to the shared cache and one assemble job
 builds tidy.csv, tables and figures. ``mechanism`` and ``gt_sensitivity`` run as ONE process (``scripts/run_single.sh``) and
@@ -30,12 +34,15 @@ REP_SECONDS: dict[str, dict[str, float]] = {
     "nhp": {"tabpfn_v2_5": 15.7, "gp_mll": 19.5, "gp_naive": 0.8, "random": 0.2, "tabicl": 30.0, "tabfm": 99.0,
             "pfns4bo": 5.3},
     "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 19.5, "gp_naive": 1.0, "random": 0.4, "tabicl": 33.0, "pfns4bo": 6.7},
+    # Spinal (budget 64 on the 8x8 grid) is NOT measured on Mila: the NHP costs above scaled by a local
+    # one-rep spinal/NHP timing (2026-09-25: TabPFN-2.5 x0.52, GP-MLL x0.60; the GP factor for the rest).
+    "spinal": {"tabpfn_v2_5": 8.2, "gp_mll": 11.7, "gp_naive": 0.5, "random": 0.1, "tabicl": 16.5, "pfns4bo": 3.2},
 }
 GUESSED: frozenset[str] = frozenset()   # every listed cost is measured (TabICL from the D3 runs: 0.43-0.52 s/step)
 #: Channels (subject x EMG) per dataset. 5d_rat dropped from 18 to 17 with the
 #: noOutliers cohort (2026-09-25): rData03 left and flag_valid_emg replaced the
 #: hand-maintained EMG lists.
-CHANNELS = {"nhp": 18, "5d_rat": 17}
+CHANNELS = {"nhp": 18, "5d_rat": 17, "spinal": 100}   # spinal: 11 subjects, 100 channels
 REPS = 10
 GPU_LANE_GAIN = 1.7      # aggregate speed-up of several lanes on one GPU (measured with 3 lanes)
 GPU_LANES = 4
@@ -66,6 +73,7 @@ class Unit:
         overrides: Extra ``key=value`` overrides passed to every job of the unit (e.g. a calibration subset).
         note: Free-text remark.
         hours: Wall-hour estimate of a single-process unit (sharded units are estimated from :data:`REP_SECONDS`).
+        channels: Channels the unit's config selects, when fewer than the dataset's (:data:`CHANNELS`).
     """
 
     name: str
@@ -82,6 +90,7 @@ class Unit:
     overrides: tuple[str, ...] = ()
     note: str = ""
     hours: float | None = None
+    channels: int | None = None
 
 
 def _u(name: str, exp: str, cfg: str, ds: str, gpu: tuple[str, ...], cpu: tuple[str, ...], mult: float = 1.0, **kw: object) -> Unit:
@@ -133,6 +142,43 @@ UNITS: tuple[Unit, ...] = (
     _u("E8. TabPFN v1 (classification-head adaptation), 5d_rat", "bo_benchmark", "hyp0_pfn_bench_5d_rat", "5d_rat",
        ("tabpfn_v1",), (), group="externals", env=V1_ENV, lanes=2, hours=None,
        note="cost UNMEASURED; after E7"),
+    # ---- spinal: every deliverable (2026-09-25). Stage data/spinal on the cluster first (runbook). Budget 64 =
+    # the 8x8 grid. Subject 5 has one trial per site on every EMG (no noise floor), so the SNR-based stress
+    # sweeps and the split-half GT run on the other 10 subjects (90 channels); the benchmarks keep all 100.
+    # Units longer than 12 h requeue themselves at the time limit and resume from the cell cache.
+    _u("P1. Hyp A (TabPFN vs GP), spinal", "bo_benchmark", "hyp_a_spinal", "spinal", _TP, _BASE_CPU, 1, group="spinal"),
+    _u("P2. Acquisition core (ts/ei/ucb), spinal", "bo_benchmark", "hyp0_acq_core_spinal", "spinal", _TP, _BASE_CPU, 3,
+       group="spinal", note="ts_marginal cells are shared with P1 (same identity)"),
+    _u("P3. UCB kappa grid, spinal", "bo_benchmark", "hyp0_ucb_kappa_spinal", "spinal", _TP, (), 5, group="spinal"),
+    _u("P4. GT sensitivity (full-mean vs split-half), spinal", "gt_sensitivity", "gt_sensitivity_spinal", "spinal", _TP,
+       ("gp_mll",), group="spinal", hours=1.0, note="task #7 Step 6 spinal arm; budget 32, 5 reps; subject 5 excluded"),
+    _u("P5. K2-channel, spinal", "stress_sweep", "stress_k2_channel_spinal", "spinal", _TP, _GP, 9, group="spinal",
+       channels=90),
+    _u("P6. K2-global, spinal", "stress_sweep", "stress_k2_global_spinal", "spinal", _TP, _GP, 8, group="spinal",
+       channels=90),
+    _u("P7. K5 slot-fraction heavy tail, spinal", "stress_sweep", "stress_k5_spinal", "spinal", _TP, _GP, 6,
+       group="spinal", channels=90),
+    _u("P8. K6 electrode failure, spinal", "stress_sweep", "stress_k6_failure_spinal", "spinal", _TP, _GP, 5,
+       group="spinal", channels=90),
+    _u("P9. K6 budget, spinal", "stress_sweep", "stress_k6_budget_spinal", "spinal", _TP, _GP, 2.5, group="spinal",
+       channels=90, note="levels 10,20,30,50,64 = ~2.5x one full budget"),
+    _u("P10. Demo 1 K2-channel, spinal twins", "stress_sweep", "stress_k2_channel_demo1_spinal", "spinal", _TP, _GP, 9,
+       group="spinal", channels=90, note="all 90 twins fit without collapse (checked 2026-09-25)"),
+    _u("P11. Demo 1 K1 decoy, spinal twins", "stress_sweep", "stress_k1_decoy_spinal", "spinal", _TP, _GP, 5,
+       group="spinal", channels=90, note="separation 3 pitches on an 8x8 grid: channels where it does not fit are skipped"),
+    _u("P12. Split-half GT, K2-channel spinal", "stress_sweep", "stress_k2_channel_spinal", "spinal", _TP, _GP, 9,
+       group="spinal", channels=90, overrides=("gt_mode=split_half", "tag=spinal-sh")),
+    _u("P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal", "bo_benchmark", "hyp0_pfn_bench_spinal", "spinal",
+       ("tabpfn_v2_5", "tabicl"), ("gp_mll",), group="spinal", env=BENCH_ENV,
+       note="bench env; TabPFN-2.5 / GP-MLL cells are shared with P1"),
+    _u("P14. PFNs4BO (native policy), spinal", "bo_benchmark", "hyp0_pfn_bench_spinal", "spinal", ("pfns4bo",), (),
+       group="spinal", lanes=2, note="main env"),
+    _u("P15. TabFM, spinal (fixed wrapper)", "bo_benchmark", "hyp0_pfn_bench_spinal", "spinal", ("tabfm",), (),
+       group="spinal", env=BENCH_ENV, lanes=2, mem="24G",
+       note="cost UNMEASURED on spinal: run after E3 and read its per-rep time; sigma is constructed (G3)"),
+    _u("P16. TabPFN v1 (classification-head adaptation), spinal", "bo_benchmark", "hyp0_pfn_bench_spinal", "spinal",
+       ("tabpfn_v1",), (), group="spinal", env=V1_ENV, lanes=2, hours=None,
+       note="cost UNMEASURED; only after E7 has run one v1 cell successfully"),
 )
 
 
@@ -151,7 +197,8 @@ def _hours(unit: Unit, models: tuple[str, ...], speedup: float) -> float | None:
     costs = [REP_SECONDS[unit.dataset].get(m) for m in models]
     if any(c is None for c in costs):
         return None
-    return sum(costs) * unit.multiplier * CHANNELS[unit.dataset] * REPS / 3600.0 / speedup
+    channels = unit.channels or CHANNELS[unit.dataset]
+    return sum(costs) * unit.multiplier * channels * REPS / 3600.0 / speedup
 
 
 def _fmt(hours: float | None) -> str:
@@ -231,12 +278,12 @@ def emit_bash(group: str) -> None:
 def main() -> None:
     """Entry point."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--group", choices=["stress", "bench", "hypc", "externals", "all"], default="all")
+    parser.add_argument("--group", choices=["stress", "bench", "hypc", "externals", "spinal", "all"], default="all")
     parser.add_argument("--emit-bash", action="store_true", help="Write a submission script to stdout.")
     args = parser.parse_args()
     if args.emit_bash:
         if args.group == "all":
-            parser.error("--emit-bash needs one --group (stress, bench, hypc or externals).")
+            parser.error("--emit-bash needs one --group (stress, bench, hypc, externals or spinal).")
         emit_bash(args.group)
     else:
         print_plan(args.group)

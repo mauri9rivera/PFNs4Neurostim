@@ -3,7 +3,8 @@
 # The same benchmark is run with gt_mode=full_mean (primary) and gt_mode=split_half
 # (observed trials and GT disjoint; rep i uses split instance i mod 2*gt_n_splits), then
 # paired per channel in an identity scatter to size the leakage bias. Budget 32 < the
-# 64-site grid (P0.3). Spinal carries 7 trials per site, so the halves hold 3 and 4 trials.
+# 64-site grid (P0.3). Trials per site vary by channel (1 to 40, measured 2026-09-25); sites with fewer
+# than 2 valid trials are dropped from a split, and subject 5 (one trial per site on every EMG) is excluded.
 #
 #   python -m pfns4neurostim gt_sensitivity --config configs/experiment/gt_sensitivity_spinal.yaml
 defaults:
@@ -14,6 +15,10 @@ defaults:
 experiment: bo_benchmark
 family: gt-sensitivity
 tag: spinal
+
+dataset:
+  # subject 5 excluded: one trial per site on all its EMGs, so a split-half GT is undefined.
+  subjects: [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
 
 budget: 32
 n_init: 5
