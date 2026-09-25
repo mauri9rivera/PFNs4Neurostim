@@ -531,6 +531,10 @@ def run_placement(cfg: MechanismConfig, replot: bool = False) -> str:
         # Formulation B with both floors and both ceilings (Steps 3-4).
         rows: list[dict[str, Any]] = []
         ref_cache: dict[tuple[bytes, str], tuple[np.ndarray, np.ndarray]] = {}
+        # Reference summaries (sorted projections, MMD self-terms) once per grid and metric.
+        train_prep = {
+            (key, name): P.prepare_bank(b["train"], m) for key, b in banks.items() for name, m in metrics.items()
+        }
         for ch in channels:
             bank = banks[ch.X_pool.tobytes()]
             y = standardize_map(ch.y_gt)
@@ -541,20 +545,21 @@ def run_placement(cfg: MechanismConfig, replot: bool = False) -> str:
             X_split = ch.X_pool[np.isfinite(ch.Y_trials).sum(axis=1) >= 2]
             for name, m in metrics.items():
                 ck = (ch.X_pool.tobytes(), name)
+                train = train_prep[ck]
                 if ck not in ref_cache:
                     ref_cache[ck] = (
-                        np.array([P.distance_to_bank(h, bank["train"], m, k) for h in bank["holdout"]]),
-                        np.array([P.distance_to_bank(nz, bank["train"], m, k) for nz in bank["noise"]]),
+                        np.array([P.distance_to_bank(h, train, m, k) for h in bank["holdout"]]),
+                        np.array([P.distance_to_bank(nz, train, m, k) for nz in bank["noise"]]),
                     )
                 floor1, ceil1 = ref_cache[ck]
                 floor2 = np.array([
                     m(feat(X_split, standardize_map(a)), feat(X_split, standardize_map(b))) for a, b in split_maps
                 ])
                 ceil2 = np.array([
-                    P.distance_to_bank(feat(ch.X_pool, rng.permutation(y)), bank["train"], m, k)
+                    P.distance_to_bank(feat(ch.X_pool, rng.permutation(y)), train, m, k)
                     for _ in range(int(p["n_shuffles"]))
                 ])
-                d = P.distance_to_bank(Z, bank["train"], m, k)
+                d = P.distance_to_bank(Z, train, m, k)
                 row: dict[str, Any] = {
                     "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg, "metric": name,
                     "metric_valid": valid[name], "representation": p["representation"], "d": d,
@@ -575,10 +580,14 @@ def run_placement(cfg: MechanismConfig, replot: bool = False) -> str:
         cp = p["context"]
         knob = build_knob(cp["stress"]["knob"], cp["stress"]["levels"])
         crow: list[dict[str, Any]] = []
+        t0 = time.time()
         for ch in channels:
             bank = banks[ch.X_pool.tobytes()]
             train_maps = bank["prior_maps"][bank["n_hold"]:]
             hold_maps = bank["prior_maps"][: bank["n_hold"]]
+            # Full-map contexts all use every site, so their references, floor and ceiling do not
+            # depend on the level or the draw: computed once per channel, per metric.
+            full_cache: dict[str, tuple[P.PreparedBank, float, float]] = {}
             for level in knob.levels:
                 stressed = knob.apply(ch, level, rng_for(ch.label, "placement_c", level, base_seed=cfg.seed))
                 snr = achieved_snr_db(stressed)
@@ -601,17 +610,31 @@ def run_placement(cfg: MechanismConfig, replot: bool = False) -> str:
                         def at_sites(maps: np.ndarray) -> list[np.ndarray]:
                             return [feat(Xs, standardize_map(mp[sites])) for mp in maps]
 
-                        ref, hold, noise_s = at_sites(train_maps), at_sites(hold_maps), at_sites(bank["noise_maps"])
+                        is_full = tt == ch.n_sites
+                        refs: dict[str, tuple[P.PreparedBank, float, float]] = {}
+                        if is_full and full_cache:
+                            refs = full_cache
+                        else:
+                            ref, hold, noise_s = at_sites(train_maps), at_sites(hold_maps), at_sites(bank["noise_maps"])
+                            for name, m in metrics.items():
+                                ref_p = P.prepare_bank(ref, m)
+                                refs[name] = (
+                                    ref_p,
+                                    float(np.median([P.distance_to_bank(h, ref_p, m, k) for h in hold])),
+                                    float(np.median([P.distance_to_bank(nz, ref_p, m, k) for nz in noise_s])),
+                                )
+                            if is_full:
+                                full_cache.update(refs)
                         for name, m in metrics.items():
-                            d = P.distance_to_bank(Zc, ref, m, k)
-                            fl = float(np.median([P.distance_to_bank(h, ref, m, k) for h in hold]))
-                            ce = float(np.median([P.distance_to_bank(nz, ref, m, k) for nz in noise_s]))
+                            ref_p, fl, ce = refs[name]
+                            d = P.distance_to_bank(Zc, ref_p, m, k)
                             crow.append({
                                 "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg, "metric": name,
                                 "knob": knob.name, "level": float(level), "achieved_snr_db": snr,
                                 "context_t": tt, "is_full": t == "full", "draw": draw, "d": d,
                                 "floor1": fl, "ceiling1": ce, "p": P.placement(d, fl, ce),
                             })
+                print(f"[mechanism] placement-C {ch.label} level={level} done ({time.time() - t0:.0f}s)", flush=True)
 
         # Formulation A: pooled marginal of y (appendix, labelled "marginal").
         arow: list[dict[str, Any]] = []

@@ -111,6 +111,50 @@ class TestPlacement:
         assert Z.shape == (64, 3)
 
 
+class TestPreparedBank:
+    """The prepared-bank fast path must reproduce the direct computation bit for bit."""
+
+    def _bank(self, rng: np.random.Generator, n_maps: int = 12) -> tuple[np.ndarray, list[np.ndarray]]:
+        X = _grid(6)
+        return X, [P.map_features(X, _smooth_map(X, rng)) for _ in range(n_maps)]
+
+    def _metric(self, name: str, bank: list[np.ndarray]) -> P.Metric:
+        if name == "mmd":
+            return P.make_metric("mmd", bandwidth=P.median_bandwidth(bank))
+        return P.make_metric("w2", projections=P.projection_set(bank[0].shape[1], 50), n_repeats=5, seed=3)
+
+    @pytest.mark.parametrize("name", ["mmd", "w2"])
+    def test_pairwise_between_equals_fn(self, rng: np.random.Generator, name: str) -> None:
+        _, bank = self._bank(rng)
+        m = self._metric(name, bank)
+        for a, b in zip(bank[:-1], bank[1:]):
+            assert m.between(m.prepare(a), m.prepare(b)) == m(a, b)
+
+    @pytest.mark.parametrize("name", ["mmd", "w2"])
+    @pytest.mark.parametrize("k", [1, 4, 100])
+    def test_distance_to_bank_is_identical(self, rng: np.random.Generator, name: str, k: int) -> None:
+        X, bank = self._bank(rng)
+        m = self._metric(name, bank)
+        prepared = P.prepare_bank(bank, m)
+        for _ in range(3):
+            Z = P.map_features(X, standardize_map(rng.normal(size=len(X))))
+            assert P.distance_to_bank(Z, prepared, m, k) == P.distance_to_bank(Z, bank, m, k)
+
+    @pytest.mark.parametrize("name", ["mmd", "w2"])
+    def test_unequal_sizes_fall_back_exactly(self, rng: np.random.Generator, name: str) -> None:
+        X, bank = self._bank(rng)
+        m = self._metric(name, bank)
+        Xs = X[:20]
+        Z = P.map_features(Xs, standardize_map(rng.normal(size=len(Xs))))
+        assert P.distance_to_bank(Z, P.prepare_bank(bank, m), m, 3) == P.distance_to_bank(Z, bank, m, 3)
+
+    def test_bank_of_another_metric_is_refused(self, rng: np.random.Generator) -> None:
+        _, bank = self._bank(rng)
+        prepared = P.prepare_bank(bank, self._metric("mmd", bank))
+        with pytest.raises(ValueError, match="prepared for 'mmd'"):
+            P.distance_to_bank(bank[0], prepared, self._metric("w2", bank), 3)
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(not __import__("os").path.exists("data/monkeys/Cebus2_M1_200123.mat"), reason="raw NHP data absent")
 def test_real_channel_ladder_rank_pairs_passes_raw_pairs_fails() -> None:

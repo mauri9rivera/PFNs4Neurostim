@@ -54,7 +54,9 @@ __all__ = [
     "sliced_w2",
     "projection_set",
     "Metric",
+    "PreparedBank",
     "make_metric",
+    "prepare_bank",
     "distance_to_bank",
     "placement",
     "bootstrap_placement",
@@ -168,6 +170,13 @@ def median_bandwidth(Z_list: Sequence[np.ndarray], max_points: int = 2000, seed:
     return bw
 
 
+def _mmd_self_term(Z: np.ndarray, g: float) -> float:
+    """Within-sample term of the unbiased MMD²: mean off-diagonal RBF kernel value."""
+    K = np.exp(-g * _sqdist(Z, Z))
+    n = len(Z)
+    return (K.sum() - np.trace(K)) / (n * (n - 1))
+
+
 def mmd2_unbiased(Z1: np.ndarray, Z2: np.ndarray, bandwidth: float) -> float:
     """Unbiased MMD² U-statistic with an RBF kernel (Gretton et al. 2012, Eq. 3).
 
@@ -182,15 +191,13 @@ def mmd2_unbiased(Z1: np.ndarray, Z2: np.ndarray, bandwidth: float) -> float:
         The estimate.
     """
     g = 1.0 / (2.0 * bandwidth ** 2)
-    Kxx = np.exp(-g * _sqdist(Z1, Z1))
-    Kyy = np.exp(-g * _sqdist(Z2, Z2))
-    Kxy = np.exp(-g * _sqdist(Z1, Z2))
-    n, m = len(Z1), len(Z2)
-    return float(
-        (Kxx.sum() - np.trace(Kxx)) / (n * (n - 1))
-        + (Kyy.sum() - np.trace(Kyy)) / (m * (m - 1))
-        - 2.0 * Kxy.mean()
-    )
+    return _mmd_from_terms(_mmd_self_term(Z1, g), _mmd_self_term(Z2, g), Z1, Z2, g)
+
+
+def _mmd_from_terms(self1: float, self2: float, Z1: np.ndarray, Z2: np.ndarray, g: float) -> float:
+    """Unbiased MMD² from precomputed within-sample terms (only the cross term is evaluated)."""
+    Kxy = np.exp(-g * _sqdist(Z1, Z2))                              # [n, m]
+    return float(self1 + self2 - 2.0 * Kxy.mean())
 
 
 def projection_set(n_features: int, n_projections: int, seed: int = 0) -> np.ndarray:
@@ -239,22 +246,69 @@ def sliced_w2(
     for _ in range(reps):
         a = Z1 if len(Z1) == m else Z1[rng.choice(len(Z1), m, replace=False)]
         b = Z2 if len(Z2) == m else Z2[rng.choice(len(Z2), m, replace=False)]
-        pa = np.sort(a @ projections.T, axis=0)                     # [m, P]
-        pb = np.sort(b @ projections.T, axis=0)                     # [m, P]
-        vals.append(float(np.sqrt(np.mean((pa - pb) ** 2))))
+        vals.append(_w2_sorted(_sorted_projections(a, projections), _sorted_projections(b, projections)))
     return float(np.mean(vals))
+
+
+def _sorted_projections(Z: np.ndarray, projections: np.ndarray) -> np.ndarray:
+    """Per-direction sorted projections of a point set, shape [n, P]."""
+    return np.sort(Z @ projections.T, axis=0)
+
+
+def _w2_sorted(pa: np.ndarray, pb: np.ndarray) -> float:
+    """Sliced W₂ between two equal-size samples from their sorted projections, each [n, P]."""
+    return float(np.sqrt(np.mean((pa - pb) ** 2)))
 
 
 @dataclass(frozen=True)
 class Metric:
-    """A named map-distance ``(Z1, Z2) -> float`` with its fixed parameters."""
+    """A named map-distance ``(Z1, Z2) -> float`` with its fixed parameters.
+
+    ``prepare`` / ``between`` are an optional exact fast path for many comparisons against
+    the same maps: ``prepare`` computes a map's metric-specific summary once (sorted
+    projections for W₂, the within-sample kernel term for MMD²) and ``between`` evaluates
+    the distance from two summaries with the same arithmetic as ``fn``.
+    """
 
     name: str
     fn: Callable[[np.ndarray, np.ndarray], float]
     params: dict[str, Any]
+    prepare: Callable[[np.ndarray], Any] | None = None
+    between: Callable[[Any, Any], float] | None = None
 
     def __call__(self, Z1: np.ndarray, Z2: np.ndarray) -> float:
         return self.fn(Z1, Z2)
+
+
+@dataclass(frozen=True)
+class PreparedBank:
+    """Reference maps with their ``metric.prepare`` summaries, computed once.
+
+    Attributes:
+        metric: Name of the metric the summaries belong to.
+        summaries: One summary per reference map.
+    """
+
+    metric: str
+    summaries: list[Any]
+
+
+def prepare_bank(bank_Z: Sequence[np.ndarray], metric: Metric) -> PreparedBank:
+    """Summarize reference maps once so repeated :func:`distance_to_bank` calls reuse them.
+
+    Args:
+        bank_Z: Reference maps' point sets.
+        metric: Distance; must define ``prepare``/``between``.
+
+    Returns:
+        The prepared bank.
+
+    Raises:
+        ValueError: If the metric has no fast path.
+    """
+    if metric.prepare is None or metric.between is None:
+        raise ValueError(f"prepare_bank: metric {metric.name!r} has no prepare/between fast path.")
+    return PreparedBank(metric.name, [metric.prepare(R) for R in bank_Z])
 
 
 def make_metric(name: str, **params: Any) -> Metric:
@@ -269,22 +323,37 @@ def make_metric(name: str, **params: Any) -> Metric:
     """
     if name == "mmd":
         bw = float(params["bandwidth"])
-        return Metric("mmd", lambda a, b: mmd2_unbiased(a, b, bw), {"bandwidth": bw})
+        g = 1.0 / (2.0 * bw ** 2)
+        return Metric(
+            "mmd",
+            lambda a, b: mmd2_unbiased(a, b, bw),
+            {"bandwidth": bw},
+            prepare=lambda Z: (Z, _mmd_self_term(Z, g)),
+            between=lambda a, b: _mmd_from_terms(a[1], b[1], a[0], b[0], g),
+        )
     if name == "w2":
         proj = np.asarray(params["projections"])
         reps = int(params.get("n_repeats", 20))
         seed = int(params.get("seed", 0))
+
+        def w2(a: np.ndarray, b: np.ndarray) -> float:
+            return sliced_w2(a, b, proj, n_repeats=reps, rng=np.random.default_rng(seed))
+
+        def w2_between(a: tuple[np.ndarray, np.ndarray], b: tuple[np.ndarray, np.ndarray]) -> float:
+            # Unequal sizes need the random equal-n subsampling: fall back to the full computation.
+            return _w2_sorted(a[1], b[1]) if len(a[0]) == len(b[0]) else w2(a[0], b[0])
+
         return Metric(
-            "w2",
-            lambda a, b: sliced_w2(a, b, proj, n_repeats=reps, rng=np.random.default_rng(seed)),
-            {"n_projections": int(len(proj)), "n_repeats": reps},
+            "w2", w2, {"n_projections": int(len(proj)), "n_repeats": reps},
+            prepare=lambda Z: (Z, _sorted_projections(Z, proj)),
+            between=w2_between,
         )
     raise ValueError(f"Unknown placement metric {name!r}; expected 'mmd' or 'w2'.")
 
 
 def distance_to_bank(
     Z: np.ndarray,
-    bank_Z: Sequence[np.ndarray],
+    bank_Z: Sequence[np.ndarray] | PreparedBank,
     metric: Metric,
     k: int,
 ) -> float:
@@ -292,14 +361,24 @@ def distance_to_bank(
 
     Args:
         Z: The map's joint points, shape [N, F].
-        bank_Z: Reference maps' joint points.
+        bank_Z: Reference maps' joint points, or a :func:`prepare_bank` of them (same result,
+            reference summaries reused across calls).
         metric: Distance.
         k: Pre-declared number of nearest references.
 
     Returns:
         Median over the ``k`` smallest distances.
+
+    Raises:
+        ValueError: If a prepared bank belongs to another metric.
     """
-    d = np.sort([metric(Z, R) for R in bank_Z])
+    if isinstance(bank_Z, PreparedBank):
+        if bank_Z.metric != metric.name:
+            raise ValueError(f"distance_to_bank: bank prepared for {bank_Z.metric!r}, metric is {metric.name!r}.")
+        s = metric.prepare(Z)
+        d = np.sort([metric.between(s, r) for r in bank_Z.summaries])
+    else:
+        d = np.sort([metric(Z, R) for R in bank_Z])
     return float(np.median(d[: max(1, min(k, len(d)))]))
 
 
