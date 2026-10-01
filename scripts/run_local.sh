@@ -76,6 +76,13 @@ step_bridge() {
   local cfg dataset source ran=0
   for cfg in configs/experiment/stress_k2_channel_demo1_*.yaml; do
     dataset=$("${PY}" -c "import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))['defaults']['dataset'])" "${cfg}")
+    # The Demo 1 run must exist too: --replot rebuilds the Demo 1 figures and overlays the Demo 2 source
+    # on them, so without it the step fails on a missing tidy.csv rather than reporting nothing to do.
+    target=$("${PY}" -c "import sys,yaml; c=yaml.safe_load(open(sys.argv[1])); print(c['tag'])" "${cfg}")
+    if ! ls output/stress/k2_channel/"${dataset}"/*"${target}"*/tidy.csv >/dev/null 2>&1; then
+      echo "   skipped ${cfg}: its own Demo 1 run has not been produced yet"
+      continue
+    fi
     for source in output/stress/k2_channel/"${dataset}"/*/; do
       [ -f "${source}/tidy.csv" ] || continue
       echo "   ${cfg}  <-  ${source}"

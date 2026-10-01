@@ -7,7 +7,12 @@
 #   bash scripts/submit_next.sh rat         # 3. 5d_rat stress + bench                   (~45 GPU-h)
 #   bash scripts/submit_next.sh hypc        # 4. Hyp C context sweeps C1-C3              (~13 GPU-h)
 #   bash scripts/submit_next.sh externals   # 5. PFN benchmark, non-v1 models            (~9 GPU-h)
-#   bash scripts/submit_next.sh spinal      # 6. spinal P1-P14                           (~141 GPU-h)
+#   bash scripts/submit_next.sh spinal --force   # 6. spinal P1-P14 (DEFERRED: needs --force)  (~141 GPU-h)
+#
+# `spinal` is DEFERRED and needs --force even on its first submission. It is 54 % of the remaining GPU
+# time and 59 % of the CPU time for a *supporting* dataset, its data is staged so its gate passes, and the
+# converged `gp_mll` (P0.10) tripled its CPU column -- seven of its units now exceed the 12 h wall and will
+# requeue. Decide it deliberately, and consider n_reps=10 instead of 20, which halves it.
 #
 # Gated sub-stages, waiting on a specific finished thing rather than on a rank:
 #   v1-test -> v1     one TabPFN v1 cell, then E7/E8/P16   (needs the v1 env, then that cell)
@@ -71,7 +76,10 @@ gate_nhp()       { have_data monkeys && echo "READY" || echo "needs data/monkeys
 gate_rat()       { have_data 5d_rat && echo "READY" || echo "needs data/5d_rat staged"; }
 gate_hypc()      { have_data monkeys && echo "READY" || echo "needs data/monkeys"; }
 gate_externals() { env_exists pfns4neurostim-bench && echo "READY" || echo "needs the bench env (bash scripts/mila_setup.sh env bench)"; }
-gate_spinal()    { have_data spinal && echo "READY" || echo "needs data/spinal staged (#14 Step 3)"; }
+gate_spinal()    {   # deferred by decision, not by a missing prerequisite
+  have_data spinal || { echo "needs data/spinal staged (#14 Step 3)"; return; }
+  echo "DEFERRED - ready, but needs --force (54% of the remaining compute)"
+}
 gate_v1_test()   { env_exists "${V1_ENV}" && echo "READY" || echo "needs the v1 env (sbatch scripts/setup_env_job.sh v1)"; }
 gate_v1()        { has_cell nhp tabpfn_v1 && echo "READY" || echo "needs a finished v1 cell (stage v1-test)"; }
 gate_tabfm()     { has_cell nhp tabfm && echo "READY" || echo "needs E3's TabFM cells (stage externals)"; }
@@ -87,10 +95,10 @@ case "${STAGE}" in
       fi
       printf '%-14s %-5s %-11s %s\n' "${name}" "${rank}" "${cost}" "${state}"
     done <<'STAGES'
-audit 1 2.7cpu-h gate_audit
-nhp 2 52gpu-h gate_nhp
+audit 1 6.6cpu-h gate_audit
+nhp 2 58gpu-h gate_nhp
 rat 3 45gpu-h gate_rat
-hypc 4 13gpu-h gate_hypc
+hypc 4 9.5gpu-h gate_hypc
 externals 5 9gpu-h gate_externals
 spinal 6 141gpu-h gate_spinal
 v1-test - 1cell gate_v1_test
@@ -98,7 +106,12 @@ v1 - ?gpu-h gate_v1
 tabfm-spinal - ?gpu-h gate_tabfm
 STAGES
     echo
-    echo "held back by a code task: rat-demo1 (S5b, #10 Step 15), hypc-5drat (C4, #18 Step 5)"
+    echo "COST is the GPU column (CPU-only for audit); the CPU column roughly TRIPLED with the converged"
+    echo "gp_mll of P0.10 -- audit 6.6, nhp 36, rat 31, spinal 110 CPU-h. Full table: python scripts/portfolio.py"
+    echo
+    echo "deferred by decision:       spinal (needs --force; 54% of the remaining compute)"
+    echo "held back by a code task:   rat-demo1 (S5b, #10 Step 15), hypc-5drat (C4, #18 Step 5)"
+    echo "run locally, not here:      hypc (C1/C2/C3) -- bash scripts/run_local.sh hypc-gpu | hypc-cpu"
     echo "stage 0 needs no cluster:   bash scripts/run_local.sh"
     echo "a stage's gates in detail:  bash scripts/preflight.sh <stage>"
     ;;
@@ -164,6 +177,13 @@ STAGES
   spinal)
     guard spinal
     need_data spinal "#14 Step 3 stages it from your machine"
+    if [ "${FORCE}" != "--force" ]; then
+      echo "[submit_next] spinal is DEFERRED: 14 units, ~141 GPU-h + ~110 CPU-h, for the supporting" >&2
+      echo "[submit_next] dataset -- 54% of everything left. Seven units exceed the 12 h wall and will" >&2
+      echo "[submit_next] requeue. Submit the NHP and 5d_rat stages first, consider n_reps=10 (halves it)," >&2
+      echo "[submit_next] then: bash scripts/submit_next.sh spinal --force" >&2
+      exit 1
+    fi
     run_units scripts/submit_spinal.sh drop 'P15|P16'
     record spinal
     ;;
