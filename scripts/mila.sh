@@ -12,7 +12,8 @@
 #   bash scripts/mila.sh run -- <read-only cmd>
 #   bash scripts/mila.sh logs <jobid> [--tail N]
 #   bash scripts/mila.sh queue | sacct <jobid> | avail | quota
-#   bash scripts/mila.sh eff <jobid>          # did the job USE what it asked for (CPU / memory / GPU)
+#   bash scripts/mila.sh eff <jobid>          # did the job USE what it asked for: sacct + sstat +
+#                                             # the per-lane CLUSTER DIAGNOSTICS block (the only GPU source)
 #   bash scripts/mila.sh share                # your fairshare and the priority of your pending jobs
 #   bash scripts/mila.sh submit <script> <config> [extra args]   # prints only
 set -euo pipefail
@@ -20,6 +21,8 @@ set -euo pipefail
 MILA_HOST="${MILA_HOST:-mila}"
 MILA_SOCKET="${MILA_SOCKET:-$HOME/.ssh/cm-mila.sock}"
 MILA_REMOTE_ROOT="${MILA_REMOTE_ROOT:-\$SCRATCH/pfns4neurostim}"
+#: Where the clone with logs/ lives (the job scripts cd into it), as opposed to the scratch data root.
+MILA_REMOTE_REPO="${MILA_REMOTE_REPO:-~/projects/PFNs4Neurostim}"
 # Defence in depth: `run` refuses anything that mutates state or submits work.
 MILA_DENY_REGEX='(^|[;&|[:space:]])(sbatch|salloc|srun|scancel|scontrol|rm|mv|cp|chmod|kill|pkill|tee|dd)([[:space:]]|$)|pip[[:space:]]+(install|uninstall)|conda[[:space:]]+(create|install|remove|update|uninstall|env[[:space:]]+(create|update|remove))|>'
 
@@ -77,14 +80,17 @@ cmd_sacct() {
 cmd_eff() {
   local jobid="${1:-}"
   [[ "${jobid}" =~ ^[0-9]+$ ]] || { log "usage: eff <numeric jobid>"; exit 2; }
-  # CPU efficiency is TotalCPU / CPUTime: the core-seconds actually burned over the core-seconds reserved.
-  # A unit asking for 4 lanes that sits at 25% was really running one. AllocTRES names the GPU request;
-  # SLURM accounting does not record GPU *utilisation*, so `eff` reports the allocation and, for a RUNNING
-  # job, sstat's live counters -- actual GPU busy-ness needs nvidia-smi inside the allocation or Mila's
-  # dashboards, neither of which this read-only socket can reach.
-  remote "sacct -j ${jobid} --format=JobID%20,JobName%24,State,Elapsed,TotalCPU,CPUTime,MaxRSS,MaxVMSize,ReqMem,AllocTRES%45"
-  remote "seff ${jobid} 2>/dev/null || true"
-  remote "sstat -j ${jobid} --format=JobID%20,AveCPU,AveRSS,MaxRSS 2>/dev/null || true"
+  # sacct FIRST, for what it is reliable about: state, elapsed, the time limit and what was allocated.
+  # Its TotalCPU column is NOT usable on this cluster -- it reads 00:00:00 even for COMPLETED jobs
+  # (checked across nine finished jobs, 2026-10-01), so CPU efficiency comes from sstat instead.
+  remote "sacct -j ${jobid} --format=JobID%14,JobName%12,State%11,Elapsed,Timelimit,MaxRSS,ReqMem,AllocTRES%42"
+  # sstat reads the LIVE cgroup counters of a running step. AveCPU is the CPU time the step has burned;
+  # divided by (cores x elapsed) it is the share of the reserved cores that did work.
+  remote "sstat -j ${jobid}.batch -o JobID%16,AveCPU,AveRSS,MaxRSS 2>/dev/null || echo '(sstat: job not running; see the diagnostics block below)'"
+  # The in-job report. job_run_lanes sends each lane's stdout to logs/lane<i>_<jobid>.out, NOT to the
+  # SBATCH --output file, so this is where the block actually lands -- the single place it is worth
+  # looking for GPU utilisation, which SLURM accounting does not record at all.
+  remote "cd ${MILA_REMOTE_REPO} && n=\$(ls logs/lane*_${jobid}.out 2>/dev/null | wc -l); echo \"lanes with a log: \${n}\"; grep -A 45 'CLUSTER DIAGNOSTICS' logs/lane0_${jobid}.out 2>/dev/null || echo '(no diagnostics block: job still running, or CLUSTER_DIAG was off)'"
 }
 
 cmd_share() {

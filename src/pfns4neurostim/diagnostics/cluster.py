@@ -55,15 +55,20 @@ class _DiagMetrics:
     # GPU memory (bytes)
     peak_gpu_mem_bytes: int = 0
     reserved_gpu_mem_bytes: int = 0
-    requested_mem_bytes: Optional[int] = None       # from SLURM_MEM_PER_NODE
+    requested_mem_bytes: Optional[int] = None       # from SLURM_MEM_PER_NODE (HOST RAM, not VRAM)
+    total_gpu_mem_bytes: Optional[int] = None       # the card's VRAM; what GPU memory must be judged against
 
     # GPU utilisation (integer 0–100 per sample)
     gpu_util_samples: List[int] = field(default_factory=list)
 
     # CPU / RAM
-    peak_rss_bytes: int = 0
+    peak_rss_bytes: int = 0                         # THIS PROCESS only -- one lane, not the job
     requested_ram_bytes: Optional[int] = None       # same as requested_mem_bytes
     n_cpus_requested: Optional[int] = None          # SLURM_CPUS_PER_TASK
+    #: Worker processes sharing this job's allocation (``--shard i/N`` -> N). 1 for a single-process job.
+    #: Everything measured by ``resource.getrusage`` is per PROCESS, so the job's footprint is this many
+    #: times the figure above -- without it the report advised --mem=1G for jobs whose true peak was 3.3 GB.
+    n_lanes: int = 1
 
     # Throughput
     n_experiments_completed: int = 0
@@ -76,6 +81,22 @@ class _DiagMetrics:
     experiment_tag: str = ''
     cuda_available: bool = False
     nvidia_smi_available: bool = False
+
+    @property
+    def job_peak_rss_bytes(self) -> int:
+        """Peak RSS of the whole job: this lane's peak times the number of lanes.
+
+        An upper bound, since the lanes do not necessarily peak together, and the right quantity to
+        compare against ``--mem`` -- which is a job-level allocation shared by every lane.
+        """
+        return self.peak_rss_bytes * max(1, self.n_lanes)
+
+    @property
+    def idle_cpus(self) -> Optional[int]:
+        """Requested CPUs that no lane can be using, or None when either count is unknown."""
+        if self.n_cpus_requested is None:
+            return None
+        return max(0, self.n_cpus_requested - max(1, self.n_lanes))
 
 
 # ---------------------------------------------------------------------------
@@ -328,23 +349,40 @@ def _wrap_lines(text: str, width: int) -> List[str]:
 #   'text':      warning text template (Python .format(**vars))
 #   'fix':       fix recipe template (Python .format(**vars))
 
+#: Lower edge of each metric's "healthy" band, from the efficiency rubric in
+#: ``.claude/skills/cluster-companion/references/slurm_primer.md``: CPU >= 85%, memory 60-90%,
+#: time 50-85%, GPU utilisation "sustained high". A metric inside its band scores full marks, so a job
+#: is only marked down for what the rubric says to act on. Before 2026-10-01 the grade scored GPU memory
+#: against ``--mem`` -- two unrelated resources -- which made every lane-parallel job an F.
+HEALTHY_BAND_LOW: Dict[str, float] = {'gpu_util': 0.70, 'memory': 0.60, 'walltime': 0.50}
+#: Most lanes the report will ever suggest. Each needs its own core, so the real ceiling is the CPU
+#: allocation; without a cap the arithmetic suggested 47 lanes for a 4-core job.
+MAX_SUGGESTED_LANES: int = 8
+#: Cores below which the report does not complain about idle CPUs: one for the work, one for the
+#: interpreter's own threads. Dropping below this is never the actionable fix.
+MIN_BASELINE_CPUS: int = 2
+
 _WARNING_RULES: List[Dict[str, Any]] = [
     {
-        'id': 'GPU_MEM_UNDERUSE',
+        'id': 'GPU_MEM_HEADROOM',
+        # Against the CARD's memory, not --mem. SLURM's --mem is host RAM and --gres=gpu:1 requests no
+        # GPU memory at all, so the old comparison was between two unrelated resources and its fix
+        # (shrink --mem) would have starved the host side (corrected 2026-10-01).
         'condition': lambda m: (
             m.cuda_available
-            and m.requested_mem_bytes is not None
-            and m.requested_mem_bytes > 0
+            and m.total_gpu_mem_bytes is not None
+            and m.total_gpu_mem_bytes > 0
             and m.peak_gpu_mem_bytes > 0
-            and (m.peak_gpu_mem_bytes / m.requested_mem_bytes) < 0.75
+            and (m.peak_gpu_mem_bytes * max(1, m.n_lanes) / m.total_gpu_mem_bytes) < 0.25
         ),
         'text': (
-            'GPU_MEM_UNDERUSE: Peak GPU memory {peak_gpu_gb:.1f} GB is below '
-            '75% of requested {req_gb:.1f} GB ({pct:.0f}% utilisation).'
+            'GPU_MEM_HEADROOM: {n_lanes} lane(s) peaked at {job_gpu_gb:.1f} GB of the card\'s '
+            '{vram_gb:.0f} GB ({pct:.0f}%). The GPU is nowhere near full.'
         ),
         'fix': (
-            'Reduce --mem to peak + 20% headroom:\n'
-            '  #SBATCH --mem={suggested_mem_gb:.0f}G'
+            'This is spare capacity, not waste: pack more lanes into the same job.\n'
+            '  LANES={suggested_lanes} sbatch scripts/run_bo_benchmark.sh ...\n'
+            'Raise --cpus-per-task to match, since each lane needs one core.'
         ),
     },
     {
@@ -357,10 +395,15 @@ _WARNING_RULES: List[Dict[str, Any]] = [
         'text': (
             'WALLTIME_OVERREQUEST: Job used {elapsed_h:.2f}h of '
             '{limit_h:.2f}h requested ({pct:.0f}%). '
-            'Over-requesting time lowers your Fairshare score.'
+            'A long limit makes the job harder to backfill into gaps.'
         ),
+        # NOT a fairshare matter: SLURM charges usage as billing weights x ALLOCATED resources x ELAPSED
+        # time, so an unused time request costs nothing in fairshare. What it costs is scheduling
+        # opportunities -- the backfill scheduler can only use a job to fill a window longer than its
+        # limit (corrected 2026-10-01).
         'fix': (
-            'Reduce --time to elapsed + 20% rounded to 15 min:\n'
+            'Reduce --time to elapsed + 20% rounded to 15 min, but keep headroom for the\n'
+            'slowest unit of the same config:\n'
             '  #SBATCH --time={suggested_time}'
         ),
     },
@@ -404,31 +447,37 @@ _WARNING_RULES: List[Dict[str, Any]] = [
     },
     {
         'id': 'CPU_UNDERUSE',
+        # Lanes ARE the parallelism: each runs single-threaded, so n_lanes cores are genuinely busy and
+        # only the surplus is idle. Measured 2026-10-01 on job 11012813: sstat AveCPU 08:42:54 against
+        # CPUTime 08:43:20 = 99.9% of 4 cores, with LANES=4. The old rule fired on every such job and
+        # advised halving the cores, which would have halved throughput.
         'condition': lambda m: (
-            m.n_cpus_requested is not None
-            and m.n_cpus_requested > 2
+            (m.idle_cpus or 0) > 0 and (m.n_cpus_requested or 0) > MIN_BASELINE_CPUS
         ),
         'text': (
-            'CPU_UNDERUSE: Job requested {n_cpus} CPUs. '
-            'TabPFN BO loops are single-threaded; extra CPUs sit idle.'
+            'CPU_UNDERUSE: {n_cpus} CPUs requested for {n_lanes} lane(s), so about '
+            '{idle_cpus} core(s) sat idle.'
         ),
         'fix': (
-            'Unless you are using multi-threaded data loading or '
-            'numpy parallelism, reduce to 2:\n'
-            '  #SBATCH --cpus-per-task=2'
+            'One core per lane is what this workload uses:\n'
+            '  #SBATCH --cpus-per-task={n_lanes}\n'
+            'Or keep the cores and raise LANES to match, which also lifts GPU utilisation.'
         ),
     },
     {
         'id': 'RAM_UNDERUSE',
+        # Judged on the JOB's footprint (lanes x per-process peak), because --mem is a job-level
+        # allocation. Per-lane it read 1.0 GB against 10 GB and advised --mem=1G, which would have
+        # OOM-killed a job whose measured MaxRSS was 3.3 GB (corrected 2026-10-01).
         'condition': lambda m: (
             m.requested_ram_bytes is not None
             and m.requested_ram_bytes > 0
             and m.peak_rss_bytes > 0
-            and (m.peak_rss_bytes / m.requested_ram_bytes) < 0.70
+            and (m.job_peak_rss_bytes / m.requested_ram_bytes) < 0.70
         ),
         'text': (
-            'RAM_UNDERUSE: Peak RSS {peak_rss_gb:.1f} GB is below '
-            '70% of requested RAM {req_ram_gb:.1f} GB ({pct:.0f}%).'
+            'RAM_UNDERUSE: {n_lanes} lane(s) x {peak_rss_gb:.1f} GB = {job_rss_gb:.1f} GB peak, '
+            'below 70% of the {req_ram_gb:.1f} GB requested ({pct:.0f}%).'
         ),
         'fix': (
             'Reduce --mem to peak RSS + 25% headroom:\n'
@@ -455,6 +504,10 @@ class ClusterDiagnostics:
         device: PyTorch device string (``'cpu'`` or ``'cuda'``).
         n_planned: Total number of ``(subject, emg)`` pairs planned for this
             SLURM job.  Used for the throughput metric denominator.
+        n_lanes: Worker processes sharing this job's allocation (the denominator of ``--shard i/N``).
+            Everything ``resource.getrusage`` reports is per process, so without this the report
+            compares one lane's footprint against the whole job's ``--mem`` and advises a request that
+            would OOM the job (observed 2026-10-01).
         poll_interval_s: GPU utilisation polling interval in seconds (default
             30 — keeps overhead negligible even for short jobs).
         enabled: ``False`` → pure no-op context manager.
@@ -477,12 +530,14 @@ class ClusterDiagnostics:
         n_planned: int = 0,
         poll_interval_s: int = 30,
         enabled: bool = True,
+        n_lanes: int = 1,
     ) -> None:
         self._enabled = enabled
         self._tag = tag
         self._device = device
         self._n_planned = n_planned
         self._poll_interval_s = poll_interval_s
+        self._n_lanes = max(1, n_lanes)
 
         self._t0: float = 0.0
         self._metrics = _DiagMetrics()
@@ -513,11 +568,15 @@ class ClusterDiagnostics:
             m.n_cpus_requested = int(raw_cpus)
 
         # GPU state
+        m.n_lanes = self._n_lanes
         try:
             import torch
             m.cuda_available = torch.cuda.is_available()
             if m.cuda_available:
                 torch.cuda.reset_peak_memory_stats()
+                # The card's own capacity: the only meaningful denominator for a GPU-memory figure,
+                # since --gres=gpu:1 requests a whole device and --mem is host RAM.
+                m.total_gpu_mem_bytes = int(torch.cuda.get_device_properties(0).total_memory)
         except ImportError:
             pass
 
@@ -588,9 +647,14 @@ class ClusterDiagnostics:
         """Compute weighted efficiency grade A–F.
 
         Sub-scores (each 0–1, linearly clamped):
-          - GPU memory efficiency  (peak / requested):  40 pts
-          - Walltime efficiency    (elapsed / timelimit): 30 pts
-          - GPU utilisation        (mean / 100):         30 pts
+          - GPU utilisation        (mean / 100):               40 pts
+          - RAM efficiency         (job peak RSS / --mem):     30 pts
+          - Walltime efficiency    (elapsed / timelimit):      30 pts
+
+        GPU *memory* is deliberately not scored. It is not a requestable resource here -- ``--gres=gpu:1``
+        asks for a whole card -- so a small GPU footprint is spare capacity, not inefficiency. Scoring it
+        against ``--mem`` (host RAM) graded every lane-parallel job F on 2026-10-01 while its real GPU
+        utilisation was 59-67%.
 
         Grade thresholds: A ≥ 90, B ≥ 75, C ≥ 60, D ≥ 45, F < 45.
         Returns ``'?'`` when no sub-scores are available.
@@ -602,20 +666,21 @@ class ClusterDiagnostics:
         total_weight = 0.0
         m = self._metrics
 
-        if (m.cuda_available and m.requested_mem_bytes
-                and m.requested_mem_bytes > 0 and m.peak_gpu_mem_bytes > 0):
-            eff = min(1.0, m.peak_gpu_mem_bytes / m.requested_mem_bytes)
-            score += 40.0 * eff
-            total_weight += 40.0
-
-        if m.slurm_timelimit_s and m.slurm_timelimit_s > 0:
-            eff = min(1.0, m.elapsed_s / m.slurm_timelimit_s)
-            score += 30.0 * eff
-            total_weight += 30.0
+        def credit(value: float, band: str) -> float:
+            """Full marks inside the healthy band, proportional credit below it."""
+            return min(1.0, value / HEALTHY_BAND_LOW[band])
 
         if m.gpu_util_samples:
-            mean_util = sum(m.gpu_util_samples) / len(m.gpu_util_samples)
-            score += 30.0 * min(1.0, mean_util / 100.0)
+            mean_util = sum(m.gpu_util_samples) / len(m.gpu_util_samples) / 100.0
+            score += 40.0 * credit(mean_util, 'gpu_util')
+            total_weight += 40.0
+
+        if (m.requested_ram_bytes and m.requested_ram_bytes > 0 and m.peak_rss_bytes > 0):
+            score += 30.0 * credit(m.job_peak_rss_bytes / m.requested_ram_bytes, 'memory')
+            total_weight += 30.0
+
+        if m.slurm_timelimit_s and m.slurm_timelimit_s > 0:
+            score += 30.0 * credit(m.elapsed_s / m.slurm_timelimit_s, 'walltime')
             total_weight += 30.0
 
         if total_weight == 0.0:
@@ -701,11 +766,44 @@ class ClusterDiagnostics:
             if m.n_cpus_requested is not None:
                 tv['n_cpus'] = m.n_cpus_requested
 
+            tv['n_lanes'] = max(1, m.n_lanes)
+            if m.idle_cpus is not None:
+                tv['idle_cpus'] = m.idle_cpus
+            if m.peak_rss_bytes:
+                tv['job_rss_gb'] = m.job_peak_rss_bytes / (1024 ** 3)
+                # The suggestion must cover the JOB, not one lane.
+                tv['suggested_mem_gb'] = max(1.0, tv['job_rss_gb'] * 1.25)
+            if m.total_gpu_mem_bytes:
+                tv['vram_gb'] = m.total_gpu_mem_bytes / (1024 ** 3)
+                tv['job_gpu_gb'] = m.peak_gpu_mem_bytes * max(1, m.n_lanes) / (1024 ** 3)
+                if m.peak_gpu_mem_bytes > 0:
+                    # How many lanes would fill ~60% of the card, leaving headroom for fragmentation.
+                    by_vram = int(0.6 * m.total_gpu_mem_bytes // m.peak_gpu_mem_bytes)
+                    tv['suggested_lanes'] = max(
+                        max(1, m.n_lanes) + 1,
+                        min(by_vram, MAX_SUGGESTED_LANES),
+                    )
+
+            # `pct` is rule-specific. It used to be whichever block ran last, so the GPU-memory and
+            # walltime warnings printed the RAM percentage: job 11012807 reported "used 0.65h of 12.00h
+            # (10%)" where the true share is 5%, and "0.5 GB below 75% of 10.0 GB (10%)" where it is 5%
+            # (found 2026-10-01).
+            if rule['id'] == 'GPU_MEM_HEADROOM' and m.total_gpu_mem_bytes:
+                tv['pct'] = (
+                    m.peak_gpu_mem_bytes * max(1, m.n_lanes) / m.total_gpu_mem_bytes * 100
+                )
+            elif rule['id'] == 'WALLTIME_OVERREQUEST' and m.slurm_timelimit_s:
+                tv['pct'] = m.elapsed_s / m.slurm_timelimit_s * 100
+            elif rule['id'] == 'RAM_UNDERUSE' and m.requested_ram_bytes:
+                tv['pct'] = m.job_peak_rss_bytes / m.requested_ram_bytes * 100
+
             try:
                 r_text = rule['text'].format(**tv)
                 r_fix = rule['fix'].format(**tv)
-            except KeyError:
-                r_text = rule['text']
+            except KeyError as exc:
+                # Visible rather than silent: a template referring to a variable this job could not
+                # measure used to print its own braces with no hint why.
+                r_text = f"{rule['id']}: (report incomplete, no value for {exc})"
                 r_fix = rule['fix']
 
             fired.append({**rule, 'rendered_text': r_text, 'rendered_fix': r_fix})
@@ -776,19 +874,19 @@ class ClusterDiagnostics:
         if m.cuda_available:
             peak_gb = m.peak_gpu_mem_bytes / (1024 ** 3)
             res_gb = m.reserved_gpu_mem_bytes / (1024 ** 3)
-            if m.requested_mem_bytes and m.requested_mem_bytes > 0:
-                req_gb = m.requested_mem_bytes / (1024 ** 3)
-                eff = m.peak_gpu_mem_bytes / m.requested_mem_bytes
-                tl = _tl(eff, 0.75, 0.40)
+            if m.total_gpu_mem_bytes and m.total_gpu_mem_bytes > 0:
+                vram_gb = m.total_gpu_mem_bytes / (1024 ** 3)
+                job_gpu_gb = peak_gb * max(1, m.n_lanes)
+                eff = job_gpu_gb / vram_gb
                 lines.append(_row(
-                    f'  [{tl}] GPU Mem  : '
-                    f'{peak_gb:.2f} GB peak / {req_gb:.2f} GB req  '
-                    f'({eff*100:.0f}%)'
+                    f'  [--] GPU Mem  : '
+                    f'{peak_gb:.2f} GB/lane x {max(1, m.n_lanes)} = {job_gpu_gb:.2f} GB of '
+                    f'{vram_gb:.0f} GB VRAM  ({eff*100:.0f}%)'
                 ))
             else:
                 lines.append(_row(
                     f'  [??] GPU Mem  : {peak_gb:.2f} GB peak  '
-                    f'(SLURM_MEM_PER_NODE not set)'
+                    f'(card capacity unknown)'
                 ))
             if res_gb > 0:
                 frag = (res_gb - peak_gb) / res_gb * 100 if res_gb > 0 else 0
@@ -814,12 +912,13 @@ class ClusterDiagnostics:
         # ---- CPU / RAM ----
         if m.peak_rss_bytes > 0 and m.requested_ram_bytes and m.requested_ram_bytes > 0:
             rss_gb = m.peak_rss_bytes / (1024 ** 3)
+            job_gb = m.job_peak_rss_bytes / (1024 ** 3)
             req_gb = m.requested_ram_bytes / (1024 ** 3)
-            eff = m.peak_rss_bytes / m.requested_ram_bytes
+            eff = m.job_peak_rss_bytes / m.requested_ram_bytes
             tl = _tl(eff, 0.70, 0.40)
             lines.append(_row(
                 f'  [{tl}] Peak RSS : '
-                f'{rss_gb:.2f} GB / {req_gb:.2f} GB req  '
+                f'{rss_gb:.2f} GB/lane x {max(1, m.n_lanes)} = {job_gb:.2f} GB / {req_gb:.2f} GB req  '
                 f'({eff*100:.0f}%)'
             ))
         elif m.peak_rss_bytes > 0:
@@ -829,7 +928,7 @@ class ClusterDiagnostics:
             lines.append(_row('  [--] Peak RSS : unavailable (non-Linux or resource module absent)'))
 
         if m.n_cpus_requested is not None:
-            lines.append(_row(f'  [--] CPUs     : {m.n_cpus_requested} requested (SLURM_CPUS_PER_TASK)'))
+            lines.append(_row(f'  [--] CPUs     : {m.n_cpus_requested} requested, {max(1, m.n_lanes)} lane(s) (SLURM_CPUS_PER_TASK)'))
 
         # ---- Throughput ----
         lines.append(_sep())

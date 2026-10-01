@@ -255,23 +255,38 @@ class TestGenerateWarnings:
             setattr(diag._metrics, k, v)
         return diag
 
-    def test_gpu_mem_underuse_fires(self):
+    def test_gpu_mem_headroom_fires_against_the_card_not_the_mem_request(self):
+        """Renamed and re-based on 2026-10-01: --gres=gpu:1 asks for a whole card and --mem is HOST RAM,
+        so GPU memory has to be judged against the device's VRAM. Comparing it with --mem graded every
+        lane-parallel job F while its GPU utilisation was 59-67%."""
         diag = self._make_diag(
             cuda_available=True,
-            peak_gpu_mem_bytes=int(3.0 * self.GB),
-            requested_mem_bytes=int(7.0 * self.GB),  # 43% → fires
+            peak_gpu_mem_bytes=int(1.0 * self.GB),
+            total_gpu_mem_bytes=int(40.0 * self.GB),   # 1 of 40 GB = 2.5% -> fires
         )
         ids = [w['id'] for w in diag._generate_warnings()]
-        assert 'GPU_MEM_UNDERUSE' in ids
+        assert 'GPU_MEM_HEADROOM' in ids
 
-    def test_gpu_mem_underuse_does_not_fire_when_efficient(self):
+    def test_gpu_mem_headroom_counts_every_lane(self):
+        """Lanes share one card, so the job's footprint is lanes x the per-process peak."""
         diag = self._make_diag(
             cuda_available=True,
-            peak_gpu_mem_bytes=int(6.0 * self.GB),
-            requested_mem_bytes=int(7.0 * self.GB),  # 86% → no fire
+            n_lanes=8,
+            peak_gpu_mem_bytes=int(2.0 * self.GB),
+            total_gpu_mem_bytes=int(40.0 * self.GB),   # 8 x 2 = 16 of 40 GB = 40% -> no fire
         )
         ids = [w['id'] for w in diag._generate_warnings()]
-        assert 'GPU_MEM_UNDERUSE' not in ids
+        assert 'GPU_MEM_HEADROOM' not in ids
+
+    def test_gpu_mem_is_silent_without_the_card_capacity(self):
+        """No VRAM figure means no denominator; it must not fall back to --mem."""
+        diag = self._make_diag(
+            cuda_available=True,
+            peak_gpu_mem_bytes=int(1.0 * self.GB),
+            requested_mem_bytes=int(40.0 * self.GB),
+        )
+        ids = [w['id'] for w in diag._generate_warnings()]
+        assert 'GPU_MEM_HEADROOM' not in ids
 
     def test_walltime_overrequest_fires(self):
         diag = self._make_diag(
@@ -474,3 +489,95 @@ class TestTimelimitAndText:
         from pfns4neurostim.diagnostics import cluster
 
         assert "%%" not in inspect.getsource(cluster)
+
+
+class TestLaneAwareness:
+    """Lanes multiply every per-process measurement (the rubric's project-specific joint rule).
+
+    Added 2026-10-01 after the report advised `--mem=1G` for jobs whose job-level MaxRSS was measured at
+    3.75 GB: it had compared one lane's 1.03 GB against the job's 10 GB allocation.
+    """
+
+    GB = 1024 ** 3
+
+    def _diag(self, **kwargs):
+        from pfns4neurostim.diagnostics.cluster import ClusterDiagnostics
+        diag = ClusterDiagnostics(enabled=True, n_lanes=kwargs.pop('n_lanes', 1))
+        for k, v in kwargs.items():
+            setattr(diag._metrics, k, v)
+        diag._metrics.n_lanes = diag._n_lanes
+        return diag
+
+    def test_job_peak_rss_multiplies_by_lanes(self):
+        diag = self._diag(n_lanes=4, peak_rss_bytes=int(1.03 * self.GB))
+        assert diag._metrics.job_peak_rss_bytes == int(1.03 * self.GB) * 4
+
+    def test_ram_underuse_judges_the_job_not_the_lane(self):
+        """4 x 1.03 = 4.12 GB of 10 GB is 41%: still under the 70% band, but the SUGGESTION must cover
+        the job. The old rule's `--mem=1G` would have OOM-killed it."""
+        diag = self._diag(n_lanes=4, peak_rss_bytes=int(1.03 * self.GB),
+                          requested_ram_bytes=10 * self.GB)
+        fired = {w['id']: w for w in diag._generate_warnings()}
+        assert 'RAM_UNDERUSE' in fired
+        assert '4.1 GB peak' in fired['RAM_UNDERUSE']['rendered_text']
+        assert '--mem=5G' in fired['RAM_UNDERUSE']['rendered_fix']
+
+    def test_ram_underuse_silent_when_the_lanes_fill_the_allocation(self):
+        diag = self._diag(n_lanes=8, peak_rss_bytes=int(1.05 * self.GB),
+                          requested_ram_bytes=10 * self.GB)   # 8.4 of 10 GB = 84%
+        assert 'RAM_UNDERUSE' not in [w['id'] for w in diag._generate_warnings()]
+
+    def test_cpu_underuse_silent_when_every_core_has_a_lane(self):
+        """Measured on job 11012813: sstat AveCPU 08:42:54 vs CPUTime 08:43:20 = 99.9% of 4 cores,
+        with LANES=4. The old rule fired anyway and advised halving the cores."""
+        diag = self._diag(n_lanes=4, n_cpus_requested=4)
+        assert diag._metrics.idle_cpus == 0
+        assert 'CPU_UNDERUSE' not in [w['id'] for w in diag._generate_warnings()]
+
+    def test_cpu_underuse_fires_on_genuinely_idle_cores(self):
+        diag = self._diag(n_lanes=2, n_cpus_requested=8)
+        fired = {w['id']: w for w in diag._generate_warnings()}
+        assert fired['CPU_UNDERUSE']['rendered_text'].count('6 core(s)') == 1
+        assert '--cpus-per-task=2' in fired['CPU_UNDERUSE']['rendered_fix']
+
+    def test_cpu_underuse_respects_the_two_core_baseline(self):
+        """One lane on two cores is the accepted minimum, not something to warn about."""
+        diag = self._diag(n_lanes=1, n_cpus_requested=2)
+        assert 'CPU_UNDERUSE' not in [w['id'] for w in diag._generate_warnings()]
+
+
+class TestPerRulePercentages:
+    """Each warning's {pct} is its own metric's share.
+
+    Before 2026-10-01 a single `pct` key was overwritten by whichever block ran last, so the GPU and
+    walltime warnings printed the RAM percentage: job 11012807 reported "used 0.65h of 12.00h (10%)"
+    where the true share is 5%.
+    """
+
+    GB = 1024 ** 3
+
+    def _diag(self, **kwargs):
+        from pfns4neurostim.diagnostics.cluster import ClusterDiagnostics
+        diag = ClusterDiagnostics(enabled=True, n_lanes=kwargs.pop('n_lanes', 1))
+        for k, v in kwargs.items():
+            setattr(diag._metrics, k, v)
+        diag._metrics.n_lanes = diag._n_lanes
+        return diag
+
+    def test_walltime_pct_is_the_time_share(self):
+        diag = self._diag(
+            n_lanes=4, elapsed_s=0.65 * 3600, slurm_timelimit_s=12 * 3600,
+            peak_rss_bytes=int(1.03 * self.GB), requested_ram_bytes=10 * self.GB,
+        )
+        fired = {w['id']: w for w in diag._generate_warnings()}
+        text = fired['WALLTIME_OVERREQUEST']['rendered_text']
+        assert '(5%)' in text, text          # 0.65 / 12, NOT the 41% RAM figure
+        assert 'Fairshare' not in text       # SLURM charges elapsed, not requested
+
+    def test_ram_pct_is_the_memory_share(self):
+        diag = self._diag(
+            n_lanes=4, elapsed_s=0.65 * 3600, slurm_timelimit_s=12 * 3600,
+            peak_rss_bytes=int(1.03 * self.GB), requested_ram_bytes=10 * self.GB,
+        )
+        fired = {w['id']: w for w in diag._generate_warnings()}
+        assert '(41%)' in fired['RAM_UNDERUSE']['rendered_text']

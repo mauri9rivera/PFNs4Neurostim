@@ -386,9 +386,12 @@ def main(argv: list[str] | None = None) -> int:
         if diag_on and not args.replot
         else 0
     )
+    # The lane count is the denominator of --shard i/N: the diagnostics report measures this process,
+    # so it needs to know how many share the job's --mem and cores (2026-10-01).
+    n_lanes = args.shard[1] if args.shard else 1
     with ClusterDiagnostics(
         tag=f"{cfg.family}-{cfg.tag}", device=cfg.device, n_planned=planned,
-        enabled=diag_on,
+        enabled=diag_on, n_lanes=n_lanes,
     ) as diag:
         run_bo_benchmark(
             args.config, args.overrides, replot=args.replot, run_dir=args.run_dir,
