@@ -59,7 +59,14 @@ cka:
   # engines build GPSurrogate(**gp_params) directly, so they do not inherit the model group -- the settings
   # have to be restated here, and they must be kept in step with configs/model/gp_mll.yaml by hand.
   # NOTE the engines pass no `device`, so the GP arms run on CPU whatever `device` says above.
-  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5}
+  # lengthscale_floor (2026-10-01): MECHANISM ONLY -- the BO experiments leave it at 0.0, so no cached cell
+  # moves. Converged type-II ML on a 10-50 point context sometimes drives one ARD lengthscale to ~0, which
+  # switches that axis off entirely; the closed-form conditioning these analyses use then builds a kernel
+  # whose entries are wrong (catastrophic cancellation once 1/ell reaches ~1e8) and the analysis dies. Every
+  # sound fit measured on these contexts had a minimum lengthscale >= 7.1e-2, the two pathological ones were
+  # 2.7e-3 and 1.2e-4, and the floor of 0.05 is half the finest grid step (0.111 on NHP), so it binds on the
+  # degenerate fits and nothing else -- at no cost in marginal likelihood (-2.189 either way, measured).
+  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5, lengthscale_floor: 0.05}
   controls: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10, t: 25, alpha: 0.05, n_seeds: 10, icc_min: 0.75, n_seed_channels: 1}
   # CKA (b), rescaled 2026-09-27 from (t 25, n_prior 30, holdout 10, noise 10, ONE draw, k_nearest 5):
   #   t: 25 -> 50. Half of the budget-96 NHP run, so the embeddings describe a mid-BO surrogate rather

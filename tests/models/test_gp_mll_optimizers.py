@@ -39,7 +39,14 @@ DIAGNOSTIC_KEYS: tuple[str, ...] = (
     "gp_noise_escalations",
     "gp_noise_floor",
     "gp_fit_degenerate",
+    "gp_grad_max_free",
+    "gp_stopped_early",
+    "gp_lengthscale_floor",
+    "gp_restart_spread",
 )
+
+#: Diagnostics that are legitimately NaN rather than missing: a single start cannot disagree with itself.
+NAN_WITH_ONE_START: frozenset[str] = frozenset({"gp_restart_spread"})
 
 
 def _data(n: int = 30, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -199,8 +206,11 @@ def test_every_diagnostic_is_present_and_finite(optimizer: str) -> None:
     gp.fit(X, y)
     diagnostics = gp.fit_diagnostics()
     assert set(diagnostics) == set(DIAGNOSTIC_KEYS)
-    assert all(np.isfinite(v) for v in diagnostics.values()), diagnostics
+    assert all(
+        np.isfinite(v) for k, v in diagnostics.items() if k not in NAN_WITH_ONE_START
+    ), diagnostics
     assert diagnostics["gp_n_restarts"] == 1.0
+    assert np.isnan(diagnostics["gp_restart_spread"])
     assert diagnostics["gp_fit_n_train"] == len(X)
     assert diagnostics["gp_n_opt_steps_max"] == 40.0
 
@@ -312,5 +322,77 @@ def test_a_run_of_fits_is_reproducible() -> None:
                              optimizer=optimizer, dtype=dtype)
             gp.fit(X, y)
             runs.append((gp.fit_diagnostics(), gp.predict(X)[0]))
-        assert runs[0][0] == runs[1][0]
+        first, second = runs[0][0], runs[1][0]
+        assert set(first) == set(second)
+        for key in first:                      # NaN == NaN is False, so compare NaN-aware
+            a, b = first[key], second[key]
+            assert (np.isnan(a) and np.isnan(b)) or a == b, key
         np.testing.assert_array_equal(runs[0][1], runs[1][1])
+
+
+# --------------------------------------------------------------------------- convergence diagnostics
+def test_restart_spread_is_recorded_and_nan_for_one_start() -> None:
+    """Agreement between independent starts is the only cheap evidence about the GLOBAL optimum."""
+    X, y = _data()
+    many = GPSurrogate(n_opt_steps=40, lr=1.0, optimizer="lbfgs", dtype="float64", n_restarts=4)
+    many.fit(X, y)
+    assert np.isfinite(many.fit_diagnostics()["gp_restart_spread"])
+    one = GPSurrogate(n_opt_steps=40, lr=1.0, optimizer="lbfgs", dtype="float64", n_restarts=1)
+    one.fit(X, y)
+    assert np.isnan(one.fit_diagnostics()["gp_restart_spread"])
+
+
+def test_a_fixed_budget_fit_can_never_read_converged() -> None:
+    """Which is the finding of P0.10, not a defect: Adam always exhausts its budget."""
+    X, y = _data()
+    gp = GPSurrogate(n_opt_steps=100, optimizer="adam")
+    gp.fit(X, y)
+    d = gp.fit_diagnostics()
+    assert d["gp_stopped_early"] == 0.0
+    assert d["gp_fit_converged"] == 0.0
+
+
+def test_the_free_gradient_excludes_a_parameter_resting_on_its_floor() -> None:
+    """At an active constraint the gradient legitimately does not vanish; the projected one is the test."""
+    rng = np.random.default_rng(3)
+    X = rng.uniform(size=(20, 2))                                            # [20, 2]
+    y = np.sin(3 * X[:, 0])                                                  # [20] noiseless
+    gp = GPSurrogate(n_opt_steps=50, lr=1.0, optimizer="lbfgs", dtype="float64", noise_floor=1e-2)
+    gp.fit(X, y)
+    d = gp.fit_diagnostics()
+    assert d["gp_noise"] <= 1e-2 * 1.01                 # it did rest on the floor
+    assert d["gp_grad_max_free"] <= d["gp_grad_max"]    # and that parameter is excluded
+
+
+def test_the_lengthscale_floor_binds_only_when_asked() -> None:
+    """Default 0.0 leaves gpytorch's own constraint alone, so no existing arm changes."""
+    assert GPSurrogate()._lengthscale_floor == 0.0
+    assert build_surrogate("gp_mll", device="cpu")._model._lengthscale_floor == 0.0
+    X, y = _data()
+    gp = GPSurrogate(n_opt_steps=50, lr=1.0, optimizer="lbfgs", dtype="float64",
+                     lengthscale_floor=0.5)
+    gp.fit(X, y)
+    assert gp.fit_diagnostics()["gp_lengthscale_min"] >= 0.5 * 0.999
+    assert gp.fit_diagnostics()["gp_lengthscale_floor"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("bad", [-1.0, -1e-9])
+def test_negative_lengthscale_floor_raises(bad: float) -> None:
+    with pytest.raises(ValueError, match="lengthscale_floor must be"):
+        GPSurrogate(lengthscale_floor=bad)
+
+
+def test_rbf_is_stable_at_a_collapsed_lengthscale() -> None:
+    """The C1 crash: the a^2+b^2-2ab identity cancels away every digit once 1/ell reaches ~1e8.
+
+    Measured 2026-10-01 on a real NHP context: kernel entries wrong by 1.25 on a [0, 1.27] scale and a
+    minimum eigenvalue of -0.44, which jitter cannot repair because the entries themselves are wrong.
+    """
+    rng = np.random.default_rng(0)
+    X = rng.uniform(size=(26, 2))                                            # [26, 2]
+    for ell in (1e-2, 1e-6, 1e-8, 6.54e-9, 1e-12):
+        hp = {"lengthscale": np.array([7.4e-2, ell]), "outputscale": 1.269, "noise": 1e-3, "mean": 0.0}
+        K = GPSurrogate._rbf(X, X, hp) + hp["noise"] * np.eye(len(X))         # [26, 26]
+        assert np.isfinite(K).all()
+        assert float(np.linalg.eigvalsh((K + K.T) / 2.0).min()) > 0.0, ell
+        np.linalg.cholesky(K)                                                # must not raise

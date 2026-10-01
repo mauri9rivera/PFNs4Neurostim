@@ -83,6 +83,22 @@ DEGENERATE_LENGTHSCALE_BAND: tuple[float, float] = (1e-3, 1e3)
 #: a noise small enough to matter (C1 on nhp-s0-e1, numpy.linalg.LinAlgError).
 CLOSED_FORM_JITTER_EXPONENTS: tuple[int, ...] = (-10, -9, -8, -7, -6, -5, -4, -3)
 
+#: Largest scaled coordinate for which the ``|a|^2 + |b|^2 - 2 a.b`` squared-distance identity is safe.
+#: Above it the identity cancels catastrophically: at a lengthscale of 6.5e-9 on a real 26-point NHP
+#: context it produced kernel entries wrong by 1.25 on a [0, 1.27] scale and a minimum eigenvalue of
+#: -0.44, which no jitter can repair because the entries themselves are wrong (measured 2026-10-01). At
+#: 1e4 the squares reach 1e8 and at most half of float64's digits are lost, which is harmless.
+RBF_IDENTITY_MAX_SCALED: float = 1e4
+#: Rows per chunk on the direct-difference path, which materialises a [rows, Q, D] intermediate.
+RBF_CHUNK_ROWS: int = 256
+
+#: Spread of the negative log marginal likelihood across feasible restarts, in nats, below which the
+#: starts are taken to agree. Agreement between independent starts is the only cheap evidence about the
+#: GLOBAL optimum; a gradient says nothing about it. Measured 2026-10-01: a 250-step Adam fit reached a
+#: SMALLER final gradient than the converged L-BFGS fit (7.1e-7 vs 6.7e-6) while sitting 0.35 nats worse,
+#: so a gradient test ranks the arms backwards and this is the term that does not.
+RESTART_AGREEMENT_NATS: float = 1e-3
+
 
 # ---------------------------------------------------------------------------
 # GPSurrogate — ExactGP wrapper conforming to SurrogateModel
@@ -120,6 +136,15 @@ class GPSurrogate:
             likelihood (-3.49 against -0.93 on the cells that failed), so plain best-of-k picks it every
             time.
         restart_seed: Seed for the restart initialisations, so a cell is reproducible.
+        lengthscale_floor: Lower bound on every ARD lengthscale, or 0.0 to leave gpytorch's own positive
+            constraint alone (the default, so no existing arm changes). Inputs are MinMax-scaled to
+            [0, 1]^D, where the finest axis step is 0.111 (NHP, 5d_rat) or 0.143 (spinal), so a lengthscale
+            much below ~0.05 cannot correlate even nearest neighbours and the kernel has become a lookup
+            table. Converged type-II ML reaches such points on small contexts -- measured 2026-10-01 on
+            10-50 point Hyp C contexts, where every sound fit had a minimum lengthscale >= 7.1e-2 and the
+            two pathological ones were 2.7e-3 and 1.2e-4. A floor of 0.05 therefore binds on the
+            degenerate fits and on nothing else. It is a guard, not a prior: it pulls nothing inside the
+            allowed range.
 
     Raises:
         ValueError: If ``optimizer`` or ``dtype`` is not a recognised key, or ``n_restarts`` < 1.
@@ -137,6 +162,7 @@ class GPSurrogate:
         noise_floor: float = 1e-4,
         n_restarts: int = 1,
         restart_seed: int = 0,
+        lengthscale_floor: float = 0.0,
     ) -> None:
         if optimizer not in GP_OPTIMIZERS:
             raise ValueError(f"optimizer must be one of {GP_OPTIMIZERS}, got {optimizer!r}.")
@@ -146,6 +172,8 @@ class GPSurrogate:
             raise ValueError(f"n_restarts must be >= 1, got {n_restarts}.")
         if noise_floor <= 0.0:
             raise ValueError(f"noise_floor must be > 0, got {noise_floor}.")
+        if lengthscale_floor < 0.0:
+            raise ValueError(f"lengthscale_floor must be >= 0, got {lengthscale_floor}.")
         self._device = device
         self._n_opt_steps = n_opt_steps
         self._lr = lr
@@ -157,6 +185,7 @@ class GPSurrogate:
         self._noise_floor = noise_floor
         self._n_restarts = n_restarts
         self._restart_seed = restart_seed
+        self._lengthscale_floor = lengthscale_floor
         self._model: ExactGP | None = None
         self._likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
         self._train_X: np.ndarray | None = None   # [N, D] float64 context, for closed-form updates
@@ -219,6 +248,7 @@ class GPSurrogate:
         floor = self._noise_floor
         best: tuple[float, ExactGP, Any, dict[str, float]] | None = None
         n_feasible, escalations, reasons = 0, 0, []
+        feasible_losses: list[float] = []
 
         while True:
             for init in inits:
@@ -228,6 +258,7 @@ class GPSurrogate:
                     reasons.append(type(exc).__name__)
                     continue
                 n_feasible += 1
+                feasible_losses.append(candidate[0])
                 if best is None or candidate[0] < best[0]:
                     best = candidate
             if best is not None or escalations >= MAX_NOISE_ESCALATIONS:
@@ -243,14 +274,23 @@ class GPSurrogate:
             )
 
         final_loss, self._model, self._likelihood, diagnostics = best
+        # Agreement between independent starts is the only cheap evidence about the GLOBAL optimum. NaN with
+        # a single feasible start, because one start cannot disagree with itself.
+        spread = (
+            float(max(feasible_losses) - min(feasible_losses)) if len(feasible_losses) > 1
+            else float("nan")
+        )
         self._last_fit = {
             **diagnostics,
             "gp_n_restarts": float(self._n_restarts),
             "gp_n_feasible": float(n_feasible),
             "gp_noise_escalations": float(escalations),
             "gp_noise_floor": float(floor),
+            "gp_lengthscale_floor": float(self._lengthscale_floor),
+            "gp_restart_spread": spread,
         }
         self._last_fit["gp_fit_degenerate"] = self._degeneracy_flag(self._last_fit, floor)
+        self._last_fit["gp_fit_converged"] = self._convergence_flag(self._last_fit)
 
     def _sample_init(self, rng: np.random.Generator) -> dict[str, float]:
         """Draw one multi-start initialisation log-uniformly from :data:`RESTART_INIT_RANGES`.
@@ -299,9 +339,18 @@ class GPSurrogate:
             )
             likelihood.initialize(noise=torch.tensor(max(10.0 * floor, 1e-2)))
         model = self._build_model(train_x, train_y, likelihood).to(dtype=self._dtype)
+        if self._lengthscale_floor > 0.0:
+            base = model.covar_module.base_kernel
+            base.register_constraint(
+                "raw_lengthscale", gpytorch.constraints.GreaterThan(self._lengthscale_floor)
+            )
+            with torch.no_grad():
+                base.lengthscale = max(2.0 * self._lengthscale_floor, 0.2)
         if init is not None:
             with torch.no_grad():
-                model.covar_module.base_kernel.lengthscale = init["lengthscale"]
+                model.covar_module.base_kernel.lengthscale = max(
+                    init["lengthscale"], self._lengthscale_floor * 1.01
+                )
                 model.covar_module.outputscale = init["outputscale"]
                 likelihood.noise = max(init["noise"], floor * 1.01)
 
@@ -312,9 +361,9 @@ class GPSurrogate:
         # _optimize reads self._model, so point the surrogate at this candidate for the duration.
         self._model, self._likelihood = model, likelihood
         final_loss = float("nan")
-        steps, n_evals, grad_max = 0, 0, float("nan")
+        steps, n_evals, grad_max, grad_max_free = 0, 0, float("nan"), float("nan")
         if self._n_opt_steps > 0:
-            steps, n_evals, grad_max = self._optimize(train_x, train_y, mll)
+            steps, n_evals, grad_max, grad_max_free = self._optimize(train_x, train_y, mll)
 
         model.eval()
         likelihood.eval()
@@ -329,7 +378,39 @@ class GPSurrogate:
         diagnostics = self._read_hyperparameters(
             final_loss, int(train_x.shape[0]), steps=steps, n_evals=n_evals, grad_max=grad_max
         )
+        diagnostics["gp_grad_max_free"] = grad_max_free
+        diagnostics["gp_stopped_early"] = float(0 < steps < self._n_opt_steps)
         return final_loss, model, likelihood, diagnostics
+
+    def _convergence_flag(self, diagnostics: dict[str, float]) -> float:
+        """1.0 when the optimiser stopped on its own criterion AND the restarts agreed.
+
+        Deliberately not a gradient threshold. Three things make the single-number gradient test
+        misleading, all measured on 2026-10-01: it is taken on gpytorch's softplus-transformed *raw*
+        parameters, so its scale is an artefact of the parameterisation; at an active constraint the
+        gradient legitimately does not vanish, so a correctly converged bounded fit reads as a failure; and
+        it ranks the arms backwards -- a 250-step Adam fit reached a smaller final gradient than the
+        converged L-BFGS fit (7.1e-7 against 6.7e-6) while sitting 0.35 nats WORSE, because first-order
+        stationarity says nothing about which basin you are in.
+
+        What this flag does assert is weaker and honest: the optimiser met one of its own tolerances before
+        exhausting its budget, and the independent starts landed within
+        :data:`RESTART_AGREEMENT_NATS` of each other. That is evidence of a global optimum, not proof of
+        one. A fixed-budget optimiser can never satisfy the first clause, which is itself the finding of
+        P0.10 rather than a defect of the flag. Read it beside ``gp_grad_max_free`` and
+        ``gp_restart_spread``, which are the actual quantities.
+
+        Args:
+            diagnostics: The selected fit's diagnostics.
+
+        Returns:
+            1.0, 0.0, or NaN when no optimisation ran.
+        """
+        if not diagnostics.get("gp_n_opt_steps"):
+            return float("nan")
+        spread = diagnostics.get("gp_restart_spread", float("nan"))
+        agreed = not math.isfinite(spread) or spread <= RESTART_AGREEMENT_NATS
+        return float(bool(diagnostics.get("gp_stopped_early")) and agreed)
 
     def _degeneracy_flag(self, diagnostics: dict[str, float], floor: float) -> float:
         """1.0 when the selected fit sits on a bound rather than at an interior optimum.
@@ -372,10 +453,12 @@ class GPSurrogate:
             mll: The exact marginal log likelihood of the current model.
 
         Returns:
-            ``(steps_taken, n_evaluations, grad_max)``: optimiser iterations actually performed,
+            ``(steps_taken, n_evaluations, grad_max, grad_max_free)``: optimiser iterations performed,
             objective+gradient evaluations they cost (Adam: one per step; L-BFGS: more, because of the
-            line search -- this is the number the latency comparison must use), and the infinity norm
-            of the gradient at the final parameters.
+            line search -- this is the number the latency comparison must use), the infinity norm of the
+            gradient at the final parameters, and that norm over the parameters that are NOT sitting on a
+            bound. The second is the one that means anything at a constrained optimum: a fit resting on the
+            noise floor has a gradient pushing into the constraint, which is a KKT point, not a failure.
 
         Raises:
             RuntimeError: If no feasible parameter vector was ever evaluated, or the final gradient is
@@ -443,15 +526,42 @@ class GPSurrogate:
                 optimizer.step()
             steps = self._n_opt_steps
 
-        grads = [p.grad.detach().abs().max() for p in params if p.grad is not None]
-        grad_max = float(torch.stack(grads).max()) if grads else float("nan")
+        named = {
+            name: float(p.grad.detach().abs().max())
+            for name, p in self._model.named_parameters()
+            if p.grad is not None
+        }
+        grad_max = max(named.values()) if named else float("nan")
+        pinned = self._pinned_parameters()
+        free = [v for name, v in named.items() if not any(frag in name for frag in pinned)]
+        grad_max_free = max(free) if free else 0.0
         if not math.isfinite(grad_max):
             raise RuntimeError(
                 f"GPSurrogate.fit: non-finite MLL gradient ({grad_max}) after {steps} "
                 f"{self._optimizer} step(s) on N={int(train_x.shape[0])} points, "
                 f"dtype {self._dtype_name}."
             )
-        return steps, n_evals, grad_max
+        return steps, n_evals, grad_max, grad_max_free
+
+    def _pinned_parameters(self) -> tuple[str, ...]:
+        """Name fragments of the parameters currently resting on a floor.
+
+        Their gradients are excluded from ``grad_max_free``, because at an active constraint the
+        first-order optimality condition is about the projected gradient, not the raw one.
+
+        Returns:
+            Fragments to match against ``named_parameters()`` keys.
+        """
+        pinned: list[str] = []
+        with torch.no_grad():
+            noise = float(self._likelihood.noise.detach().reshape(-1)[0])
+            if noise <= self._noise_floor * (1.0 + DEGENERATE_NOISE_TOL):
+                pinned.append("raw_noise")
+            if self._lengthscale_floor > 0.0:
+                ls = self._model.covar_module.base_kernel.lengthscale.detach().reshape(-1)
+                if float(ls.min()) <= self._lengthscale_floor * (1.0 + DEGENERATE_NOISE_TOL):
+                    pinned.append("raw_lengthscale")
+        return tuple(pinned)
 
     def _read_hyperparameters(
         self,
@@ -502,11 +612,6 @@ class GPSurrogate:
             "gp_n_opt_steps_max": float(self._n_opt_steps),
             "gp_n_obj_evals": float(n_evals),
             "gp_grad_max": grad_max,
-            "gp_fit_converged": (
-                float("nan")
-                if not math.isfinite(grad_max)
-                else float(grad_max <= self._tolerance_grad or steps < self._n_opt_steps)
-            ),
             "gp_fit_n_train": float(n_train),
         }
 
@@ -766,7 +871,18 @@ class GPSurrogate:
         """
         a = np.asarray(A, dtype=np.float64) / hp["lengthscale"]                    # [P, D]
         b = np.asarray(B, dtype=np.float64) / hp["lengthscale"]                    # [Q, D]
-        sq = (a ** 2).sum(1)[:, None] + (b ** 2).sum(1)[None, :] - 2.0 * a @ b.T    # [P, Q]
+        largest = max(float(np.abs(a).max(initial=0.0)), float(np.abs(b).max(initial=0.0)))
+        if largest <= RBF_IDENTITY_MAX_SCALED:
+            # The fast path: one matrix product, exact enough while the scaled coordinates stay modest.
+            sq = (a ** 2).sum(1)[:, None] + (b ** 2).sum(1)[None, :] - 2.0 * a @ b.T    # [P, Q]
+        else:
+            # A collapsed ARD lengthscale blows the scaled coordinates up and the identity cancels away
+            # every significant digit, so the differences are formed directly instead -- chunked, because
+            # that needs a [rows, Q, D] intermediate rather than a [P, Q] one.
+            sq = np.empty((len(a), len(b)), dtype=np.float64)                      # [P, Q]
+            for start in range(0, len(a), RBF_CHUNK_ROWS):
+                block = a[start:start + RBF_CHUNK_ROWS]                            # [rows, D]
+                sq[start:start + RBF_CHUNK_ROWS] = ((block[:, None, :] - b[None, :, :]) ** 2).sum(-1)
         return hp["outputscale"] * np.exp(-0.5 * np.maximum(sq, 0.0))
 
     @classmethod
