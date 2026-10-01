@@ -42,6 +42,7 @@ submit_unit "N4. K6 electrode failure, NHP" stress_sweep scripts/run_stress_swee
 submit_unit "N5. K6 budget, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "N6. Demo 1 K2-channel, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_demo1_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "N7. Demo 1 K1 decoy, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
+submit_unit "N13. K7 spatial shuffle, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k7_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
 submit_unit "N8. Hyp A (TabPFN vs GP), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
 submit_unit "N9. Acquisition core (ts/ei/ucb), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
 submit_unit "N10. UCB kappa grid, NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_ucb_kappa_nhp.yaml pfns4neurostim "tabpfn_v2_5" "-" 4 "-"

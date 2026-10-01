@@ -43,13 +43,15 @@ import argparse
 from dataclasses import dataclass
 
 #: Seconds per repetition at the deliverable budget (96 NHP / 100 5d_rat), per model. Absent = unmeasured.
+#: `gp_mll` re-measured 2026-09-30 after P0.10 redefined it (converged multi-start L-BFGS instead of 100
+#: Adam steps): the GP arms run on the CPU lanes, so this moves the CPU column of every unit.
 REP_SECONDS: dict[str, dict[str, float]] = {
-    "nhp": {"tabpfn_v2_5": 15.7, "gp_mll": 19.5, "gp_naive": 0.8, "random": 0.2, "tabicl": 30.0, "tabfm": 99.0,
+    "nhp": {"tabpfn_v2_5": 15.7, "gp_mll": 51.5, "gp_naive": 0.8, "random": 0.2, "tabicl": 30.0, "tabfm": 99.0,
             "pfns4bo": 5.3},
-    "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 19.5, "gp_naive": 1.0, "random": 0.4, "tabicl": 33.0, "pfns4bo": 6.7},
+    "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 62.9, "gp_naive": 1.0, "random": 0.4, "tabicl": 33.0, "pfns4bo": 6.7},
     # Spinal (budget 64 on the 8x8 grid) is NOT measured on Mila: the NHP costs above scaled by a local
     # one-rep spinal/NHP timing (2026-09-25: TabPFN-2.5 x0.52, GP-MLL x0.60; the GP factor for the rest).
-    "spinal": {"tabpfn_v2_5": 8.2, "gp_mll": 11.7, "gp_naive": 0.5, "random": 0.1, "tabicl": 16.5, "pfns4bo": 3.2},
+    "spinal": {"tabpfn_v2_5": 8.2, "gp_mll": 34.6, "gp_naive": 0.5, "random": 0.1, "tabicl": 16.5, "pfns4bo": 3.2},
 }
 GUESSED: frozenset[str] = frozenset()   # every listed cost is measured (TabICL from the D3 runs: 0.43-0.52 s/step)
 #: Channels (subject x EMG) per dataset. 5d_rat dropped from 18 to 17 with the
