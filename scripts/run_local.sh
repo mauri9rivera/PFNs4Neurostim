@@ -46,6 +46,16 @@ STEP="${1:-all}"
 PY="${PYTHON:-python}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 
+# Every step shells out to ${PY}. If that interpreter cannot import the package, each step fails in its
+# own way and the failures read like data problems rather than a wrong interpreter -- `tables` even
+# reported a missing run (2026-09-30). Check once, loudly, before anything runs.
+if ! "${PY}" -c "import pfns4neurostim" >/dev/null 2>&1; then
+  echo "[run_local] ${PY} cannot import pfns4neurostim." >&2
+  echo "[run_local] activate the env (conda activate pfns4neurostim) or point PYTHON at its interpreter:" >&2
+  echo "[run_local]   PYTHON=/path/to/envs/pfns4neurostim/bin/python bash scripts/run_local.sh ${STEP}" >&2
+  exit 1
+fi
+
 step_replot() {
   echo "== replot: every run directory from its own CSVs =="
   "${PY}" scripts/replot_all.py --run
@@ -56,7 +66,8 @@ step_tables() {
   if "${PY}" scripts/export_summary_tables.py; then
     echo "   wrote the summary tables"
   else
-    echo "   SKIPPED: a run this table cites is missing (it hardcodes its inputs - task plan #1 Step 14)" >&2
+    echo "   SKIPPED: export_summary_tables.py failed; it hardcodes its inputs, so the usual cause is a" >&2
+    echo "   run it cites not existing yet (task plan #1 Step 14). Read the traceback above to be sure." >&2
   fi
 }
 

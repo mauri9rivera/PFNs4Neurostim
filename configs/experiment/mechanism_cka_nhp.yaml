@@ -54,7 +54,12 @@ cka:
   # threshold alpha/L = 0.05/18 = 2.8e-3, which needs n_perm >= 359. 1000 clears it with margin.
   n_perm: 1000
   inference_seed: 0
-  gp_params: {n_opt_steps: 100, lr: 0.1}
+  # Converged GP reference (2026-09-30, option A): these are the settings `gp_mll` itself now uses, so the
+  # GP this analysis measures TabPFN against is the SAME GP the rest of the paper compares against. The
+  # engines build GPSurrogate(**gp_params) directly, so they do not inherit the model group -- the settings
+  # have to be restated here, and they must be kept in step with configs/model/gp_mll.yaml by hand.
+  # NOTE the engines pass no `device`, so the GP arms run on CPU whatever `device` says above.
+  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5}
   controls: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10, t: 25, alpha: 0.05, n_seeds: 10, icc_min: 0.75, n_seed_channels: 1}
   # CKA (b), rescaled 2026-09-27 from (t 25, n_prior 30, holdout 10, noise 10, ONE draw, k_nearest 5):
   #   t: 25 -> 50. Half of the budget-96 NHP run, so the embeddings describe a mid-BO surrogate rather
