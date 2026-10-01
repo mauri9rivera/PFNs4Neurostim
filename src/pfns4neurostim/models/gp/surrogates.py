@@ -799,10 +799,18 @@ class GPSurrogate:
             except np.linalg.LinAlgError:
                 continue
         if L is None:
+            # Report what is actually wrong with K, not just that it failed: the smallest eigenvalue says
+            # whether this is conditioning (tiny negative) or a broken matrix (large negative / non-finite),
+            # and the two are different bugs with different fixes.
+            eig_min = float(np.linalg.eigvalsh((K + K.T) / 2.0).min()) if np.isfinite(K).all() else float("nan")
             raise RuntimeError(
-                f"GPSurrogate._conditioned: K + noise I is not positive definite on N={n} points even "
-                f"with {CLOSED_FORM_JITTER_EXPONENTS[-1]:+d} relative jitter. noise={hp['noise']:.3e}, "
-                f"outputscale={hp['outputscale']:.3e}, lengthscale mean={float(np.mean(hp['lengthscale'])):.3e}. "
+                f"GPSurrogate._conditioned: K + noise I is not positive definite on N={n} points even with "
+                f"{scale * 10.0 ** CLOSED_FORM_JITTER_EXPONENTS[-1]:.3e} absolute jitter "
+                f"(1e{CLOSED_FORM_JITTER_EXPONENTS[-1]} x mean diagonal {scale:.3e}). "
+                f"min eigenvalue {eig_min:.3e}; non-finite entries: {int((~np.isfinite(K)).sum())}; "
+                f"duplicate rows: {n - len(np.unique(np.asarray(X_train, dtype=np.float64), axis=0))}; "
+                f"noise={hp['noise']:.3e}, outputscale={hp['outputscale']:.3e}, "
+                f"lengthscale={np.array2string(np.asarray(hp['lengthscale']).ravel(), precision=4)}. "
                 "A fit this degenerate should not be conditioned on: check gp_fit_degenerate for this cell."
             )
         if relative > 0.0:

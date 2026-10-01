@@ -997,7 +997,14 @@ def run_cka(cfg: MechanismConfig, replot: bool = False) -> str:
                         kernels = kernels_for(st, ctx)
                         for readout in p["readouts"]:
                             E = embed(ctx.X, ctx.y, st.X_pool, readout)
-                            for r in _cka_layer_table(E, kernels, int(p["n_perm"]), rng):
+                            # Keyed per cell, so the permutation null is reproducible and independent of
+                            # the order the cells happen to run in. The 2026-09-30 shared-grid restructure
+                            # dropped this definition entirely and the analysis died on an
+                            # UnboundLocalError at its first permutation (2026-10-01); the fast suite
+                            # cannot see it because the CKA end-to-end test is marked gpu/slow.
+                            perm_rng = rng_for(ch.label, "cka-perm", level, t, rep, readout,
+                                               base_seed=cfg.seed)
+                            for r in _cka_layer_table(E, kernels, int(p["n_perm"]), perm_rng):
                                 rows.append({
                                     "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
                                     "model": "tabpfn_v2_5", "readout": readout, "context_t": int(t),
