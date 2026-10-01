@@ -12,6 +12,8 @@
 #   bash scripts/mila.sh run -- <read-only cmd>
 #   bash scripts/mila.sh logs <jobid> [--tail N]
 #   bash scripts/mila.sh queue | sacct <jobid> | avail | quota
+#   bash scripts/mila.sh eff <jobid>          # did the job USE what it asked for (CPU / memory / GPU)
+#   bash scripts/mila.sh share                # your fairshare and the priority of your pending jobs
 #   bash scripts/mila.sh submit <script> <config> [extra args]   # prints only
 set -euo pipefail
 
@@ -72,6 +74,27 @@ cmd_sacct() {
   [[ "${jobid}" =~ ^[0-9]+$ ]] || { log "usage: sacct <numeric jobid>"; exit 2; }
   remote "sacct -j ${jobid} --format=JobID,JobName,State,Elapsed,MaxRSS,ExitCode"
 }
+cmd_eff() {
+  local jobid="${1:-}"
+  [[ "${jobid}" =~ ^[0-9]+$ ]] || { log "usage: eff <numeric jobid>"; exit 2; }
+  # CPU efficiency is TotalCPU / CPUTime: the core-seconds actually burned over the core-seconds reserved.
+  # A unit asking for 4 lanes that sits at 25% was really running one. AllocTRES names the GPU request;
+  # SLURM accounting does not record GPU *utilisation*, so `eff` reports the allocation and, for a RUNNING
+  # job, sstat's live counters -- actual GPU busy-ness needs nvidia-smi inside the allocation or Mila's
+  # dashboards, neither of which this read-only socket can reach.
+  remote "sacct -j ${jobid} --format=JobID%20,JobName%24,State,Elapsed,TotalCPU,CPUTime,MaxRSS,MaxVMSize,ReqMem,AllocTRES%45"
+  remote "seff ${jobid} 2>/dev/null || true"
+  remote "sstat -j ${jobid} --format=JobID%20,AveCPU,AveRSS,MaxRSS 2>/dev/null || true"
+}
+
+cmd_share() {
+  # RawUsage / fairshare: the cluster's view of what you have consumed relative to your share, which is
+  # what decides where new jobs land in the queue. sprio breaks a pending job's priority into its parts.
+  remote 'sshare -U -o Account,User,RawShares,NormShares,RawUsage,EffectvUsage,FairShare 2>/dev/null || true'
+  remote 'sprio -u $USER -o "%.12i %.10Y %.10A %.10F %.10J %.10P %.10Q" 2>/dev/null || true'
+  remote 'squeue --me -o "%.12i %.9P %.28j %.2t %.10M %.6D %.20R" '
+}
+
 cmd_avail() { remote 'sinfo -o "%P %a %l %D %G" | head -20; savail 2>/dev/null || true'; }
 cmd_quota() { remote 'disk-quota'; }
 
@@ -91,6 +114,8 @@ case "${sub}" in
   logs) cmd_logs "$@" ;;
   queue) cmd_queue ;;
   sacct) cmd_sacct "$@" ;;
+  eff) cmd_eff "$@" ;;
+  share) cmd_share ;;
   avail) cmd_avail ;;
   quota) cmd_quota ;;
   submit) cmd_submit "$@" ;;
