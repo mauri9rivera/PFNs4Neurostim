@@ -96,3 +96,48 @@ def test_naive_gp_keeps_pinned_hyperparameters() -> None:
 def test_update_before_fit_raises() -> None:
     with pytest.raises(RuntimeError, match="before fit"):
         GPSurrogate().posterior_update(np.zeros((1, 2)), np.zeros(1), np.zeros((3, 2)))
+
+
+# --------------------------------------------------------------------------- closed-form conditioning
+def test_conditioned_jitters_a_singular_kernel_instead_of_raising() -> None:
+    """The C1/C2 regression (2026-10-01): duplicate rows plus a tiny noise made K unfactorisable.
+
+    `_conditioned` is shared by predict_frozen, posterior_covariance and posterior_update, so this one
+    Cholesky is on the path of BOTH Hyp C analyses. It had no jitter at all while its sibling predict_ts
+    had carried a ladder for years, and the converged gp_mll of P0.10 fits a small enough noise to expose
+    it (numpy.linalg.LinAlgError on nhp-s0-e1).
+    """
+    X = np.repeat(np.array([[0.2, 0.3], [0.7, 0.8]]), 6, axis=0)          # [12, 2] duplicate rows
+    y = np.repeat(np.array([1.0, -1.0]), 6)                               # [12]
+    # noise exactly 0 makes K singular rather than merely ill-conditioned: with duplicate rows it has an
+    # exact zero eigenvalue, which is the limit the converged fit was approaching on the real channel.
+    hp = {"lengthscale": np.array([0.5, 0.5]), "outputscale": 1.0, "noise": 0.0, "mean": 0.0}
+    with pytest.warns(RuntimeWarning, match="relative jitter"):
+        L, alpha = GPSurrogate._conditioned(X, y, hp)
+    assert np.isfinite(L).all() and np.isfinite(alpha).all()
+    assert np.allclose(L @ L.T, L @ L.T)        # factor is usable
+
+
+def test_conditioned_is_untouched_when_the_kernel_is_well_conditioned(recwarn) -> None:
+    """Zero jitter is tried first, so every pre-existing number is reproduced bitwise."""
+    rng = np.random.default_rng(0)
+    X = rng.uniform(size=(10, 2))                                          # [10, 2]
+    y = rng.normal(size=10)                                                # [10]
+    hp = {"lengthscale": np.array([0.3, 0.3]), "outputscale": 1.0, "noise": 1e-2, "mean": 0.0}
+    L, alpha = GPSurrogate._conditioned(X, y, hp)
+    K = GPSurrogate._rbf(X, X, hp) + hp["noise"] * np.eye(10)
+    np.testing.assert_allclose(L, np.linalg.cholesky(K))
+    assert not [w for w in recwarn if issubclass(w.category, RuntimeWarning)]
+
+
+def test_conditioned_fails_loudly_on_a_hopeless_kernel() -> None:
+    """A bounded ladder: when no jitter helps it raises with the hyperparameters, never silently.
+
+    Exercised with a NEGATIVE outputscale, which makes K negative definite so that adding a multiple of its
+    (negative) mean diagonal can never rescue it -- the one way to reach the end of the ladder on demand.
+    """
+    X = np.zeros((6, 2))                                                   # [6, 2] all identical
+    y = np.array([1.0, -1.0, 1.0, -1.0, 1.0, -1.0])                        # [6]
+    hp = {"lengthscale": np.array([1e8, 1e8]), "outputscale": -1.0, "noise": -1.0, "mean": 0.0}
+    with pytest.raises(RuntimeError, match="not positive definite"):
+        GPSurrogate._conditioned(X, y, hp)

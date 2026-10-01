@@ -213,8 +213,11 @@ UNITS: tuple[Unit, ...] = (
             "channels of one grid: ~3.5 h before) + controls. Still CANNOT resume, so if it ever times out, "
             "drop cka.targets to [K_GT, K_GP] -- that halves (a)"),
     _u("C3. Placement MMD / W2 (t = 10...96), NHP", "mechanism", "mechanism_placement_nhp", "nhp", (), ("placement",),
-       group="hypc", cpu_only=True, hours=3.0,
-       note="CPU unit (device: cpu in the config). 6 context sizes instead of 4 and the ladder now reaches "
+       group="hypc", cpu_only=True, hours=6.8,
+       note="MEASURED 6.8 h locally 2026-10-01 (was estimated 3.0): formulation C dominates at ~430 s per "
+            "channel-level. Its known-shift gate FAILED for MMD (Spearman 0.900 vs > 0.9) and passed for "
+            "W2, so the MMD panels are not interpretable from that run. "
+            "CPU unit (device: cpu in the config). 6 context sizes instead of 4 and the ladder now reaches "
             "the full 96-site map; needs libs/tabpfn-v1-prior (bash scripts/mila_setup.sh submodules)"),
     _u("C4. Placement MMD / W2 (t = 10...200), 5d_rat", "mechanism", "mechanism_placement_5d_rat", "5d_rat", (),
        ("placement",), group="hypc", cpu_only=True, hours=None,

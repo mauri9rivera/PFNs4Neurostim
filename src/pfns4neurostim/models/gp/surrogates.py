@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import math
+import warnings
 from typing import Any, Optional
 
 import gpytorch
@@ -70,6 +71,17 @@ NOISE_ESCALATION_FACTOR: float = 10.0
 DEGENERATE_NOISE_TOL: float = 0.01
 DEGENERATE_OUTPUTSCALE: float = 1e-6
 DEGENERATE_LENGTHSCALE_BAND: tuple[float, float] = (1e-3, 1e3)
+
+#: Relative jitter the closed-form conditioning may add to make ``K + noise I`` factorisable, as powers of
+#: ten times the mean diagonal of K. Zero is tried first, so a well-conditioned problem is untouched and
+#: every existing number is reproduced bitwise. The ladder is BOUNDED and the failure is loud: an
+#: unbounded "add more until it works" retry hides a degenerate fit instead of reporting one.
+#:
+#: Added 2026-10-01. ``predict_ts`` has carried this ladder for its own Cholesky since the float32 era;
+#: ``_conditioned`` never did, and it is the one shared by predict_frozen, posterior_covariance and
+#: posterior_update -- so both Hyp C analyses died on it the first time the converged gp_mll of P0.10 fitted
+#: a noise small enough to matter (C1 on nhp-s0-e1, numpy.linalg.LinAlgError).
+CLOSED_FORM_JITTER_EXPONENTS: tuple[int, ...] = (-10, -9, -8, -7, -6, -5, -4, -3)
 
 
 # ---------------------------------------------------------------------------
@@ -771,9 +783,35 @@ class GPSurrogate:
         Returns:
             ``(L, alpha)`` with ``L L^T = K + noise I`` ([N, N]) and
             ``alpha = (K + noise I)^{-1} (y - m)`` ([N]).
+
+        Raises:
+            RuntimeError: If no jitter on :data:`CLOSED_FORM_JITTER_EXPONENTS` makes K factorisable.
         """
-        K = cls._rbf(X_train, X_train, hp) + hp["noise"] * np.eye(len(X_train))  # [N, N]
-        L = np.linalg.cholesky(K)
+        n = len(X_train)
+        K = cls._rbf(X_train, X_train, hp) + hp["noise"] * np.eye(n)               # [N, N]
+        eye = np.eye(n)
+        scale = float(np.mean(np.diagonal(K)))
+        L = None
+        for relative in (0.0, *(10.0 ** e for e in CLOSED_FORM_JITTER_EXPONENTS)):
+            try:
+                L = np.linalg.cholesky(K + scale * relative * eye)
+                break
+            except np.linalg.LinAlgError:
+                continue
+        if L is None:
+            raise RuntimeError(
+                f"GPSurrogate._conditioned: K + noise I is not positive definite on N={n} points even "
+                f"with {CLOSED_FORM_JITTER_EXPONENTS[-1]:+d} relative jitter. noise={hp['noise']:.3e}, "
+                f"outputscale={hp['outputscale']:.3e}, lengthscale mean={float(np.mean(hp['lengthscale'])):.3e}. "
+                "A fit this degenerate should not be conditioned on: check gp_fit_degenerate for this cell."
+            )
+        if relative > 0.0:
+            warnings.warn(
+                f"GPSurrogate._conditioned added {relative:.0e} relative jitter to factorise K on N={n} "
+                f"points (noise={hp['noise']:.3e}). The closed-form update is regularised by that much.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train - hp["mean"]))     # [N]
         return L, alpha
 

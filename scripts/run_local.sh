@@ -94,9 +94,21 @@ step_bridge() {
 }
 
 step_hypc_gpu() {
+  # C1 and C2 are INDEPENDENT analyses that merely share a GPU, so one failing must not cancel the other.
+  # On 2026-10-01 C1 died 21 minutes in and `set -e` took C2 with it, which cost a night for nothing.
   echo "== hypc-gpu: C1 then C2, sequentially (hours; nothing else should use the GPU) =="
-  "${PY}" -m pfns4neurostim mechanism --config configs/experiment/mechanism_update_rule_nhp.yaml
-  "${PY}" -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml
+  local failed=()
+  for cfg in mechanism_update_rule_nhp mechanism_cka_nhp; do
+    echo "-- ${cfg}"
+    if ! "${PY}" -m pfns4neurostim mechanism --config "configs/experiment/${cfg}.yaml"; then
+      echo "   FAILED: ${cfg} (continuing with the next analysis)" >&2
+      failed+=("${cfg}")
+    fi
+  done
+  if [ ${#failed[@]} -gt 0 ]; then
+    echo "[run_local] hypc-gpu finished with failures: ${failed[*]}" >&2
+    return 1
+  fi
 }
 
 step_hypc_cpu() {
