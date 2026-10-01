@@ -34,7 +34,9 @@ check_repo() {
   local branch head upstream dirty
   branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
   head=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
-  dirty=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+  # --ignore-submodules=dirty: libs/ submodules carry generated __pycache__, which is not a reason to
+  # block a stage. A submodule POINTER change still shows, which is the thing that would matter.
+  dirty=$(git status --porcelain --untracked-files=no --ignore-submodules=dirty 2>/dev/null | wc -l | tr -d ' ')
   say note "branch / HEAD" "${branch} @ ${head}"
   if [ "${dirty}" = "0" ]; then
     say ok "working tree" "clean (tracked files)"
