@@ -66,13 +66,22 @@ check_data() {   # check_data <dataset> <subdir>
 
 # ---------------------------------------------------------------- environments
 check_env() {   # check_env <env name> <models to import, comma separated>
-  local env="$1" models="$2"
-  if ! conda env list 2>/dev/null | grep -qE "^${env}[[:space:]]"; then
+  local env="$1" models="$2" prefix py out
+  prefix=$(conda env list 2>/dev/null | awk -v e="${env}" '$1 == e {print $NF}' | head -1)
+  if [ -z "${prefix}" ]; then
     say no "env ${env}" "not built — bash scripts/mila_setup.sh env ${env##*-}"
     return
   fi
-  local out
-  out=$(conda run -n "${env}" python -c "
+  # The env's interpreter is called DIRECTLY, never through `conda run`: in a non-interactive login shell
+  # conda run returns no output at all, which read as a blocked environment on a perfectly good one
+  # (2026-09-30). The same lesson is recorded for clean_mila_results.sh.
+  py="${prefix}/bin/python"
+  [ -x "${py}" ] || py="${prefix}/python.exe"          # Windows layout, for a local dry run
+  if [ ! -x "${py}" ]; then
+    say no "env ${env}" "no interpreter at ${prefix}/bin/python"
+    return
+  fi
+  out=$("${py}" -c "
 import sys
 from pfns4neurostim.models.registry import require_models
 try:
@@ -85,7 +94,7 @@ print('ok')
   if [ "${out}" = "ok" ]; then
     say ok "env ${env}" "models importable: ${models}"
   else
-    say no "env ${env}" "${out}"
+    say no "env ${env}" "${out:-no output from ${py}}"
   fi
 }
 
