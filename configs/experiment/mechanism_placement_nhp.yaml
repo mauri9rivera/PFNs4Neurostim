@@ -35,4 +35,10 @@ placement:
   n_boot: 1000
   ladder_lambdas: [0.0, 0.25, 0.5, 0.75, 1.0]
   ladder_min_spearman: 0.9
-  context: {sizes: [5, 10, 20, 40], n_draws: 10, stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}}
+  # Context ladder (2026-09-30): starts at 10, not 5 -- with 4 neighbour pairs per site a 5-site context
+  # gives a handful of pairs and the reading is dominated by draw-to-draw noise -- and ends at 96, the FULL
+  # budget-96 NHP run, so the trajectory covers 10-100 % of what a real BO run ever conditions on. t = 96
+  # equals the grid, so that point is the whole map: it is the same quantity the `full` row reports and is
+  # the natural right-hand anchor of the curve.
+  context: {sizes: [10, 20, 40, 60, 80, 96], n_draws: 10,
+            stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}}

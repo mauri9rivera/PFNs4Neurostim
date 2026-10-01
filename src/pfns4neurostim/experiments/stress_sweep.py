@@ -33,6 +33,7 @@ import pandas as pd
 from ..config import ExperimentConfig, load_experiment_config, resolved_dict
 from ..data.channels import parse_shard, ChannelData, iter_channels
 from ..data.ground_truth import instance_for_rep
+from ..models.registry import require_models
 from ..data.stress import KnobNotApplicable, build_knob, calibrate_levels, floor_snr_db
 from ..data.synthetic_neurostim import meta_features, synthetic_channels
 from ..diagnostics import ClusterDiagnostics, diagnostics_enabled
@@ -128,6 +129,7 @@ def _compute_cell(
         seed=seed,
         device=cfg.device,
         model_params=cfg.model_params.get(model, {}),
+        online_y_scaler=cfg.online_y_scaler,
     )
     row = build_row(
         result,
@@ -148,7 +150,7 @@ def _compute_cell(
             f"rec_regret={row.recommended_regret:.4f} ({time.time() - t0:.1f}s)",
             flush=True,
         )
-    return row_payload(row, achieved), result.trajectory
+    return row_payload(row, {**achieved, **result.diagnostics}), result.trajectory
 
 
 def build_tidy_rows(
@@ -397,6 +399,10 @@ def run_stress_sweep(
             )
         df = pd.read_csv(tidy_path)
     else:
+        # Rule 3 of the #8 environment plan: a model that cannot run here fails NOW, naming the
+        # environment to activate, instead of at the first cell of a queued job.
+        if not only_cached:
+            require_models(cfg.models)
         run_tag = f"{cfg.dataset.name}-{cfg.knob.type}-{cfg.tag}"
         store = CellStore(
             cfg.cell_cache_root, enabled=use_cache, only_cached=only_cached, on_cell=on_cell

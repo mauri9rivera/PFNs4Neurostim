@@ -8,6 +8,9 @@ Deliverables (2026-09-21: curves along the BO run, no bar plots):
                                one line per model (x acquisition), mean over repetitions and channels
     ``latency.svg``            per-step latency vs BO iteration, same averaging
     ``comparison_table.csv``   final values, regret AUC and latency per model x acquisition
+    ``queries_to_target.svg``  (A8) fraction of runs that have reached 90% / 95% of the optimum vs query index
+    ``queries_to_target.csv``  (A8) median [IQR] queries to target per model, with the censored count
+    ``anytime_regret.svg``     (A9) best-so-far regret vs cumulative wall clock (log), at equal compute
 """
 from __future__ import annotations
 
@@ -38,4 +41,11 @@ def render_all(df: pd.DataFrame, out_dir: str, *, dataset: str) -> list[str]:
     written = [table_path]
     written += T.plot_trace_panels(frame, out_dir, dataset=dataset, name="trajectories")
     written += T.plot_latency_curves(frame, out_dir, dataset=dataset, name="latency")
+    # A8 / A9 (2026-09-30): both are derived from the trajectories already stored, so they cost no compute
+    # and regenerate with --replot like everything else here.
+    written += T.plot_queries_to_target(frame, out_dir, dataset=dataset)
+    qtt = T.queries_to_target_table(frame, out_dir)
+    if qtt is not None:
+        written.append(qtt[1])
+    written += T.plot_anytime_regret(frame, out_dir, dataset=dataset)
     return written

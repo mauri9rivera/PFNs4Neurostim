@@ -30,4 +30,17 @@ update_rule:
   positive_control: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10}
   seed_floor: {n_seeds: 10, n_channels: 2}
   link: {tidy_csv: null, model: tabpfn_v2_5, outcomes: [recommended_regret, cumulative_regret], predictors: [saturation_index_median, ell_adaptivity, rho_shape_median], n_boot: 2000}
-  layer_arm: {enabled: true, context_t: 25, level: 1.0, ridge: 1.0}
+  # context_ts (2026-09-30): the layer arm and figure F1 now sweep the same three context sizes as the
+  # main grid -- 10 / 25 / 50 of the budget-96 NHP run (n_init 5) = early / quarter / half way. gates
+  # .context_t = 25 stays inside the list, so the validation gates describe an operating point both
+  # figures actually show. Cost is linear in the number of entries for the layer arm; F1 is free (the
+  # arrays are already computed for every cell of the grid).
+  layer_arm: {enabled: true, context_ts: [10, 25, 50], level: 1.0, ridge: 1.0}
+  # Figure F1 (exemplar delta-maps). Every field is explicit and written into update_rule_exemplar.npz, so
+  # the panel can be captioned and reproduced; see UPDATE_RULE_DEFAULTS for why each value was chosen.
+  # select: median_alignment picks the channel at the MEDIAN rho_shape_offanchor -- representative rather
+  # than a best case, which is what makes the "TabPFN updates like a GP" reading defensible.
+  # One COLUMN PER CONTEXT SIZE, one channel: the channel is selected once (median rho_shape_offanchor
+  # across these contexts), so the columns differ only in how much evidence the surrogate was given.
+  exemplar: {context_ts: [10, 25, 50], level: 1.0, draw: 0, anchor_stratum: centre,
+             select: median_alignment, subject: null, emg: null}

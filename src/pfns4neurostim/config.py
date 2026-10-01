@@ -23,6 +23,7 @@ silently run the wrong experiment.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import platform
@@ -31,7 +32,7 @@ from typing import Any, Sequence
 
 import yaml
 
-from .data.preprocessing import DEFAULT_NORMALIZATION, get_normalization
+from .data.preprocessing import DEFAULT_NORMALIZATION, ONLINE_Y_MODES, get_normalization
 
 __all__ = [
     "DatasetConfig",
@@ -210,6 +211,7 @@ class ExperimentConfig:
     n_reps: int = 5
     gt_mode: str = "full_mean"
     gt_n_splits: int = 10
+    online_y_scaler: str = "none"
     device: str = "cpu"
     seed: int = 42
     output_root: str = "output"
@@ -249,6 +251,11 @@ class ExperimentConfig:
             )
         if self.gt_n_splits < 1:
             raise ValueError(f"gt_n_splits must be >= 1, got {self.gt_n_splits}.")
+        if self.online_y_scaler not in ONLINE_Y_MODES:
+            raise ValueError(
+                f"online_y_scaler must be one of {list(ONLINE_Y_MODES)}, "
+                f"got {self.online_y_scaler!r}."
+            )
         if not self.models:
             raise ValueError("models is empty; nothing to compare.")
         if self.equivalence_margin <= 0:
@@ -505,6 +512,7 @@ def load_experiment_config(
         "n_reps",
         "gt_mode",
         "gt_n_splits",
+        "online_y_scaler",
         "device",
         "seed",
         "output_root",
@@ -556,7 +564,34 @@ def _host_info() -> dict[str, Any]:
         "cuda_device": device,
         "cpu": _cpu_model(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "python": platform.python_version(),
+        "conda_env": os.environ.get("CONDA_DEFAULT_ENV"),
+        "env_hash": _environment_hash(),
     }
+
+
+def _environment_hash() -> str | None:
+    """Short hash of the installed distributions, identifying the exact software stack (#8 rule 7).
+
+    A cell's numbers depend on the whole stack, not only on this package: the same model version under a
+    different torch or scikit-learn can differ. The Hyp 0 benchmark deliberately computes cells in three
+    conda environments and merges them, so "which stack produced this row" has to be recoverable from the
+    artefacts rather than from memory. Recorded as a hash rather than the full list to keep every shard
+    record small; ``scripts/mila_setup.sh verify`` prints the list the hash was taken over.
+
+    Returns:
+        The first 12 hex characters of a SHA-1 over ``name==version`` for every installed distribution,
+        sorted; ``None`` if the metadata cannot be read (provenance must never fail a finished run).
+    """
+    try:
+        from importlib.metadata import distributions  # noqa: PLC0415 - stdlib, kept local
+
+        names = sorted(
+            f"{d.metadata['Name']}=={d.version}" for d in distributions() if d.metadata["Name"]
+        )
+        return hashlib.sha1("\n".join(names).encode()).hexdigest()[:12]
+    except Exception:  # noqa: BLE001 - a missing or broken metadata tree must not fail a run
+        return None
 
 
 def _cpu_model() -> str:
@@ -619,6 +654,7 @@ def resolved_dict(cfg: ExperimentConfig) -> dict[str, Any]:
         "n_init": cfg.n_init,
         "n_reps": cfg.n_reps,
         "gt_mode": cfg.gt_mode,
+        "online_y_scaler": cfg.online_y_scaler,
         "gt_n_splits": cfg.gt_n_splits,
         "device": cfg.device,
         "seed": cfg.seed,

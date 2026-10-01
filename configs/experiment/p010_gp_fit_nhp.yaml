@@ -1,0 +1,56 @@
+# P0.10 / guardrail G1 -- is "the tuned GP" a converged GP, and does the answer change the cost claim?
+#
+# ARCHIVED 2026-09-30: this config ran the audit that settled P0.10, and its RESULT is the definition of
+# `gp_mll` today -- the Adam arm is retired, so the three-arm comparison it describes can no longer be
+# re-run from here. The evidence lives in output/benchmark/nhp/hyp-a-p010-{cuda,cpu}, whose config.yaml
+# carries the OLD model_version strings ("MLL-tuned per step" = Adam-100, plus a separate gp_mll_lbfgs
+# arm); never pool those CSVs with newer ones by model NAME, only by model_version. The config is kept so
+# those two run directories stay replottable.
+#
+# What it measured (18 NHP channels x 5 reps, both devices): Adam-100 was unconverged in 90/90 cells
+# (final gradient 1.6e-2, noise pinned near the 1e-4 floor); the converged L-BFGS fit reached grad 6e-6 in
+# 22 iterations, was 1.71x cheaper per query, and lowered cumulative regret in 67/90 cells. Against the
+# Adam arm TabPFN won cumulative regret (median -9.5, p = 7e-4); against the converged arm all three
+# regrets tie (p >= 0.15) and only R^2 survives (+0.09, 16/18 channels).
+#
+# Originally: three arms under the canonical online-minmax BO loop, everything else held fixed:
+#   gp_mll        100 Adam steps, float32   (the historical "tuned GP" of every result so far)
+#   gp_mll_lbfgs  L-BFGS + strong Wolfe, float64, stopped by its own tolerances   (the P0.10 fit)
+#   tabpfn_v2_5   the headline surrogate, as the reference row
+#
+# Run it TWICE, once per device, so latency is reported per model per device (P0.12) instead of on one
+# shared device: `device` is part of a cell's identity, so the two runs are separate cache cells and
+# neither reads the other's timings.
+#
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/p010_gp_fit_nhp.yaml --set device=cuda tag=p010-cuda
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/p010_gp_fit_nhp.yaml --set device=cpu tag=p010-cpu
+#
+# No per-model `model_params.device` override here, deliberately: every model follows `device`, which is
+# what makes the two runs a clean device contrast.
+#
+# Pre-registered read-out (decided before the runs, 2026-09-30): the L-BFGS arm replaces gp_mll as the
+# tuned-GP comparator if it dominates on BOTH `gp_fit_converged` and final NLL (`gp_mll_final`) without
+# losing regret; the latency claim of Hyp A is then stated best-device vs best-device, per model, and if
+# the converged GP is not slower than TabPFN at n = 96 the cost claim moves entirely to the A7 scaling
+# curve. Micro-benchmark already in hand (one NHP channel, fit + pool predict at n = 96): Adam 0.275 s
+# CPU / 0.633 s CUDA and not converged at any n; L-BFGS 0.048 s CPU / 0.191 s CUDA, converged; TabPFN
+# 0.176 s CPU / 0.181 s CUDA.
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll]
+  acquisition: ts_marginal
+
+experiment: bo_benchmark
+family: hyp-a
+tag: p010
+
+budget: 96
+n_init: 5
+n_reps: 5                  # a diagnostic, not a deliverable: 5 reps x 18 channels = 90 paired cells per arm
+gt_mode: full_mean
+online_y_scaler: minmax    # canonical arm, so these numbers are comparable with the group-`nhp` runs
+device: cuda               # overridden per run (see the two commands above)
+seed: 42
+cache_version: 2
+output_root: output
+equivalence_margin: 0.05

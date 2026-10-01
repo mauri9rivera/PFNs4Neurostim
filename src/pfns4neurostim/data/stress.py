@@ -15,14 +15,16 @@ Implemented (stress design of 2026-09-23): **K2** in two settings (channel-relat
 residual amplification against each channel's floor, and one global absolute noise
 level for every channel), **K5** epsilon-contamination of the trial slots with a
 heavy tail, and **K6** sparsity (BO budget, and electrode failure during the run).
-**K1** decoy peak (Demo 1). Declared but not yet implemented: K7 spatial shuffle. Each
-placeholder carries its name, levels and label key so configs, schemas and
-figures can reference it, and raises a message naming the step that implements it.
+**K1** decoy peak (Demo 1) and **K7** spatial shuffle (2026-09-30). No placeholder
+knobs remain; ``_PlaceholderKnob`` is kept for the next declared-but-pending one,
+which carries its name, levels and label key so configs, schemas and figures can
+reference it before it computes anything.
 
 Knobs differ in *what* they alter, which the ``alters`` class attribute records:
-``trials`` (K2, K5) rewrites the observation bank, ``pool`` (K6 failure) changes
-what some sites return during the run, and ``budget``
-(K6 budget) changes only how many queries the loop gets.
+``trials`` (K2, K5) rewrites the observation bank, ``map`` (K1, K7) changes which
+response belongs to which coordinate, ``pool`` (K6 failure) changes what some sites
+return during the run, and ``budget`` (K6 budget) changes only how many queries the
+loop gets.
 
 Roadmap: ``.claude/roadmap.md`` sections S1-S7; plan: task #10.
 """
@@ -38,7 +40,7 @@ from dataclasses import dataclass, replace
 from ..seeding import rng_for
 from .channels import ChannelData
 from .snr import achieved_snr_db, noise_power
-from .synthetic_neurostim import Hotspot, generate_neurostim_map, hotspot_drive
+from .synthetic_neurostim import Hotspot, generate_neurostim_map, hotspot_drive, morans_i
 
 __all__ = [
     "StressKnob",
@@ -808,18 +810,115 @@ class K6FailureKnob(StressKnob):
 
 
 @register_knob
-class K7ShuffleKnob(_PlaceholderKnob):
-    """K7 spatial-shuffle structure knob f: destroy coordinate-response binding.
+class K7ShuffleKnob(StressKnob):
+    """K7 spatial-shuffle structure knob *f*: destroy the coordinate-response binding.
 
-    Implemented at task #10 Step 8 by lifting
-    ``utils.data_utils.shuffle_response_pairing`` (already used by the legacy
-    ``mechanistic_ablation.py``) onto the knob contract.
+    The level is the fraction of sites whose responses are re-paired with other coordinates. A site's whole
+    response moves together -- its ground-truth mean **and** its trial bank -- so the response marginals the
+    channel carries (skewness, heteroscedasticity, noise floor, and hence the achieved SNR and the GT range)
+    are untouched. What changes is only *which coordinate carries which response*.
+
+    **Why this knob is not a variant of the others.** Every surrogate here exploits one assumption: nearby
+    electrodes give similar responses. A GP states it as a prior (an RBF/Matern kernel with a fitted
+    lengthscale); a PFN has to infer it in context. K2 degrades how well that structure can be *observed*, K5
+    corrupts a fraction of *trials*, K6 removes *budget* or *electrodes* -- only K7 removes the structure
+    itself. At ``f = 1`` position carries no information about response, the Bayes-optimal policy is
+    exhaustive search, and every surrogate must collapse to random search; the readout is the *shape* of that
+    collapse and where each model's curve crosses random search (roadmap S7, and the control that Hyp C's
+    placement Ceiling 2 already uses at ``f = 1``).
+
+    **Common random numbers and a nested ladder.** The site ordering is drawn once per channel from a
+    channel-keyed stream (not level-keyed), and level *f* shuffles the first ``k = round(f * N)`` sites of
+    that fixed ordering, so the shuffled set *grows monotonically* with *f* and the levels stay paired: two
+    levels differ only in how many sites were re-paired, never in which ones were eligible (the lesson of
+    review finding R13 on K1). Within that prefix the re-pairing is a **single cycle** (each selected site
+    takes the response of the next one in the ordering). A cycle is deliberate rather than convenient: it has
+    no fixed points, so exactly ``k`` sites lose their own response and ``achieved_shuffle`` is exact instead
+    of an expectation, and it keeps the transformation a deterministic function of the ordering alone.
     """
 
     name: ClassVar[str] = "k7_shuffle"
     default_levels: ClassVar[tuple[float, ...]] = (0.0, 0.25, 0.5, 0.75, 1.0)
     nominal_level: ClassVar[float] = 0.0
     alters: ClassVar[str] = "map"
+
+    def __init__(self, levels: Sequence[float] | None = None) -> None:
+        """Create the knob.
+
+        Args:
+            levels: Shuffle fractions in [0, 1] to sweep.
+
+        Raises:
+            ValueError: On a fraction outside [0, 1].
+        """
+        super().__init__(levels)
+        for level in self.levels:
+            if not 0.0 <= level <= 1.0:
+                raise ValueError(f"K7ShuffleKnob: shuffle fraction must be in [0, 1], got {level}.")
+
+    def apply(self, channel: ChannelData, level: float, rng: np.random.Generator) -> ChannelData:
+        """Re-pair the responses of ``round(level * N)`` sites with other coordinates.
+
+        Args:
+            channel: Nominal channel.
+            level: Shuffle fraction *f*.
+            rng: Unused: the site ordering is a channel-keyed stream, so the ladder is nested and paired
+                (see the class docstring).
+
+        Returns:
+            Stressed channel whose ``y_gt`` and ``Y_trials`` rows have been permuted together.
+
+        Raises:
+            KnobNotApplicable: If the channel has fewer than two sites, where no re-pairing exists.
+        """
+        n = int(channel.n_sites)
+        if n < 2:
+            raise KnobNotApplicable(f"{channel.label}: K7 needs at least two sites, got {n}.")
+        k = int(round(float(level) * n))
+        if k < 2:
+            # A fraction this small selects at most one site, and one site cannot be re-paired with anything.
+            # Reported truthfully by ``achieved`` (achieved_shuffle = 0) rather than silently claimed as
+            # stress: the figure's x-axis is the achieved fraction for exactly this reason.
+            return replace(
+                channel,
+                stress={"knob": self.name, "level": float(level), "n_shuffled": 0},
+            )
+        order = rng_for(channel.label, self.seed_key, "order", base_seed=0).permutation(n)   # [N]
+        prefix = order[:k]                                                                  # [k]
+        source = np.roll(prefix, -1)                                                        # [k]
+        y_gt = np.array(channel.y_gt, dtype=np.float64, copy=True)                           # [N]
+        trials = np.array(channel.Y_trials, dtype=np.float64, copy=True)                     # [N, R]
+        y_gt[prefix] = channel.y_gt[source]
+        trials[prefix] = channel.Y_trials[source]
+        return replace(
+            channel,
+            y_gt=y_gt,
+            Y_trials=trials,
+            stress={"knob": self.name, "level": float(level), "n_shuffled": int(k)},
+        )
+
+    def achieved(self, channel: ChannelData) -> dict[str, float]:
+        """Report the realized shuffle fraction and the structure that survived it.
+
+        ``achieved_moran_i`` is the point of the knob made measurable: Moran's I of the (possibly shuffled)
+        ground-truth map is *the* quantity K7 manipulates, so it is to K7 what achieved SNR is to K2 -- the
+        honest x-axis, since ``f`` is a nominal dose and the realized loss of structure is what a surrogate
+        actually faces. It is NaN on a non-grid condition set (``5d_rat``), where unit-distance neighbours are
+        undefined; ``level`` remains the x-axis there.
+
+        Args:
+            channel: The stressed channel.
+
+        Returns:
+            ``achieved_shuffle``, ``achieved_moran_i`` and ``achieved_snr_db`` (which the knob leaves
+            unchanged by construction, recorded so that the claim is checkable rather than asserted).
+        """
+        n_shuffled = float((channel.stress or {}).get("n_shuffled", 0))
+        return {
+            "achieved_shuffle": n_shuffled / float(channel.n_sites),
+            "achieved_moran_i": morans_i(channel.y_gt, channel.ch2xy),
+            "achieved_snr_db": achieved_snr_db(channel),
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -27,11 +27,11 @@ submit_unit() {
   echo "submitted: $name  (assemble job ${id%%;*} runs after$deps)"
 }
 
-# submit_single <name> <experiment> <config> <env> [overrides...]   (one process, writes its own outputs)
+# submit_single <name> <experiment> <config> <env> <script> [overrides...]   (one process, writes its own outputs)
 submit_single() {
-  local name="$1" exp="$2" cfg="$3" env="$4" id
-  shift 4
-  id=$(CONDA_ENV="$env" sbatch --parsable scripts/run_single.sh "$exp" "$cfg" "$@")
+  local name="$1" exp="$2" cfg="$3" env="$4" script="$5" id
+  shift 5
+  id=$(CONDA_ENV="$env" sbatch --parsable "$script" "$exp" "$cfg" "$@")
   echo "submitted: $name  (job ${id%%;*})"
 }
 

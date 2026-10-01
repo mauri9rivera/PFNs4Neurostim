@@ -45,20 +45,6 @@ def _bo_benchmark(argv: list[str]) -> int:
     return runner(argv)
 
 
-def _gt_sensitivity(argv: list[str]) -> int:
-    """Dispatch to the full-mean vs split-half ground-truth check (task #7).
-
-    Args:
-        argv: Remaining CLI arguments.
-
-    Returns:
-        Process exit code.
-    """
-    from .experiments.gt_sensitivity import main as runner  # noqa: PLC0415 - lazy
-
-    return runner(argv)
-
-
 def _mechanism(argv: list[str]) -> int:
     """Dispatch to the Hyp C mechanism analyses (update rule, placement, CKA).
 
@@ -77,7 +63,6 @@ def _mechanism(argv: list[str]) -> int:
 EXPERIMENTS: dict[str, Callable[[list[str]], int]] = {
     "bo_benchmark": _bo_benchmark,
     "stress_sweep": _stress_sweep,
-    "gt_sensitivity": _gt_sensitivity,
     "mechanism": _mechanism,
 }
 

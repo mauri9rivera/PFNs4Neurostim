@@ -99,23 +99,47 @@ class Context:
     y: np.ndarray
 
 
-def draw_context(channel: ChannelData, t: int, rng: np.random.Generator) -> Context:
+def draw_context(
+    channel: ChannelData,
+    t: int,
+    rng: np.random.Generator,
+    sites: np.ndarray | None = None,
+) -> Context:
     """Draw ``t`` distinct sites and one random valid trial at each.
 
     Args:
         channel: Source channel.
         t: Context size (``<= n_sites``).
         rng: Generator.
+        sites: Site indices to use instead of drawing them, shape [t]. Passing them makes the site set a
+            *shared* quantity across channels while the trial draw stays per channel (added 2026-09-30): a
+            paired design, which both removes site selection as a source of between-channel variance and lets
+            an analysis reuse everything that depends on the sites alone -- reference-map embeddings, geometry
+            kernels, floors and ceilings -- across every channel on the same grid.
 
     Returns:
         The context.
 
     Raises:
-        ValueError: If ``t`` exceeds the number of sites or is < 2.
+        ValueError: If ``t`` exceeds the number of sites or is < 2, or if ``sites`` has the wrong length or
+            repeats an index.
     """
     if not 2 <= t <= channel.n_sites:
         raise ValueError(f"draw_context: t={t} must be in [2, {channel.n_sites}].")
-    sites = np.sort(rng.choice(channel.n_sites, size=t, replace=False))     # [t]
+    if sites is None:
+        sites = np.sort(rng.choice(channel.n_sites, size=t, replace=False))     # [t]
+    else:
+        sites = np.sort(np.asarray(sites, dtype=int))                           # [t]
+        if sites.size != t or np.unique(sites).size != t:
+            raise ValueError(
+                f"draw_context: sites must hold {t} distinct indices, got {sites.size} "
+                f"({np.unique(sites).size} distinct)."
+            )
+        if sites.min() < 0 or sites.max() >= channel.n_sites:
+            raise ValueError(
+                f"draw_context: sites out of range for {channel.n_sites} sites: "
+                f"[{sites.min()}, {sites.max()}]."
+            )
     y = np.empty(t)
     for i, s in enumerate(sites):
         valid = np.flatnonzero(np.isfinite(channel.Y_trials[s]))

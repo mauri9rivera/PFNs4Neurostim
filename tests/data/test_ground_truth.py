@@ -220,21 +220,3 @@ def test_bo_benchmark_split_half_end_to_end(
     assert df.sort_values("rep")["split_id"].tolist() == [0, 1, 0]
     assert df["gt_r_half"].notna().all() and df["gt_reliability"].notna().all()
     assert (df["gt_reliability"] >= df["gt_r_half"]).all()
-
-
-def test_pair_gt_modes_pairs_channel_means() -> None:
-    """The sensitivity pairing averages reps per channel and differences the modes."""
-    from pfns4neurostim.experiments.gt_sensitivity import pair_gt_modes
-
-    base = {"dataset": "nhp", "subject": 1, "emg": 0, "model": "gp_mll", "acq_label": "ei"}
-    full = pd.DataFrame([{**base, "recommended_regret": v, "r2": 0.9} for v in (0.1, 0.3)])
-    split = pd.DataFrame(
-        [{**base, "recommended_regret": v, "r2": 0.5, "gt_r_half": 0.6, "gt_reliability": 0.75}
-         for v in (0.2, 0.4)]
-    )
-    out = pair_gt_modes(full, split)
-    assert len(out) == 1
-    assert out.loc[0, "recommended_regret_full_mean"] == pytest.approx(0.2)
-    assert out.loc[0, "recommended_regret_delta"] == pytest.approx(0.1)
-    assert out.loc[0, "r2_delta"] == pytest.approx(-0.4)
-    assert out.loc[0, "gt_r_half"] == pytest.approx(0.6)

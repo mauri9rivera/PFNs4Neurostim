@@ -14,18 +14,20 @@ Outputs go to ``{output_root}/mechanism/{analysis}/{dataset}/{tag}/`` with the r
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
 import yaml
 
 from ..config import DatasetConfig, apply_overrides, compose, dataset_config_from_raw
+from ..analysis.context import context_for, context_sites, grid_id
 from ..data.channels import ChannelData, iter_channels
 from ..seeding import rng_for, set_seed
 
@@ -168,7 +170,44 @@ UPDATE_RULE_DEFAULTS: dict[str, Any] = {
     "gp_params": {"n_opt_steps": 100, "lr": 0.1},
     "inference_seed": 0,
     "max_batch_tokens": 400000,
-    "layer_arm": {"enabled": True, "context_t": 25, "level": 1.0, "ridge": 1.0},
+    # Secondary layer-wise arm. ``context_ts`` is a LIST since 2026-09-30: the layer profile is a property
+    # of the surrogate *given its evidence*, so a single context could not separate "this is where the
+    # update becomes GP-like" from "this is what 25 observations buy". Each entry adds one pass of
+    # ``layer_alignment`` per channel at ``level``, so cost is linear in len(context_ts).
+    "layer_arm": {"enabled": True, "context_ts": [10, 25, 50], "level": 1.0, "ridge": 1.0},
+    # Which cell figure F1 (the exemplar delta-maps) is drawn from. Until 2026-09-27 the exemplar was
+    # whichever cell the loop reached first, and the saved arrays recorded neither the stress level nor the
+    # context size, so the figure could not be reproduced or captioned. Every field below is now explicit
+    # and written into ``update_rule_exemplar.npz``.
+    #
+    #   context_ts      A LIST since 2026-09-30: F1 now draws ONE COLUMN PER CONTEXT SIZE for the same
+    #                   channel, anchor and surprise, so the reader sees the update sharpening (or not) as
+    #                   evidence accumulates instead of one unexplained slice. The channel is selected once
+    #                   -- by the rule below, scored across the listed contexts -- so the columns are
+    #                   comparable. Keep ``gates.context_t`` inside the list so the gates describe an
+    #                   operating point the figure actually shows.
+    #   level           The nominal anchor (alpha = 1.0). F1 asks whether the update is GP-like at all;
+    #                   the stress response is what F3 and F4 are for.
+    #   anchor_stratum  'centre' gives the full kernel bump: an edge anchor truncates half of it off-grid,
+    #                   and a high-response anchor sits where the GP's predictive variance is smallest, so
+    #                   the denominator k(x*,x*)+sigma^2 shrinks the update and weakens the comparison.
+    #   select          How the channel is chosen. 'median_alignment' takes the channel whose
+    #                   rho_shape_offanchor is the MEDIAN over candidates -- representative by
+    #                   construction, and the honest choice: picking the best-aligned channel would make
+    #                   the figure an upper bound rather than a typical case. 'explicit' uses
+    #                   subject/emg; 'first' reproduces the old behaviour.
+    #
+    # The plotted profile is the antisymmetrized response at the SMALLEST surprise magnitude, which is the
+    # same estimator ``ell_hat`` uses, so the figure and the metric cannot disagree.
+    "exemplar": {
+        "context_ts": [10, 25, 50],
+        "level": 1.0,
+        "draw": 0,
+        "anchor_stratum": "centre",
+        "select": "median_alignment",
+        "subject": None,
+        "emg": None,
+    },
     "gates": {
         "positive_r": 0.7, "lengthscale_tol": 0.25, "icc_min": 0.75, "linear_regime_tol": 0.25,
         "null_quantile": 0.95, "context_t": 25,
@@ -241,7 +280,7 @@ def run_update_rule(cfg: MechanismConfig, replot: bool = False) -> str:
         cell_rows: list[dict[str, Any]] = []
         surprise_rows: list[dict[str, Any]] = []
         layer_rows: list[dict[str, Any]] = []
-        exemplar: dict[str, Any] | None = None
+        exemplar_candidates: list[dict[str, Any]] = []
         channels = _channels(cfg)
         t0 = time.time()
         engines = {name: _make_engine(name, p, cfg.device, int(p["inference_seed"])) for name in p["engines"]}
@@ -253,8 +292,11 @@ def run_update_rule(cfg: MechanismConfig, replot: bool = False) -> str:
                     if t >= stressed.n_sites:
                         continue
                     for draw in range(int(p["n_context_draws"])):
+                        # One shared context per (grid, t, draw) with this channel's own trials (#19 Step 1):
+                        # every Hyp C analysis now conditions on the same sites, so M8 joins cells that really
+                        # are the same cells, and anything that depends on the sites alone can be reused.
+                        ctx = context_for(stressed, int(t), draw, base_seed=cfg.seed, level=float(level))
                         rng = rng_for(ch.label, "update_rule", level, t, draw, base_seed=cfg.seed)
-                        ctx = U.draw_context(stressed, int(t), rng)
                         anchors, strata = U.select_anchors(stressed, int(p["n_anchors"]), rng, exclude=ctx.sites)
                         reference = U.GPFrozenEngine(GPSurrogate(**p["gp_params"]), name="reference")
                         reference.fit(ctx.X, ctx.y)
@@ -268,7 +310,8 @@ def run_update_rule(cfg: MechanismConfig, replot: bool = False) -> str:
                             res = U.run_probes(engine, reference, ctx, stressed.X_pool, anchors, strata, surprises)
                             rows, cell = U.update_metrics(res, stressed.X_pool)
                             la = p["layer_arm"]
-                            if (name == "tabpfn_v2_5" and la["enabled"] and int(t) == int(la["context_t"])
+                            if (name == "tabpfn_v2_5" and la["enabled"]
+                                    and int(t) in {int(v) for v in la["context_ts"]}
                                     and float(level) == float(la["level"])):
                                 layer_rows += [{**keys, **r} for r in U.layer_alignment(
                                     engine, res, stressed.X_pool, ridge=float(la["ridge"]))]
@@ -284,16 +327,22 @@ def run_update_rule(cfg: MechanismConfig, replot: bool = False) -> str:
                                         "dsd_anchor": float(res.d_sd[i, j, a]),
                                         "base_sd_anchor": float(res.base_sd[a]),
                                     })
-                            if exemplar is None and (name == "tabpfn_v2_5" or "tabpfn_v2_5" not in engines):
-                                exemplar = _exemplar(stressed, res)
+                            if _exemplar_cell_matches(p["exemplar"], ch, level, t, draw) and (
+                                    name == "tabpfn_v2_5" or "tabpfn_v2_5" not in engines):
+                                exemplar_candidates.append(
+                                    _exemplar(stressed, res, strata, p["exemplar"], keys, cell)
+                                )
                 print(f"[mechanism] {ch.label} level={level} done ({time.time() - t0:.0f}s)", flush=True)
         pd.DataFrame(anchor_rows).to_csv(os.path.join(out, "update_rule.csv"), index=False)
         pd.DataFrame(cell_rows).to_csv(os.path.join(out, "update_rule_cell.csv"), index=False)
         pd.DataFrame(surprise_rows).to_csv(os.path.join(out, "update_rule_surprise.csv"), index=False)
         if layer_rows:
             pd.DataFrame(layer_rows).to_csv(os.path.join(out, "update_rule_layers.csv"), index=False)
+        exemplar = _select_exemplar(exemplar_candidates, p["exemplar"])
         if exemplar is not None:
             np.savez(os.path.join(out, "update_rule_exemplar.npz"), **exemplar)
+        else:
+            print(f"[mechanism] no exemplar cell matched {p['exemplar']}; F1 will be skipped", flush=True)
 
         # --- validation gates (Step 2) ---
         g = p["gates"]
@@ -378,20 +427,147 @@ def _predictive_link(out: str, link: dict[str, Any], seed: int) -> str:
     return path
 
 
-def _exemplar(channel: ChannelData, res: Any) -> dict[str, Any]:
-    """Arrays of the first anchor for figure F1 (grid heatmaps)."""
+def _exemplar_cell_matches(
+    spec: dict[str, Any],
+    channel: ChannelData,
+    level: float,
+    context_t: int,
+    draw: int,
+) -> bool:
+    """Whether this (channel, level, t, draw) cell is a candidate for figure F1.
+
+    Args:
+        spec: The resolved ``update_rule.exemplar`` block.
+        channel: Channel being probed.
+        level: Stress level of the cell.
+        context_t: Context size of the cell.
+        draw: Context-draw index of the cell.
+
+    Returns:
+        True when the cell matches the requested operating point (and, for ``select: explicit``, the
+        requested channel).
+    """
+    if (int(context_t) not in {int(v) for v in spec["context_ts"]}
+            or float(level) != float(spec["level"]) or int(draw) != int(spec["draw"])):
+        return False
+    if spec["select"] == "explicit":
+        return (int(channel.subject) == int(spec["subject"]) and int(channel.emg) == int(spec["emg"]))
+    return True
+
+
+def _exemplar(
+    channel: ChannelData,
+    res: Any,
+    strata: Sequence[str],
+    spec: dict[str, Any],
+    keys: dict[str, Any],
+    cell: dict[str, Any],
+) -> dict[str, Any]:
+    """Arrays and full provenance of one candidate exemplar for figure F1 (grid heatmaps).
+
+    The plotted profile is the antisymmetrized change at the smallest surprise magnitude -- the same
+    estimator :func:`analysis.update_rule.implicit_kernel` uses for ``ell_hat`` -- so the figure and the
+    quantitative metric describe the same object. The anchor is the first one of the requested stratum,
+    falling back to the first anchor when that stratum was not sampled in this cell.
+
+    Args:
+        channel: Channel being probed.
+        res: Probe result for one engine.
+        strata: Stratum name of each sampled anchor, parallel to ``res.anchors``.
+        spec: The resolved ``update_rule.exemplar`` block.
+        keys: Cell key columns (dataset, subject, emg, knob, level, achieved SNR, context size, draw).
+        cell: Per-cell metrics, used to rank candidates under ``select: median_alignment``.
+
+    Returns:
+        A mapping ready for :func:`numpy.savez`, carrying the arrays and every field needed to caption
+        and reproduce the figure.
+    """
     from ..analysis.update_rule import _antisym, _symmetric_magnitudes  # noqa: PLC0415
 
     c0 = _symmetric_magnitudes(res.surprises)[0]
+    wanted = str(spec["anchor_stratum"])
+    idx = next((i for i, s in enumerate(strata) if s == wanted), 0)
     return {
         "engine": np.array(res.engine),
         "label": np.array(channel.label),
-        "anchor": np.array(int(res.anchors[0])),
+        "anchor": np.array(int(res.anchors[idx])),
+        "anchor_stratum": np.array(strata[idx] if idx < len(strata) else "unknown"),
+        "anchor_stratum_requested": np.array(wanted),
+        "surprise_c": np.array(float(c0)),
+        "select_rule": np.array(str(spec["select"])),
+        "subject": np.array(int(keys["subject"])),
+        "emg": np.array(int(keys["emg"])),
+        "knob": np.array(str(keys["knob"])),
+        "level": np.array(float(keys["level"])),
+        "achieved_snr_db": np.array(float(keys["achieved_snr_db"])),
+        "context_t": np.array(int(keys["context_t"])),
+        "draw": np.array(int(keys["draw"])),
+        "rho_shape_offanchor": np.array(float(cell.get("rho_shape_offanchor_median", np.nan))),
         "ch2xy": channel.ch2xy,
         "grid_shape": np.array(channel.grid_shape),
-        "g_model": _antisym(res.d_mean, res.surprises, c0)[0],
-        "g_gp": _antisym(res.d_gp, res.surprises, c0)[0],
+        "g_model": _antisym(res.d_mean, res.surprises, c0)[idx],
+        "g_gp": _antisym(res.d_gp, res.surprises, c0)[idx],
     }
+
+
+def _select_exemplar(
+    candidates: Sequence[dict[str, Any]],
+    spec: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Pick ONE channel and stack its exemplars over the requested context sizes (figure F1).
+
+    The channel is chosen once and then shown at every context size, so the columns of F1 differ only in
+    how much evidence the surrogate was given. ``median_alignment`` ranks channels by the median of their
+    ``rho_shape_offanchor`` over those context sizes and takes the channel at the median of that ranking: a
+    median exemplar is representative by construction, whereas selecting the best-aligned channel would
+    turn F1 into an upper bound rather than a typical case, so that option is deliberately absent.
+
+    The anchor is drawn per (context, draw) cell upstream, so it may differ between columns; the per-column
+    anchors are stored and each panel marks its own.
+
+    Args:
+        candidates: Candidate exemplars from :func:`_exemplar`, over channels and context sizes.
+        spec: The resolved ``update_rule.exemplar`` block.
+
+    Returns:
+        A mapping ready for :func:`numpy.savez` whose ``g_model`` / ``g_gp`` are ``[T, N]`` and whose
+        ``context_ts`` / ``anchors`` are ``[T]``, ordered by context size; or ``None`` when no cell matched.
+
+    Raises:
+        ValueError: If ``spec['select']`` is not a known rule.
+    """
+    if not candidates:
+        return None
+    rule = str(spec["select"])
+    if rule not in ("first", "explicit", "median_alignment"):
+        raise ValueError(
+            f"update_rule.exemplar.select={rule!r} is not one of 'median_alignment', 'explicit', 'first'."
+        )
+    by_channel: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for cand in candidates:
+        by_channel.setdefault((int(cand["subject"]), int(cand["emg"])), []).append(cand)
+    if rule in ("first", "explicit"):
+        chosen = by_channel[(int(candidates[0]["subject"]), int(candidates[0]["emg"]))]
+    else:
+        keys = list(by_channel)
+        scores = np.array([
+            np.nanmedian([float(c["rho_shape_offanchor"]) for c in by_channel[k]]) for k in keys
+        ])
+        finite = np.flatnonzero(np.isfinite(scores))
+        if finite.size == 0:
+            chosen = by_channel[keys[0]]
+        else:
+            # Lower median of the finite scores, so the pick is an actual channel rather than an interpolant.
+            ordered = finite[np.argsort(scores[finite], kind="stable")]
+            chosen = by_channel[keys[int(ordered[(len(ordered) - 1) // 2])]]
+    chosen = sorted(chosen, key=lambda c: int(c["context_t"]))
+    ref = chosen[len(chosen) // 2]     # provenance scalars come from the middle context
+    stacked = {k: v for k, v in ref.items() if k not in ("g_model", "g_gp", "anchor", "context_t")}
+    stacked["g_model"] = np.stack([c["g_model"] for c in chosen])          # [T, N]
+    stacked["g_gp"] = np.stack([c["g_gp"] for c in chosen])                # [T, N]
+    stacked["anchors"] = np.array([int(c["anchor"]) for c in chosen])      # [T]
+    stacked["context_ts"] = np.array([int(c["context_t"]) for c in chosen])  # [T]
+    return stacked
 
 
 # ---------------------------------------------------------------------------
@@ -596,12 +772,10 @@ def run_placement(cfg: MechanismConfig, replot: bool = False) -> str:
                     if tt > ch.n_sites or tt <= int(p["n_neighbors"]):
                         continue
                     for draw in range(int(cp["n_draws"])):
-                        rng = rng_for(ch.label, "placement_c", level, t, draw, base_seed=cfg.seed)
-                        sites = np.sort(rng.choice(ch.n_sites, tt, replace=False))
-                        yv = np.array([
-                            stressed.Y_trials[s, rng.choice(np.flatnonzero(np.isfinite(stressed.Y_trials[s])))]
-                            for s in sites
-                        ])
+                        # Shared sites, this channel's own trials (#19 Step 1), so the placement trajectory
+                        # describes the same operating points as the CKA and update-rule cells.
+                        ctx = context_for(stressed, tt, draw, base_seed=cfg.seed, level=float(level))
+                        sites, yv = ctx.sites, ctx.y
                         if np.std(yv) == 0:
                             continue
                         Xs = ch.X_pool[sites]
@@ -702,9 +876,34 @@ CKA_DEFAULTS: dict[str, Any] = {
         "grid_side": 10, "lengthscale": 0.2, "noise_sd": 0.3, "n_trials": 10, "t": 25,
         "alpha": 0.05, "n_seeds": 10, "icc_min": 0.75, "n_seed_channels": 1,
     },
+    # CKA (b): placement of a channel's layer-wise embedding between the on-grid prior bank and the noise
+    # bank. Scaled up on 2026-09-27 -- it previously ran ONE context draw per channel (324 rows = 18
+    # channels x 18 layers), which is why the figure was unreadable.
+    #   ts         context sizes the embeddings are conditioned on. A LIST since 2026-09-30: one context
+    #              was a single slice through a surrogate whose behaviour is context-dependent by
+    #              construction, so the layer curve could not be told apart from the amount of evidence it
+    #              was conditioned on. Each entry is clamped to n_sites - 1; cost is linear in len(ts).
+    #   n_prior    on-grid prior maps forming the comparison bank (distance = median over the k nearest).
+    #   n_noise    noise maps forming the ceiling.
+    #   n_draws    independent context draws per channel; the figure medians over them.
+    #   min_gap    placement is (d - floor) / (ceiling - floor); when the denominator is ~0 the ratio
+    #              explodes and its sign is meaningless. On the 2026-09-24 NHP run, layers 0-3 had gaps of
+    #              0.0000-0.0024 (some NEGATIVE, i.e. the noise ceiling below the prior floor) and 114 of
+    #              324 rows had |gap| < 0.02, which is the whole reason p ranged over -8 to +12. Rows below
+    #              this threshold are marked ``gap_ok = False`` so the figure can drop them: early layers
+    #              genuinely cannot separate prior from noise, and no number of draws changes that.
+    #   bank_quantile
+    #              Which quantile of the channel-to-bank distances defines "distance to the prior bag".
+    #              This REPLACES the old absolute ``k_nearest`` (median of the k smallest), which made
+    #              ``n_prior`` a definitional parameter rather than a precision knob: with k fixed, drawing
+    #              more prior maps can only bring the k nearest closer, so the measured distance -- and
+    #              therefore the placement p -- drifted downward as n_prior grew, and two runs with
+    #              different n_prior were not comparable. A quantile is a population quantity: it converges
+    #              as n_prior grows, so n_prior becomes a pure precision/cost knob and can be raised freely.
     "placement": {
-        "enabled": True, "t": 25, "n_prior": 30, "n_prior_holdout": 10, "n_noise": 10,
-        "k_nearest": 5, "n_dense": 1024, "holdout_frac": 0.1, "rmse_threshold": 0.5,
+        "enabled": True, "ts": [10, 25, 50, 80], "n_prior": 100, "n_prior_holdout": 30, "n_noise": 30,
+        "n_draws": 5, "min_gap": 0.02,
+        "bank_quantile": 0.10, "n_dense": 1024, "holdout_frac": 0.1, "rmse_threshold": 0.5,
         "prior_type": "prior_bag",
     },
 }
@@ -794,8 +993,7 @@ def run_cka(cfg: MechanismConfig, replot: bool = False) -> str:
                     if t >= st.n_sites:
                         continue
                     for rep in range(int(p["n_context_draws"])):
-                        rng = rng_for(ch.label, "cka", level, t, rep, base_seed=cfg.seed)
-                        ctx = U.draw_context(st, int(t), rng)
+                        ctx = context_for(st, int(t), rep, base_seed=cfg.seed, level=float(level))
                         kernels = kernels_for(st, ctx)
                         for readout in p["readouts"]:
                             E = embed(ctx.X, ctx.y, st.X_pool, readout)
@@ -845,45 +1043,77 @@ def run_cka(cfg: MechanismConfig, replot: bool = False) -> str:
                           "icc": icc, "passed": bool(icc >= c["icc_min"])})
 
         # --- CKA (b) placement (Step 6) ---
+        # Restructured 2026-09-30 so the work that does not depend on the channel is done once. Three things
+        # are channel-independent at a fixed (grid, context size, draw): the prior/noise BANKS, the bank maps'
+        # EMBEDDINGS at the context sites, and therefore the FLOOR and CEILING. Before, all three were
+        # recomputed inside the channel loop -- for NHP that is one grid and 18 channels, so the banks were
+        # sampled 18 times identically and ~61 map embeddings per cell became ~1,100. Sharing them needs the
+        # context SITES to be shared too, which is why they are drawn from a grid-keyed stream while each
+        # channel still draws its own trials at those sites (`draw_context(..., sites=)`). That also makes the
+        # comparison paired: between-channel differences can no longer come from having seen different sites.
         pl = p["placement"]
         prow: list[dict[str, Any]] = []
         if pl["enabled"]:
+            readout = p["readouts"][0]
+            q = float(pl["bank_quantile"])
+            min_gap = float(pl["min_gap"])
+            n_total = int(pl["n_prior"]) + int(pl["n_prior_holdout"])
+            grids: dict[bytes, list[ChannelData]] = {}
             for ch in channels:
-                n_total = int(pl["n_prior"]) + int(pl["n_prior_holdout"])
-                prior = prior_grid_bank(ch.X_pool, n_total, n_dense=int(pl["n_dense"]),
+                grids.setdefault(ch.X_pool.tobytes(), []).append(ch)
+            for grid_key, grid_channels in grids.items():
+                ref = grid_channels[0]
+                grid = grid_id(ref.X_pool)
+                prior = prior_grid_bank(ref.X_pool, n_total, n_dense=int(pl["n_dense"]),
                                         holdout_frac=float(pl["holdout_frac"]),
                                         rmse_threshold=float(pl["rmse_threshold"]),
                                         prior_type=pl["prior_type"], seed=cfg.seed)
-                noise = noise_grid_bank(ch.X_pool, int(pl["n_noise"]), seed=cfg.seed + 1)
+                noise = noise_grid_bank(ref.X_pool, int(pl["n_noise"]), seed=cfg.seed + 1)
                 n_hold = min(int(pl["n_prior_holdout"]), len(prior.maps) // 2)
-                rng = rng_for(ch.label, "cka_placement", base_seed=cfg.seed)
-                ctx = U.draw_context(ch, min(int(pl["t"]), ch.n_sites - 1), rng)
-                sites = ctx.sites
-                readout = p["readouts"][0]
+                # Context sizes are clamped to the grid and de-duplicated, so a config may ask for a
+                # ladder that runs past a small dataset's site count without silently doubling a cell.
+                ts = sorted({min(int(t), ref.n_sites - 1) for t in pl["ts"]})
+                for t_ctx, draw in itertools.product(ts, range(int(pl["n_draws"]))):
+                    sites = context_sites(ref.X_pool, t_ctx, draw, base_seed=cfg.seed)         # [t]
 
-                def grams(y_map: np.ndarray) -> list[np.ndarray]:
-                    E = embed(ch.X_pool[sites], y_map[sites], ch.X_pool, readout)
-                    return [linear_gram(E[l]) for l in range(E.shape[0])]
+                    def grams(y_map: np.ndarray, sites: np.ndarray = sites) -> list[np.ndarray]:
+                        E = embed(ref.X_pool[sites], y_map[sites], ref.X_pool, readout)
+                        return [linear_gram(E[l]) for l in range(E.shape[0])]
 
-                G_ch = [linear_gram(E) for E in embed(ctx.X, ctx.y, ch.X_pool, readout)]
-                bank = [grams(m) for m in prior.maps[n_hold:]]
-                hold = [grams(m) for m in prior.maps[:n_hold]]
-                nz = [grams(m) for m in noise.maps]
-                k = int(pl["k_nearest"])
+                    bank = [grams(m) for m in prior.maps[n_hold:]]
+                    hold = [grams(m) for m in prior.maps[:n_hold]]
+                    nz = [grams(m) for m in noise.maps]
 
-                def dist(Gs: list[np.ndarray], layer: int) -> float:
-                    d = np.sort([1.0 - cka_debiased(Gs[layer], B[layer]) for B in bank])
-                    return float(np.median(d[:k]))
+                    def dist(Gs: list[np.ndarray], layer: int, bank: list = bank) -> float:
+                        """Distance from one map's layer-``layer`` embedding to the prior bank.
 
-                for layer in range(len(G_ch)):
-                    d = dist(G_ch, layer)
-                    fl = float(np.median([dist(h, layer) for h in hold]))
-                    ce = float(np.median([dist(z, layer) for z in nz]))
-                    prow.append({"dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
-                                 "layer": layer, "context_t": len(sites), "d": d, "floor1": fl,
-                                 "ceiling1": ce, "gap": ce - fl, "p": place(d, fl, ce),
-                                 "prior_rejection_rate": prior.rejection_rate})
-                print(f"[mechanism] cka placement {ch.label} done", flush=True)
+                        The ``q``-quantile of the per-bank-member CKA distances, so the value converges as
+                        the bank grows instead of drifting with its size (see ``bank_quantile``).
+                        """
+                        d = [1.0 - cka_debiased(Gs[layer], B[layer]) for B in bank]
+                        return float(np.quantile(d, q))
+
+                    n_layers = len(bank[0])
+                    # Floor and ceiling depend on the sites and the banks only, so they are the same number
+                    # for every channel on this grid at this (t, draw): computed once, not once per channel.
+                    floors = [float(np.median([dist(h, l) for h in hold])) for l in range(n_layers)]
+                    ceilings = [float(np.median([dist(z, l) for z in nz])) for l in range(n_layers)]
+                    for ch in grid_channels:
+                        ctx = context_for(ch, t_ctx, draw, base_seed=cfg.seed)
+                        G_ch = [linear_gram(E) for E in embed(ctx.X, ctx.y, ch.X_pool, readout)]
+                        for layer in range(n_layers):
+                            d = dist(G_ch, layer)
+                            fl, ce = floors[layer], ceilings[layer]
+                            gap = ce - fl
+                            prow.append({"dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
+                                         "layer": layer, "context_t": len(sites), "draw": draw, "d": d,
+                                         "floor1": fl, "ceiling1": ce, "gap": gap,
+                                         "gap_ok": bool(abs(gap) >= min_gap and gap > 0.0),
+                                         "min_gap": min_gap, "p": place(d, fl, ce),
+                                         "grid_id": grid,
+                                         "prior_rejection_rate": prior.rejection_rate})
+                    print(f"[mechanism] cka placement grid {grid} t={t_ctx} draw {draw} done "
+                          f"({len(grid_channels)} channels)", flush=True)
         pd.DataFrame(prow).to_csv(os.path.join(out, "cka_placement.csv"), index=False)
         with open(os.path.join(out, "gates.json"), "w", encoding="utf-8") as fh:
             json.dump(gates, fh, indent=2, default=_json_default)

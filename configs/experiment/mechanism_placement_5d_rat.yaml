@@ -1,0 +1,42 @@
+# Task #6 - placement of every 5d_rat channel between the TabPFN v1 prior bag and noise (P0.6).
+#
+# The 5D arm of the NHP config of the same name (added 2026-09-30). Everything is identical except the
+# dataset and the context ladder: 5d_rat is a 2048-point non-grid condition set (D = 5) with a BO budget of
+# 100, so the references are interpolated onto the real condition set (data/references/grid.py) rather than
+# sampled on a lattice, and the ladder runs to 200 = 2x the budget, which is the most context any 5d_rat
+# run can ever hold plus a margin to show where the curve flattens.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_placement_5d_rat.yaml
+defaults:
+  dataset: 5d_rat
+
+analysis: placement
+tag: 5d_rat
+device: cpu
+seed: 42
+output_root: output
+
+placement:
+  metrics: [mmd, w2]
+  representation: rank_pairs   # pairs / joint fail the M0 ladder on real NHP channels (rho = -0.9)
+  n_neighbors: 4
+  n_prior: 200
+  n_prior_holdout: 50
+  n_noise: 50
+  n_dense: 1024
+  holdout_frac: 0.1
+  rmse_threshold: 0.5          # pre-declared max standardized hold-out interpolation RMSE
+  prior_type: prior_bag
+  k_nearest: 10                # pre-declared
+  n_projections: 200
+  w2_repeats: 20
+  n_splits: 5
+  n_shuffles: 10
+  n_boot: 1000
+  ladder_lambdas: [0.0, 0.25, 0.5, 0.75, 1.0]
+  ladder_min_spearman: 0.9
+  # Context ladder (2026-09-30): 10 (the floor below which the neighbour-pair reading is draw noise) to 200
+  # = 2x the budget-100 run. Unlike NHP, 200 is far below the 2048 conditions, so no entry collapses onto
+  # the full map and the `full` row stays a separate, much larger reference point.
+  context: {sizes: [10, 20, 40, 60, 100, 200], n_draws: 10,
+            stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}}

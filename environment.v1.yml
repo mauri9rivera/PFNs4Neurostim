@@ -20,9 +20,15 @@
 # adaptation" and its calibration numbers are bounded by the bin count — see
 # docs/tabpfn_v1_adaptation.md before reporting any of them.
 #
+# v1 has no config of its own: it is one MODEL ROW of the PFN benchmark, so it runs through the same
+# hyp0_pfn_bench_{nhp,spinal,5d_rat}.yaml as every other Hyp 0 model, selected with `models=[tabpfn_v1]`.
+#
 #   bash scripts/mila_setup.sh env v1     # create pfns4neurostim-v1 + install the package
 #   conda activate pfns4neurostim-v1
-#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_tabpfn_v1_nhp.yaml
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_pfn_bench_nhp.yaml --set models=[tabpfn_v1]
+#
+# On the cluster, use scripts/submit_tabpfn_v1.sh, which builds the env if needed, runs one smoke cell,
+# and only then submits the three datasets.
 name: pfns4neurostim-v1
 channels:
   - conda-forge

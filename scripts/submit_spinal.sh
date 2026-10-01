@@ -27,18 +27,17 @@ submit_unit() {
   echo "submitted: $name  (assemble job ${id%%;*} runs after$deps)"
 }
 
-# submit_single <name> <experiment> <config> <env> [overrides...]   (one process, writes its own outputs)
+# submit_single <name> <experiment> <config> <env> <script> [overrides...]   (one process, writes its own outputs)
 submit_single() {
-  local name="$1" exp="$2" cfg="$3" env="$4" id
-  shift 4
-  id=$(CONDA_ENV="$env" sbatch --parsable scripts/run_single.sh "$exp" "$cfg" "$@")
+  local name="$1" exp="$2" cfg="$3" env="$4" script="$5" id
+  shift 5
+  id=$(CONDA_ENV="$env" sbatch --parsable "$script" "$exp" "$cfg" "$@")
   echo "submitted: $name  (job ${id%%;*})"
 }
 
 submit_unit "P1. Hyp A (TabPFN vs GP), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
 submit_unit "P2. Acquisition core (ts/ei/ucb), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
 submit_unit "P3. UCB kappa grid, spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_ucb_kappa_spinal.yaml pfns4neurostim "tabpfn_v2_5" "-" 4 "-"
-submit_single "P4. GT sensitivity (full-mean vs split-half), spinal" gt_sensitivity configs/experiment/gt_sensitivity_spinal.yaml pfns4neurostim
 submit_unit "P5. K2-channel, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "P6. K2-global, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "P7. K5 slot-fraction heavy tail, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
@@ -46,10 +45,9 @@ submit_unit "P8. K6 electrode failure, spinal" stress_sweep scripts/run_stress_s
 submit_unit "P9. K6 budget, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "P10. Demo 1 K2-channel, spinal twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_demo1_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "P11. Demo 1 K1 decoy, spinal twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "P12. Split-half GT, K2-channel spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "gt_mode=split_half" "tag=spinal-sh"
-submit_unit "P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "-"
-submit_unit "P14. PFNs4BO (native policy), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim "pfns4bo" "-" 2 "-"
+submit_unit "P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "16G"
+submit_unit "P14. PFNs4BO (native policy), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim "pfns4bo" "-" 2 "12G"
 submit_unit "P15. TabFM, spinal (fixed wrapper)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabfm" "-" 2 "24G"
-submit_unit "P16. TabPFN v1 (classification-head adaptation), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-v1 "tabpfn_v1" "-" 2 "-"
+submit_unit "P16. TabPFN v1 (classification-head adaptation), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-v1 "tabpfn_v1" "-" 2 "12G"
 
 echo "Done. Check with: squeue --me"

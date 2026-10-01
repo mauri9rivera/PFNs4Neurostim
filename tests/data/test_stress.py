@@ -32,10 +32,11 @@ class TestRegistry:
     """The knob registry and its declared placeholders."""
 
     def test_implemented_knobs(self) -> None:
-        """K1 (Demo 1), both K2 settings, K5 and both K6 variants are live; K7 is still declared."""
+        """Every declared knob is live since K7 landed on 2026-09-30."""
         assert stress.available_knobs(implemented_only=True) == [
-            "k1_decoy", "k2_channel", "k2_global", "k5_outliers", "k6_budget", "k6_failure"
+            "k1_decoy", "k2_channel", "k2_global", "k5_outliers", "k6_budget", "k6_failure", "k7_shuffle"
         ]
+        assert stress.available_knobs(implemented_only=True) == stress.available_knobs()
 
     def test_every_knob_is_registered(self) -> None:
         for name in ("k1_decoy", "k2_channel", "k2_global", "k5_outliers", "k6_budget", "k6_failure", "k7_shuffle"):
@@ -47,11 +48,9 @@ class TestRegistry:
         for name in ("k2_global", "k5_outliers", "k6_budget", "k6_failure", "k1_decoy"):
             assert stress.KNOB_REGISTRY[name].seed_key == name
 
-    def test_remaining_placeholders_raise(self) -> None:
-        """K7 (spatial shuffle) is the only declared placeholder left."""
-        for name in ("k7_shuffle",):
-            with pytest.raises(NotImplementedError, match="not implemented"):
-                stress.build_knob(name)
+    def test_no_placeholder_knobs_remain(self) -> None:
+        """Nothing is declared-but-pending since K7 landed; the base class is kept for the next one."""
+        assert [n for n, k in stress.KNOB_REGISTRY.items() if not k.implemented] == []
 
     def test_unknown_knob_raises_with_options(self) -> None:
         with pytest.raises(KeyError, match="k2_channel"):

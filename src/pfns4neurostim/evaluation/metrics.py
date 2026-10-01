@@ -79,6 +79,107 @@ def regret_metrics(
     return out
 
 
+#: Fractions of the ground-truth range a run must reach for A8. 0.90 and 0.95 name the columns
+#: ``queries_to_target_90`` / ``_95`` that the tidy schema has declared since 2026-09-18 and that nothing
+#: populated until 2026-09-30.
+QUERIES_TO_TARGET_FRACTIONS: tuple[float, ...] = (0.90, 0.95)
+
+
+def queries_to_target(
+    y_gt: np.ndarray,
+    queried_values: list[float] | np.ndarray,
+    *,
+    reference: np.ndarray | None = None,
+    fractions: tuple[float, ...] = QUERIES_TO_TARGET_FRACTIONS,
+) -> dict[str, float]:
+    """Queries needed to reach a fraction of the channel optimum (roadmap A8).
+
+    The target is stated on the ground-truth **range**, exactly as the regrets are (P0.9): a run reaches
+    fraction ``q`` at the first query whose value satisfies ``y >= y_min + q * (y_max - y_min)``, i.e. when
+    its range-normalized best-queried regret first falls to ``1 - q`` or below. The basis is the *queried*
+    value, not the recommendation: A8 asks how many stimulations the experiment had to deliver before one of
+    them actually produced a near-optimal response, which is the quantity an animal or a patient pays for.
+
+    A run that never reaches the target is **right-censored**, reported as NaN rather than as the budget or
+    dropped: dropping it would silently report the mean of the runs that succeeded, which is exactly the bias
+    A8 exists to expose. Every run in a cell shares one budget, so the censoring is administrative at a common
+    horizon and ``mean(qtt <= k)`` is an unbiased reach-by-k curve; no Kaplan-Meier correction is needed as
+    long as budgets are not mixed within a panel.
+
+    Args:
+        y_gt: Ground-truth response per site at the end of the run, shape [N].
+        queried_values: True value of each query at the time it was made, in order, shape [T].
+        reference: Boolean mask of the sites the optimum and range are taken over, shape [N] (the surviving
+            electrodes under K6 failure). ``None`` means every site.
+        fractions: Target fractions of the range.
+
+    Returns:
+        ``queries_to_target_<pct>`` per fraction: the 1-based query index at which the target was first
+        reached, or NaN if it never was.
+
+    Raises:
+        RuntimeError: If the ground-truth range is degenerate.
+    """
+    y_gt = np.asarray(y_gt, dtype=np.float64)                                  # [N]
+    ref = y_gt if reference is None else y_gt[np.asarray(reference, dtype=bool)]
+    lo, hi = float(np.min(ref)), float(np.max(ref))
+    gt_range = hi - lo
+    if not np.isfinite(gt_range) or gt_range <= 0.0:
+        raise RuntimeError(f"queries_to_target: degenerate ground-truth range {gt_range}.")
+    queried = np.asarray(queried_values, dtype=np.float64)                     # [T]
+    best_so_far = np.maximum.accumulate(queried)                               # [T]
+    out: dict[str, float] = {}
+    for q in fractions:
+        threshold = lo + q * gt_range
+        reached = np.flatnonzero(best_so_far >= threshold)
+        key = f"queries_to_target_{int(round(q * 100))}"
+        out[key] = float(reached[0] + 1) if reached.size else float("nan")
+    return out
+
+
+def anytime_regret_curve(
+    step_times_s: list[float] | np.ndarray,
+    regret_per_step: list[float] | np.ndarray,
+    grid_s: np.ndarray,
+) -> np.ndarray:
+    """Best-so-far regret resampled onto a shared wall-clock grid (roadmap A9).
+
+    A9 compares surrogates at **equal elapsed compute** rather than at equal query count, which is the
+    comparison that matters when one model's step costs several times another's. The curve is a right-
+    continuous step function of cumulative time: at grid time ``t`` it holds the best regret achieved by the
+    last step that had finished by ``t``. Before the first step finishes the value is undefined (NaN) rather
+    than optimistic, so a model with a slow first step is not credited with regret it had not yet earned.
+
+    ``step_times_s`` already contains each step's full cost -- surrogate fit, acquisition and the
+    exploitation read-out -- so a GP that refits its hyperparameters every step pays for that here, and no
+    separate cold-fit term is added.
+
+    Args:
+        step_times_s: Wall-clock seconds per BO step, shape [T].
+        regret_per_step: Regret after each step, shape [T] or [T+1] (a leading value before any step is
+            dropped, so the two line up).
+        grid_s: Increasing cumulative-time grid to resample onto, shape [G].
+
+    Returns:
+        Best-so-far regret at each grid time, shape [G]; NaN before the first step completes.
+    """
+    times = np.cumsum(np.asarray(step_times_s, dtype=np.float64))               # [T]
+    regret = np.asarray(regret_per_step, dtype=np.float64)
+    if regret.size == times.size + 1:
+        regret = regret[1:]                                                    # drop the pre-run value
+    if regret.size != times.size:
+        raise ValueError(
+            f"anytime_regret_curve: {regret.size} regret values against {times.size} step times."
+        )
+    best = np.minimum.accumulate(regret)                                       # [T]
+    grid = np.asarray(grid_s, dtype=np.float64)                                # [G]
+    out = np.full(grid.shape, np.nan)
+    pos = np.searchsorted(times, grid, side="right") - 1                       # [G]
+    valid = pos >= 0
+    out[valid] = best[pos[valid]]
+    return out
+
+
 def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Coefficient of determination of a prediction over the whole pool.
 

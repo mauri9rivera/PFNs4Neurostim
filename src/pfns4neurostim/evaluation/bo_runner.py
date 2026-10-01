@@ -21,6 +21,7 @@ import numpy as np
 
 from ..acquisition.registry import build_acquisition
 from ..data.channels import ChannelData
+from ..data.preprocessing import OnlineYScaler
 from ..models.registry import MODEL_REGISTRY, build_surrogate, model_version
 from . import metrics as _metrics
 from .bo_loop import run_bo_loop
@@ -35,10 +36,17 @@ class BOResult:
     Attributes:
         row: Scalar metrics and the keys the tidy schema needs from this level.
         trajectory: Per-step data for the companion pickle.
+        diagnostics: Model-specific fit diagnostics outside the fixed tidy schema (the GP family's
+            ``gp_*`` hyperparameters). Kept separate from ``row`` because :class:`~evaluation.results.TidyRow`
+            is a closed dataclass that silently drops undeclared keys -- which is exactly what happened to
+            these between 2026-09-27 and 2026-09-30: they were computed on every fit and then thrown away, so
+            P0.10 ("is the tuned GP converged?") stayed unanswerable from the artefacts. The runners pass them
+            through the same ``extras`` channel the knobs' achieved metrics use.
     """
 
     row: dict[str, Any]
     trajectory: dict[str, Any] = field(default_factory=dict)
+    diagnostics: dict[str, float] = field(default_factory=dict)
 
 
 def run_channel_bo(
@@ -54,6 +62,7 @@ def run_channel_bo(
     device: str = "cpu",
     model_params: dict[str, Any] | None = None,
     with_calibration: bool = True,
+    online_y_scaler: str = "none",
 ) -> BOResult:
     """Run one BO repetition and compute every tidy metric for it.
 
@@ -72,6 +81,9 @@ def run_channel_bo(
             overrides ``device`` for this model only (e.g. GP on CPU, TabPFN on CUDA).
         with_calibration: Compute coverage/ECE/NLL/CRPS from the final posterior.
             Ignored for models without a predictive distribution (random search).
+        online_y_scaler: Causal y-scaling mode refit inside the loop from the observations collected so
+            far (``'none'``, ``'minmax'`` or ``'zscore'``; see
+            :class:`~data.preprocessing.OnlineYScaler`). ``'none'`` keeps the dataset-level scaler.
 
     Returns:
         A :class:`BOResult`.
@@ -93,8 +105,9 @@ def run_channel_bo(
     surrogate = build_surrogate(model, device=device, **extra)
 
     t0 = time.time()
+    online_y = OnlineYScaler(online_y_scaler)
     traj = run_bo_loop(
-        surrogate, channel, spec, params, budget=budget, n_init=n_init, rng=rng
+        surrogate, channel, spec, params, budget=budget, n_init=n_init, rng=rng, online_y=online_y
     )
     total_time = time.time() - t0
 
@@ -109,6 +122,7 @@ def run_channel_bo(
         "n_init": int(n_init),
         "seed": int(seed),
         "device": device,
+        "online_y_scaler": online_y_scaler,
         "n_sites": channel.n_sites,
         "n_dims": channel.n_dims,
         "total_time_s": float(total_time),
@@ -126,6 +140,11 @@ def run_channel_bo(
             reference=alive, queried_values=traj.real_values,
         )
     )
+    row.update(
+        _metrics.queries_to_target(
+            y_end, traj.real_values, reference=alive,
+        )
+    )
     row.update(_metrics.surrogate_accuracy(y_end[alive], traj.y_pred[alive]))
     row.update(
         _metrics.identification_metrics(np.where(alive, y_end, -np.inf), recommended, channel.ch2xy)
@@ -133,6 +152,14 @@ def run_channel_bo(
     if "decoy_basin" in channel.meta:
         # K1: did the final recommendation land on the decoy's side of the map?
         row["decoy_capture"] = float(channel.meta["decoy_basin"][recommended])
+
+    # Kernel hyperparameters of the LAST fit of the run, for any surrogate that exposes them (the GP
+    # family). Value columns, not key columns, so cached cells stay valid. Added 2026-09-27: no artefact
+    # recorded what the MLL fit converged to, which left P0.10 ("is the tuned GP actually converged?") and
+    # guardrail G1 unanswerable from the saved results. ``gp_noise`` is a variance and is meant to be
+    # compared against the empirical per-site trial variance.
+    hyper = getattr(surrogate, "fit_diagnostics", None)
+    diagnostics = dict(hyper()) if callable(hyper) else {}
 
     # Per-step curves along the BO run (post-processing reads these, never re-runs).
     y_star = float(np.max(y_end[alive]))
@@ -172,4 +199,4 @@ def run_channel_bo(
         "survivors": alive,
         "gt_range": y_range,
     }
-    return BOResult(row=row, trajectory=trajectory)
+    return BOResult(row=row, trajectory=trajectory, diagnostics=diagnostics)

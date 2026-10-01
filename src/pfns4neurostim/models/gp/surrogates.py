@@ -22,10 +22,54 @@ from typing import Any, Optional
 import gpytorch
 import numpy as np
 import torch
+from linear_operator.utils.errors import NanError, NotPSDError
 
 from .exact_gp import DeepKernelGP, ExactGP
 
-__all__ = ["GPSurrogate", "DeepKernelGPSurrogate", "NaiveGPSurrogate"]
+__all__ = ["GPSurrogate", "DeepKernelGPSurrogate", "NaiveGPSurrogate", "GP_OPTIMIZERS", "GP_DTYPES"]
+
+#: Marginal-likelihood optimisers ``GPSurrogate`` accepts. ``'lbfgs'`` is the converged-fit arm of
+#: prerequisite P0.10 (guardrail G1): quasi-Newton with a strong-Wolfe line search, stopped by its own
+#: gradient/step tolerances rather than by a fixed step count, so "the tuned GP" is a converged GP and the
+#: latency comparison is not an artefact of running a fixed 100 Adam steps.
+GP_OPTIMIZERS: tuple[str, ...] = ("adam", "lbfgs")
+
+#: Floating-point precision of the GP model, its fit and its predictions. P0.10 names float32 alongside Adam
+#: as a reason the MLL fit may not converge: a near-singular K in single precision makes the marginal
+#: likelihood's gradient noise comparable to the gradient itself.
+GP_DTYPES: dict[str, "torch.dtype"] = {"float32": torch.float32, "float64": torch.float64}
+
+#: Loss returned for a parameter vector at which the marginal likelihood cannot be evaluated (a
+#: non-positive-definite or NaN kernel matrix). L-BFGS's strong-Wolfe line search can extrapolate far
+#: enough to leave the feasible region -- measured on an NHP channel at N = 5, where the likelihood is
+#: nearly flat -- and it must be able to *see* that and contract, rather than crash the run or carry a
+#: NaN gradient forward. Any value far above an attainable negative log marginal likelihood works; the
+#: gradient is zeroed at such a point, and the best feasible parameters seen are restored afterwards.
+INFEASIBLE_LOSS: float = 1e10
+
+#: Log-uniform ranges the multi-start initialisations are drawn from. They are stated once, here, because
+#: they are not a modelling choice: the preprocessing contract puts X in [0, 1]^D and the canonical online
+#: scaler puts y in [0, 1], so one set of ranges covers every dataset. A start is only a place to begin --
+#: the selection rule is the marginal likelihood, not the initialisation.
+RESTART_INIT_RANGES: dict[str, tuple[float, float]] = {
+    "lengthscale": (1e-2, 1e1),
+    "outputscale": (1e-2, 1e1),
+    "noise": (1e-3, 1e0),
+}
+
+#: Last-resort ladder when NO start produced a usable fit: multiply the noise floor by
+#: :data:`NOISE_ESCALATION_FACTOR` at most this many times, then fail. Bounded on purpose -- gpytorch's own
+#: jitter escalation is bounded the same way, and an unbounded "raise the noise until it factorises" loop
+#: is exactly how this kind of safeguard turns into a hang.
+MAX_NOISE_ESCALATIONS: int = 4
+NOISE_ESCALATION_FACTOR: float = 10.0
+
+#: A fit is flagged degenerate when it sits on the noise floor (within this relative tolerance), or its
+#: signal variance has collapsed, or its mean lengthscale has left this band. Reported, never raised: the
+#: flag is a column so the frequency can be read off a finished run, per dataset and per stress level.
+DEGENERATE_NOISE_TOL: float = 0.01
+DEGENERATE_OUTPUTSCALE: float = 1e-6
+DEGENERATE_LENGTHSCALE_BAND: tuple[float, float] = (1e-3, 1e3)
 
 
 # ---------------------------------------------------------------------------
@@ -41,8 +85,32 @@ class GPSurrogate:
 
     Args:
         device: PyTorch device string ('cpu' or 'cuda').
-        n_opt_steps: Number of Adam optimiser steps for hyperparameter training.
-        lr: Learning rate for the Adam optimiser.
+        n_opt_steps: Optimiser budget per fit. For ``'adam'`` this is the exact number of steps taken;
+            for ``'lbfgs'`` it is ``max_iter``, an upper bound the tolerances may stop short of.
+        lr: Learning rate / initial step size of the optimiser.
+        optimizer: One of :data:`GP_OPTIMIZERS`. ``'adam'`` is the historical fixed-budget fit;
+            ``'lbfgs'`` is the converged fit of P0.10.
+        dtype: Key of :data:`GP_DTYPES`; the precision of the model, the fit and the predictions.
+        tolerance_grad: Gradient-infinity-norm tolerance. L-BFGS stops on it, and both optimisers are
+            *reported* against it through the ``gp_fit_converged`` diagnostic, so the two arms are
+            judged converged by the same rule.
+        tolerance_change: Parameter/loss change tolerance of L-BFGS (unused by Adam).
+        noise_floor: Lower bound on the observation-noise **variance**. gpytorch's default is 1e-4, which
+            a converged fit will sit on: the marginal likelihood is maximised by interpolating, and with
+            re-queried sites (duplicate rows) or a near-interpolable context the resulting ridge is too
+            small for ``K + noise I`` to factorise. Measured 2026-09-30: five of ninety NHP cells died
+            there, and raising this to 1e-3 fixed all five while the fitted noise still settled at ~1e-2,
+            i.e. the floor prevents a numerical pathology without doing modelling work.
+        n_restarts: Multi-start count. Start 0 uses gpytorch's own initialisation; the rest are drawn from
+            :data:`RESTART_INIT_RANGES`. The selected fit is the best marginal likelihood **among the
+            starts that produced a usable model** -- the feasibility filter. Without that filter restarts
+            make things worse, not better: the degenerate interpolating solution has by far the best
+            likelihood (-3.49 against -0.93 on the cells that failed), so plain best-of-k picks it every
+            time.
+        restart_seed: Seed for the restart initialisations, so a cell is reproducible.
+
+    Raises:
+        ValueError: If ``optimizer`` or ``dtype`` is not a recognised key, or ``n_restarts`` < 1.
     """
 
     def __init__(
@@ -50,10 +118,33 @@ class GPSurrogate:
         device: str = 'cpu',
         n_opt_steps: int = 100,
         lr: float = 0.1,
+        optimizer: str = 'adam',
+        dtype: str = 'float32',
+        tolerance_grad: float = 1e-7,
+        tolerance_change: float = 1e-9,
+        noise_floor: float = 1e-4,
+        n_restarts: int = 1,
+        restart_seed: int = 0,
     ) -> None:
+        if optimizer not in GP_OPTIMIZERS:
+            raise ValueError(f"optimizer must be one of {GP_OPTIMIZERS}, got {optimizer!r}.")
+        if dtype not in GP_DTYPES:
+            raise ValueError(f"dtype must be one of {sorted(GP_DTYPES)}, got {dtype!r}.")
+        if n_restarts < 1:
+            raise ValueError(f"n_restarts must be >= 1, got {n_restarts}.")
+        if noise_floor <= 0.0:
+            raise ValueError(f"noise_floor must be > 0, got {noise_floor}.")
         self._device = device
         self._n_opt_steps = n_opt_steps
         self._lr = lr
+        self._optimizer = optimizer
+        self._dtype_name = dtype
+        self._dtype = GP_DTYPES[dtype]
+        self._tolerance_grad = tolerance_grad
+        self._tolerance_change = tolerance_change
+        self._noise_floor = noise_floor
+        self._n_restarts = n_restarts
+        self._restart_seed = restart_seed
         self._model: ExactGP | None = None
         self._likelihood: gpytorch.likelihoods.GaussianLikelihood | None = None
         self._train_X: np.ndarray | None = None   # [N, D] float64 context, for closed-form updates
@@ -79,17 +170,27 @@ class GPSurrogate:
         return ExactGP(train_x, train_y, likelihood).to(self._device)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Train GP hyperparameters via marginal likelihood on observed data.
+        """Fit the GP hyperparameters by marginal likelihood, over ``n_restarts`` starts.
+
+        A start is kept only if it produced a *usable* model -- the fit ran and the posterior over the
+        context factorises in evaluation mode, which is the operation that every later prediction needs.
+        The selected fit is the best marginal likelihood among those. If no start is usable the noise floor
+        is raised by :data:`NOISE_ESCALATION_FACTOR`, at most :data:`MAX_NOISE_ESCALATIONS` times, and the
+        starts are retried; only then does the fit fail, with the escalation recorded.
 
         Args:
             X: Feature matrix of observed points, shape [N, D].  # [N, D]
             y: Response vector of observed targets, shape [N].   # [N]
+
+        Raises:
+            RuntimeError: On NaN inputs, or if no start yielded a usable model even at the highest floor.
         """
         if self._model is not None:
             del self._model, self._likelihood
+            self._model, self._likelihood = None, None
 
-        train_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [N, D]
-        train_y = torch.tensor(y, dtype=torch.float32, device=self._device)  # [N]
+        train_x = torch.tensor(X, dtype=self._dtype, device=self._device)  # [N, D]
+        train_y = torch.tensor(y, dtype=self._dtype, device=self._device)  # [N]
 
         if torch.isnan(train_x).any() or torch.isnan(train_y).any():
             raise RuntimeError(
@@ -100,24 +201,314 @@ class GPSurrogate:
 
         self._train_X = np.asarray(X, dtype=np.float64).copy()
         self._train_y = np.asarray(y, dtype=np.float64).copy()
-        self._likelihood = gpytorch.likelihoods.GaussianLikelihood().to(self._device)
-        self._model = self._build_model(train_x, train_y, self._likelihood)
 
-        self._model.train()
-        self._likelihood.train()
+        rng = np.random.default_rng([self._restart_seed, int(train_x.shape[0])])
+        inits = [None, *(self._sample_init(rng) for _ in range(self._n_restarts - 1))]
+        floor = self._noise_floor
+        best: tuple[float, ExactGP, Any, dict[str, float]] | None = None
+        n_feasible, escalations, reasons = 0, 0, []
 
-        optimizer = torch.optim.Adam(self._model.parameters(), lr=self._lr)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(self._likelihood, self._model)
+        while True:
+            for init in inits:
+                try:
+                    candidate = self._fit_candidate(train_x, train_y, init, floor)
+                except (NanError, NotPSDError, RuntimeError) as exc:
+                    reasons.append(type(exc).__name__)
+                    continue
+                n_feasible += 1
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+            if best is not None or escalations >= MAX_NOISE_ESCALATIONS:
+                break
+            floor *= NOISE_ESCALATION_FACTOR
+            escalations += 1
 
-        for _ in range(self._n_opt_steps):
-            optimizer.zero_grad()
-            output = self._model(train_x)
-            loss = -mll(output, train_y)
-            loss.backward()
-            optimizer.step()
+        if best is None:
+            raise RuntimeError(
+                f"GPSurrogate.fit: no usable fit from {self._n_restarts} start(s) on "
+                f"N={int(train_x.shape[0])} points after {escalations} noise-floor escalation(s) "
+                f"(floor now {floor:.1e}, dtype {self._dtype_name}); failures: {sorted(set(reasons))}."
+            )
 
-        self._model.eval()
-        self._likelihood.eval()
+        final_loss, self._model, self._likelihood, diagnostics = best
+        self._last_fit = {
+            **diagnostics,
+            "gp_n_restarts": float(self._n_restarts),
+            "gp_n_feasible": float(n_feasible),
+            "gp_noise_escalations": float(escalations),
+            "gp_noise_floor": float(floor),
+        }
+        self._last_fit["gp_fit_degenerate"] = self._degeneracy_flag(self._last_fit, floor)
+
+    def _sample_init(self, rng: np.random.Generator) -> dict[str, float]:
+        """Draw one multi-start initialisation log-uniformly from :data:`RESTART_INIT_RANGES`.
+
+        Args:
+            rng: Seeded generator, so a cell's starts are reproducible.
+
+        Returns:
+            Starting ``lengthscale``, ``outputscale`` and ``noise``.
+        """
+        return {
+            name: float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            for name, (lo, hi) in RESTART_INIT_RANGES.items()
+        }
+
+    def _fit_candidate(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        init: dict[str, float] | None,
+        floor: float,
+    ) -> tuple[float, ExactGP, Any, dict[str, float]]:
+        """Fit one start and return it only if the resulting model is usable.
+
+        Args:
+            train_x: Context inputs, shape [N, D].  # [N, D]
+            train_y: Context targets, shape [N].    # [N]
+            init: Starting hyperparameters, or None for gpytorch's own initialisation.
+            floor: Noise-variance lower bound for this attempt.
+
+        Returns:
+            ``(negative_mll, model, likelihood, diagnostics)``.
+
+        Raises:
+            NotPSDError, NanError, RuntimeError: If the fit or the evaluation-mode posterior fails; the
+                caller treats that as an infeasible start rather than an error.
+        """
+        likelihood = gpytorch.likelihoods.GaussianLikelihood().to(
+            device=self._device, dtype=self._dtype
+        )
+        if floor > 1e-4:
+            # Only touched when the floor is raised above gpytorch's own default, so every surrogate that
+            # keeps the default (gp_naive, the deep kernel, the mechanism engines) is numerically unchanged.
+            likelihood.noise_covar.register_constraint(
+                "raw_noise", gpytorch.constraints.GreaterThan(floor)
+            )
+            likelihood.initialize(noise=torch.tensor(max(10.0 * floor, 1e-2)))
+        model = self._build_model(train_x, train_y, likelihood).to(dtype=self._dtype)
+        if init is not None:
+            with torch.no_grad():
+                model.covar_module.base_kernel.lengthscale = init["lengthscale"]
+                model.covar_module.outputscale = init["outputscale"]
+                likelihood.noise = max(init["noise"], floor * 1.01)
+
+        model.train()
+        likelihood.train()
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+        # _optimize reads self._model, so point the surrogate at this candidate for the duration.
+        self._model, self._likelihood = model, likelihood
+        final_loss = float("nan")
+        steps, n_evals, grad_max = 0, 0, float("nan")
+        if self._n_opt_steps > 0:
+            steps, n_evals, grad_max = self._optimize(train_x, train_y, mll)
+
+        model.eval()
+        likelihood.eval()
+        with torch.no_grad():
+            if self._n_opt_steps > 0:
+                # This is the feasibility test as well as the diagnostic: it is the evaluation-mode
+                # factorisation of the context posterior, the exact operation that killed five cells on
+                # 2026-09-30. A start that cannot do it is discarded instead of aborting the run.
+                final_loss = float(-mll(model(train_x), train_y).detach())
+                if not math.isfinite(final_loss):
+                    raise NanError(f"non-finite marginal likelihood after the fit ({final_loss}).")
+        diagnostics = self._read_hyperparameters(
+            final_loss, int(train_x.shape[0]), steps=steps, n_evals=n_evals, grad_max=grad_max
+        )
+        return final_loss, model, likelihood, diagnostics
+
+    def _degeneracy_flag(self, diagnostics: dict[str, float], floor: float) -> float:
+        """1.0 when the selected fit sits on a bound rather than at an interior optimum.
+
+        Reported, never raised: a fit on the noise floor is still usable, but a run in which it happens
+        often is not a converged-GP comparison, and until this column existed there was no way to tell.
+
+        Args:
+            diagnostics: The selected fit's diagnostics.
+            floor: Noise-variance floor in force.
+
+        Returns:
+            1.0 if degenerate, 0.0 otherwise, NaN when no fit was performed.
+        """
+        if not math.isfinite(diagnostics.get("gp_noise", float("nan"))):
+            return float("nan")
+        lo, hi = DEGENERATE_LENGTHSCALE_BAND
+        return float(
+            diagnostics["gp_noise"] <= floor * (1.0 + DEGENERATE_NOISE_TOL)
+            or diagnostics["gp_outputscale"] < DEGENERATE_OUTPUTSCALE
+            or not lo <= diagnostics["gp_lengthscale"] <= hi
+        )
+
+    def _optimize(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        mll: "gpytorch.mlls.ExactMarginalLogLikelihood",
+    ) -> tuple[int, float]:
+        """Maximise the exact marginal likelihood with the configured optimiser.
+
+        Both arms evaluate the same objective through the same closure, so the only difference between
+        them is the update rule: Adam takes exactly ``n_opt_steps`` first-order steps, L-BFGS takes at
+        most ``n_opt_steps`` quasi-Newton steps with a strong-Wolfe line search and stops early on its
+        own tolerances. Implements the P0.10 "converged MLL fit" arm.
+
+        Args:
+            train_x: Context inputs, shape [N, D].  # [N, D]
+            train_y: Context targets, shape [N].    # [N]
+            mll: The exact marginal log likelihood of the current model.
+
+        Returns:
+            ``(steps_taken, n_evaluations, grad_max)``: optimiser iterations actually performed,
+            objective+gradient evaluations they cost (Adam: one per step; L-BFGS: more, because of the
+            line search -- this is the number the latency comparison must use), and the infinity norm
+            of the gradient at the final parameters.
+
+        Raises:
+            RuntimeError: If no feasible parameter vector was ever evaluated, or the final gradient is
+                not finite.
+        """
+        params = [p for p in self._model.parameters() if p.requires_grad]
+        best_loss = math.inf
+        best_params: list[torch.Tensor] = []
+        n_evals = 0
+
+        def closure() -> torch.Tensor:
+            """One objective + gradient evaluation of the negative marginal log likelihood.
+
+            Returns :data:`INFEASIBLE_LOSS` with a zero gradient where the kernel matrix cannot be
+            factorised, so a line search contracts instead of the fit dying on a NaN.
+            """
+            nonlocal best_loss, best_params, n_evals
+            n_evals += 1
+            optimizer.zero_grad(set_to_none=False)
+            try:
+                loss = -mll(self._model(train_x), train_y)
+                if not torch.isfinite(loss):
+                    raise NanError("non-finite marginal log likelihood")
+                loss.backward()
+            except (NanError, NotPSDError):
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.zero_()
+                return torch.as_tensor(INFEASIBLE_LOSS, dtype=self._dtype, device=self._device)
+            value = float(loss.detach())
+            if value < best_loss and all(
+                p.grad is None or bool(torch.isfinite(p.grad).all()) for p in params
+            ):
+                best_loss = value
+                best_params = [p.detach().clone() for p in params]
+            return loss
+
+        if self._optimizer == "lbfgs":
+            optimizer: torch.optim.Optimizer = torch.optim.LBFGS(
+                params,
+                lr=self._lr,
+                max_iter=self._n_opt_steps,
+                tolerance_grad=self._tolerance_grad,
+                tolerance_change=self._tolerance_change,
+                line_search_fn="strong_wolfe",
+            )
+            optimizer.step(closure)
+            # LBFGS keeps its iteration count in the state of its first parameter.
+            steps = int(optimizer.state[params[0]].get("n_iter", self._n_opt_steps))
+            if not best_params:
+                raise RuntimeError(
+                    f"GPSurrogate.fit: the L-BFGS fit never reached a feasible point in {n_evals} "
+                    f"evaluation(s) on N={int(train_x.shape[0])} points, dtype {self._dtype_name}."
+                )
+            # The line search may end on a worse (or infeasible) point than the best one it saw, so the
+            # fit keeps the best feasible parameters and reports the gradient there.
+            with torch.no_grad():
+                for p, best in zip(params, best_params):
+                    p.copy_(best)
+            closure()
+        else:
+            optimizer = torch.optim.Adam(params, lr=self._lr)
+            for _ in range(self._n_opt_steps):
+                closure()
+                optimizer.step()
+            steps = self._n_opt_steps
+
+        grads = [p.grad.detach().abs().max() for p in params if p.grad is not None]
+        grad_max = float(torch.stack(grads).max()) if grads else float("nan")
+        if not math.isfinite(grad_max):
+            raise RuntimeError(
+                f"GPSurrogate.fit: non-finite MLL gradient ({grad_max}) after {steps} "
+                f"{self._optimizer} step(s) on N={int(train_x.shape[0])} points, "
+                f"dtype {self._dtype_name}."
+            )
+        return steps, n_evals, grad_max
+
+    def _read_hyperparameters(
+        self,
+        final_loss: float,
+        n_train: int,
+        *,
+        steps: int = 0,
+        n_evals: int = 0,
+        grad_max: float = float("nan"),
+    ) -> dict[str, float]:
+        """Read the kernel hyperparameters back off the fitted model.
+
+        Recorded per fit so a run is auditable: until 2026-09-27 no artefact stored what the MLL fit
+        actually converged to, which made the open P0.10 question ("is the tuned GP converged?") and
+        guardrail G1 (the latency claim) impossible to settle from the saved results. ``mll_final`` is the
+        negative log marginal likelihood after the last step, and ``noise`` is a variance, so it is
+        directly comparable with the empirical per-site trial variance.
+
+        Args:
+            final_loss: Negative log marginal likelihood after the final optimiser step.
+            n_train: Context size this fit saw.
+            steps: Optimiser iterations actually performed (Adam: the fixed budget; L-BFGS: however
+                many it took before its tolerances stopped it).
+            n_evals: Objective+gradient evaluations those steps cost; the cost-comparable quantity,
+                since one L-BFGS iteration line-searches over several evaluations.
+            grad_max: Infinity norm of the MLL gradient at the final parameters; NaN when no step
+                was taken.
+
+        ``gp_fit_converged`` is 1.0 when the optimiser stopped on a convergence criterion rather than on
+        its budget: either the gradient is within ``tolerance_grad``, or it took fewer than
+        ``n_opt_steps`` iterations, which for L-BFGS means one of its own tolerances fired. A fixed-budget
+        Adam fit therefore reports 1.0 only if its gradient really is small, which is the P0.10 question.
+
+        Returns:
+            Scalar diagnostics of the fit. ``lengthscale`` is the mean over ARD dimensions and
+            ``lengthscale_min`` / ``lengthscale_max`` bracket them, so an isotropic kernel reports all three
+            equal.
+        """
+        ls = self._model.covar_module.base_kernel.lengthscale.detach().cpu().numpy().ravel()
+        return {
+            "gp_lengthscale": float(np.mean(ls)),
+            "gp_lengthscale_min": float(np.min(ls)),
+            "gp_lengthscale_max": float(np.max(ls)),
+            "gp_outputscale": float(self._model.covar_module.outputscale.detach()),
+            "gp_noise": float(self._likelihood.noise.detach().ravel()[0]),
+            "gp_mll_final": final_loss,
+            "gp_n_opt_steps": float(steps),
+            "gp_n_opt_steps_max": float(self._n_opt_steps),
+            "gp_n_obj_evals": float(n_evals),
+            "gp_grad_max": grad_max,
+            "gp_fit_converged": (
+                float("nan")
+                if not math.isfinite(grad_max)
+                else float(grad_max <= self._tolerance_grad or steps < self._n_opt_steps)
+            ),
+            "gp_fit_n_train": float(n_train),
+        }
+
+    def fit_diagnostics(self) -> dict[str, float]:
+        """Flat, tidy-row-ready diagnostics of the most recent :meth:`fit`.
+
+        Distinct from :meth:`hyperparameters`, which returns the raw values (an ARD lengthscale is a [D]
+        array) for closed-form conditioning and for tests. This one returns only ``gp_``-prefixed scalars,
+        so it can be merged straight into a tidy row, and it never raises before the first fit.
+
+        Returns:
+            The diagnostics of :meth:`_read_hyperparameters`, or an empty mapping before the first fit.
+        """
+        return dict(getattr(self, "_last_fit", {}) or {})
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Return GP posterior mean and standard deviation.
@@ -135,7 +526,7 @@ class GPSurrogate:
             raise RuntimeError(
                 "GPSurrogate.predict called before fit. Call fit() first."
             )
-        query_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [M, D]
+        query_x = torch.tensor(X, dtype=self._dtype, device=self._device)  # [M, D]
         with torch.no_grad():
             posterior = self._likelihood(self._model(query_x))
             mean = posterior.mean.cpu().numpy()   # [M]
@@ -224,7 +615,7 @@ class GPSurrogate:
         if temperature <= 0.0:
             raise ValueError(f"temperature must be > 0, got {temperature}.")
 
-        query_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [M, D]
+        query_x = torch.tensor(X, dtype=self._dtype, device=self._device)  # [M, D]
         with torch.no_grad():
             latent = self._model(query_x)                        # N(μ, Σ) — [M]
             posterior = self._likelihood(latent) if include_noise else latent
@@ -298,7 +689,7 @@ class GPSurrogate:
         if temperature <= 0.0:
             raise ValueError(f"temperature must be > 0, got {temperature}.")
 
-        query_x = torch.tensor(X, dtype=torch.float32, device=self._device)  # [M, D]
+        query_x = torch.tensor(X, dtype=self._dtype, device=self._device)  # [M, D]
         with torch.no_grad():
             posterior = self._likelihood(self._model(query_x))   # [M]
             mean = posterior.mean                                # [M]

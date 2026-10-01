@@ -40,6 +40,7 @@ import numpy as np
 from ..acquisition.base import BOState, acquire
 from ..acquisition.registry import AcqParams, AcquisitionSpec
 from ..data.channels import ChannelData
+from ..data.preprocessing import OnlineYScaler
 from ..models.protocol import marginals
 from .metrics import r2_score
 
@@ -113,6 +114,52 @@ def draw_trial(Y_trials: np.ndarray, index: int, rng: np.random.Generator) -> fl
     return float(row[rng.choice(valid)])
 
 
+def _fit_scaled(
+    surrogate: Any,
+    X_pool: np.ndarray,
+    traj: "BOTrajectory",
+    online_y: OnlineYScaler | None,
+) -> None:
+    """Fit the surrogate on the observations so far, through the online y scaler when there is one.
+
+    Args:
+        surrogate: Surrogate adapter.
+        X_pool: Candidate coordinates, shape [N, D].
+        traj: Trajectory holding the observations so far.
+        online_y: Causal y scaler, or None.
+    """
+    idx = np.asarray(traj.observed_indices, dtype=int)              # [t]
+    y_obs = np.asarray(traj.observed_values, dtype=np.float64)      # [t]
+    if online_y is not None and online_y.active:
+        y_obs = online_y.fit(y_obs).transform(y_obs)
+    surrogate.fit(X_pool[idx], y_obs)
+
+
+def _predict_unscaled(
+    surrogate: Any,
+    X_pool: np.ndarray,
+    online_y: OnlineYScaler | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Predictive marginals over the pool, mapped back into the channel's own y space.
+
+    Acquisition runs in the *scaled* space (it only ever compares candidates, and an increasing affine
+    map preserves the ranking), but every reported metric -- R-squared, calibration, the recommendation's
+    ground-truth value -- is computed against ``channel.y_gt``, so the summaries must come back out.
+
+    Args:
+        surrogate: Fitted surrogate adapter.
+        X_pool: Candidate coordinates, shape [N, D].
+        online_y: Causal y scaler, or None.
+
+    Returns:
+        ``(mean, std)``, each shape [N], in the channel's y space.
+    """
+    mean, std = marginals(surrogate, X_pool)                        # [N], [N]
+    if online_y is None or not online_y.active:
+        return mean, std
+    return online_y.inverse_mean(mean), online_y.inverse_std(std)
+
+
 def run_bo_loop(
     surrogate: Any,
     channel: ChannelData,
@@ -122,6 +169,7 @@ def run_bo_loop(
     budget: int,
     n_init: int,
     rng: np.random.Generator,
+    online_y: OnlineYScaler | None = None,
 ) -> BOTrajectory:
     """Run one Bayesian-optimization repetition over a channel's candidate pool.
 
@@ -133,6 +181,11 @@ def run_bo_loop(
         budget: Total queries including ``n_init`` (P0.3).
         n_init: Random initial queries.
         rng: Seeded generator; the only source of randomness in the loop.
+        online_y: Optional causal y scaler, refit from the observations collected so far before every
+            surrogate fit (deployment-aligned; see :class:`~data.preprocessing.OnlineYScaler`). The
+            surrogate is fitted in the scaled space and its predictions are mapped back, so every metric
+            is computed in the channel's own y space whatever the mode. ``None`` (the default) keeps the
+            dataset-level scaler alone.
 
     Returns:
         The :class:`BOTrajectory`.
@@ -195,11 +248,11 @@ def run_bo_loop(
             n_steps=n_steps,
             n_dims=channel.n_dims,
         )
-        surrogate.fit(X_pool[np.asarray(traj.observed_indices, dtype=int)], np.asarray(traj.observed_values))
+        _fit_scaled(surrogate, X_pool, traj, online_y)
         result = acquire(spec.score_fn, surrogate, X_pool, state, rng, params)
 
-        # Pure-exploitation recommendation over the whole pool.
-        pool_mean, _ = marginals(surrogate, X_pool)           # [N]
+        # Pure-exploitation recommendation over the whole pool, back in the channel's own y space.
+        pool_mean, _ = _predict_unscaled(surrogate, X_pool, online_y)   # [N]
         traj.recommendations.append(int(np.argmax(pool_mean)))
         traj.r2_per_step.append(r2_score(channel.y_gt[survivors], pool_mean[survivors]))
 
@@ -208,8 +261,8 @@ def run_bo_loop(
         traj.step_times_s.append(time.time() - t0)
 
     # --- final refit and prediction on the full pool -------------------------
-    surrogate.fit(X_pool[np.asarray(traj.observed_indices, dtype=int)], np.asarray(traj.observed_values))
-    mean, std = marginals(surrogate, X_pool)                  # [N], [N]
+    _fit_scaled(surrogate, X_pool, traj, online_y)
+    mean, std = _predict_unscaled(surrogate, X_pool, online_y)   # [N], [N]
     traj.y_pred = np.asarray(mean, dtype=np.float64)
     traj.y_std = np.asarray(std, dtype=np.float64)
     traj.recommendations.append(int(np.argmax(traj.y_pred)))

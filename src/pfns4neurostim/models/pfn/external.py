@@ -42,6 +42,7 @@ import numpy as np
 from .bar_distribution import BarDistribution, quantile_borders
 
 __all__ = [
+    "availability_reasons",
     "ExternalSurrogate",
     "BucketizedClassifierSurrogate",
     "ExternalSpec",
@@ -76,6 +77,16 @@ class ExternalSpec:
             ``pfns4neurostim-<env>`` (``'main'`` means the plain env). Model -> env
             is data here and nowhere else, so a failed availability check can name
             the environment to switch to instead of leaving the caller guessing.
+        weights: Path, relative to ``libs/``, that must exist for the model to run,
+            or ``''`` when the checkpoint ships inside the wheel or is fetched by the
+            backend itself. Checked by :func:`availability`, because an importable
+            package with unreachable weights is not a runnable model: TabFlex
+            reported available for months while its weight host was NXDOMAIN
+            (#8 rule 2, finding N3).
+        mem_per_lane_gb: Peak resident memory of one worker lane, in GB. The
+            portfolio derives ``--mem`` from this instead of naming numbers by hand.
+        max_lanes: Most lanes of this model that may share one job, from its memory.
+        gpu: Whether the model needs a GPU to run at a usable speed.
         notes: Constraints worth knowing before installing.
     """
 
@@ -89,12 +100,28 @@ class ExternalSpec:
     python_min: tuple[int, int] | None = None
     repo_subdir: str = ""
     env: str = "main"
+    weights: str = ""
+    mem_per_lane_gb: float = 4.0
+    max_lanes: int = 4
+    gpu: bool = True
     notes: str = ""
 
     @property
     def conda_env(self) -> str:
         """Name of the conda environment this model runs in."""
         return "pfns4neurostim" if self.env == "main" else f"pfns4neurostim-{self.env}"
+
+    @property
+    def weights_path(self) -> str:
+        """Absolute path of :attr:`weights`, or ``''`` when the model declares none."""
+        if not self.weights:
+            return ""
+        return os.path.join(libs_root(), *self.weights.split("/"))
+
+    def weights_present(self) -> bool:
+        """Whether the declared weights exist on this machine (True when none are declared)."""
+        path = self.weights_path
+        return True if not path else os.path.exists(path)
 
 
 EXTERNAL_SPECS: dict[str, ExternalSpec] = {
@@ -104,6 +131,9 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         extra="pfns4bo",
         route="native",
         source="https://github.com/automl/PFNs4BO",
+        weights="PFNs4BO/pfns4bo/final_models/model_hebo_morebudget_9_unused_features_3.pt.gz",
+        mem_per_lane_gb=3.0,
+        max_lanes=4,
         notes="Vendored weights in libs/PFNs4BO/pfns4bo/final_models/*.pt.gz; pip pkg installed (0.1.5).",
     ),
     "tabpfn_v1": ExternalSpec(
@@ -116,6 +146,9 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         major_below=2,
         python_min=(3, 8),
         env="v1",
+        weights="",   # the checkpoint ships inside the wheel (tabpfn/models_diff/)
+        mem_per_lane_gb=3.0,
+        max_lanes=4,
         notes=(
             "Requires tabpfn<2, which cannot coexist with the pinned tabpfn 6.3.2 (both own "
             "the module name 'tabpfn'), so it runs in its own environment built from "
@@ -131,6 +164,8 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         python_min=(3, 11),
         repo_subdir="tabfm",
         env="bench",
+        mem_per_lane_gb=12.0,   # measured 9.9 GB RSS + headroom (task plan #8)
+        max_lanes=2,
         notes=(
             "Vendored as libs/tabfm (2026-09-20). Requires Python >= 3.11, so it cannot "
             "run in the pinned 3.9 env. TabFMRegressor.predict returns point predictions "
@@ -145,6 +180,8 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         route="native",
         source="https://huggingface.co/autogluon/mitra-regressor",
         env="mitra",
+        mem_per_lane_gb=8.0,
+        max_lanes=2,
         notes="Heavy install (AutoGluon >= 1.4); verify predictive-distribution access.",
     ),
     "tabicl": ExternalSpec(
@@ -156,6 +193,8 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         python_min=(3, 10),
         repo_subdir="tabicl/src",
         env="bench",
+        mem_per_lane_gb=4.0,
+        max_lanes=4,
         notes=(
             "Vendored as libs/tabicl at tag v2.2.0 (2026-09-20). **Route corrected**: "
             "v2 ships a native TabICLRegressor whose predict(output_type='quantiles') "
@@ -171,6 +210,9 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         source="https://github.com/microsoft/ticl",
         python_min=(3, 8),
         repo_subdir="ticl",
+        weights="ticl/checkpoints/tabflex.ckpt",   # host is NXDOMAIN; declaring it makes availability() honest
+        mem_per_lane_gb=4.0,
+        max_lanes=4,
         notes=(
             "Vendored as libs/ticl (2026-09-20). Runs on the pinned Python 3.9. "
             "Classification-only upstream, so it goes through the bucketized adapter. "
@@ -188,6 +230,18 @@ def availability() -> dict[str, bool]:
         Mapping model key -> whether its backend module can be imported.
     """
     return {key: _backend_ok(spec)[0] for key, spec in EXTERNAL_SPECS.items()}
+
+
+def availability_reasons() -> dict[str, str]:
+    """Why each external backend is unavailable here, or ``''`` when it is runnable.
+
+    The reason string of :func:`availability`, kept separate so a preflight check can report *what* to fix
+    (and which environment to activate) instead of only that something is wrong.
+
+    Returns:
+        Mapping model key -> reason, empty string when the model can run.
+    """
+    return {key: _backend_ok(spec)[1] for key, spec in EXTERNAL_SPECS.items()}
 
 
 def conda_env_for(key: str) -> str:
@@ -260,6 +314,12 @@ def _backend_ok(spec: ExternalSpec) -> tuple[bool, str]:
             return False, f"module {spec.module!r} not installed"
     except (ImportError, ValueError):
         return False, f"module {spec.module!r} not installed"
+
+    if not spec.weights_present():
+        return False, (
+            f"backend is importable but its weights are missing at {spec.weights_path!r}; "
+            f"an importable package without weights is not a runnable model (see {spec.source})"
+        )
 
     if spec.major_below is not None:
         dist = spec.dist or spec.module

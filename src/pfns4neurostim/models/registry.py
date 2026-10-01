@@ -13,7 +13,7 @@ are package-native modules; nothing here reaches into the old flat ``src/`` tree
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 __all__ = [
     "ModelSpec",
@@ -82,21 +82,45 @@ def _build_tabpfn_v2_5(device: str = "cpu", n_estimators: int = 1, **kwargs: Any
     return TabPFNSurrogate(regressor)
 
 
-def _build_gp_mll(device: str = "cpu", n_opt_steps: int = 100, lr: float = 0.1, **kwargs: Any) -> Any:
-    """Construct the MLL-tuned exact GP surrogate.
+def _build_gp_mll(
+    device: str = "cpu",
+    n_opt_steps: int = 50,
+    lr: float = 1.0,
+    noise_floor: float = 1.0e-3,
+    n_restarts: int = 5,
+    **kwargs: Any,
+) -> Any:
+    """Construct the MLL-tuned exact GP surrogate: a **converged** type-II maximum-likelihood fit.
+
+    Settled 2026-09-30 (P0.10). Until then this was 100 Adam steps at lr 0.1 in float32, which was
+    measured to be unconverged in **0 of 90** NHP cells (final gradient 1.6e-2) and to change the Hyp A
+    conclusion: against the Adam fit TabPFN wins cumulative regret (median -9.5, p = 7e-4), against the
+    converged fit all three regrets tie and only R^2 survives (+0.09). The comparator therefore has to be
+    the converged one. Fitted by L-BFGS with a strong-Wolfe line search in float64, multi-start with a
+    feasibility filter, and a noise-variance floor; no priors, so it remains type-II ML rather than MAP
+    (a prior-regularised "expert" GP is a separate, later arm).
 
     Args:
         device: Torch device string.
-        n_opt_steps: Marginal-likelihood optimisation steps per fit.
-        lr: Adam learning rate.
-        **kwargs: Forwarded to ``GPSurrogate``.
+        n_opt_steps: L-BFGS ``max_iter`` per start -- an upper bound, not a step count (the fit typically
+            stops on its own tolerance after 15-25 iterations).
+        lr: Initial step size; 1.0 is the natural scale for a line-searched quasi-Newton step.
+        noise_floor: Noise-variance lower bound. 1e-3 rather than gpytorch's 1e-4, which a converged fit
+            sits on and where ``K + noise I`` stops factorising; dimensionless because the canonical online
+            scaler puts y in [0, 1], so it transfers across datasets unchanged.
+        n_restarts: Multi-start count; the best marginal likelihood among the *usable* starts is kept.
+        **kwargs: Forwarded to ``GPSurrogate`` (``dtype``, tolerances, ``restart_seed``).
 
     Returns:
-        A ``GPSurrogate``.
+        A ``GPSurrogate`` fitted by converged L-BFGS.
     """
     from .gp.surrogates import GPSurrogate  # noqa: PLC0415 - gpytorch import, load on demand
 
-    return GPSurrogate(device=device, n_opt_steps=n_opt_steps, lr=lr, **kwargs)
+    kwargs.setdefault("dtype", "float64")
+    return GPSurrogate(
+        device=device, n_opt_steps=n_opt_steps, lr=lr, optimizer="lbfgs",
+        noise_floor=noise_floor, n_restarts=n_restarts, **kwargs,
+    )
 
 
 def _build_gp_naive(device: str = "cpu", **kwargs: Any) -> Any:
@@ -185,11 +209,16 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "gp_mll": ModelSpec(
         key="gp_mll",
-        version="gpytorch ExactGP (RBF), MLL-tuned per step",
+        version="gpytorch ExactGP (RBF), converged L-BFGS MLL, float64, 5 starts, noise floor 1e-3",
         family="gp",
         factory=_build_gp_mll,
         supports=("ei", "ucb", "ts_marginal", "ts_joint"),
-        notes="Hyperparameters refit by marginal likelihood at every BO step.",
+        notes=(
+            "Hyperparameters refit by marginal likelihood at every BO step, to convergence: strong-Wolfe "
+            "L-BFGS in float64, 5 starts, best marginal likelihood among the usable ones. No priors "
+            "(type-II ML, not MAP). Report `gp_fit_converged` and `gp_fit_degenerate` next to any claim "
+            "that rests on the GP being tuned (P0.10 / guardrail G1)."
+        ),
     ),
     "gp_naive": ModelSpec(
         key="gp_naive",
@@ -291,6 +320,39 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
 
 #: Comparator set for the Hyp B stress sweeps (user decision 2026-09-18).
 STRESS_COMPARATORS: tuple[str, ...] = ("tabpfn_v2_5", "gp_mll", "gp_naive")
+
+
+def require_models(names: Sequence[str]) -> None:
+    """Fail now, with an actionable message, if any requested model cannot run in this environment.
+
+    Rule 3 of the task-plan #8 environment plan, landed 2026-09-30. Before this, a job submitted with the
+    wrong conda environment queued, started, loaded its data and only then failed at the first cell -- after
+    minutes to hours of wall clock, and on the cluster with a log nobody reads until the morning. The check
+    costs milliseconds: an unknown key, a backend whose interpreter or import or weights are wrong, each
+    reported together rather than one per attempt, and each naming the environment to activate.
+
+    Built-in models (the GP family, TabPFN-2.5, random search) are available wherever the package installs,
+    so they pass trivially; only the external specs have anything to check.
+
+    Args:
+        names: Model keys the run intends to compute.
+
+    Raises:
+        ValueError: If any key is unknown or unavailable, listing every problem found.
+    """
+    from .pfn.external import EXTERNAL_SPECS, availability_reasons  # noqa: PLC0415 - avoids a cycle
+
+    problems: list[str] = []
+    reasons = availability_reasons()
+    for name in names:
+        if name not in MODEL_REGISTRY:
+            problems.append(f"{name!r}: unknown model. Known: {sorted(MODEL_REGISTRY)}.")
+        elif name in EXTERNAL_SPECS and reasons.get(name):
+            problems.append(f"{name!r}: {reasons[name]}")
+    if problems:
+        raise ValueError(
+            "These models cannot run in this environment:\n  - " + "\n  - ".join(problems)
+        )
 
 
 def build_surrogate(name: str, device: str = "cpu", **params: Any) -> Any:

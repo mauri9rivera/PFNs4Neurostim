@@ -1,10 +1,9 @@
 #!/bin/bash
 # SLURM dispatcher for runners that run as ONE process and write their own deliverables
-# (no lanes, no --compute-only, no separate assemble job): `mechanism` (Hyp C) and `gt_sensitivity`.
+# (no lanes, no --compute-only, no separate assemble job): `mechanism` (Hyp C).
 #
 # Usage (from a Mila login node, repo root; the USER runs sbatch):
 #   sbatch scripts/run_single.sh mechanism configs/experiment/mechanism_update_rule_nhp.yaml
-#   sbatch scripts/run_single.sh gt_sensitivity configs/experiment/gt_sensitivity_nhp.yaml n_reps=5
 #
 # Everything after the config path is forwarded to `--set`. The dataset is staged to $SLURM_TMPDIR.
 #SBATCH --job-name=single
@@ -19,7 +18,7 @@
 #SBATCH --time=12:00:00
 set -euo pipefail
 
-EXPERIMENT="${1:?usage: sbatch scripts/run_single.sh <mechanism|gt_sensitivity> <config.yaml> [key=value ...]}"
+EXPERIMENT="${1:?usage: sbatch scripts/run_single.sh <mechanism> <config.yaml> [key=value ...]}"
 CONFIG="${2:?missing config.yaml}"
 shift 2 || true
 

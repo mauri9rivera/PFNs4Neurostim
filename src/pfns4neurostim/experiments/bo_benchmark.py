@@ -41,7 +41,7 @@ from ..evaluation import shards as _shards
 from ..evaluation.cache import CellStore, row_payload
 from ..evaluation.bo_runner import run_channel_bo
 from ..evaluation.results import TidyRow
-from ..models.registry import MODEL_REGISTRY
+from ..models.registry import MODEL_REGISTRY, require_models
 from ..seeding import seed_for
 from ._cells import cell_identity, count_channels, gt_instances, row_from_payload
 from ._rows import build_row
@@ -154,6 +154,7 @@ def _compute_cell(
         seed=seed,
         device=cfg.device,
         model_params=cfg.model_params.get(model, {}),
+        online_y_scaler=cfg.online_y_scaler,
     )
     row = build_row(
         result, channel, run_tag=run_tag, experiment="bo_benchmark",
@@ -164,7 +165,8 @@ def _compute_cell(
         f"({time.time() - t0:.1f}s)",
         flush=True,
     )
-    return row_payload(row, {}), result.trajectory
+    # Fit diagnostics ride the same non-schema `extras` channel as a knob's achieved metrics.
+    return row_payload(row, result.diagnostics), result.trajectory
 
 
 def run_bo_benchmark(
@@ -219,6 +221,12 @@ def run_bo_benchmark(
             raise FileNotFoundError(f"--replot needs an existing {tidy_path}; run the benchmark first.")
         df = pd.read_csv(tidy_path)
     else:
+        # Rule 3 of the #8 environment plan: a model that cannot run here fails NOW, in milliseconds, naming
+        # the environment to activate -- not at the first cell of a queued job. Skipped when only assembling
+        # from cache, which computes nothing and may legitimately run in the main env for cells produced in
+        # another (rule 6).
+        if not only_cached:
+            require_models(cfg.models)
         run_tag = f"{cfg.dataset.name}-benchmark-{cfg.tag}"
         acquisitions = cfg.acquisitions
         rows: list[TidyRow] = []
@@ -304,7 +312,15 @@ def run_bo_benchmark(
                 continue
             frame = _results.rows_to_dataframe([rows[i] for i in idx], acquisition=acq.as_block())
             hosts = _shards.host_columns([payloads[i] for i in idx])
-            frames.append(pd.concat([frame.reset_index(drop=True), hosts], axis=1))
+            # Non-schema `extras` (the GP family's gp_* fit diagnostics) become columns here, the way
+            # stress_sweep already did it for a knob's achieved metrics. Missing until 2026-09-30: this
+            # runner always passed an empty extras dict, so the diagnostics were computed on every fit,
+            # written into the cell payload, and then never reached tidy.csv -- which is why P0.10 could
+            # not be read off a finished Hyp A run.
+            extras = pd.DataFrame([dict(payloads[i].get("extras") or {}) for i in idx])
+            frames.append(pd.concat(
+                [frame.reset_index(drop=True), hosts, extras.reset_index(drop=True)], axis=1
+            ))
         df = pd.concat(frames, ignore_index=True, sort=False)
         df.to_csv(tidy_path, index=False)
         _results.write_trajectories(target, trajectories)

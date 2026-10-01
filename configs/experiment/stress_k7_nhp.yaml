@@ -1,0 +1,62 @@
+# Hypothesis B - K7 spatial shuffle: destroy the coordinate<->response binding, nothing else.
+# Dataset: NHP (Demo 2, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed vs Random.
+#
+# Knob:   a fraction f of sites have their response re-paired with another coordinate; a site's GT mean and
+#         its whole trial bank move together, so the response marginals, the GT range and the achieved SNR
+#         are unchanged and only the spatial structure is lost. At f = 1 position carries no information and
+#         the Bayes-optimal policy is exhaustive search: every surrogate must meet random search there.
+#         Random search is in the model list precisely because it is the floor this knob drives everyone to.
+# Why:    the only knob that removes the assumption all these surrogates share (nearby electrodes behave
+#         alike) rather than degrading how well it can be observed (K2), corrupting trials (K5) or removing
+#         budget/electrodes (K6). The readout is the SHAPE of the collapse - where each model's curve crosses
+#         random search - which separates "a better-calibrated smoothness prior" from "less dependence on one".
+# x-axis: the level f, which the knob realizes EXACTLY (unlike K2's alpha, whose achieved SNR is what a
+#         channel really sees). The realized loss of structure is recorded per cell as achieved_moran_i.
+#
+# Ladder, pre-registered from the MAPS ALONE (2026-09-30, no model was run to choose it). Median Moran's I
+# over all 18 NHP channels, as a fraction of its nominal value:
+#     f      0     0.05   0.10   0.20   0.30   0.50   0.75   1.00
+#     I      0.594 0.508  0.388  0.324  0.209  0.051 -0.025 -0.016
+#     I/I0   1.00  0.85   0.65   0.54   0.35   0.09  -0.04  -0.03
+# The structure is gone by f = 0.5, so the roadmap's ladder {0, .25, .5, .75, 1} would spend two of its five
+# levels on one saturated condition. This ladder resolves the decay instead and keeps f = 1 as the
+# no-structure anchor.
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k7_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive, random]
+  acquisition: [ts_marginal, random]
+
+experiment: stress_sweep
+family: stress-k7
+tag: nhp
+
+knob:
+  type: k7_shuffle
+  levels: [0.0, 0.1, 0.2, 0.3, 0.5, 1.0]
+
+budget: 96
+n_init: 5
+n_reps: 20                 # raised 10 -> 20 on 2026-09-30: with the causal (online) y scaler the early
+                           # steps of a run are genuinely harder, so per-cell variance is higher and 10
+                           # repetitions no longer represent a surrogate's reconstruction performance.
+                           # n_reps is NOT part of cell identity (the rep index is), so raising it is
+                           # additive: reps 0-9 are served from cache and only 10-19 are computed.
+gt_mode: full_mean
+online_y_scaler: minmax   # CANONICAL 2026-09-30: causal y scaling, refit inside the BO loop from the
+                          # observations so far (none | minmax | zscore). This is the deployment-honest
+                          # setting; the offline `none` arm survives as the pre-09-30 NHP runs.
+gt_n_splits: 10
+device: cuda
+seed: 42
+output_root: output
+
+# Pre-registered TOST/non-inferiority margin, in range-normalized regret units.
+equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

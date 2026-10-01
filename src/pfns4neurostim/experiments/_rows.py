@@ -84,6 +84,10 @@ def build_row(
         acq_type=acq_type,
         acq_label=acq_label or acq_type,
         device=str(row.get("device", "")),
+        # Provenance, not a key: which y-scaling arm produced the row (2026-09-30). The runner already puts it
+        # in ``row``; before today it was dropped on the way into the tidy schema, so the only thing that told
+        # the canonical `minmax` runs from the `zscore` arm and the archived offline runs was the run tag.
+        online_y_scaler=str(row.get("online_y_scaler", "none")),
         knob=knob,
         level=None if level is None else float(level),
         gt_mode=channel.gt_mode,
@@ -97,6 +101,13 @@ def build_row(
         recommended_regret=_clean(row.get("recommended_regret")),
         best_queried_regret=_clean(row.get("best_queried_regret")),
         cumulative_regret=_clean(row.get("cumulative_regret")),
+        # A8: NaN here means "never reached the target", which is right-censoring, not a bug -- _clean maps
+        # it to None so the column reads as empty rather than as a number. Declared in the schema on
+        # 2026-09-18, produced by the runner on 2026-09-30 and still dropped here until this mapping was
+        # added: the fourth metric lost between a producer and the CSV, which is what
+        # tests/evaluation/test_row_schema_coverage.py now guards.
+        queries_to_target_90=_clean(row.get("queries_to_target_90")),
+        queries_to_target_95=_clean(row.get("queries_to_target_95")),
         top1_hit=_clean(row.get("top1_hit")),
         top3_hit=_clean(row.get("top3_hit")),
         opt_distance=_clean(row.get("opt_distance")),

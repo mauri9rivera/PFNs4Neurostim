@@ -105,6 +105,18 @@ class SurrogateAdapter:
         """
         self._model.fit(X, y)
 
+    def fit_diagnostics(self) -> dict[str, float]:
+        """Fit diagnostics of the wrapped model, or ``{}`` when it exposes none.
+
+        Lets the tidy row record what a GP's marginal-likelihood fit converged to without the runner
+        knowing which model family it is holding (added 2026-09-27).
+
+        Returns:
+            Scalar diagnostics; empty for a surrogate with no hyperparameters to report.
+        """
+        inner = getattr(self._model, "fit_diagnostics", None)
+        return dict(inner()) if callable(inner) else {}
+
     def predict_marginals(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Return predictive mean and standard deviation per candidate.
 

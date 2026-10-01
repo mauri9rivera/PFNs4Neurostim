@@ -151,6 +151,7 @@ def set_seed(seed: int = 42) -> None:
 - **y:** z-scored, scaler fitted on valid trials only (GP priors assume standardized targets; TabPFN standardizes internally).
 - Regret is divided by the ground-truth range, so it is **independent of the y scaler**.
 - Implemented natively in `data/preprocessing.py` (`NORMALIZATIONS`, default `pfn`); selected by `dataset.normalization`, recorded in `config.yaml` and the tidy `normalization` column. `data/legacy_io.py` is frozen and only used as a numerical reference in tests.
+- **Online (causal) y scaling**, added 2026-09-27: the scalers above are fitted on *all* trials of a channel, which no live experiment can do. `OnlineYScaler` (`experiment.online_y_scaler: none | minmax | zscore`, default `none`) instead refits the y transform inside the BO loop from the observations collected so far, and predictions are mapped back before any metric. Measured: **TabPFN's decisions are invariant, its uncertainty is not** (corrected 2026-09-30, `tests/models/test_y_affine_invariance.py`): a pure *rescaling* of y washes out exactly, and the posterior *mean* also survives a *shift* (≤ 5e-6 of the target range in the operating regime, ≤ 3e-4 at a 50× offset), so acquisition ranking, recommendation, regret and R² are unmoved; the predictive **σ depends on where the targets sit**, not only on their spread — ~1 % at the tail for an O(range) offset, and far worse when the observed spread is tiny (an early-run flat initial design). Both modes shift as well as scale, so σ is always in that regime. GP-MLL is hurt (~75% worse regret under `minmax`), GP-fixed is *helped* (90% coverage 0.60 → 0.95). Regret and R² stay comparable across modes; **calibration does not** — never compare NLL (units change) *or* coverage/ECE/CRPS across `online_y_scaler` settings, for any model. The legacy `'gp'` arm's y-MinMax was **offline** and paired with **raw X** (= `raw_x_minmax_y`), which guardrail G2 forbids reusing.
 
 ### Fail Fast on NaN/Inf
 - Never silently swallow NaN or Inf values. Raise immediately with a descriptive message.
@@ -212,7 +213,7 @@ PFNs4Neurostim/
     │   ├── robustness.py        ← breakdown point, degradation AUC, CVaR, relative robustness
     │   ├── stats.py             ← TOST, equivalence margins, bootstrap
     │   └── results.py           ← tidy schema + run-dir I/O
-    ├── experiments/             ← bo_benchmark.py (Hyp 0/A) · stress_sweep.py (Hyp B) · mechanism.py (Hyp C) · gt_sensitivity.py
+    ├── experiments/             ← bo_benchmark.py (Hyp 0/A) · stress_sweep.py (Hyp B) · mechanism.py (Hyp C)
     ├── analysis/                ← update_rule.py (M10) · placement.py · cka.py · embeddings.py · predictive_link.py (Hyp C)
     ├── visualization/           ← style.py (single source of style) · bo · stress · mechanism
     └── legacy_code/             ← superseded CLIs, finetuning/LoRA, old loop and plotting
@@ -316,9 +317,23 @@ or axis string. Settled with the user on 2026-09-18 for the JNE/IOP target:
 - **Typography:** Arial → Helvetica → DejaVu Sans; base 9 pt, ticks 8 pt, panel letters 10 pt bold;
   TrueType/Type-42 (`pdf.fonttype=42`, `svg.fonttype="none"`)
 - **Palette:** two hardcoded anchors, everything else derived (`style.ANCHOR_PFN` `#0072B2` = TabPFN-2.5,
-  `style.ANCHOR_GP` `#D55E00` = GP-MLL; `NEUTRAL_GREY` for non-learning baselines). Other PFNs/GPs are shades of
-  their family anchor via `derive_shade` (hue held, lightness walks a bounded band), and `acquisition_style(model, acq)`
-  shades a model's colour by acquisition while linestyle carries the acquisition. Never add a hex literal for a model
+  `style.ANCHOR_GP` `#D55E00` = GP-MLL; `NEUTRAL_GREY` for non-learning baselines). Other PFNs/GPs are derived by
+  `derive_family`, a greedy farthest-point search in CIE L\*a\*b\* constrained to their family's `FAMILY_HUE_BAND`
+  (PFN `0.33–0.92`, GP `0.0–0.20`; widened 2026-09-27 — the old 0.21-wide PFN band left TabICL and TabFM
+  44 ΔE apart and reading as one colour). Family non-overlap is kept, but hue no longer separates the families
+  on its own: **linestyle does** (PFN solid, GP dashed/dash-dot/dotted). `derive_shade` (hue held, lightness
+  walks a band) is for ordered *series* — acquisitions, stress levels — not for model identity, and
+  `acquisition_style(model, acq)` shades a model's colour by acquisition while linestyle carries the
+  acquisition. Never add a hex literal for a model. The prior/noise reference bands of the Hyp C placement
+  figures use `REFERENCE_FLOOR_COLOR` / `REFERENCE_CEILING_COLOR` and must **never** reuse the
+  model anchors — they did until 2026-09-27, which made readers see the noise ceiling as GP-MLL. Those two
+  tokens are a **crimson/pink pair** since 2026-09-30: the greys that replaced the anchors competed with
+  `NEUTRAL_GREY` and with every unlabelled line, and crimson/pink is the one hue region no other token
+  occupies (PFN blue, GP vermillion, `LEVEL_CMAP` viridis). They are also the two ends of the
+  placement-surface colormap, so p = 0 and p = 1 read the same colour in every Hyp C figure
+- **Figure widths:** `single` / `onehalf` / `double` are the JNE print grid; `wide` (10 in) and `full` (13.5 in)
+  are for multi-panel **analysis** figures only (Hyp C mechanism panels, the placement trajectory, regime heatmaps),
+  which are cropped or split before submission
 - **Model names:** compact code-like — `TabPFN-2.5`, `GP-MLL`, `GP-fixed`, `GP-oracle`, `Random`
 - **Stress vocabulary:** roadmap jargon is canonical in code, figures *and* text — `knob`, `level`,
   `K1`/`K2`/`K5`/`K6`, `Demo 1 (synthetic)` / `Demo 2 (in vivo)`, `breakdown point`; K2's x-axis is

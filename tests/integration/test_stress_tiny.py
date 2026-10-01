@@ -194,33 +194,8 @@ class TestDeliverables:
         names = {os.path.basename(p) for p in written}
         assert "robustness.csv" in names
         assert "degradation_invivo.svg" in names
-        assert "outcomes_invivo.svg" in names
         for path in written:
             assert os.path.getsize(path) > 0
-
-    def test_breakdown_vs_budget_from_traces(self, sweep: pd.DataFrame) -> None:
-        """Breakdown points are recomputed at several budgets from the per-step regret traces."""
-        rng = np.random.default_rng(0)
-        n_steps = BUDGET - N_INIT + 1
-        rows = []
-        for model, offset in (("gp_mll", 0.0), ("tabpfn_v2_5", 0.4)):
-            for level in LEVELS:
-                for rep in range(N_REPS + 2):
-                    trace = np.clip(offset * level + 0.05 * rng.normal(size=n_steps) + 0.1, 0.0, 1.0)
-                    rows.append({"model": model, "level": float(level), "subject": 1, "emg": 0, "rep": rep,
-                                 "n_init": N_INIT, "recommended_regret_per_step": trace})
-        table = stress_figs.breakdown_vs_budget(pd.DataFrame(rows), sweep, knob="k2_channel", margin=0.05)
-        assert set(table["model"]) == {"tabpfn_v2_5"}
-        assert table["budget"].nunique() > 1
-        assert table["breakdown_x"].notna().any(), "a clearly worse model must break down somewhere"
-
-    def test_breakdown_vs_budget_without_reference_is_empty(self, sweep: pd.DataFrame) -> None:
-        """A shard without the reference model (the GPU-only job) yields no breakdown instead of raising."""
-        n_steps = BUDGET - N_INIT + 1
-        rows = [{"model": "tabpfn_v2_5", "level": float(lv), "subject": 1, "emg": 0, "rep": r, "n_init": N_INIT,
-                 "recommended_regret_per_step": np.full(n_steps, 0.2)} for lv in LEVELS for r in range(N_REPS)]
-        table = stress_figs.breakdown_vs_budget(pd.DataFrame(rows), sweep, knob="k2_channel", margin=0.05)
-        assert table.empty
 
     def test_render_all_on_shard_without_reference_model(self, sweep: pd.DataFrame, tmp_path) -> None:
         """A GPU-only shard (no GP-MLL reference) renders every figure and reports no breakdown, never raises."""
@@ -228,7 +203,7 @@ class TestDeliverables:
         assert not shard.empty and stress_figs.REFERENCE_MODEL not in set(shard["model"])
         written = stress_figs.render_all(shard, str(tmp_path), knob="k2_channel", dataset="nhp", min_snr_db=None)
         names = {os.path.basename(p) for p in written}
-        assert {"robustness.csv", "degradation_invivo.svg", "outcomes_invivo.svg"} <= names
+        assert {"robustness.csv", "degradation_invivo.svg"} <= names
         table = pd.read_csv(os.path.join(str(tmp_path), "robustness.csv"))
         assert table["breakdown_level"].isna().all(), "no reference means no breakdown to report"
 

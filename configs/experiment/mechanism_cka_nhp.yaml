@@ -21,11 +21,61 @@ cka:
   layers: null                 # all 18
   readouts: [feature_mean]
   targets: [K_X, K_GT, K_GT_linear, K_GP]
-  context_sizes: [5, 10, 20, 40]
+  # Includes a LATE-BO context (80 of 96 sites, ~83% of the budget-96 run) so the layer curves cover the
+  # operating point the surrogate actually ends at, not only the early steps. t must stay < n_sites.
+  context_sizes: [5, 10, 20, 40, 80]
   stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
-  n_context_draws: 3
+  # Raised from 3 on 2026-09-27. RULE: pool at least TARGET x d_model embedding rows per cell, where
+  # d_model = 192 and each draw contributes n_sites rows, so
+  #     n_context_draws = ceil(TARGET * 192 / n_sites)
+  # A rule and not a flat count, because a flat count gives datasets with different grid sizes different
+  # effective sample sizes and makes their placements non-comparable -- which is exactly what the
+  # cross-dataset claim must avoid. One draw gives 96 < 192 rows: the n << d regime debiased CKA only
+  # partly rescues.
+  #
+  # TARGET = 5 (settled 2026-09-27 on measured cost, not on taste):
+  #   * statistically, pooled n = 5 x 192 = 960 is the usual floor for a well-conditioned second-moment
+  #     estimate (n >~ 5d); TARGET = 10 is better but costs 2x.
+  #   * measured on this box: one 18-layer embedding of 96 sites is ~170 ms (CPU), and ONE
+  #     permutation_null at n_perm = 1000 is ~80 ms. Per cell that is 0.17 s of embedding against
+  #     18 layers x 4 targets x 0.08 = 5.8 s of permutations, so the permutation null -- NOT the draw
+  #     count -- is ~97% of the cost.
+  #   * cells = 18 channels x 3 levels x 5 context sizes x draws. At TARGET = 5 (10 draws) that is 2700
+  #     cells ~ 4.4 h; at TARGET = 10 (20 draws) 5400 cells ~ 8.9 h, which leaves no headroom under the
+  #     12 h wall clock.
+  #   * so if more precision is ever needed, the cheap lever is dropping K_X and K_GT_linear from
+  #     `targets` (halves the cost outright), not cutting draws.
+  # => NHP 10 draws; spinal (64 sites) 15; rat (32 sites) 30.
+  n_context_draws: 10
+  # Kept at 1000, deliberately. Measured 2026-09-27 (96 sites, d=192, 12 repeats per setting): the SD of the
+  # estimated null mean is 5.8e-4 at n_perm=1000 and 1.4e-4 at 8000, against observed cka_minus_null effects
+  # of 0.1-0.65 -- so the null is already ~1000x better resolved than the effect and more permutations buy
+  # nothing. The real constraint is p-value RESOLUTION: min p = 1/(n_perm+1) must clear the Bonferroni
+  # threshold alpha/L = 0.05/18 = 2.8e-3, which needs n_perm >= 359. 1000 clears it with margin.
   n_perm: 1000
   inference_seed: 0
   gp_params: {n_opt_steps: 100, lr: 0.1}
   controls: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10, t: 25, alpha: 0.05, n_seeds: 10, icc_min: 0.75, n_seed_channels: 1}
-  placement: {enabled: true, t: 25, n_prior: 30, n_prior_holdout: 10, n_noise: 10, k_nearest: 5, n_dense: 1024, holdout_frac: 0.1, rmse_threshold: 0.5, prior_type: prior_bag}
+  # CKA (b), rescaled 2026-09-27 from (t 25, n_prior 30, holdout 10, noise 10, ONE draw, k_nearest 5):
+  #   t: 25 -> 50. Half of the budget-96 NHP run, so the embeddings describe a mid-BO surrogate rather
+  #       than an early one. Must stay < n_sites.
+  #   bank_quantile REPLACES k_nearest. With an absolute k, raising n_prior could only pull the k nearest
+  #       maps closer, so the distance -- and the placement p -- drifted downward with bank size and two
+  #       runs at different n_prior were incomparable. A quantile converges as the bank grows, which is
+  #       what makes the numbers below safe to raise at all.
+  #   n_prior 30 -> 100 (70 bank + 30 holdout), n_noise 10 -> 30, n_draws 1 -> 10. Measured cost per
+  #       channel per draw: 34.6 s (22.3 s embeddings + 12.3 s CKA) => 18 channels x 10 draws ~ 1.7 h,
+  #       versus ~3.7 h for n_prior 300. The prior-bank sampling cost (v1 prior + 5D-style interpolation)
+  #       is NOT included in that figure and is unmeasured, so n_prior 300 is deliberately not taken yet.
+  #   min_gap drops the layers where the noise ceiling and the prior floor coincide (NHP layers 0-3 had
+  #       gaps of 0.0000-0.0024, some NEGATIVE) -- the cause of p ranging -8..+12.
+  #   ts REPLACES the single t (2026-09-30). The placement of a layer's embedding is conditioned on the
+  #       evidence it saw, so one context could not separate "this layer sits near the prior bag" from
+  #       "this layer had 50 observations". The ladder spans early to late BO for the budget-96 NHP run
+  #       (10 / 25 / 50 / 80 = ~10 / 26 / 52 / 83 % of the budget) and feeds the layer x context surface
+  #       figure. Cost is LINEAR in len(ts): measured 34.6 s per channel per draw, so 18 channels x 4
+  #       context sizes x 5 draws ~ 3.5 h; n_draws was cut 10 -> 5 to pay for the new axis, which trades
+  #       per-cell precision for a real second axis (the between-channel IQR dominates either way).
+  placement: {enabled: true, ts: [10, 25, 50, 80], n_prior: 100, n_prior_holdout: 30, n_noise: 30,
+              n_draws: 5, min_gap: 0.02, bank_quantile: 0.10, n_dense: 1024, holdout_frac: 0.1,
+              rmse_threshold: 0.5, prior_type: prior_bag}

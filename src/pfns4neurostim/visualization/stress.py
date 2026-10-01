@@ -5,13 +5,23 @@ can be regenerated without re-running an experiment (``--replot``). All geometry
 colours, labels and axis wording come from :mod:`pfns4neurostim.visualization.style`.
 
 Deliverables:
-    ``degradation_{demo}.svg``  regret and R-squared vs the knob axis, per model,
-                               with 95% CI bands, faint per-channel lines and
+    ``degradation_{demo}.svg``  recommended regret, exploration score and R-squared vs the knob axis,
+                               per model, with 95% CI bands, faint per-channel lines and
                                breakdown points marked.
-    ``outcomes_{demo}.svg``     simple regret, exploration score and R-squared vs the knob axis.
     ``robustness.csv``          breakdown point, degradation AUC, CVaR-10%,
                                 relative robustness, per model.
-    ``breakdown_vs_budget.svg`` breakdown point (TOST vs GP-MLL) against the BO budget, one line per model.
+
+Retired 2026-09-27:
+    ``outcomes_{demo}.svg``     merged into ``degradation_{demo}.svg``. Both drew recommended regret and
+                                R-squared against the same axis for the same run; ``outcomes`` added only
+                                the exploration-score panel, which is now the middle panel of
+                                ``degradation``, and ``degradation`` keeps the breakdown markers and the
+                                per-channel traces that ``outcomes`` lacked. No information was lost.
+    ``breakdown_vs_budget.svg`` dropped. It re-evaluated the breakdown rule at budget fractions, but the
+                                rule is defined *relative to GP-MLL*, so the curve mixed "robust under
+                                stress" with "ahead of the reference at this budget" and could not be read
+                                as either. The budget axis is covered by the K6-budget knob and by
+                                ``regime_heatmap.svg``, both of which report regret directly.
 """
 from __future__ import annotations
 
@@ -36,10 +46,7 @@ from . import traces as T
 __all__ = [
     "clip_low_snr",
     "plot_degradation_curves",
-    "plot_outcome_panels",
     "build_robustness_table",
-    "breakdown_vs_budget",
-    "plot_breakdown_vs_budget",
     "render_all",
 ]
 
@@ -374,7 +381,7 @@ def plot_degradation_curves(
     *,
     knob: str,
     dataset: str,
-    metrics: Sequence[str] = ("recommended_regret", "r2"),
+    metrics: Sequence[str] = ("recommended_regret", "exploration_score", "r2"),
     breakdowns: dict[str, float] | None = None,
     show_channels: bool = True,
     counts: pd.DataFrame | None = None,
@@ -383,6 +390,9 @@ def plot_degradation_curves(
 
     Bounded metrics show the mean over channels with a 95% CI; heavy-tailed ones (R^2) the median with an
     interquartile band (see :func:`_model_band`), and the R^2 axis is clipped for display only.
+
+    Absorbed the retired ``outcomes_{demo}.svg`` on 2026-09-27: ``exploration_score`` is now a default
+    panel, so this is the single per-knob outcome figure. A metric absent from ``df`` is skipped.
 
     Args:
         df: Tidy sweep frame.
@@ -401,9 +411,13 @@ def plot_degradation_curves(
     x_col = _knob_axis(df, knob)
     demo = str(df["demo"].iloc[0]) if "demo" in df.columns else "demo2"
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
+    # A knob that does not record one of the default metrics simply loses that panel.
+    metrics = [m for m in metrics if m in df.columns]
+    if not metrics:
+        return []
 
     # One panel per metric side by side (a vertical stack of 1.5-aspect panels would be too tall).
-    fig, axes = S.figure("double", nrows=1, ncols=len(metrics), sharex=True, layout=S.LAYOUT_ENGINE)
+    fig, axes = S.figure("wide", nrows=1, ncols=len(metrics), sharex=True, layout=S.LAYOUT_ENGINE)
     axes = np.atleast_1d(axes)
 
     for idx, metric in enumerate(metrics):
@@ -475,80 +489,6 @@ def plot_degradation_curves(
     )
     S.panel_letters(axes, x=0.0, y=1.06 if counts is not None else 1.02)
     return S.save_figure(fig, out_dir, f"degradation_{'invivo' if demo == 'demo2' else 'synthetic'}")
-
-
-def plot_outcome_panels(
-    df: pd.DataFrame,
-    out_dir: str,
-    *,
-    knob: str,
-    dataset: str,
-    counts: pd.DataFrame | None = None,
-) -> list[str]:
-    """Final-run outcomes vs the knob axis: (a) simple regret, (b) exploration score, (c) R^2.
-
-    Replaces the 90%-coverage calibration figure (2026-09-21). Lines and bands over channels, one line per
-    model; no bars. Regret and exploration show the mean with a 95% CI; R^2 (heavy-tailed) the median with
-    an interquartile band, its axis clipped for display only.
-
-    Args:
-        df: Tidy sweep frame.
-        out_dir: Destination directory.
-        knob: Knob name.
-        dataset: Dataset name.
-        counts: Output of :func:`clip_low_snr`; the channels kept per level are written above panel (a).
-
-    Returns:
-        Paths written (empty when the frame has none of the outcome columns).
-    """
-    panels = [
-        (col, key)
-        for col, key in (
-            ("recommended_regret", "simple_regret"),
-            ("exploration_score", "exploration_score"),
-            ("r2", "r2"),
-        )
-        if col in df.columns and df[col].notna().any()
-    ]
-    if not panels:
-        return []
-
-    x_col = _knob_axis(df, knob)
-    demo = str(df["demo"].iloc[0]) if "demo" in df.columns else "demo2"
-    models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
-
-    fig, axes = S.figure("double", nrows=1, ncols=len(panels), layout=S.LAYOUT_ENGINE)
-    axes = np.atleast_1d(axes)
-    for ax, (col, key) in zip(axes, panels):
-        for model in models:
-            sub = df[df["model"] == model]
-            if sub.empty or sub[col].isna().all():
-                continue
-            x, centre, lower, upper = _model_band(sub, x_col, col)
-            ax.plot(x, centre, **S.plot_kwargs(model))
-            ax.fill_between(x, lower, upper, color=S.model_color(model), alpha=S.BAND_ALPHA, linewidth=0)
-        ax.set_ylabel(S.axis_label(f"{key}_median" if _is_heavy_tailed(col) else key))
-        ax.set_xlabel(S.knob_x_label(knob, x_col))
-        if col == "r2":
-            ax.set_ylim(bottom=S.R2_AXIS_FLOOR, top=1.0)
-            ax.text(0.98, 0.02, f"axis clipped at {S.R2_AXIS_FLOOR:g}", transform=ax.transAxes, ha="right",
-                    va="bottom", fontsize=S.FONT_SIZES["annotation"], alpha=0.7)
-        if x_col in X_DESCENDS_WITH_STRESS:
-            ax.invert_xaxis()
-    _annotate_counts(axes[0], df, x_col, counts)
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside lower center", ncol=len(labels), frameon=False,
-               fontsize=S.FONT_SIZES["legend"])
-    n_reps = int(df["rep"].nunique()) if "rep" in df.columns else 0
-    n_chan = int(df[["subject", "emg"]].drop_duplicates().shape[0])
-    note = "; top of (a): channels kept per level" if counts is not None else ""
-    fig.suptitle(
-        f"{S.DATASET_LABELS.get(dataset, dataset)} - {S.KNOB_LABELS.get(knob, knob)} "
-        f"(n={n_reps} reps, {n_chan} channels{note})",
-        x=0.01, ha="left", fontsize=S.FONT_SIZES["title"],
-    )
-    S.panel_letters(axes, x=0.0, y=1.06 if counts is not None else 1.02)
-    return S.save_figure(fig, out_dir, f"outcomes_{'invivo' if demo == 'demo2' else 'synthetic'}")
 
 
 def build_robustness_table(
@@ -661,133 +601,6 @@ def build_robustness_table(
     path = os.path.join(out_dir, "robustness.csv")
     table.to_csv(path, index=False)
     return table, path
-
-
-#: Fractions of the run's budget at which the breakdown point is re-evaluated.
-BREAKDOWN_BUDGET_FRACTIONS: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0)
-
-
-def breakdown_vs_budget(
-    frame: pd.DataFrame,
-    df: pd.DataFrame,
-    *,
-    knob: str,
-    margin: float,
-    reference: str = REFERENCE_MODEL,
-    fractions: Sequence[float] = BREAKDOWN_BUDGET_FRACTIONS,
-) -> pd.DataFrame:
-    """Breakdown point of every model as a function of the BO budget.
-
-    At each budget t the recommended-site regret after t observations (read from the stored
-    per-step trace, so no re-run) is fed to the same paired-TOST breakdown rule as the
-    robustness table.
-
-    Args:
-        frame: Trace frame from :func:`traces.load_trace_frame`.
-        df: Tidy sweep frame (supplies the knob level -> plotted-axis mapping).
-        knob: Knob name.
-        margin: Pre-registered TOST margin.
-        reference: Reference model.
-        fractions: Budget fractions at which to evaluate.
-
-    Returns:
-        Long frame with ``model``, ``budget``, ``breakdown_level``, ``breakdown_x``, ``reason``.
-    """
-    x_col = _knob_axis(df, knob)
-    level_ascending = _level_severity_ascending(knob, df)
-    level_x = _level_to_x(df, x_col)
-    field = "recommended_regret_per_step"
-    frame = frame[frame[field].notna()].sort_values(["level", "subject", "emg", "rep"])
-    if frame.empty or reference not in set(frame["model"]):
-        # A shard that holds only some models (e.g. the GPU job without the GP reference) has no breakdown to report.
-        return pd.DataFrame(columns=["model", "budget", "breakdown_level", "breakdown_x", "reason"])
-    n_init = int(frame["n_init"].iloc[0])
-    total = int(frame[field].iloc[0].shape[0]) - 1 + n_init
-    budgets = sorted({int(round(f * total)) for f in fractions if n_init < round(f * total) <= total})
-
-    def per_level(model: str, t: int) -> dict[float, np.ndarray]:
-        sub = frame[frame["model"] == model]
-        return {
-            float(level): np.array([trace[t - n_init] for trace in grp[field]], dtype=float)
-            for level, grp in sub.groupby("level", dropna=False)
-        }
-
-    records: list[dict[str, Any]] = []
-    for model in [m for m in S.MODEL_ORDER if m in set(frame["model"]) and m != reference]:
-        for t in budgets:
-            bp = breakdown_point(
-                per_level(model, t), per_level(reference, t), margin=margin, severity_ascending=level_ascending,
-                test=BREAKDOWN_TEST,
-            )
-            level = bp["breakdown_level"]
-            records.append(
-                {
-                    "model": model,
-                    "budget": t,
-                    "breakdown_level": level,
-                    "breakdown_x": level_x.get(level, float("nan")) if np.isfinite(level) else float("nan"),
-                    "reason": bp["breakdown_reason"],
-                }
-            )
-    return pd.DataFrame.from_records(records)
-
-
-def plot_breakdown_vs_budget(
-    table: pd.DataFrame,
-    df: pd.DataFrame,
-    out_dir: str,
-    *,
-    knob: str,
-    dataset: str,
-) -> list[str]:
-    """Breakdown point (y) vs BO budget (x), coloured by model.
-
-    A filled marker is a breakdown at that budget; an open marker at the most severe tested level
-    means the model never broke down within the ladder.
-
-    Args:
-        table: Output of :func:`breakdown_vs_budget`.
-        df: Tidy sweep frame.
-        out_dir: Destination directory.
-        knob: Knob name.
-        dataset: Dataset name.
-
-    Returns:
-        Paths written (empty when the table is empty).
-    """
-    if table.empty:
-        return []
-    x_col = _knob_axis(df, knob)
-    ascending = _severity_ascending(x_col)
-    level_x = _level_to_x(df, x_col)
-    xs = sorted(level_x.values())
-    harshest = max(xs) if ascending else min(xs)
-
-    table.to_csv(os.path.join(out_dir, "breakdown_vs_budget.csv"), index=False)
-    fig, ax = S.figure("single", layout=S.LAYOUT_ENGINE)   # lone panel: single column (PANEL_ASPECT)
-    for model, grp in table.groupby("model"):
-        grp = grp.sort_values("budget")
-        y = grp["breakdown_x"].fillna(harshest).to_numpy(dtype=float)
-        broken = grp["breakdown_x"].notna().to_numpy()
-        color = S.model_color(str(model))
-        ax.plot(grp["budget"], y, color=color, linewidth=S.LINE_WIDTH, label=S.model_label(str(model)))
-        ax.plot(grp["budget"][broken], y[broken], linestyle="none", marker=S.model_style(str(model)).marker,
-                color=color, markersize=S.MARKER_SIZE + 1)
-        ax.plot(grp["budget"][~broken], y[~broken], linestyle="none", marker=S.model_style(str(model)).marker,
-                markerfacecolor="white", color=color, markersize=S.MARKER_SIZE + 1)
-    ax.set_xlabel(S.axis_label("budget"))
-    ax.set_ylabel(f"Breakdown point\n{S.knob_x_label(knob, x_col)}")
-    fig.suptitle(
-        f"{S.DATASET_LABELS.get(dataset, dataset)} - {S.KNOB_LABELS.get(knob, knob)} breakdown",
-        x=0.01, ha="left", fontsize=S.FONT_SIZES["title"],
-    )
-    handles, labels = ax.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside lower center", ncol=len(labels), frameon=False,
-               fontsize=S.FONT_SIZES["legend"])
-    return S.save_figure(fig, out_dir, "breakdown_vs_budget")
-
-
-#: Knobs whose sweep also yields the S5 interaction surface with the K6 budget (read from the per-step traces).
 REGIME_KNOBS: frozenset[str] = frozenset({"k2_channel", "k2_global"})
 
 #: Number of BO-budget columns of a regime surface (S5/S10), spread evenly from the first acquisition to the full budget.
@@ -912,11 +725,16 @@ def plot_regime_heatmap(
     margin: float,
     reference: str = REFERENCE_MODEL,
 ) -> list[str]:
-    """K2 x K6-budget interaction surface (roadmap S5), one panel per model plus differences.
+    """K2 x K6-budget interaction surface (roadmap S5), one panel per model plus one difference.
 
-    Top row: median recommended regret per (level, budget) for every model. Bottom row:
-    paired difference of each non-reference model against ``reference``, diverging around
-    zero, with the non-inferior cells outlined.
+    Top row: median recommended regret per (level, budget) for every model. Bottom row: a **single**
+    centred panel, the paired difference of the primary PFN against ``reference``, diverging around zero,
+    with the non-inferior cells outlined. Negative (blue) means the PFN has less regret than the reference.
+
+    Changed 2026-09-27: the bottom row used to carry one difference panel per non-reference model, which
+    added a GP-fixed-minus-GP-MLL surface. That compared two GP variants to each other and answered no
+    question the hypothesis asks, so only the PFN-vs-reference contrast is drawn; it keeps the same panel
+    geometry as the top row and sits under the middle column.
 
     Args:
         frame: Trace frame restricted to the sweep's cells.
@@ -931,9 +749,13 @@ def plot_regime_heatmap(
         Paths written (the figure and ``regime_surface.csv``).
     """
     models = [m for m in S.MODEL_ORDER if m in set(frame["model"])]
-    others = [m for m in models if m != reference] if reference in models else []
+    # Exactly one difference surface: the primary PFN against the reference. A GP-fixed-vs-GP-MLL panel
+    # contrasts two GP variants, which is not a question any hypothesis asks (changed 2026-09-27).
+    contrast = [m for m in models if m != reference and S.MODEL_STYLES[m].family == "pfn"][:1] \
+        if reference in models else []
     surfaces = {m: regime_surface(frame, df, knob=knob, model=m) for m in models}
-    diffs = {m: regime_surface(frame, df, knob=knob, model=m, reference=reference, margin=margin) for m in others}
+    diffs = {m: regime_surface(frame, df, knob=knob, model=m, reference=reference, margin=margin)
+             for m in contrast}
 
     records = []
     for kind, table in (("regret", surfaces), ("difference", diffs)):
@@ -949,7 +771,7 @@ def plot_regime_heatmap(
     pd.DataFrame.from_records(records).to_csv(csv_path, index=False)
 
     nrows = 2 if diffs else 1
-    fig, axes = S.figure("double", nrows=nrows, ncols=len(models),
+    fig, axes = S.figure("wide", nrows=nrows, ncols=len(models),
                          layout=S.LAYOUT_ENGINE, squeeze=False)
     y_label = S.knob_x_label(knob, _knob_axis(df, knob))
     top = max(float(np.nanmax(s["value"])) for s in surfaces.values())
@@ -963,13 +785,15 @@ def plot_regime_heatmap(
         span = max(float(np.nanmax(np.abs(s["value"]))) for s in diffs.values()) or 1.0
         for ax in axes[1]:
             ax.set_visible(False)
-        for ax, m in zip(axes[1], others):
+        # Centre the single difference panel under the middle column, keeping the top row's geometry.
+        centre = len(models) // 2
+        for ax, m in zip([axes[1][centre]], contrast):
             ax.set_visible(True)
             im = _draw_surface(ax, diffs[m], cmap=S.DIVERGING_CMAP, vmin=-span, vmax=span)
             ax.set_title(f"{S.model_label(m)} - {S.model_label(reference)}", fontsize=S.FONT_SIZES["title"])
             ax.set_xlabel(S.axis_label("budget"))
             ax.set_ylabel(y_label)
-        fig.colorbar(im, ax=list(axes[1]), label=S.axis_label("regret_difference"))
+        fig.colorbar(im, ax=[axes[1][centre]], label=S.axis_label("regret_difference"))
     fig.suptitle(
         f"{S.DATASET_LABELS.get(dataset, dataset)} - {S.KNOB_LABELS.get(knob, knob)} x K6 budget",
         x=0.01, ha="left", fontsize=S.FONT_SIZES["title"],
@@ -1111,12 +935,8 @@ def render_all(
     written += plot_degradation_curves(
         df, out_dir, knob=knob, dataset=dataset, breakdowns=breakdowns, counts=counts
     )
-    written += plot_outcome_panels(df, out_dir, knob=knob, dataset=dataset, counts=counts)
     frame = T.load_trace_frame(out_dir)
-    if frame is not None and not frame.empty and knob != "k6_budget":
+    if frame is not None and not frame.empty and knob != "k6_budget" and knob in REGIME_KNOBS:
         frame = _restrict_to_cells(_trace_frame_on_ladder(frame, df), df)
-        bd = breakdown_vs_budget(frame, df, knob=knob, margin=margin)
-        written += plot_breakdown_vs_budget(bd, df, out_dir, knob=knob, dataset=dataset)
-        if knob in REGIME_KNOBS:
-            written += plot_regime_heatmap(frame, df, out_dir, knob=knob, dataset=dataset, margin=margin)
+        written += plot_regime_heatmap(frame, df, out_dir, knob=knob, dataset=dataset, margin=margin)
     return written

@@ -48,7 +48,7 @@ STALE_SUFFIXES: frozenset[str] = frozenset({".csv", ".pkl", ".yaml", ".yml", ".j
 STALE_DIRS: frozenset[str] = frozenset({"shards"})
 
 #: Output trees that hold run directories, as ``<root>/<kind>/<dataset>/<tag>/``.
-RUN_KINDS: tuple[str, ...] = ("benchmark", "stress", "gt_sensitivity", "mechanism", "scaling")
+RUN_KINDS: tuple[str, ...] = ("benchmark", "stress", "mechanism", "scaling")
 
 _MARKER = "STALE_COHORT.md"
 
@@ -136,7 +136,10 @@ def quarantine_runs(
             os.makedirs(target, exist_ok=True)
             for name in present:
                 shutil.move(os.path.join(run, name), os.path.join(target, name))
-            with open(os.path.join(run, _MARKER), "w", encoding="utf-8") as fh:
+            # The marker goes INSIDE the quarantine directory (changed 2026-09-27). At the run root it
+            # outlived the retirement: once the dataset was recomputed, fresh tidy.csv and figures landed
+            # beside a note still saying "do not cite their numbers", which is worse than no note at all.
+            with open(os.path.join(target, _MARKER), "w", encoding="utf-8") as fh:
                 fh.write(_marker_text(dataset, cohort, quarantine, present))
     return affected
 

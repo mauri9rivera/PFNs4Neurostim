@@ -95,7 +95,7 @@ class TestRenderAll:
         df = _sweep(lambda ch, lv: 12.0 - 2.0 * lv)
         written = stress_figs.render_all(df, str(tmp_path), knob="k2_channel", dataset="nhp")
         names = {os.path.basename(p) for p in written}
-        assert {"channel_counts.csv", "degradation_invivo.svg", "outcomes_invivo.svg", "robustness.csv"} <= names
+        assert {"channel_counts.csv", "degradation_invivo.svg", "robustness.csv"} <= names
         counts = pd.read_csv(tmp_path / "channel_counts.csv")
         assert {"level", "n_channels_total", "n_channels_kept", "kept"} <= set(counts.columns)
 
@@ -117,7 +117,7 @@ class TestRenderAll:
             df = _sweep(lambda ch, lv: 10.0).assign(knob=knob)
             out = tmp_path / knob
             stress_figs.render_all(df, str(out), knob=knob, dataset="nhp", min_snr_db=None)
-            assert expected in (out / "outcomes_invivo.svg").read_text(encoding="utf-8")
+            assert expected in (out / "degradation_invivo.svg").read_text(encoding="utf-8")
 
 
 class TestTraceHelpers:

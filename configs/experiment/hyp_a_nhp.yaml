@@ -18,10 +18,19 @@ tag: nhp
 
 budget: 96
 n_init: 5
-n_reps: 10
+n_reps: 20                 # raised 10 -> 20 on 2026-09-30: with the causal (online) y scaler the early
+                           # steps of a run are genuinely harder, so per-cell variance is higher and 10
+                           # repetitions no longer represent a surrogate's reconstruction performance.
+                           # n_reps is NOT part of cell identity (the rep index is), so raising it is
+                           # additive: reps 0-9 are served from cache and only 10-19 are computed.
 gt_mode: full_mean
+online_y_scaler: minmax   # CANONICAL 2026-09-30: causal y scaling, refit inside the BO loop from the
+                          # observations so far (none | minmax | zscore). This is the deployment-honest
+                          # setting; the offline `none` arm survives as the pre-09-30 NHP runs.
 device: cuda
 seed: 42
+cache_version: 2            # spelled out so a run can bump it (--set cache_version=3) to force a recompute
+                            # of cells whose *value* columns changed (e.g. new gp_* fit diagnostics)
 output_root: output
 equivalence_margin: 0.05
 

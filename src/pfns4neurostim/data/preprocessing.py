@@ -190,3 +190,155 @@ def preprocess_channel(
         scaler_y=scaler_y,
         normalization=normalization,
     )
+
+
+# ---------------------------------------------------------------------------
+# Online (causal) y scaling — deployment-aligned, refit inside the BO loop
+# ---------------------------------------------------------------------------
+#: Smallest y spread an online scaler will divide by. Below it the scale is set to 1.0 (offset only):
+#: at ``n_init`` a handful of initial draws can share almost the same value, and a range of ~0 would
+#: otherwise produce inf/NaN targets, which the fail-fast contract forbids.
+ONLINE_SCALE_FLOOR: float = 1e-8
+
+#: Online y-scaling modes. ``'none'`` keeps the dataset-level scaler of :data:`NORMALIZATIONS` (the
+#: current behaviour); the others refit an affine y transform from the observations collected SO FAR.
+ONLINE_Y_MODES: tuple[str, ...] = ("none", "minmax", "zscore")
+
+
+@dataclass
+class OnlineYScaler:
+    """Affine y transform refit from the observations collected so far.
+
+    Why this exists (2026-09-27). The dataset-level scaler of :data:`NORMALIZATIONS` is fitted on *all*
+    trials of a channel, which no live experiment can do: at query *t* you have seen *t* responses and
+    nothing else. This scaler is the deployment-aligned alternative -- it is *causal*, fitted only on the
+    observations already collected -- so the gap between the two is measurable rather than argued about.
+
+    It is applied inside the BO loop, not at load time: the transform changes at every step, and the
+    surrogate's predictions must be mapped back before they are compared with the ground truth. ``minmax``
+    is the mode the legacy GP arm used offline (``raw_x_minmax_y``); ``zscore`` is the online counterpart of
+    the current default.
+
+    This is **not** a neutral reparameterization, and the effect differs per model family. Measured
+    2026-09-27 on 3 NHP channels x 2 reps, ``ts_marginal``, budget 40 (mean recommended regret / R^2 /
+    90% coverage):
+
+    ==============  ===============  ===============  ===============
+    model           none             minmax           zscore
+    ==============  ===============  ===============  ===============
+    TabPFN-2.5      0.491/0.37/0.94  0.491/0.37/0.94  0.491/0.37/0.94
+    GP-MLL          0.322/0.46/0.97  0.563/0.31/0.93  0.493/0.25/0.93
+    GP-fixed        0.255/-0.86/0.60 0.224/-0.18/0.95 0.380/-2.08/0.68
+    ==============  ===============  ===============  ===============
+
+    * **TabPFN is exactly invariant** -- identical to four decimals in every mode, which confirms directly
+      that it undoes any affine y transform internally (it z-scores ``y`` and rescales its
+      bar-distribution borders to match).
+    * **GP-MLL is hurt**, by ~75% in regret under ``minmax``. Its priors assume standardized targets, and
+      refitting the scaler every step makes the marginal-likelihood fit chase a moving target that is
+      itself estimated from very few points early in the run.
+    * **GP-fixed is helped, contrary to the expectation first written here.** Under ``minmax`` its regret
+      improves slightly and its calibration improves a lot (90% coverage 0.60 -> 0.95, R^2 -0.86 -> -0.18):
+      its pinned ``noise=0.01`` is far too small next to z-scored targets but close to reasonable next to
+      ``[0, 1]`` targets. So online ``minmax`` is not a uniform cost -- it redistributes accuracy between
+      the two GP arms.
+    * Under ``minmax`` the running maximum *is* the incumbent, and the max of noisy draws is upward
+      biased, so the scale is itself a noisy, monotonically growing quantity early in a run.
+
+    Range-normalized regret is unaffected either way, because it divides by the ground-truth range and is
+    invariant to any affine transform of ``y``; R-squared is scale-invariant too. NLL is **not** (it carries
+    a ``log(scale)`` term), so NLL must not be compared across modes.
+
+    Attributes:
+        mode: One of :data:`ONLINE_Y_MODES`.
+        offset: Subtracted before scaling.
+        scale: Divided by after the offset.
+    """
+
+    mode: str
+    offset: float = 0.0
+    scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        """Validate the mode.
+
+        Raises:
+            ValueError: If ``mode`` is not in :data:`ONLINE_Y_MODES`.
+        """
+        if self.mode not in ONLINE_Y_MODES:
+            raise ValueError(
+                f"OnlineYScaler mode must be one of {list(ONLINE_Y_MODES)}, got {self.mode!r}."
+            )
+
+    @property
+    def active(self) -> bool:
+        """Whether this scaler does anything (``mode != 'none'``)."""
+        return self.mode != "none"
+
+    def fit(self, y: np.ndarray) -> "OnlineYScaler":
+        """Refit the transform from the observations seen so far.
+
+        Args:
+            y: Observed responses, shape [t].
+
+        Returns:
+            ``self``, so a fit can be chained into a transform.
+
+        Raises:
+            RuntimeError: If ``y`` holds a non-finite value.
+        """
+        if self.mode == "none":
+            return self
+        y = np.asarray(y, dtype=np.float64).ravel()
+        if not np.isfinite(y).all():
+            raise RuntimeError(
+                f"OnlineYScaler.fit received {int((~np.isfinite(y)).sum())} non-finite observations."
+            )
+        if self.mode == "minmax":
+            lo, hi = float(np.min(y)), float(np.max(y))
+            self.offset, spread = lo, hi - lo
+        else:
+            self.offset, spread = float(np.mean(y)), float(np.std(y))
+        self.scale = spread if spread > ONLINE_SCALE_FLOOR else 1.0
+        return self
+
+    def transform(self, y: np.ndarray) -> np.ndarray:
+        """Map observations into the scaled space the surrogate is fitted in.
+
+        Args:
+            y: Responses, any shape.
+
+        Returns:
+            The transformed array (a copy).
+        """
+        if not self.active:
+            return np.asarray(y, dtype=np.float64)
+        return (np.asarray(y, dtype=np.float64) - self.offset) / self.scale
+
+    def inverse_mean(self, mean: np.ndarray) -> np.ndarray:
+        """Map a predicted mean back to the channel's own y space.
+
+        Args:
+            mean: Predictive means in the scaled space.
+
+        Returns:
+            The means in channel space.
+        """
+        if not self.active:
+            return np.asarray(mean, dtype=np.float64)
+        return np.asarray(mean, dtype=np.float64) * self.scale + self.offset
+
+    def inverse_std(self, std: np.ndarray) -> np.ndarray:
+        """Map a predictive standard deviation back to the channel's own y space.
+
+        A standard deviation carries the scale but not the offset.
+
+        Args:
+            std: Predictive standard deviations in the scaled space.
+
+        Returns:
+            The standard deviations in channel space.
+        """
+        if not self.active:
+            return np.asarray(std, dtype=np.float64)
+        return np.asarray(std, dtype=np.float64) * self.scale

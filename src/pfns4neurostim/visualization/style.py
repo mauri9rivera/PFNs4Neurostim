@@ -48,6 +48,10 @@ __all__ = [
     "ANCHOR_PFN",
     "ANCHOR_GP",
     "NEUTRAL_GREY",
+    "REFERENCE_FLOOR_COLOR",
+    "REFERENCE_CEILING_COLOR",
+    "REFERENCE_BAND_ALPHA",
+    "LEVEL_CMAP",
     "ACQUISITION_ORDER",
     "ACQUISITION_LINESTYLES",
     "derive_shade",
@@ -80,6 +84,12 @@ FIG_WIDTHS: dict[str, float] = {
     "single": 3.27,    # 8.3 cm  - default
     "onehalf": 4.90,   # 12.4 cm
     "double": 6.93,    # 17.6 cm
+    # Beyond the JNE print grid, for multi-panel *analysis* figures only (Hyp C mechanism panels, the
+    # placement strip, the regime heatmaps). Added 2026-09-27: an 8-panel row at 'double' leaves 1.7 in
+    # per panel, which tangles tick labels and panel titles. These are diagnostic figures that are
+    # cropped or split before submission, so they are allowed to exceed the column width.
+    "wide": 10.00,     # 25.4 cm
+    "full": 13.50,     # 34.3 cm
 }
 
 DEFAULT_WIDTH: str = "single"
@@ -153,6 +163,25 @@ ANCHOR_PFN: str = "#0072B2"   # TabPFN-2.5 (cool = PFN family)
 ANCHOR_GP: str = "#D55E00"    # GP-MLL (warm = GP family)
 NEUTRAL_GREY: str = "#999999"  # non-learning baselines
 
+#: Colours of the *reference* bands in the Hyp C placement figures (prior floor, noise ceiling).
+#: A **crimson/pink family**, chosen 2026-09-30, and deliberately NOT the model anchors: until 2026-09-27 the
+#: floor was ANCHOR_PFN and the ceiling ANCHOR_GP, which mean TabPFN-2.5 and GP-MLL in every other figure, so
+#: a reader trained on the rest of the paper read the noise ceiling as the GP. Greys fixed that but competed
+#: with NEUTRAL_GREY (the non-learning baselines) and with every unlabelled line in a busy panel, so the
+#: references are now chromatic in the one hue region no other token occupies: ANCHOR_PFN is blue, ANCHOR_GP
+#: vermillion, and LEVEL_CMAP (viridis) runs blue-purple -> green -> yellow, leaving crimson/pink free. The
+#: two are told apart by lightness, an edge linestyle and a legend entry, and they are the two ends of the
+#: placement-surface colormap, so p = 0 and p = 1 mean the same colour wherever they appear.
+REFERENCE_FLOOR_COLOR: str = "#C2185B"
+REFERENCE_CEILING_COLOR: str = "#F48FB1"
+#: Fill alpha and edge style of those bands (a dark band at BAND_ALPHA is indistinguishable from a light one).
+REFERENCE_BAND_ALPHA: float = 0.25
+REFERENCE_FLOOR_LINESTYLE: str = "-"
+REFERENCE_CEILING_LINESTYLE: str = "--"
+#: Sequential colormap for an ordered *stress level* series (the K2 ladder in the placement trajectory).
+#: Replaces grey shades, which collided with the achromatic reference bands above.
+LEVEL_CMAP: str = "viridis"
+
 #: Lightness band (HLS) that derived shades walk; bounded so shades stay mutually
 #: distinguishable, lighter than either anchor, and never wash out on white.
 SHADE_LIGHTNESS_BAND: tuple[float, float] = (0.48, 0.78)
@@ -223,9 +252,16 @@ def perceptual_distance(hex_a: str, hex_b: str) -> float:
     return float(np.linalg.norm(_srgb_to_lab(hex_a) - _srgb_to_lab(hex_b)))
 
 
-#: Hue band (HLS hue, 0-1) each family's derived colours may occupy: cool blues/teals for PFNs, warm
-#: reds/oranges/golds for GPs. The families never overlap, so the cool-PFN / warm-GP reading always survives.
-FAMILY_HUE_BAND: dict[str, tuple[float, float]] = {"pfn": (0.47, 0.68), "gp": (0.0, 0.14)}
+#: Hue band (HLS hue, 0-1) each family's derived colours may occupy. The families never overlap, so the
+#: PFN-vs-GP reading always survives, and each family's *anchor* keeps the canonical cool/warm identity.
+#:
+#: Widened 2026-09-27. The previous PFN band (0.47, 0.68) was only 0.21 wide, so six non-anchor PFNs were
+#: all some shade of blue-violet: TabICL and TabFM sat 44 dE apart and read as the same colour in a line
+#: plot. Widening the bands (PFN green -> cyan -> blue -> violet -> magenta, GP red -> orange -> gold)
+#: lifts the worst within-family separation from 26.6 to 40.9 dE, with TabICL-vs-TabFM at 190 dE. The
+#: allocation is still over every *registered* model, not the models in one figure, because a model must
+#: keep one colour across every figure in the paper.
+FAMILY_HUE_BAND: dict[str, tuple[float, float]] = {"pfn": (0.33, 0.92), "gp": (0.0, 0.20)}
 #: Candidate lightness / saturation / hue-step grids searched by :func:`derive_family`. The lightness cap
 #: keeps every derived colour visible on white.
 DERIVED_LIGHTNESS: tuple[float, ...] = (0.25, 0.32, 0.4, 0.48, 0.56, 0.64)
@@ -297,6 +333,7 @@ MODEL_ORDER: tuple[str, ...] = (
     "gp_naive",
     "gp_oracle",
     "gp_deep_kernel",
+    "gp_mll_lbfgs",
     "tabicl",
     "tabfm",
     "pfns4bo",
@@ -316,6 +353,7 @@ _MODEL_SPECS: dict[str, tuple[str, str, str, str, int]] = {
     "mitra": ("Mitra", "-", "P", "pfn", 3),
     "tabicl": ("TabICL", "-", "d", "pfn", 3),
     "gp_mll": ("GP-MLL", "--", "s", "gp", 4),
+    "gp_mll_lbfgs": ("GP-MLL (L-BFGS)", "--", "p", "gp", 4),
     "gp_naive": ("GP-fixed", "-.", "D", "gp", 3),
     "gp_oracle": ("GP-oracle", ":", "*", "gp", 3),
     "gp_deep_kernel": ("GP-deep", "--", "X", "gp", 2),
@@ -566,6 +604,13 @@ AXIS_LABELS: dict[str, str] = {
     "best_queried_regret": "Best-queried regret (norm. GT range)",
     "cumulative_regret": "Cumulative regret (norm. GT range)",
     "budget": r"BO iterations (incl. $n_\mathrm{init}$)",
+    # A8 / A9 (2026-09-30).
+    "reached_fraction": "Runs reaching the target",
+    # K7's achieved statistics: how much spatial autocorrelation survived, and the realized shuffle fraction.
+    "achieved_moran_i": "Spatial autocorrelation (Moran's $I$)",
+    "achieved_shuffle": "Shuffled sites (realized fraction)",
+    "elapsed_s": "Cumulative wall clock (s)",
+    "queries_to_target": "Queries to target",
     "iteration": "BO iteration",
     "achieved_snr_db": "Achieved SNR (dB)",
     "target_delta_snr_db": "SNR degradation vs channel floor (dB)",
@@ -622,7 +667,10 @@ KNOB_LABELS: dict[str, str] = {
     "nominal": "Nominal anchor",
 }
 
-#: The knob level itself is never the primary x-axis for K2 - achieved SNR is.
+#: The knob level itself is never the primary x-axis for K2 - achieved SNR is. K7 is the opposite case and
+#: deliberately plots its level: the shuffle knob realizes the requested fraction EXACTLY (its re-pairing is a
+#: cycle, so it has no fixed points), and its achieved structure statistic (Moran's I) is non-monotone once the
+#: structure is gone - it fluctuates around zero - so it makes a poor axis and a good annotation.
 KNOB_X_AXIS: dict[str, str] = {
     "k1_decoy": "level",
     "k2_channel": "achieved_snr_db",
@@ -639,6 +687,7 @@ KNOB_X_LABELS: dict[str, str] = {
     "k1_decoy": "Decoy amplitude ratio\n($a_2/a_1$)",
     "k5_outliers": "Contamination $\\varepsilon$\n(fraction of trial slots)",
     "k6_failure": "Failed electrodes $\\varepsilon$\n(fraction of array)",
+    "k7_shuffle": "Shuffled sites $f$\n(fraction of array)",
 }
 
 

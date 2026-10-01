@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from pfns4neurostim.evaluation.results import (
+    PROVENANCE_COLUMNS,
     ALL_COLUMNS,
     KEY_COLUMNS,
     METRIC_COLUMNS,
@@ -111,8 +112,17 @@ class TestTidyRowSchema:
         assert "recommended_regret" in METRIC_COLUMNS
         assert "best_queried_regret" in METRIC_COLUMNS
 
-    def test_all_columns_is_key_then_metric(self) -> None:
-        assert ALL_COLUMNS == KEY_COLUMNS + METRIC_COLUMNS
+    def test_all_columns_is_key_then_provenance_then_metric(self) -> None:
+        assert ALL_COLUMNS == KEY_COLUMNS + PROVENANCE_COLUMNS + METRIC_COLUMNS
+
+    def test_provenance_is_not_part_of_the_trajectory_key(self) -> None:
+        """Adding one to KEY_COLUMNS would make every archived trajectories.pkl unreadable."""
+        assert not set(PROVENANCE_COLUMNS) & set(KEY_COLUMNS)
+
+    def test_the_y_scaling_arm_reaches_the_row(self) -> None:
+        """The column that stops a pooled table averaging three different experiments."""
+        assert _make_row(online_y_scaler="zscore").to_dict()["online_y_scaler"] == "zscore"
+        assert _make_row().to_dict()["online_y_scaler"] == "none"
 
     def test_to_dict_has_all_columns(self) -> None:
         row = _make_row()

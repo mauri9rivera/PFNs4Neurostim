@@ -107,7 +107,10 @@ def test_placement_runner(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) -> No
     summary = json.load(open(os.path.join(out, "placement_summary.json")))
     assert summary["banks"][0]["n_attempted"] == 16
     assert {g["metric"] for g in summary["gates"]} == {"mmd", "w2"}
-    assert os.path.exists(os.path.join(out, "placement_strip.svg"))
+    # The formulation-B strip figure was dropped on 2026-09-30 (its pair columns live on as CSV columns
+    # only); the trajectory panel is the placement deliverable.
+    assert not os.path.exists(os.path.join(out, "placement_strip.svg"))
+    assert os.path.exists(os.path.join(out, "placement_context.svg"))
 
 
 def test_cka_runner_rejects_unresolvable_permutation_count(tmp_path, tiny) -> None:
@@ -143,7 +146,7 @@ def test_cka_runner_end_to_end(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) 
           n_perm: 60
           gp_params: {n_opt_steps: 20, lr: 0.1}
           controls: {grid_side: 7, lengthscale: 0.25, noise_sd: 0.3, n_trials: 6, t: 15, alpha: 0.05, n_seeds: 2, icc_min: 0.75, n_seed_channels: 1}
-          placement: {enabled: true, t: 15, n_prior: 6, n_prior_holdout: 2, n_noise: 2, k_nearest: 2, n_dense: 256, holdout_frac: 0.1, rmse_threshold: 0.5, prior_type: prior_bag}
+          placement: {enabled: true, ts: [10, 15], n_prior: 6, n_prior_holdout: 2, n_noise: 2, n_draws: 1, min_gap: 0.0, bank_quantile: 0.5, n_dense: 256, holdout_frac: 0.1, rmse_threshold: 0.5, prior_type: prior_bag}
     """.replace("device: cuda\n", ""))
     out = mechanism.run_mechanism(cfg, ["device=cuda"])
     df = pd.read_csv(os.path.join(out, "cka.csv"))
@@ -151,3 +154,12 @@ def test_cka_runner_end_to_end(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) 
     assert os.path.exists(os.path.join(out, "cka_vs_layer.svg"))
     gates = json.load(open(os.path.join(out, "gates.json")))
     assert {g["gate"] for g in gates} == {"positive_control", "negative_control", "seed_stability"}
+    # CKA (b): the context ladder is swept, and the work that does not depend on the channel is shared
+    # (2026-09-30). Channels on one grid see the SAME context sites at a given (t, draw), so their floor and
+    # ceiling must come out as identical numbers -- that identity is what the restructure bought.
+    pl = pd.read_csv(os.path.join(out, "cka_placement.csv"))
+    assert set(pl["context_t"]) == {10, 15}
+    assert pl["grid_id"].nunique() == 1
+    for _keys, part in pl.groupby(["context_t", "draw", "layer"]):
+        assert part["floor1"].nunique() == 1 and part["ceiling1"].nunique() == 1
+    assert os.path.exists(os.path.join(out, "cka_placement.svg"))

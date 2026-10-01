@@ -95,6 +95,10 @@ def cell_identity(
         "seed": seed,
         "cache_version": cfg.cache_version,
     }
+    # Online y scaling changes what the surrogate is fitted on, so it must be part of the identity --
+    # but added ONLY when active, so the thousands of cached 'none' cells stay valid (2026-09-27).
+    if getattr(cfg, "online_y_scaler", "none") != "none":
+        identity["online_y_scaler"] = cfg.online_y_scaler
     # The raw files' cohort stamp, for datasets whose loader versions them (5d_rat).
     # Added conditionally, so replacing one dataset's raw data invalidates that
     # dataset's cached cells and leaves every other dataset's identity untouched.

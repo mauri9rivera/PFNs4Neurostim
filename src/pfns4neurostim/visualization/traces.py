@@ -31,6 +31,9 @@ __all__ = [
     "comparison_table",
     "plot_trace_panels",
     "plot_latency_curves",
+    "plot_queries_to_target",
+    "plot_anytime_regret",
+    "queries_to_target_table",
 ]
 
 TRAJECTORY_FILE: str = "trajectories.pkl"
@@ -41,6 +44,15 @@ TRACE_PANELS: tuple[tuple[str, str], ...] = (
     ("exploration_per_step", "exploration_score"),
     ("r2_per_step", "r2"),
 )
+
+#: Extra trajectory fields the A8 / A9 figures need on top of :data:`TRACE_PANELS`: the true value of each
+#: query (A8's basis) and the end-of-run ground truth with its survivor mask (to state A8's target on the
+#: same range the regrets use). Loaded as object columns because their lengths differ from the panels'.
+EXTRA_TRACE_FIELDS: tuple[str, ...] = ("real_values", "y_gt", "survivors")
+
+#: Wall-clock grid of the A9 figure: log-spaced between the fastest single step and the slowest full run in
+#: the frame, so both ends of a two-orders-of-magnitude cost difference are visible.
+ANYTIME_GRID_POINTS: int = 120
 
 #: Trace fields that are heavy-tailed (early GP predictions reach R^2 far below -1; latency has weight-load
 #: outliers), so they are summarized by the median over channels with an interquartile band.
@@ -88,6 +100,9 @@ def load_trace_frame(run_dir: str) -> pd.DataFrame | None:
         for field, _ in TRACE_PANELS:
             value = traj.get(field)
             rec[field] = None if value is None else np.asarray(value, dtype=float)
+        for field in EXTRA_TRACE_FIELDS:
+            value = traj.get(field)
+            rec[field] = None if value is None else np.asarray(value)
         records.append(rec)
     return pd.DataFrame.from_records(records)
 
@@ -263,6 +278,244 @@ def plot_latency_curves(frame: pd.DataFrame, out_dir: str, *, dataset: str, name
                title_fontsize=S.FONT_SIZES["annotation"])
     return S.save_figure(fig, out_dir, name)
 
+
+def _queries_to_target(frame: pd.DataFrame, fraction: float) -> pd.DataFrame:
+    """Per-repetition queries-to-target, derived from the trajectories (roadmap A8).
+
+    Computed here rather than read from ``tidy.csv`` so a run recorded before the columns were populated
+    (every run before 2026-09-30) still produces the figure from its pickle alone. The arithmetic is the
+    canonical :func:`evaluation.metrics.queries_to_target`, not a copy of it.
+
+    Args:
+        frame: Trace frame from :func:`load_trace_frame`.
+        fraction: Target fraction of the ground-truth range.
+
+    Returns:
+        ``frame`` with a ``qtt`` column: the 1-based query index at which the target was first reached, or
+        NaN for a right-censored repetition.
+    """
+    from ..evaluation.metrics import queries_to_target  # noqa: PLC0415 - avoids a viz -> eval import at load
+
+    key = f"queries_to_target_{int(round(fraction * 100))}"
+    values: list[float] = []
+    for _, row in frame.iterrows():
+        if row["real_values"] is None or row["y_gt"] is None:
+            values.append(float("nan"))
+            continue
+        survivors = row["survivors"]
+        values.append(queries_to_target(
+            np.asarray(row["y_gt"], dtype=float),
+            np.asarray(row["real_values"], dtype=float),
+            reference=None if survivors is None else np.asarray(survivors, dtype=bool),
+            fractions=(fraction,),
+        )[key])
+    return frame.assign(qtt=values)
+
+
+def plot_queries_to_target(
+    frame: pd.DataFrame,
+    out_dir: str,
+    *,
+    dataset: str,
+    fractions: tuple[float, ...] = (0.90, 0.95),
+    name: str = "queries_to_target",
+) -> list[str]:
+    """A8: fraction of runs that have reached a target response, against query index.
+
+    One panel per target fraction, one line per model: the reach-by-k curve ``mean(qtt <= k)``. Runs that
+    never reach the target are **right-censored**, so each curve simply plateaus below 1 -- the plateau height
+    is the share of (channel, repetition) runs that got there at all, which is as much the result as the
+    speed. Repetitions are reduced within a channel first, so the curve weights channels equally.
+
+    Args:
+        frame: Trace frame from :func:`load_trace_frame`.
+        out_dir: Destination directory.
+        dataset: Dataset name.
+        fractions: Target fractions of the ground-truth range.
+        name: Output basename.
+
+    Returns:
+        Paths written (empty when no repetition recorded the queried values).
+    """
+    if "real_values" not in frame or frame["real_values"].isna().all():
+        return []
+    series = _series(frame)
+    budget = int(max(len(v) for v in frame["real_values"] if v is not None))
+    steps = np.arange(1, budget + 1)
+    fig, axes = S.figure("double", ncols=len(fractions), layout=S.LAYOUT_ENGINE, squeeze=False)
+    for ax, fraction in zip(axes[0], fractions):
+        for model, label, rows, st in series:
+            sub = _queries_to_target(rows, fraction)
+            per_channel = []
+            for _keys, chan in sub.groupby(["subject", "emg"], dropna=False):
+                qtt = chan["qtt"].to_numpy(dtype=float)
+                # NaN (never reached) never satisfies <=, so a censored run lowers the curve at every k,
+                # which is the intended reading.
+                per_channel.append([(np.nan_to_num(qtt, nan=np.inf) <= k).mean() for k in steps])
+            if not per_channel:
+                continue
+            curve = np.mean(np.asarray(per_channel), axis=0)
+            ax.plot(steps, curve, color=st.color, linestyle=st.linestyle, linewidth=S.LINE_WIDTH,
+                    label=st.label, zorder=st.zorder)
+        ax.set_xlabel(S.axis_label("budget"))
+        ax.set_ylabel(S.axis_label("reached_fraction"))
+        ax.set_ylim(0.0, 1.0)
+        ax.set_title(f"{int(round(fraction * 100))}% of the optimum")
+    fig.suptitle(_title(frame, dataset, "queries to target"), x=0.01, ha="left",
+                 fontsize=S.FONT_SIZES["title"])
+    S.panel_letters(axes[0], x=0.0)
+    _legend_below(fig, axes[0], len(series))
+    return S.save_figure(fig, out_dir, name)
+
+
+def queries_to_target_table(
+    frame: pd.DataFrame,
+    out_dir: str,
+    *,
+    fractions: tuple[float, ...] = (0.90, 0.95),
+    name: str = "queries_to_target.csv",
+) -> tuple[pd.DataFrame, str] | None:
+    """A8's companion table: median [IQR] queries to target per model, with the censored count.
+
+    The median is reported as ``> budget`` when more than half the runs never reached the target, because a
+    median over the reaching runs alone would describe a subset selected on the outcome.
+
+    Args:
+        frame: Trace frame.
+        out_dir: Destination directory.
+        fractions: Target fractions.
+        name: Output filename.
+
+    Returns:
+        ``(table, path)``, or ``None`` when the frame carries no queried values.
+    """
+    if "real_values" not in frame or frame["real_values"].isna().all():
+        return None
+    records: list[dict[str, Any]] = []
+    for fraction in fractions:
+        for model, label, rows, _st in _series(frame):
+            sub = _queries_to_target(rows, fraction)
+            qtt = sub["qtt"].to_numpy(dtype=float)
+            reached = qtt[np.isfinite(qtt)]
+            censored = int(qtt.size - reached.size)
+            budget = int(max(len(v) for v in sub["real_values"] if v is not None))
+            enough = reached.size > qtt.size / 2
+            records.append({
+                "model": model,
+                "acq_label": label,
+                "target": fraction,
+                "n_runs": int(qtt.size),
+                "n_censored": censored,
+                "reached_fraction": float(reached.size / qtt.size) if qtt.size else float("nan"),
+                "median": float(np.median(reached)) if enough else float("nan"),
+                "median_display": f"{np.median(reached):.0f}" if enough else f"> {budget}",
+                "q25": float(np.quantile(reached, 0.25)) if enough else float("nan"),
+                "q75": float(np.quantile(reached, 0.75)) if enough else float("nan"),
+            })
+    table = pd.DataFrame.from_records(records)
+    path = os.path.join(out_dir, name)
+    table.to_csv(path, index=False)
+    return table, path
+
+
+def _nanmean(block: np.ndarray) -> np.ndarray:
+    """Column-wise mean of finite entries; NaN where a column has none, without a warning.
+
+    The A9 grid deliberately extends below a model's first completed step, so whole columns are legitimately
+    undefined. ``np.nanmean`` returns the right answer there but warns on every all-NaN slice, and a warning
+    on expected behaviour trains the reader to ignore warnings.
+
+    Args:
+        block: Values with runs on axis 0, shape [R, G].
+
+    Returns:
+        Mean per column, shape [G].
+    """
+    finite = np.isfinite(block)
+    count = finite.sum(axis=0)                                                      # [G]
+    total = np.where(finite, block, 0.0).sum(axis=0)                                # [G]
+    return np.where(count > 0, total / np.maximum(count, 1), np.nan)
+
+
+def _nanstd(block: np.ndarray) -> np.ndarray:
+    """Column-wise sample standard deviation of finite entries; 0 where fewer than two exist.
+
+    Args:
+        block: Values with runs on axis 0, shape [R, G].
+
+    Returns:
+        Standard deviation per column, shape [G].
+    """
+    finite = np.isfinite(block)
+    count = finite.sum(axis=0)                                                      # [G]
+    mean = _nanmean(block)                                                          # [G]
+    dev = np.where(finite, (block - mean) ** 2, 0.0).sum(axis=0)                    # [G]
+    return np.where(count > 1, np.sqrt(dev / np.maximum(count - 1, 1)), 0.0)
+
+
+def plot_anytime_regret(
+    frame: pd.DataFrame,
+    out_dir: str,
+    *,
+    dataset: str,
+    name: str = "anytime_regret",
+) -> list[str]:
+    """A9: best-so-far simple regret against cumulative wall-clock seconds (log x).
+
+    The comparison Hyp A's cost claim actually needs: at equal elapsed compute, not at equal query count.
+    Each repetition's regret is resampled onto one shared log-spaced time grid by
+    :func:`evaluation.metrics.anytime_regret_curve`, repetitions are reduced within a channel, and the band is
+    a 95% CI over channels. A curve starts only once that model's first step has finished, so a slow first
+    step shows as a late start rather than as free progress.
+
+    Carries the same caveat as the latency figure: until the converged-GP fix (P0.10) lands, the GP arm's
+    per-step cost is not a converged GP's cost, so this is descriptive (guardrail G1).
+
+    Args:
+        frame: Trace frame.
+        out_dir: Destination directory.
+        dataset: Dataset name.
+        name: Output basename.
+
+    Returns:
+        Paths written (empty when no repetition recorded both latency and regret).
+    """
+    from ..evaluation.metrics import anytime_regret_curve  # noqa: PLC0415
+
+    field = "recommended_regret_per_step"
+    usable = frame[frame["latency"].notna() & frame[field].notna()]
+    if usable.empty:
+        return []
+    totals = [float(np.sum(v)) for v in usable["latency"] if v is not None and len(v)]
+    firsts = [float(v[0]) for v in usable["latency"] if v is not None and len(v)]
+    if not totals:
+        return []
+    grid = np.geomspace(max(min(firsts), 1e-4), max(totals), ANYTIME_GRID_POINTS)   # [G]
+    fig, ax = S.figure("onehalf", layout=S.LAYOUT_ENGINE)
+    series = _series(usable)
+    for model, label, rows, st in series:
+        per_channel = []
+        for _keys, chan in rows.groupby(["subject", "emg"], dropna=False):
+            curves = np.asarray([anytime_regret_curve(r["latency"], r[field], grid)
+                                 for _, r in chan.iterrows()])                      # [R, G]
+            per_channel.append(_nanmean(curves))
+        block = np.asarray(per_channel)                                             # [C, G]
+        n = np.sum(np.isfinite(block), axis=0)                                      # [G]
+        centre = _nanmean(block)
+        sd = _nanstd(block) if block.shape[0] > 1 else np.zeros_like(centre)
+        half = 1.96 * sd / np.sqrt(np.maximum(n, 1))
+        ax.plot(grid, centre, color=st.color, linestyle=st.linestyle, linewidth=S.LINE_WIDTH,
+                label=st.label, zorder=st.zorder)
+        ax.fill_between(grid, centre - half, centre + half, color=st.color, alpha=S.BAND_ALPHA, linewidth=0)
+    ax.set_xscale("log")
+    ax.set_xlabel(S.axis_label("elapsed_s"))
+    ax.set_ylabel(S.axis_label("simple_regret"))
+    ax.set_ylim(0.0, 1.0)
+    ax.text(0.98, 0.98, textwrap.fill(LATENCY_NOTE, LATENCY_WRAP), transform=ax.transAxes, ha="right",
+            va="top", fontsize=S.FONT_SIZES["annotation"], alpha=0.8)
+    fig.suptitle(_title(usable, dataset, "anytime regret"), x=0.01, ha="left", fontsize=S.FONT_SIZES["title"])
+    _legend_below(fig, np.atleast_1d(ax), len(series))
+    return S.save_figure(fig, out_dir, name)
 
 def comparison_table(frame: pd.DataFrame, out_dir: str) -> tuple[pd.DataFrame, str]:
     """Final values per model x acquisition, for choosing a headline acquisition.

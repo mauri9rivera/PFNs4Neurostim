@@ -144,6 +144,12 @@ def shard_registry(run_dir: str) -> list[dict[str, Any]]:
             "gpu": r["host"].get("cuda_device"),
             "cpu": r["host"].get("cpu"),
             "slurm_job_id": r["host"].get("slurm_job_id"),
+            # Which software stack produced the shard (#8 rule 7, 2026-09-30). The Hyp 0 benchmark merges
+            # cells computed in three conda environments, so the interpreter and a hash over the installed
+            # distributions belong in the provenance next to the hardware.
+            "python": r["host"].get("python"),
+            "conda_env": r["host"].get("conda_env"),
+            "env_hash": r["host"].get("env_hash"),
             "cells_computed": r["cells_computed"],
             "cells_cached": r["cells_cached"],
             "status": r["status"],

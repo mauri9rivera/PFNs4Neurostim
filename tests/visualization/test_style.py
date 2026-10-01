@@ -80,9 +80,19 @@ def test_derive_family_is_deterministic_and_validates() -> None:
         style.derive_family(style.ANCHOR_GP, 2, (0.5, 0.2))
 
 
-def test_pfn_cool_gp_warm() -> None:
-    assert all(0.45 < _hue(s.color) < 0.70 for s in style.MODEL_STYLES.values() if s.family == "pfn")
-    assert all(_hue(s.color) < 0.15 for s in style.MODEL_STYLES.values() if s.family == "gp")
+def test_anchors_keep_the_cool_pfn_warm_gp_reading() -> None:
+    """The two *anchors* carry cool-PFN / warm-GP; derived members only stay inside their family band.
+
+    The bands were widened on 2026-09-27 so six non-anchor PFNs are mutually discriminable (the old
+    0.21-wide band made TabICL and TabFM read as one colour), so hue no longer separates the families
+    on its own -- linestyle does (PFN solid, GP dashed/dash-dot/dotted). ``test_family_hue_inside_band``
+    keeps the non-overlap guarantee; this test pins the anchors.
+    """
+    assert 0.45 < _hue(style.ANCHOR_PFN) < 0.70
+    assert _hue(style.ANCHOR_GP) < 0.15
+    pfn_lo, pfn_hi = style.FAMILY_HUE_BAND["pfn"]
+    gp_lo, gp_hi = style.FAMILY_HUE_BAND["gp"]
+    assert gp_hi < pfn_lo, "family hue bands must not overlap"
 
 
 def test_only_anchors_and_grey_are_literals() -> None:

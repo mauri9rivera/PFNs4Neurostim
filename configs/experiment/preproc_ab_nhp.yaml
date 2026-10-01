@@ -19,6 +19,7 @@ budget: 50
 n_init: 5
 n_reps: 5
 gt_mode: full_mean
+online_y_scaler: none   # deliberately OFFLINE: this experiment compares offline (X, y) contracts
 device: cpu
 seed: 42
 output_root: output

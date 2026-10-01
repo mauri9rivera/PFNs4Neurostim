@@ -2,9 +2,9 @@
 
 Each run directory records its resolved config (``config.yaml``: ``experiment``, ``family``, dataset, knob,
 ``gt_mode``). This script matches it to the experiment YAML with the same family and dataset and calls the
-runner's ``--replot`` on that exact directory (``--run-dir``), so runs with overridden tags (``nhp-sh``)
-replot in place. Mechanism analyses (``output/mechanism/<analysis>/<dataset>``) and the GT-sensitivity run
-are replotted through their own runners. Use it after any change to ``visualization/``.
+runner's ``--replot`` on that exact directory (``--run-dir``), so runs with overridden tags
+replot in place. Mechanism analyses (``output/mechanism/<analysis>/<dataset>``) are replotted
+through their own runner. Use it after any change to ``visualization/``.
 
     python scripts/replot_all.py            # print the commands
     python scripts/replot_all.py --run      # run them
@@ -70,11 +70,6 @@ def commands(output: str) -> list[list[str]]:
         dataset = (raw.get("defaults") or {}).get("dataset")
         if glob.glob(os.path.join(output, "mechanism", analysis, str(dataset), "*", "*.csv")):
             cmds.append(["mechanism", "--config", path, "--replot"])
-    for path in sorted(glob.glob(os.path.join(EXPERIMENT_DIR, "gt_sensitivity_*.yaml"))):
-        dataset = (_yaml(path).get("defaults") or {}).get("dataset")
-        for run in glob.glob(os.path.join(output, "gt_sensitivity", str(dataset), "*")):
-            if os.path.exists(os.path.join(run, "gt_sensitivity.csv")):
-                cmds.append(["gt_sensitivity", "--config", path, "--replot", "--run-dir", run])
     if missing:
         raise SystemExit("No experiment YAML for:\n  " + "\n  ".join(missing))
     return cmds

@@ -27,13 +27,17 @@ submit_unit() {
   echo "submitted: $name  (assemble job ${id%%;*} runs after$deps)"
 }
 
-# submit_single <name> <experiment> <config> <env> [overrides...]   (one process, writes its own outputs)
+# submit_single <name> <experiment> <config> <env> <script> [overrides...]   (one process, writes its own outputs)
 submit_single() {
-  local name="$1" exp="$2" cfg="$3" env="$4" id
-  shift 4
-  id=$(CONDA_ENV="$env" sbatch --parsable scripts/run_single.sh "$exp" "$cfg" "$@")
+  local name="$1" exp="$2" cfg="$3" env="$4" script="$5" id
+  shift 5
+  id=$(CONDA_ENV="$env" sbatch --parsable "$script" "$exp" "$cfg" "$@")
   echo "submitted: $name  (job ${id%%;*})"
 }
 
+submit_single "C1. M10 update rule (t = 10/25/50), NHP" mechanism configs/experiment/mechanism_update_rule_nhp.yaml pfns4neurostim scripts/run_single.sh
+submit_single "C2. CKA (a) + placement ladder (t = 10/25/50/80), NHP" mechanism configs/experiment/mechanism_cka_nhp.yaml pfns4neurostim scripts/run_single.sh
+submit_single "C3. Placement MMD / W2 (t = 10...96), NHP" mechanism configs/experiment/mechanism_placement_nhp.yaml pfns4neurostim scripts/run_single_cpu.sh
+submit_single "C4. Placement MMD / W2 (t = 10...200), 5d_rat" mechanism configs/experiment/mechanism_placement_5d_rat.yaml pfns4neurostim scripts/run_single_cpu.sh
 
 echo "Done. Check with: squeue --me"

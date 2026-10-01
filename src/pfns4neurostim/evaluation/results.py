@@ -108,8 +108,17 @@ METRIC_COLUMNS: tuple[str, ...] = (
     "seed",
 )
 
-#: Full tidy-table column order: key columns followed by metric columns.
-ALL_COLUMNS: tuple[str, ...] = KEY_COLUMNS + METRIC_COLUMNS
+#: Columns that identify *how* a row was produced without being part of a trajectory's key. Added
+#: 2026-09-30 for ``online_y_scaler``: with the canonical `minmax` runs, the `zscore` sensitivity arm and the
+#: archived offline runs coexisting, a pooled table that told the arms apart only by a naming convention in
+#: ``run_tag`` would be one careless glob away from averaging three different experiments. The arm is part of
+#: cell identity, so it belongs in the row; it is deliberately NOT in :data:`KEY_COLUMNS`, because those form
+#: the key tuple of every ``trajectories.pkl`` and adding one would make every archived pickle unreadable --
+#: including the offline arm's, which is the comparison this column exists to protect.
+PROVENANCE_COLUMNS: tuple[str, ...] = ("online_y_scaler",)
+
+#: Full tidy-table column order: key columns, provenance, then metric columns.
+ALL_COLUMNS: tuple[str, ...] = KEY_COLUMNS + PROVENANCE_COLUMNS + METRIC_COLUMNS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -198,6 +207,9 @@ class TidyRow:
     acq_label: str = ""
     device: str = ""
 
+    # --- provenance (:data:`PROVENANCE_COLUMNS`) ---
+    online_y_scaler: str = "none"
+
     # --- metric / value columns (optional; None => NaN at write time) ---
     r2: Optional[float] = None
     spearman: Optional[float] = None
@@ -248,10 +260,10 @@ class TidyRow:
         """Flatten this row to a dict in :data:`ALL_COLUMNS` order.
 
         Returns:
-            Dict with every key column verbatim and every metric column
+            Dict with every key and provenance column verbatim and every metric column
             either its finite value or ``float('nan')`` when unset.
         """
-        out: dict[str, Any] = {col: getattr(self, col) for col in KEY_COLUMNS}
+        out: dict[str, Any] = {col: getattr(self, col) for col in KEY_COLUMNS + PROVENANCE_COLUMNS}
         for col in METRIC_COLUMNS:
             value = getattr(self, col)
             out[col] = float("nan") if value is None else value
