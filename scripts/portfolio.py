@@ -372,7 +372,8 @@ def print_plan(group: str) -> None:
     print("\n# Mila caps: 2 GPUs on `main` (extra GPU jobs queue), 8 CPUs on `main-cpu`. Watch: bash scripts/mila.sh queue")
     print("# Submit: bash scripts/submit_nhp.sh | submit_audit.sh | submit_portfolio.sh (stress) | "
           "submit_bench.sh | submit_hypc.sh | submit_externals.sh | submit_spinal.sh")
-    print("# Or all of it, prerequisite-gated, in one command: bash scripts/submit_next.sh now")
+    print("# One stage at a time, each individually gated: bash scripts/submit_next.sh status | <stage>")
+    print("# There is deliberately NO submit-everything mode; `spinal` additionally needs --force.")
 
 
 def emit_bash(group: str) -> None:
