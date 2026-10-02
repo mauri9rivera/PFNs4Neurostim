@@ -70,7 +70,7 @@ do_sbatch() {   # do_sbatch <gpu|cpu> [options] -- <script> <args...>
       --gpu-type) need gpu-type "$2" '^a100(_[0-9]g\.[0-9]+gb)?$'; gpu_type="$2" ;;
       --mem) need mem "$2" '^[0-9]{1,3}[MG]$'; extra+=("--mem=$2") ;;
       --cpus) need cpus "$2" '^[0-9]{1,2}$'; extra+=("--cpus-per-task=$2") ;;
-      --time) need time "$2" '^([0-9]{1,2}-)?[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?$'; extra+=("--time=$2") ;;
+      --time) need time "$2" '^([0-9]{1,2}-)?[0-9]{1,2}:[0-9]{2}:[0-9]{2}$'; extra+=("--time=$2") ;;   # HH:MM:SS only: Slurm reads 0:15 as 15 SECONDS
       --dependency) need dependency "$2" '^afterany(:[0-9]+)+$'; extra+=("--dependency=$2") ;;
       --job-name) need job-name "$2" '^[A-Za-z0-9_.-]+$'; extra+=("--job-name=$2") ;;
       *) die "unknown option $1" ;;
