@@ -32,9 +32,12 @@ VENV_ROOT="${VENV_ROOT:-${HOME}/venvs}"
 NARVAL_ACCOUNT="${NARVAL_ACCOUNT:-def-bonizzat}"
 NARVAL_GPU="${NARVAL_GPU:-a100}"
 NARVAL_STDENV="${NARVAL_STDENV:-2023}"
-# The main and v1 envs are pinned to Python 3.9 (CLAUDE.md section 3). Whether a 3.9 module exists under the
-# chosen StdEnv is checked by narval_setup.sh, which says what to set if it does not.
-PY_MAIN="${PY_MAIN:-3.9}"
+# Mila and local keep the main and v1 envs on Python 3.9 (CLAUDE.md section 3), but 3.9 is a reproducibility pin, not a
+# requirement: every pinned package declares >=3.9 with no cap, TabPFN v1 only mirrors the main env, the v1-prior dataset
+# generator declares >=3.10,<3.13, and Narval offers 3.9 only under StdEnv/2020. Narval therefore runs main and v1 on
+# Python 3.11 under StdEnv/2023 (decided 2026-10-02); record this before comparing Narval and Mila results.
+# Set PY_MAIN=3.9 NARVAL_STDENV=2020 to get the pinned interpreter back.
+PY_MAIN="${PY_MAIN:-3.11}"
 PY_BENCH="${PY_BENCH:-3.11}"
 
 cluster_python_version() {   # cluster_python_version <env name>
