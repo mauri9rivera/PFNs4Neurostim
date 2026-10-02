@@ -13,17 +13,19 @@
 # Usage (Narval LOGIN node, repo root). Login nodes have internet; compute nodes do not, so environments are built
 # HERE, not in a job (unlike Mila's setup_env_job.sh). A venv build is light enough for a login node.
 #   bash scripts/narval_setup.sh layout       # scratch dirs + data/ output/ logs/ symlinks in the checkout
-#   bash scripts/narval_setup.sh shared-data  # shared_data/ of SYMLINKS to datasets already on the cluster (no copy, nothing moved)
-#   bash scripts/narval_setup.sh stage        # data master (shared_data/) -> scratch working copy (symlinks followed)
+#   bash scripts/narval_setup.sh check-data   # verify shared_data/ against scripts/data_manifest.sha256; fails loudly on any change
+#   bash scripts/narval_setup.sh stage        # copy ONLY this project's datasets from shared_data/ to scratch, then verify the copy
 #   bash scripts/narval_setup.sh submodules   # git submodule update --init --recursive (+ ticl excludes)
 #   bash scripts/narval_setup.sh env [main|bench|v1]   # build/update the virtualenv from environment*.yml
 #   bash scripts/narval_setup.sh install [main|bench|v1]   # only pip install -e . --no-deps
 #   bash scripts/narval_setup.sh verify       # layout, quotas, imports
 #   bash scripts/narval_setup.sh weights [main|bench|v1] [models]   # pre-download checkpoints (compute nodes are offline)
 #
-# The data master is shared_data/ next to the projects. NHP, rat and the 5d_rat noOutliers cohort already exist inside
-# additive_neurostim/datasets (checked byte-identical to the local copies on 2026-10-02), so `shared-data` only links them;
-# that project is never modified. Spinal differs there (1.6 GB against 3.9 GB local) and is NOT linked: upload it when needed.
+# The data master is shared_data/ next to the projects, and other projects write to it (additive_neurostim moved its datasets
+# there on 2026-10-02), so nothing here trusts it blindly: scripts/data_manifest.sha256 lists the sha256 of every file this
+# project loads (NHP, rat, the five 5d_rat noOutliers animals), `check-data` fails if any differs, and `stage` copies only
+# those datasets and re-verifies the copy. Spinal is deliberately not in the manifest: the copy in shared_data/ (1.6 GB)
+# differs from the local one (3.9 GB), and spinal is deferred; add it to the manifest once its canonical version is chosen.
 #
 # Env: CODE_DIR, SCRATCH_ROOT, DATA_MASTER, plus everything scripts/cluster.sh reads (VENV_ROOT, NARVAL_STDENV,
 # PY_MAIN, PY_BENCH). Nothing in this script deletes anything.
@@ -37,7 +39,7 @@ CODE_DIR="${CODE_DIR:-$(pwd)}"
 SCRATCH_ROOT="${SCRATCH_ROOT:-${HOME}/scratch/pfns4neurostim}"
 PROJECTS_ROOT="${PROJECTS_ROOT:-${HOME}/projects/def-bonizzat/mauriv/my-projects}"
 DATA_MASTER="${DATA_MASTER:-${PROJECTS_ROOT}/shared_data}"
-ADDITIVE_DATASETS="${ADDITIVE_DATASETS:-${PROJECTS_ROOT}/additive_neurostim/datasets}"
+MANIFEST="${MANIFEST:-${CODE_DIR}/scripts/data_manifest.sha256}"
 
 log() { printf '[narval_setup] %s\n' "$*"; }
 
@@ -90,33 +92,31 @@ cmd_layout() {
   done
 }
 
-cmd_shared_data() {
-  # Link the datasets that already live in additive_neurostim into shared_data/ under the names this project loads
-  # (data/monkeys, data/rat, data/5d_rat/<animal>/5D_step4_OutliersRemoved.mat). Symlinks only: nothing is copied,
-  # moved, replaced or deleted, and the other project's tree is only read.
-  [ -d "${ADDITIVE_DATASETS}" ] || { log "ERROR: ${ADDITIVE_DATASETS} not found."; exit 1; }
-  mkdir -p "${DATA_MASTER}/5d_rat"
-  link() {   # link <target> <link>
-    [ -e "$1" ] || { log "ERROR: link target missing: $1"; exit 1; }
-    if [ -L "$2" ]; then log "link exists: $2 -> $(readlink "$2")"
-    elif [ -e "$2" ]; then log "WARNING: $2 exists and is not a symlink; leaving it untouched."
-    else ln -s "$1" "$2"; log "linked $2 -> $1"
-    fi
-  }
-  link "${ADDITIVE_DATASETS}/nhp" "${DATA_MASTER}/monkeys"
-  link "${ADDITIVE_DATASETS}/rat" "${DATA_MASTER}/rat"
-  local cohort="${ADDITIVE_DATASETS}/5d_rat/datasets_noOutliers/datasets_noOutliers" animal
-  for animal in BCI00 rCer1.5 rCer1.12 rCer1.14 rCer1.15; do
-    link "${cohort}/${animal}" "${DATA_MASTER}/5d_rat/${animal}"
-  done
-  log "spinal is not linked (the copy in additive_neurostim differs from the local one); upload it separately when needed."
+verify_manifest() {   # verify_manifest <data root>: every manifest file must exist there with the recorded sha256
+  [ -f "${MANIFEST}" ] || { log "ERROR: ${MANIFEST} not found."; exit 1; }
+  if (cd "$1" && sha256sum -c --quiet "${MANIFEST}" > /dev/null 2>&1); then
+    log "data OK: $(wc -l < "${MANIFEST}") files in $1 match scripts/data_manifest.sha256"
+  else
+    log "ERROR: data in $1 differs from scripts/data_manifest.sha256. Files that do not match:"
+    (cd "$1" && sha256sum -c "${MANIFEST}" 2>&1 | grep -v ': OK$' || true) | sed 's/^/  /'
+    log "Another project may have changed them. Do not stage or run until this is understood."
+    exit 1
+  fi
 }
 
+cmd_check_data() { verify_manifest "${DATA_MASTER}"; }
+
 cmd_stage() {
-  [ -n "$(ls -A "${DATA_MASTER}" 2>/dev/null)" ] || { log "ERROR: ${DATA_MASTER} is empty; upload the data master first (see the header)."; exit 1; }
-  log "restoring ${DATA_MASTER} -> ${SCRATCH_ROOT}/data"
-  rsync -aL --info=progress2 "${DATA_MASTER}/" "${SCRATCH_ROOT}/data/"   # -L: copy what the symlinks point at
-  du -sh "${SCRATCH_ROOT}/data"
+  # Copy only the datasets this project loads, never the whole of shared_data/ (it also holds other projects' data), then verify.
+  verify_manifest "${DATA_MASTER}"
+  local dirs; dirs=$(awk -F'[ *]+' '{print $NF}' "${MANIFEST}" | xargs -n1 dirname | sort -u)
+  local d
+  for d in ${dirs}; do
+    mkdir -p "${SCRATCH_ROOT}/data/${d}"
+    log "staging ${d}"
+    rsync -a "${DATA_MASTER}/${d}/" "${SCRATCH_ROOT}/data/${d}/"
+  done
+  verify_manifest "${SCRATCH_ROOT}/data"
 }
 
 cmd_submodules() {
@@ -232,7 +232,7 @@ cmd_verify() {
 
 case "${1:-}" in
   layout) cmd_layout ;;
-  shared-data) cmd_shared_data ;;
+  check-data) cmd_check_data ;;
   stage) cmd_stage ;;
   submodules) cmd_submodules ;;
   env) cmd_env "${2:-main}" ;;

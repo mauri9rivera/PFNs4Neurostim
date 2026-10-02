@@ -11,7 +11,7 @@
 #   bash scripts/narval.sh run -- <read-only cmd>
 #   bash scripts/narval.sh pull [subpath under output/]              # results Narval -> local (scripts/export_results.sh)
 #   bash scripts/narval.sh do pull                                   # git pull --ff-only + submodule update in the cluster checkout
-#   bash scripts/narval.sh do setup <layout|stage|submodules|shared-data|env|install|weights|verify> [main|bench|v1] [models]
+#   bash scripts/narval.sh do setup <layout|stage|submodules|check-data|env|install|weights|verify> [main|bench|v1] [models]
 #   bash scripts/narval.sh do sbatch <gpu|cpu> [--lanes N] [--conda-env E] [--gpu-type T] [--mem M] [--cpus C] [--time T]
 #                                    [--dependency afterany:ID[:ID]] [--job-name N] -- <scripts/run_*.sh> <args...>
 #
@@ -53,7 +53,7 @@ do_pull() {
 
 do_setup() {   # do_setup <subcommand> [env] [models]
   local sub="${1:?usage: do setup <subcommand> [main|bench|v1] [models]}"; shift
-  need subcommand "${sub}" '^(layout|stage|submodules|shared-data|env|install|weights|verify)$'
+  need subcommand "${sub}" '^(layout|stage|submodules|check-data|env|install|weights|verify)$'
   local args=""
   for a in "$@"; do need argument "${a}" '^[A-Za-z0-9_,.-]+$'; args+=" ${a}"; done
   remote_do "setup ${sub}" "cd ${REMOTE_CODE_DIR} && bash scripts/narval_setup.sh ${sub}${args}"
