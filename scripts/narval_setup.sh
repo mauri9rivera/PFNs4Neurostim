@@ -168,7 +168,16 @@ cmd_env() {
   log "installing $(grep -cv '^--' "${req}") pinned packages from ${file}"
   # Alliance's wheelhouse is searched first via its pip config; pins it does not carry come from PyPI / the torch
   # index on the login node. A pin that resolves to neither fails here, loudly, not inside a job.
+  # pfns4bo 0.1.5 declares scikit-learn<1.2 while the stack pins 1.6.1 (CLAUDE.md section 3). The conda environments on Mila and
+  # locally carry exactly this conflict (`pip check` reports it) and PFNs4BO runs on them, but pip's resolver refuses it. So the
+  # package goes in last with --no-deps, together with the two packages it would pull in at the versions those environments have.
+  local nodeps; nodeps=$(grep -E '^pfns4bo==' "${req}" || true)
+  if [ -n "${nodeps}" ]; then grep -vE '^pfns4bo==' "${req}" > "${req}.main" && mv "${req}.main" "${req}"; fi
   pip install -r "${req}"
+  if [ -n "${nodeps}" ]; then
+    pip install --no-deps "${nodeps}" "bayesmark==0.0.8" "configspace==1.2.2"
+    pip install pyparsing more_itertools typing_extensions requests
+  fi
   rm -f "${req}"
   cmd_install "${which}"
 }
