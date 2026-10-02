@@ -13,15 +13,17 @@
 # Usage (Narval LOGIN node, repo root). Login nodes have internet; compute nodes do not, so environments are built
 # HERE, not in a job (unlike Mila's setup_env_job.sh). A venv build is light enough for a login node.
 #   bash scripts/narval_setup.sh layout       # scratch dirs + data/ output/ logs/ symlinks in the checkout
-#   bash scripts/narval_setup.sh stage        # data master (project) -> scratch working copy
+#   bash scripts/narval_setup.sh shared-data  # shared_data/ of SYMLINKS to datasets already on the cluster (no copy, nothing moved)
+#   bash scripts/narval_setup.sh stage        # data master (shared_data/) -> scratch working copy (symlinks followed)
 #   bash scripts/narval_setup.sh submodules   # git submodule update --init --recursive (+ ticl excludes)
 #   bash scripts/narval_setup.sh env [main|bench|v1]   # build/update the virtualenv from environment*.yml
 #   bash scripts/narval_setup.sh install [main|bench|v1]   # only pip install -e . --no-deps
 #   bash scripts/narval_setup.sh verify       # layout, quotas, imports
 #   bash scripts/narval_setup.sh weights [main|bench|v1] [models]   # pre-download checkpoints (compute nodes are offline)
 #
-# The data master is uploaded once from your machine (it never comes from git):
-#   rsync -av data/ narval:~/projects/def-bonizzat/mauriv/my-projects/pfns4neurostim_data/
+# The data master is shared_data/ next to the projects. NHP, rat and the 5d_rat noOutliers cohort already exist inside
+# additive_neurostim/datasets (checked byte-identical to the local copies on 2026-10-02), so `shared-data` only links them;
+# that project is never modified. Spinal differs there (1.6 GB against 3.9 GB local) and is NOT linked: upload it when needed.
 #
 # Env: CODE_DIR, SCRATCH_ROOT, DATA_MASTER, plus everything scripts/cluster.sh reads (VENV_ROOT, NARVAL_STDENV,
 # PY_MAIN, PY_BENCH). Nothing in this script deletes anything.
@@ -33,7 +35,9 @@ source scripts/cluster.sh
 
 CODE_DIR="${CODE_DIR:-$(pwd)}"
 SCRATCH_ROOT="${SCRATCH_ROOT:-${HOME}/scratch/pfns4neurostim}"
-DATA_MASTER="${DATA_MASTER:-${HOME}/projects/def-bonizzat/mauriv/my-projects/pfns4neurostim_data}"
+PROJECTS_ROOT="${PROJECTS_ROOT:-${HOME}/projects/def-bonizzat/mauriv/my-projects}"
+DATA_MASTER="${DATA_MASTER:-${PROJECTS_ROOT}/shared_data}"
+ADDITIVE_DATASETS="${ADDITIVE_DATASETS:-${PROJECTS_ROOT}/additive_neurostim/datasets}"
 
 log() { printf '[narval_setup] %s\n' "$*"; }
 
@@ -86,10 +90,32 @@ cmd_layout() {
   done
 }
 
+cmd_shared_data() {
+  # Link the datasets that already live in additive_neurostim into shared_data/ under the names this project loads
+  # (data/monkeys, data/rat, data/5d_rat/<animal>/5D_step4_OutliersRemoved.mat). Symlinks only: nothing is copied,
+  # moved, replaced or deleted, and the other project's tree is only read.
+  [ -d "${ADDITIVE_DATASETS}" ] || { log "ERROR: ${ADDITIVE_DATASETS} not found."; exit 1; }
+  mkdir -p "${DATA_MASTER}/5d_rat"
+  link() {   # link <target> <link>
+    [ -e "$1" ] || { log "ERROR: link target missing: $1"; exit 1; }
+    if [ -L "$2" ]; then log "link exists: $2 -> $(readlink "$2")"
+    elif [ -e "$2" ]; then log "WARNING: $2 exists and is not a symlink; leaving it untouched."
+    else ln -s "$1" "$2"; log "linked $2 -> $1"
+    fi
+  }
+  link "${ADDITIVE_DATASETS}/nhp" "${DATA_MASTER}/monkeys"
+  link "${ADDITIVE_DATASETS}/rat" "${DATA_MASTER}/rat"
+  local cohort="${ADDITIVE_DATASETS}/5d_rat/datasets_noOutliers/datasets_noOutliers" animal
+  for animal in BCI00 rCer1.5 rCer1.12 rCer1.14 rCer1.15; do
+    link "${cohort}/${animal}" "${DATA_MASTER}/5d_rat/${animal}"
+  done
+  log "spinal is not linked (the copy in additive_neurostim differs from the local one); upload it separately when needed."
+}
+
 cmd_stage() {
   [ -n "$(ls -A "${DATA_MASTER}" 2>/dev/null)" ] || { log "ERROR: ${DATA_MASTER} is empty; upload the data master first (see the header)."; exit 1; }
   log "restoring ${DATA_MASTER} -> ${SCRATCH_ROOT}/data"
-  rsync -a --info=progress2 "${DATA_MASTER}/" "${SCRATCH_ROOT}/data/"
+  rsync -aL --info=progress2 "${DATA_MASTER}/" "${SCRATCH_ROOT}/data/"   # -L: copy what the symlinks point at
   du -sh "${SCRATCH_ROOT}/data"
 }
 
@@ -197,6 +223,7 @@ cmd_verify() {
 
 case "${1:-}" in
   layout) cmd_layout ;;
+  shared-data) cmd_shared_data ;;
   stage) cmd_stage ;;
   submodules) cmd_submodules ;;
   env) cmd_env "${2:-main}" ;;
