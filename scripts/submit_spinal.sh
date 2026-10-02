@@ -5,9 +5,12 @@
 # jobs (--dependency=afterany, so a partial unit still assembles). All jobs of an experiment share ONE run directory:
 # they compute cells (--compute-only) and leave a provenance record in <run_dir>/shards/; the assemble job writes
 # tidy.csv, tables and figures. The agent never submits: you run this ONCE on the login node. Jobs beyond the
-# per-user caps (2 GPUs on `main`, 8 CPUs on `main-cpu`) wait in the queue. Watch with `squeue --me`.
+# per-user caps (on Mila: 2 GPUs on `main`, 8 CPUs on `main-cpu`) wait in the queue. Watch with `squeue --me`.
+# Runs unchanged on Mila and Narval: the cluster-specific sbatch flags come from scripts/cluster.sh.
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
+read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"
+read -r -a CPU_FLAGS <<< "$(bash scripts/cluster.sh flags cpu)"
 
 # submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> [overrides...]
 submit_unit() {
@@ -16,22 +19,23 @@ submit_unit() {
   local extra=("$@") memflag=()
   if [ "$mem" != "-" ]; then memflag=(--mem="$mem"); fi
   if [ "$gpu" != "-" ]; then
-    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})
+    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})
     deps="$deps:${id%%;*}"
   fi
   if [ "$cpu" != "-" ]; then
-    id=$(CONDA_ENV="$env" sbatch --parsable scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})
+    id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})
     deps="$deps:${id%%;*}"
   fi
-  id=$(CONDA_ENV="$env" sbatch --parsable --dependency="afterany$deps" scripts/run_assemble.sh "$exp" "$cfg" ${extra[@]+"${extra[@]}"})
+  id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} --dependency="afterany$deps" scripts/run_assemble.sh "$exp" "$cfg" ${extra[@]+"${extra[@]}"})
   echo "submitted: $name  (assemble job ${id%%;*} runs after$deps)"
 }
 
 # submit_single <name> <experiment> <config> <env> <script> [overrides...]   (one process, writes its own outputs)
 submit_single() {
-  local name="$1" exp="$2" cfg="$3" env="$4" script="$5" id
+  local name="$1" exp="$2" cfg="$3" env="$4" script="$5" id flags=(${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"})
   shift 5
-  id=$(CONDA_ENV="$env" sbatch --parsable "$script" "$exp" "$cfg" "$@")
+  case "$script" in *_cpu.sh) flags=(${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"}) ;; esac
+  id=$(CONDA_ENV="$env" sbatch --parsable ${flags[@]+"${flags[@]}"} "$script" "$exp" "$cfg" "$@")
   echo "submitted: $name  (job ${id%%;*})"
 }
 
@@ -45,8 +49,8 @@ submit_unit "P8. K6 electrode failure, spinal" stress_sweep scripts/run_stress_s
 submit_unit "P9. K6 budget, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "P10. Demo 1 K2-channel, spinal twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_demo1_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "P11. Demo 1 K1 decoy, spinal twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "16G"
-submit_unit "P14. PFNs4BO (native policy), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim "pfns4bo" "-" 2 "12G"
+submit_unit "P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "8G"
+submit_unit "P14. PFNs4BO (native policy), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim "pfns4bo" "-" 2 "-"
 submit_unit "P15. TabFM, spinal (fixed wrapper)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabfm" "-" 2 "24G"
 submit_unit "P16. TabPFN v1 (classification-head adaptation), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-v1 "tabpfn_v1" "-" 2 "12G"
 

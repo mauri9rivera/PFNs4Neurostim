@@ -22,7 +22,10 @@ MILA_HOST="${MILA_HOST:-mila}"
 MILA_SOCKET="${MILA_SOCKET:-$HOME/.ssh/cm-mila.sock}"
 MILA_REMOTE_ROOT="${MILA_REMOTE_ROOT:-\$SCRATCH/pfns4neurostim}"
 #: Where the clone with logs/ lives (the job scripts cd into it), as opposed to the scratch data root.
-MILA_REMOTE_REPO="${MILA_REMOTE_REPO:-~/projects/PFNs4Neurostim}"
+# Overridden by scripts/narval.sh, which reuses this file for Narval.
+REMOTE_CODE_DIR="${REMOTE_CODE_DIR:-~/projects/PFNs4Neurostim}"
+REMOTE_QUOTA_CMD="${REMOTE_QUOTA_CMD:-disk-quota}"
+MILA_REMOTE_REPO="${MILA_REMOTE_REPO:-${REMOTE_CODE_DIR}}"
 # Defence in depth: `run` refuses anything that mutates state or submits work.
 MILA_DENY_REGEX='(^|[;&|[:space:]])(sbatch|salloc|srun|scancel|scontrol|rm|mv|cp|chmod|kill|pkill|tee|dd)([[:space:]]|$)|pip[[:space:]]+(install|uninstall)|conda[[:space:]]+(create|install|remove|update|uninstall|env[[:space:]]+(create|update|remove))|>'
 
@@ -102,13 +105,15 @@ cmd_share() {
 }
 
 cmd_avail() { remote 'sinfo -o "%P %a %l %D %G" | head -20; savail 2>/dev/null || true'; }
-cmd_quota() { remote 'disk-quota'; }
+cmd_quota() { remote "${REMOTE_QUOTA_CMD}"; }
 
 cmd_submit() {
   local script="${1:?usage: submit <script> <config> [extra args]}" config="${2:?missing config}"
   shift 2
   log "The agent never submits. Run this on the login node:"
-  printf 'cd ~/projects/PFNs4Neurostim && sbatch %s %s %s\n' "${script}" "${config}" "$*"
+  local kind=gpu
+  case "${script}" in *cpu*|*assemble*) kind=cpu ;; esac
+  printf 'cd %s && sbatch $(bash scripts/cluster.sh flags %s) %s %s %s\n' "${REMOTE_CODE_DIR}" "${kind}" "${script}" "${config}" "$*"
 }
 
 sub="${1:-}"; shift || true

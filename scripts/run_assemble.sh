@@ -8,7 +8,7 @@
 #SBATCH --job-name=assemble
 #SBATCH --output=logs/assemble_%j.out
 #SBATCH --error=logs/assemble_%j.err
-#SBATCH --partition=main-cpu
+# Partition/account/GPU type are cluster-specific and come from the command line: sbatch $(bash scripts/cluster.sh flags cpu) ...
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G

@@ -2,7 +2,7 @@
 # Shared helpers for the SLURM dispatchers (sourced, never run directly).
 #
 #   source "${SLURM_SUBMIT_DIR:-$PWD}/scripts/_job_common.sh"
-#   job_activate                       # conda env: $CONDA_ENV (default pfns4neurostim)
+#   job_activate                       # env $CONDA_ENV (default pfns4neurostim): conda on Mila, venv on Narval
 #   job_stage_data "${CONFIG}"         # copies the dataset to $SLURM_TMPDIR, sets STAGED_ROOT
 #   job_dispatch bo_benchmark "${CONFIG}" "${OVERRIDES[@]}"    # LANES=N (default 1) processes
 #
@@ -12,15 +12,13 @@
 # `job_run` forwards it to the experiment, then requeues the job. Every finished cell is
 # already in the cell cache (output/cells), so the requeued job resumes where this one stopped.
 
+# shellcheck disable=SC1091
+source "${REPO_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}/scripts/cluster.sh"
+
 job_activate() {
-  # `module` and `conda activate` reference unset variables, so they abort under `set -u`
-  # (observed on Mila, job scripts patched by hand on 2026-09-18).
-  set +u
-  module load anaconda/3
-  # shellcheck disable=SC1091
-  conda activate "${CONDA_ENV:-pfns4neurostim}"
-  set -u
-  echo "[job] env=${CONDA_ENV:-pfns4neurostim} python=$(python --version 2>&1)"
+  # Mila: conda env; Narval: module Python + virtualenv of the same name (scripts/cluster.sh).
+  cluster_activate "${CONDA_ENV:-pfns4neurostim}"
+  echo "[job] cluster=${CLUSTER} env=${CONDA_ENV:-pfns4neurostim} python=$(python --version 2>&1)"
 }
 
 job_stage_data() {

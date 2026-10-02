@@ -65,7 +65,7 @@ GPU_LANES = 4
 CPU_LANES = 8
 #: Default --mem of the job scripts (run_bo_benchmark.sh / run_stress_sweep.sh); a unit states --mem only
 #: when its models need more than this.
-DEFAULT_JOB_MEM_GB = 10
+DEFAULT_JOB_MEM_GB = 7
 BENCH_ENV = "pfns4neurostim-bench"
 MAIN_ENV = "pfns4neurostim"
 V1_ENV = "pfns4neurostim-v1"    # tabpfn<2; cannot share an interpreter with the pinned 6.3.2
@@ -388,9 +388,12 @@ def emit_bash(group: str) -> None:
     print("# jobs (--dependency=afterany, so a partial unit still assembles). All jobs of an experiment share ONE run directory:")
     print("# they compute cells (--compute-only) and leave a provenance record in <run_dir>/shards/; the assemble job writes")
     print("# tidy.csv, tables and figures. The agent never submits: you run this ONCE on the login node. Jobs beyond the")
-    print("# per-user caps (2 GPUs on `main`, 8 CPUs on `main-cpu`) wait in the queue. Watch with `squeue --me`.")
+    print("# per-user caps (on Mila: 2 GPUs on `main`, 8 CPUs on `main-cpu`) wait in the queue. Watch with `squeue --me`.")
+    print("# Runs unchanged on Mila and Narval: the cluster-specific sbatch flags come from scripts/cluster.sh.")
     print("set -euo pipefail")
     print('cd "${SLURM_SUBMIT_DIR:-$PWD}"')
+    print('read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"')
+    print('read -r -a CPU_FLAGS <<< "$(bash scripts/cluster.sh flags cpu)"')
     print("")
     print("# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> [overrides...]")
     print("submit_unit() {")
@@ -399,22 +402,23 @@ def emit_bash(group: str) -> None:
     print('  local extra=("$@") memflag=()')
     print('  if [ "$mem" != "-" ]; then memflag=(--mem="$mem"); fi')
     print('  if [ "$gpu" != "-" ]; then')
-    print('    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})')
+    print('    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})')
     print('    deps="$deps:${id%%;*}"')
     print("  fi")
     print('  if [ "$cpu" != "-" ]; then')
-    print('    id=$(CONDA_ENV="$env" sbatch --parsable scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})')
+    print('    id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})')
     print('    deps="$deps:${id%%;*}"')
     print("  fi")
-    print('  id=$(CONDA_ENV="$env" sbatch --parsable --dependency="afterany$deps" scripts/run_assemble.sh "$exp" "$cfg" ${extra[@]+"${extra[@]}"})')
+    print('  id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} --dependency="afterany$deps" scripts/run_assemble.sh "$exp" "$cfg" ${extra[@]+"${extra[@]}"})')
     print('  echo "submitted: $name  (assemble job ${id%%;*} runs after$deps)"')
     print("}")
     print("")
     print("# submit_single <name> <experiment> <config> <env> <script> [overrides...]   (one process, writes its own outputs)")
     print("submit_single() {")
-    print('  local name="$1" exp="$2" cfg="$3" env="$4" script="$5" id')
+    print('  local name="$1" exp="$2" cfg="$3" env="$4" script="$5" id flags=(${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"})')
     print("  shift 5")
-    print('  id=$(CONDA_ENV="$env" sbatch --parsable "$script" "$exp" "$cfg" "$@")')
+    print('  case "$script" in *_cpu.sh) flags=(${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"}) ;; esac')
+    print('  id=$(CONDA_ENV="$env" sbatch --parsable ${flags[@]+"${flags[@]}"} "$script" "$exp" "$cfg" "$@")')
     print('  echo "submitted: $name  (job ${id%%;*})"')
     print("}")
     print("")

@@ -14,12 +14,12 @@
 #SBATCH --job-name=cpu-lanes
 #SBATCH --output=logs/cpu_%j.out
 #SBATCH --error=logs/cpu_%j.err
-#SBATCH --partition=main-cpu
+# Partition/account/GPU type are cluster-specific and come from the command line: sbatch $(bash scripts/cluster.sh flags cpu) ...
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@300
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
+#SBATCH --mem=9G
 #SBATCH --time=12:00:00
 set -euo pipefail
 

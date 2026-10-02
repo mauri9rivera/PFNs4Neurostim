@@ -13,13 +13,13 @@
 #SBATCH --job-name=stress
 #SBATCH --output=logs/stress_%j.out
 #SBATCH --error=logs/stress_%j.err
-#SBATCH --partition=main
+# Partition/account/GPU type are cluster-specific and come from the command line: sbatch $(bash scripts/cluster.sh flags gpu) ...
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@300
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
-#SBATCH --mem=10G
+#SBATCH --mem=7G
 #SBATCH --time=12:00:00
 set -euo pipefail
 

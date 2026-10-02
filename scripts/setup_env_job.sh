@@ -10,10 +10,10 @@
 #SBATCH --job-name=setup-env
 #SBATCH --output=logs/setup_%j.out
 #SBATCH --error=logs/setup_%j.err
-#SBATCH --partition=main-cpu
+# Partition/account/GPU type are cluster-specific and come from the command line: sbatch $(bash scripts/cluster.sh flags cpu) ...
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=32G
 #SBATCH --time=01:30:00
 set -euo pipefail
 

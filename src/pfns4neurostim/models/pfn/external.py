@@ -132,7 +132,7 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         route="native",
         source="https://github.com/automl/PFNs4BO",
         weights="PFNs4BO/pfns4bo/final_models/model_hebo_morebudget_9_unused_features_3.pt.gz",
-        mem_per_lane_gb=3.0,
+        mem_per_lane_gb=1.0,   # measured 2.9 GB peak for the whole NHP job (Mila 2026-10-01) + headroom
         max_lanes=4,
         notes="Vendored weights in libs/PFNs4BO/pfns4bo/final_models/*.pt.gz; pip pkg installed (0.1.5).",
     ),
@@ -193,7 +193,7 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         python_min=(3, 10),
         repo_subdir="tabicl/src",
         env="bench",
-        mem_per_lane_gb=4.0,
+        mem_per_lane_gb=2.0,   # measured 5.8 GB peak for 4 lanes with TabPFN-2.5 (Mila 2026-10-01) + headroom
         max_lanes=4,
         notes=(
             "Vendored as libs/tabicl at tag v2.2.0 (2026-09-20). **Route corrected**: "

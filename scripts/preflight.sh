@@ -18,7 +18,9 @@ STAGE_FILTER="${1:-all}"
 PASS=0
 FAIL=0
 
-if ! command -v conda >/dev/null 2>&1; then set +u; module load anaconda/3 >/dev/null 2>&1 || true; set -u; fi
+# shellcheck disable=SC1091
+source scripts/cluster.sh          # CLUSTER, cluster_env_python, cluster_setup_script
+SETUP="bash $(cluster_setup_script)"
 
 say() {   # say <ok|no|note> <what> <detail>
   case "$1" in
@@ -60,25 +62,20 @@ check_data() {   # check_data <dataset> <subdir>
     size=$(du -sh "data/${subdir}" 2>/dev/null | cut -f1)
     say ok "data/${subdir} (${name})" "present, ${size}"
   else
-    say no "data/${subdir} (${name})" "missing — bash scripts/mila_setup.sh stage"
+    say no "data/${subdir} (${name})" "missing — ${SETUP} stage"
   fi
 }
 
 # ---------------------------------------------------------------- environments
 check_env() {   # check_env <env name> <models to import, comma separated>
-  local env="$1" models="$2" prefix py out
-  prefix=$(conda env list 2>/dev/null | awk -v e="${env}" '$1 == e {print $NF}' | head -1)
-  if [ -z "${prefix}" ]; then
-    say no "env ${env}" "not built — bash scripts/mila_setup.sh env ${env##*-}"
-    return
-  fi
-  # The env's interpreter is called DIRECTLY, never through `conda run`: in a non-interactive login shell
-  # conda run returns no output at all, which read as a blocked environment on a perfectly good one
-  # (2026-09-30). The same lesson is recorded for clean_mila_results.sh.
-  py="${prefix}/bin/python"
-  [ -x "${py}" ] || py="${prefix}/python.exe"          # Windows layout, for a local dry run
-  if [ ! -x "${py}" ]; then
-    say no "env ${env}" "no interpreter at ${prefix}/bin/python"
+  local env="$1" models="$2" py out which
+  which="${env##*-}"; [ "${env}" = "pfns4neurostim" ] && which=main
+  # The env's interpreter is called DIRECTLY (conda env on Mila, virtualenv on Narval), never through `conda run`:
+  # in a non-interactive login shell conda run returns no output at all, which read as a blocked environment on a
+  # perfectly good one (2026-09-30). The same lesson is recorded for clean_mila_results.sh.
+  py=$(cluster_env_python "${env}")
+  if [ -z "${py}" ]; then
+    say no "env ${env}" "not built — ${SETUP} env ${which}"
     return
   fi
   out=$("${py}" -c "

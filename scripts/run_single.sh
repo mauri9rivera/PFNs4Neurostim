@@ -9,7 +9,7 @@
 #SBATCH --job-name=single
 #SBATCH --output=logs/single_%j.out
 #SBATCH --error=logs/single_%j.err
-#SBATCH --partition=main
+# Partition/account/GPU type are cluster-specific and come from the command line: sbatch $(bash scripts/cluster.sh flags gpu) ...
 #SBATCH --signal=B:USR1@300
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
