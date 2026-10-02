@@ -61,6 +61,45 @@ def test_update_rule_runner_writes_tables_gates_and_figures(tmp_path, tiny) -> N
     assert os.path.exists(os.path.join(out, "kernel_properties.svg"))
 
 
+def test_fixed_reference_runs_end_to_end_and_is_recorded(tmp_path, tiny) -> None:
+    """reference_gp: fixed measures every arm against the GP-fixed kernel (no fitting); the GP-fixed arm is then identical to
+    the reference by construction, and the choice is written into the rows and the exemplar so figures label it."""
+    cfg = _config(tmp_path, """
+        analysis: update_rule
+        update_rule:
+          engines: [gp_fixed_frozen, gp_mll_frozen]
+          reference_gp: fixed
+          context_sizes: [10]
+          stress: {knob: k2_channel, levels: [1.0]}
+          n_context_draws: 1
+          n_anchors: 4
+          gp_params: {n_opt_steps: 20, lr: 0.1}
+          positive_control: {grid_side: 7, lengthscale: 0.25, noise_sd: 0.3, n_trials: 6}
+          exemplar: {context_ts: [10], level: 1.0, draw: 0, anchor_stratum: centre, select: first, subject: null, emg: null}
+    """)
+    out = mechanism.run_mechanism(cfg)
+    cell = pd.read_csv(os.path.join(out, "update_rule_cell.csv"))
+    assert set(cell["reference_gp"]) == {"fixed"}
+    fixed_arm = cell[cell["engine"] == "gp_fixed_frozen"]
+    assert (fixed_arm["rho_shape_median"] > 0.99).all()           # the reference measured against itself
+    assert np.load(os.path.join(out, "update_rule_exemplar.npz"))["reference_gp"] == "fixed"
+    assert os.path.exists(os.path.join(out, "shape_vs_context.svg"))
+
+
+def test_make_reference_and_fixed_engine_use_the_fixed_hyperparameters() -> None:
+    from pfns4neurostim.models.gp.surrogates import GPSurrogate, NaiveGPSurrogate
+
+    p = {**mechanism.UPDATE_RULE_DEFAULTS, "reference_gp": "fixed"}
+    ref = mechanism._make_reference(p)
+    assert isinstance(ref.gp, NaiveGPSurrogate)
+    assert (ref.gp._lengthscale, ref.gp._outputscale, ref.gp._noise) == (0.2, 1.0, 0.01)
+    arm = mechanism._make_engine("gp_fixed_frozen", p, "cpu", 0)
+    assert isinstance(arm.gp, NaiveGPSurrogate)
+    assert type(mechanism._make_reference({**p, "reference_gp": "mll"}).gp) is GPSurrogate
+    with pytest.raises(ValueError, match="reference_gp"):
+        mechanism._make_reference({**p, "reference_gp": "bogus"})
+
+
 def test_unknown_block_key_raises(tmp_path, tiny) -> None:
     cfg = _config(tmp_path, """
         analysis: update_rule

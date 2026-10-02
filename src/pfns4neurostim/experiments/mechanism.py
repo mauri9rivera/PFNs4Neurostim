@@ -168,6 +168,13 @@ UPDATE_RULE_DEFAULTS: dict[str, Any] = {
     "surprises": [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0],
     "refit_surprises": [-1.0, -0.5, 0.5, 1.0],
     "gp_params": {"n_opt_steps": 100, "lr": 0.1},
+    # Which GP every metric is measured against (rho_shape, the surprise-response reference, the exemplar's GP row):
+    # ``mll`` is the converged type-II ML GP of ``gp_params``; ``fixed`` is the GP-fixed arm of the paper (no fitting,
+    # the hyperparameters of ``fixed_gp_params``). Added 2026-10-02 because the converged fit can drive one ARD
+    # lengthscale to ~0 and another to ~1e4 on a 10-point context, which makes the GP update a one-column stripe.
+    "reference_gp": "mll",
+    # Keep in step with configs/model/gp_naive.yaml by hand: the engines build the surrogate directly.
+    "fixed_gp_params": {"lengthscale": 0.2, "outputscale": 1.0, "noise": 0.01},
     "inference_seed": 0,
     "max_batch_tokens": 400000,
     # Secondary layer-wise arm. ``context_ts`` is a LIST since 2026-09-30: the layer profile is a property
@@ -229,7 +236,7 @@ def _make_engine(name: str, p: dict[str, Any], device: str, inference_seed: int)
     """Build one update engine by name.
 
     Args:
-        name: ``'tabpfn_v2_5'``, ``'gp_mll_frozen'`` or ``'gp_mll_refit'``.
+        name: ``'tabpfn_v2_5'``, ``'gp_mll_frozen'``, ``'gp_mll_refit'`` or ``'gp_fixed_frozen'``.
         p: Resolved ``update_rule`` block.
         device: Torch device for TabPFN.
         inference_seed: TabPFN preprocessing seed.
@@ -238,7 +245,7 @@ def _make_engine(name: str, p: dict[str, Any], device: str, inference_seed: int)
         The engine.
     """
     from ..analysis import update_rule as U  # noqa: PLC0415
-    from ..models.gp.surrogates import GPSurrogate  # noqa: PLC0415
+    from ..models.gp.surrogates import GPSurrogate, NaiveGPSurrogate  # noqa: PLC0415
 
     if name == "tabpfn_v2_5":
         return U.PFNEngine(device=device, random_state=inference_seed,
@@ -247,7 +254,33 @@ def _make_engine(name: str, p: dict[str, Any], device: str, inference_seed: int)
         return U.GPFrozenEngine(GPSurrogate(**p["gp_params"]), name=name)
     if name == "gp_mll_refit":
         return U.GPRefitEngine(GPSurrogate(**p["gp_params"]), name=name)
+    if name == "gp_fixed_frozen":
+        return U.GPFrozenEngine(NaiveGPSurrogate(**p["fixed_gp_params"]), name=name)
     raise ValueError(f"Unknown update_rule engine {name!r}.")
+
+
+def _make_reference(p: dict[str, Any], name: str = "reference") -> Any:
+    """The frozen GP every update is measured against, chosen by ``update_rule.reference_gp``.
+
+    Args:
+        p: Resolved ``update_rule`` block.
+        name: Engine name (``'reference'`` inside the grid).
+
+    Returns:
+        A :class:`GPFrozenEngine`: the converged ML GP for ``'mll'``, the fixed-kernel GP-fixed for ``'fixed'``.
+
+    Raises:
+        ValueError: For any other ``reference_gp``.
+    """
+    from ..analysis import update_rule as U  # noqa: PLC0415
+    from ..models.gp.surrogates import GPSurrogate, NaiveGPSurrogate  # noqa: PLC0415
+
+    kind = p["reference_gp"]
+    if kind == "mll":
+        return U.GPFrozenEngine(GPSurrogate(**p["gp_params"]), name=name)
+    if kind == "fixed":
+        return U.GPFrozenEngine(NaiveGPSurrogate(**p["fixed_gp_params"]), name=name)
+    raise ValueError(f"update_rule.reference_gp must be 'mll' or 'fixed', got {kind!r}.")
 
 
 def run_update_rule(cfg: MechanismConfig, replot: bool = False) -> str:
@@ -298,12 +331,12 @@ def run_update_rule(cfg: MechanismConfig, replot: bool = False) -> str:
                         ctx = context_for(stressed, int(t), draw, base_seed=cfg.seed, level=float(level))
                         rng = rng_for(ch.label, "update_rule", level, t, draw, base_seed=cfg.seed)
                         anchors, strata = U.select_anchors(stressed, int(p["n_anchors"]), rng, exclude=ctx.sites)
-                        reference = U.GPFrozenEngine(GPSurrogate(**p["gp_params"]), name="reference")
+                        reference = _make_reference(p)
                         reference.fit(ctx.X, ctx.y)
                         keys = {
                             "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
                             "knob": knob.name, "level": float(level), "achieved_snr_db": snr,
-                            "context_t": int(t), "draw": draw,
+                            "context_t": int(t), "draw": draw, "reference_gp": p["reference_gp"],
                         }
                         for name, engine in engines.items():
                             surprises = p["refit_surprises"] if name == "gp_mll_refit" else p["surprises"]
@@ -369,7 +402,7 @@ def run_update_rule(cfg: MechanismConfig, replot: bool = False) -> str:
             gates.append({**_positive(eng), "role": "model"})
             if channels:
                 gates.append({**U.negative_control(
-                    eng, U.GPFrozenEngine(GPSurrogate(**p["gp_params"])), channels[0],
+                    eng, _make_reference(p), channels[0],
                     t=min(g["context_t"], channels[0].n_sites - 1), n_anchors=int(p["n_anchors"]),
                     surprises=p["surprises"], null_quantile=g["null_quantile"], seed=cfg.seed,
                 ), "channel": channels[0].label})
@@ -379,7 +412,7 @@ def run_update_rule(cfg: MechanismConfig, replot: bool = False) -> str:
             for ch in channels[: int(p["seed_floor"]["n_channels"])]:
                 gates.append({**U.seed_floor(
                     lambda s: _make_engine("tabpfn_v2_5", p, cfg.device, s),
-                    U.GPFrozenEngine(GPSurrogate(**p["gp_params"])), ch,
+                    _make_reference(p), ch,
                     n_seeds=int(p["seed_floor"]["n_seeds"]), t=min(g["context_t"], ch.n_sites - 1),
                     n_anchors=int(p["n_anchors"]), surprises=p["surprises"], icc_min=g["icc_min"],
                     seed=cfg.seed,
@@ -502,6 +535,7 @@ def _exemplar(
         "achieved_snr_db": np.array(float(keys["achieved_snr_db"])),
         "context_t": np.array(int(keys["context_t"])),
         "draw": np.array(int(keys["draw"])),
+        "reference_gp": np.array(str(keys.get("reference_gp", "mll"))),
         "rho_shape_offanchor": np.array(float(cell.get("rho_shape_offanchor_median", np.nan))),
         "ch2xy": channel.ch2xy,
         "grid_shape": np.array(channel.grid_shape),

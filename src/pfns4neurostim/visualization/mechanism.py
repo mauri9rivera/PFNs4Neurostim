@@ -97,6 +97,8 @@ def arm_style(engine: str) -> style.ModelStyle:
     for arm in _GP_ARMS:
         if engine == f"gp_mll_{arm}":
             return style.series_style("gp_mll", arm, list(_GP_ARMS))
+    if engine == "gp_fixed_frozen":
+        return style.model_style("gp_naive")   # the GP-fixed arm of the paper (fixed kernel, no fitting)
     return style.model_style(engine)
 
 
@@ -137,7 +139,9 @@ def _f1_exemplar(run_dir: str) -> list[str]:
     context_ts = np.atleast_1d(ex["context_ts"] if "context_ts" in ex.files else ex["context_t"])
     anchors = np.atleast_1d(ex["anchors"] if "anchors" in ex.files else ex["anchor"])
     n_ctx = g_model.shape[0]
-    row_titles = (arm_style(str(ex["engine"])).label, style.model_label("gp_mll"), "Difference")
+    reference = str(ex["reference_gp"]) if "reference_gp" in ex.files else "mll"   # older files predate the key
+    row_titles = (arm_style(str(ex["engine"])).label,
+                  style.model_label("gp_naive" if reference == "fixed" else "gp_mll"), "Difference")
     fig, axes = style.figure(
         "full", nrows=3, ncols=n_ctx, squeeze=False, panel_aspect=_F1_PANEL_ASPECT,
         gridspec_kw={"wspace": _F1_WSPACE, "hspace": _F1_HSPACE},
@@ -212,8 +216,9 @@ def _exemplar_provenance(ex: Any) -> str:
 def _f2_shape_vs_context(cell: pd.DataFrame, run_dir: str, gates: list[dict[str, Any]]) -> list[str]:
     """F2: rho_shape vs context size with the anchor-permutation null and the seed floor."""
     fig, ax = style.figure("onehalf")
+    reference = str(cell["reference_gp"].iloc[0]) if "reference_gp" in cell and len(cell) else "mll"
     for engine, sub in cell.groupby("engine"):
-        if engine == "gp_mll_frozen":
+        if engine == f"gp_{reference}_frozen":
             continue   # identical to the reference by construction
         st = arm_style(str(engine))
         agg = sub.groupby("context_t")["rho_shape_median"].apply(_iqr)

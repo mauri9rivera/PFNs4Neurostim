@@ -37,6 +37,13 @@ update_rule:
   # 2.7e-3 and 1.2e-4, and the floor of 0.05 is half the finest grid step (0.111 on NHP), so it binds on the
   # degenerate fits and nothing else -- at no cost in marginal likelihood (-2.189 either way, measured).
   gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5, lengthscale_floor: 0.05}
+  # reference_gp (2026-10-02): the GP every update is measured against. `mll` = the converged type-II ML GP above; `fixed` = the
+  # GP-fixed arm of the paper (no fitting, fixed_gp_params). The converged fit can drive one ARD lengthscale to ~0 and another to
+  # ~1e4 on a 10-point context, so its update is a one-column stripe; `fixed` is an isotropic blob. Engines may add
+  # `gp_fixed_frozen` to show that arm next to the others (identical to the reference when reference_gp is fixed).
+  reference_gp: mll
+  # Keep in step with configs/model/gp_naive.yaml by hand.
+  fixed_gp_params: {lengthscale: 0.2, outputscale: 1.0, noise: 0.01}
   inference_seed: 0
   gates: {positive_r: 0.7, lengthscale_tol: 0.25, icc_min: 0.75, linear_regime_tol: 0.25, null_quantile: 0.95, context_t: 25}
   positive_control: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10}
