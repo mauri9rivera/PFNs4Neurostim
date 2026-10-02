@@ -794,11 +794,12 @@ def figure(
     *,
     nrows: int = 1,
     ncols: int = 1,
+    panel_aspect: float | None = None,
     **subplots_kwargs: object,
 ):
     """Create a correctly sized figure for the JNE column grid.
 
-    Every panel is :data:`PANEL_ASPECT` times taller than it is wide, whatever ``nrows`` and ``ncols``:
+    Every panel is ``panel_aspect`` (default :data:`PANEL_ASPECT`) times taller than it is wide, whatever ``nrows`` and ``ncols``:
     the width is fixed by the journal column, so the height follows the panel width
     (``width / ncols * PANEL_ASPECT`` per row) plus :data:`DECORATION_HEIGHT` for titles and legends.
 
@@ -806,6 +807,8 @@ def figure(
         width: Width token (``'single'``/``'onehalf'``/``'double'``) or inches.
         nrows: Subplot rows.
         ncols: Subplot columns.
+        panel_aspect: Panel height / width. Square image grids (heatmaps) pass 1.0, otherwise the default
+            tall panel leaves a wide empty band between rows.
         **subplots_kwargs: Forwarded to :func:`matplotlib.pyplot.subplots`.
 
     Returns:
@@ -813,7 +816,8 @@ def figure(
     """
     apply_style()
     w = FIG_WIDTHS[width] if isinstance(width, str) else float(width)
-    height = w / max(ncols, 1) * PANEL_ASPECT * nrows + DECORATION_HEIGHT
+    aspect = PANEL_ASPECT if panel_aspect is None else float(panel_aspect)
+    height = w / max(ncols, 1) * aspect * nrows + DECORATION_HEIGHT
     return plt.subplots(nrows, ncols, figsize=(w, height), **subplots_kwargs)
 
 

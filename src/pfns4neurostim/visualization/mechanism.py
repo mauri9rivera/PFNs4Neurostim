@@ -78,6 +78,11 @@ def _reference_bands(ax, orientation: str, *, label_it: bool, lines_only: bool =
 
 #: Update-rule engine arms and how they map onto the model palette.
 _GP_ARMS: tuple[str, ...] = ("frozen", "refit")
+#: Geometry of the F1 heatmap grid: square panels, a small gap between them, and a colorbar close to the grid.
+_F1_PANEL_ASPECT: float = 1.0
+_F1_WSPACE: float = 0.08
+_F1_HSPACE: float = 0.12
+_F1_COLORBAR_PAD: float = 0.02
 
 
 def arm_style(engine: str) -> style.ModelStyle:
@@ -133,7 +138,10 @@ def _f1_exemplar(run_dir: str) -> list[str]:
     anchors = np.atleast_1d(ex["anchors"] if "anchors" in ex.files else ex["anchor"])
     n_ctx = g_model.shape[0]
     row_titles = (arm_style(str(ex["engine"])).label, style.model_label("gp_mll"), "Difference")
-    fig, axes = style.figure("full", nrows=3, ncols=n_ctx, squeeze=False)
+    fig, axes = style.figure(
+        "full", nrows=3, ncols=n_ctx, squeeze=False, panel_aspect=_F1_PANEL_ASPECT,
+        gridspec_kw={"wspace": _F1_WSPACE, "hspace": _F1_HSPACE},
+    )
     im = None
     for c in range(n_ctx):
         # Each column is normalized by its own peak: the update SHRINKS with context, and a shared scale
@@ -155,7 +163,7 @@ def _f1_exemplar(run_dir: str) -> list[str]:
                 ax.set_title(f"$t$ = {int(context_ts[min(c, len(context_ts) - 1)])}")
             if c == 0:
                 ax.set_ylabel(row_title)
-    fig.colorbar(im, ax=axes, shrink=0.6, label=style.axis_label("update_normalized"))
+    fig.colorbar(im, ax=axes, shrink=0.6, pad=_F1_COLORBAR_PAD, label=style.axis_label("update_normalized"))
     fig.suptitle(_exemplar_provenance(ex), x=0.01, ha="left", fontsize=style.FONT_SIZES["annotation"])
     return style.save_figure(fig, run_dir, "update_exemplar")
 
@@ -163,6 +171,14 @@ def _f1_exemplar(run_dir: str) -> list[str]:
 def _contexts(ex: Any) -> str:
     """Comma-separated context sizes stored in an exemplar ``.npz``."""
     key = "context_ts" if "context_ts" in getattr(ex, "files", []) else "context_t"
+    if key not in getattr(ex, "files", []):
+        return "?"
+    return ", ".join(str(int(v)) for v in np.atleast_1d(ex[key]))
+
+
+def _anchors(ex: Any) -> str:
+    """Anchor site index of each context column of an exemplar ``.npz`` (``'?'`` when none is stored)."""
+    key = "anchors" if "anchors" in getattr(ex, "files", []) else "anchor"
     if key not in getattr(ex, "files", []):
         return "?"
     return ", ".join(str(int(v)) for v in np.atleast_1d(ex[key]))
@@ -188,7 +204,7 @@ def _exemplar_provenance(ex: Any) -> str:
     return (
         f"{field('label')} | {field('knob')} level {field('level', '{:g}')} "
         f"({field('achieved_snr_db', '{:.1f}')} dB) | context t = {_contexts(ex)}, "
-        f"draw {field('draw')} | anchor {field('anchor')} ({field('anchor_stratum')}), "
+        f"draw {field('draw')} | anchor {_anchors(ex)} ({field('anchor_stratum')}), "
         f"surprise c = {field('surprise_c', '{:g}')} | channel picked by {field('select_rule')}"
     )
 
