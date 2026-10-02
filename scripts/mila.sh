@@ -15,6 +15,7 @@
 #   bash scripts/mila.sh eff <jobid>          # did the job USE what it asked for: sacct + sstat +
 #                                             # the per-lane CLUSTER DIAGNOSTICS block (the only GPU source)
 #   bash scripts/mila.sh share                # your fairshare and the priority of your pending jobs
+#   bash scripts/mila.sh report [YYYY-MM-DD]  # raw rows for the per-job efficiency table: pipe into scripts/cluster_report.py
 #   bash scripts/mila.sh submit <script> <config> [extra args]   # prints only
 set -euo pipefail
 
@@ -104,6 +105,15 @@ cmd_share() {
   remote 'squeue --me -o "%.12i %.9P %.28j %.2t %.10M %.6D %.20R" '
 }
 
+cmd_report() {
+  # Everything the efficiency table needs in ONE read-only round trip: sacct rows (the .batch step carries MaxRSS) and the key
+  # lines of the CLUSTER DIAGNOSTICS block of every job log since the date. Printed raw so scripts/cluster_report.py does the
+  # joining and scoring locally; each cluster prints its own ##CLUSTER section, so two reports can be concatenated.
+  local since="${1:-$(date -d '7 days ago' +%F)}"
+  [[ "${since}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { log "usage: report [YYYY-MM-DD]"; exit 2; }
+  remote "echo '##CLUSTER ${MILA_HOST}'; sacct -S ${since} -P -n -o JobID,JobName,State,Elapsed,Timelimit,AllocCPUS,ReqMem,TotalCPU,CPUTime,MaxRSS,AllocTRES%80,ExitCode; echo '##DIAG'; cd ${MILA_REMOTE_REPO}/logs && find . -maxdepth 1 -name '*.out' -newermt '${since}' -exec grep -H -E 'EFFICIENCY GRADE|GPU Mem|GPU Util|Throughput' {} +"
+}
+
 cmd_avail() { remote 'sinfo -o "%P %a %l %D %G" | head -20; savail 2>/dev/null || true'; }
 cmd_quota() { remote "${REMOTE_QUOTA_CMD}"; }
 
@@ -127,8 +137,9 @@ case "${sub}" in
   sacct) cmd_sacct "$@" ;;
   eff) cmd_eff "$@" ;;
   share) cmd_share ;;
+  report) cmd_report "$@" ;;
   avail) cmd_avail ;;
   quota) cmd_quota ;;
   submit) cmd_submit "$@" ;;
-  *) sed -n 2,17p "$0"; exit 2 ;;
+  *) sed -n 2,18p "$0"; exit 2 ;;
 esac

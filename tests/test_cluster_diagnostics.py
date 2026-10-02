@@ -288,6 +288,48 @@ class TestGenerateWarnings:
         ids = [w['id'] for w in diag._generate_warnings()]
         assert 'GPU_MEM_HEADROOM' not in ids
 
+    # --- cluster-shaped recipes and the Narval MIG-slice rule (2026-10-02) ---------------------------------
+
+    def _fired(self, diag, rule_id):
+        return {w['id']: w for w in diag._generate_warnings()}.get(rule_id)
+
+    def test_slice_oversized_fires_on_a_whole_a100_on_narval(self):
+        """Job 4487625 peaked at 0.08 GB; a 5 GB slice holds it, so the whole card is the wrong request."""
+        diag = self._make_diag(
+            cluster_name='narval', cuda_available=True,
+            peak_gpu_mem_bytes=int(0.5 * self.GB), total_gpu_mem_bytes=int(40.0 * self.GB),
+        )
+        w = self._fired(diag, 'GPU_SLICE_OVERSIZED')
+        assert w is not None
+        assert 'a100_1g.5gb' in w['rendered_text'] and '--gpu-type a100_1g.5gb' in w['rendered_fix']
+
+    def test_slice_rule_picks_the_smallest_slice_with_headroom(self):
+        diag = self._make_diag(
+            cluster_name='narval', cuda_available=True,
+            peak_gpu_mem_bytes=int(5.0 * self.GB), total_gpu_mem_bytes=int(40.0 * self.GB),
+        )   # 5 GB x 1.25 = 6.25 GB: the 5 GB slice is too small, the 10 GB one fits
+        assert 'a100_2g.10gb' in self._fired(diag, 'GPU_SLICE_OVERSIZED')['rendered_text']
+
+    def test_slice_rule_is_silent_off_narval_inside_a_slice_and_when_the_job_needs_the_card(self):
+        base = dict(cuda_available=True, peak_gpu_mem_bytes=int(0.5 * self.GB))
+        mila = self._make_diag(cluster_name='mila', total_gpu_mem_bytes=int(40.0 * self.GB), **base)
+        in_slice = self._make_diag(cluster_name='narval', total_gpu_mem_bytes=int(5.0 * self.GB), **base)
+        needs_card = self._make_diag(
+            cluster_name='narval', cuda_available=True,
+            peak_gpu_mem_bytes=int(18.0 * self.GB), total_gpu_mem_bytes=int(40.0 * self.GB),
+        )
+        for diag in (mila, in_slice, needs_card):
+            assert self._fired(diag, 'GPU_SLICE_OVERSIZED') is None
+
+    def test_recipes_use_narval_options_there_and_sbatch_lines_elsewhere(self):
+        kw = dict(
+            requested_ram_bytes=int(10.0 * self.GB), peak_rss_bytes=int(1.0 * self.GB), n_lanes=1,
+        )
+        narval = self._fired(self._make_diag(cluster_name='narval', **kw), 'RAM_UNDERUSE')['rendered_fix']
+        mila = self._fired(self._make_diag(cluster_name='mila', **kw), 'RAM_UNDERUSE')['rendered_fix']
+        assert 'narval.sh do sbatch ... --mem 2G' in narval and '#SBATCH' not in narval
+        assert '#SBATCH --mem=2G' in mila
+
     def test_walltime_overrequest_fires(self):
         diag = self._make_diag(
             elapsed_s=0.4 * 3600,
@@ -520,7 +562,8 @@ class TestLaneAwareness:
         fired = {w['id']: w for w in diag._generate_warnings()}
         assert 'RAM_UNDERUSE' in fired
         assert '4.1 GB peak' in fired['RAM_UNDERUSE']['rendered_text']
-        assert '--mem=5G' in fired['RAM_UNDERUSE']['rendered_fix']
+        # 4.12 GB x 1.25 = 5.15 GB: rounded UP (2026-10-02) the request is 6G; to-nearest gave 5G, below peak + 25%.
+        assert '--mem=6G' in fired['RAM_UNDERUSE']['rendered_fix']
 
     def test_ram_underuse_silent_when_the_lanes_fill_the_allocation(self):
         diag = self._diag(n_lanes=8, peak_rss_bytes=int(1.05 * self.GB),

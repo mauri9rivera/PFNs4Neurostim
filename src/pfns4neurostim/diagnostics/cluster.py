@@ -31,6 +31,7 @@ Usage::
 """
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import textwrap
@@ -361,6 +362,32 @@ MAX_SUGGESTED_LANES: int = 8
 #: Cores below which the report does not complain about idle CPUs: one for the work, one for the
 #: interpreter's own threads. Dropping below this is never the actionable fix.
 MIN_BASELINE_CPUS: int = 2
+#: GPU memory (GB) of each MIG slice Narval offers, smallest first (``sinfo -o "%G"``, 2026-10-02).
+MIG_SLICES_GB: Dict[str, float] = {
+    'a100_1g.5gb': 5.0, 'a100_2g.10gb': 10.0, 'a100_3g.20gb': 20.0, 'a100_4g.20gb': 20.0,
+}
+#: Headroom kept over the job's measured GPU peak when a slice is suggested (fragmentation, the next lane).
+SLICE_HEADROOM: float = 1.25
+#: A card with more memory than this is a whole GPU; the largest MIG slice has 20 GB.
+FULL_GPU_MIN_GB: float = 30.0
+#: How a fix recipe names each knob, per cluster. Narval jobs are submitted through
+#: ``scripts/narval.sh do sbatch`` (options, not ``#SBATCH`` lines); every other cluster keeps the plain form.
+FLAG_STYLE: Dict[str, Dict[str, str]] = {
+    'narval': {
+        'time': 'narval.sh do sbatch ... --time {v}',
+        'mem': 'narval.sh do sbatch ... --mem {v}',
+        'cpus': 'narval.sh do sbatch ... --cpus {v}',
+        'lanes': 'narval.sh do sbatch ... --lanes {v} --cpus {v}',
+        'slice': 'narval.sh do sbatch gpu ... --gpu-type {v}',
+    },
+    'default': {
+        'time': '#SBATCH --time={v}',
+        'mem': '#SBATCH --mem={v}',
+        'cpus': '#SBATCH --cpus-per-task={v}',
+        'lanes': 'LANES={v} sbatch scripts/run_bo_benchmark.sh ...',
+        'slice': '--gres=gpu:{v}:1',
+    },
+}
 
 _WARNING_RULES: List[Dict[str, Any]] = [
     {
@@ -381,8 +408,31 @@ _WARNING_RULES: List[Dict[str, Any]] = [
         ),
         'fix': (
             'This is spare capacity, not waste: pack more lanes into the same job.\n'
-            '  LANES={suggested_lanes} sbatch scripts/run_bo_benchmark.sh ...\n'
-            'Raise --cpus-per-task to match, since each lane needs one core.'
+            '  {lanes_flag}\n'
+            'Raise the CPUs to match, since each lane needs one core.'
+        ),
+    },
+    {
+        'id': 'GPU_SLICE_OVERSIZED',
+        # Narval only: it offers MIG slices, and a job that peaks far below a whole A100's memory schedules
+        # sooner and costs less fairshare on the smallest slice that holds it (measured 2026-10-02, job 4487625:
+        # 0.08 GB peak, ran on a 5 GB slice).
+        'condition': lambda m: (
+            m.cluster_name == 'narval'
+            and m.cuda_available
+            and m.total_gpu_mem_bytes is not None
+            and m.total_gpu_mem_bytes / (1024 ** 3) > FULL_GPU_MIN_GB
+            and m.peak_gpu_mem_bytes > 0
+            and (m.peak_gpu_mem_bytes * max(1, m.n_lanes) / (1024 ** 3)) * SLICE_HEADROOM
+            <= max(MIG_SLICES_GB.values())
+        ),
+        'text': (
+            'GPU_SLICE_OVERSIZED: the job peaked at {job_gpu_gb:.1f} GB on a whole {vram_gb:.0f} GB GPU; '
+            'the {suggested_slice} MIG slice ({slice_gb:.0f} GB) holds it with headroom.'
+        ),
+        'fix': (
+            'Request the smaller slice (it schedules sooner and costs less fairshare):\n'
+            '  {slice_flag}'
         ),
     },
     {
@@ -404,7 +454,7 @@ _WARNING_RULES: List[Dict[str, Any]] = [
         'fix': (
             'Reduce --time to elapsed + 20% rounded to 15 min, but keep headroom for the\n'
             'slowest unit of the same config:\n'
-            '  #SBATCH --time={suggested_time}'
+            '  {time_flag}'
         ),
     },
     {
@@ -460,7 +510,7 @@ _WARNING_RULES: List[Dict[str, Any]] = [
         ),
         'fix': (
             'One core per lane is what this workload uses:\n'
-            '  #SBATCH --cpus-per-task={n_lanes}\n'
+            '  {cpus_flag}\n'
             'Or keep the cores and raise LANES to match, which also lifts GPU utilisation.'
         ),
     },
@@ -480,8 +530,8 @@ _WARNING_RULES: List[Dict[str, Any]] = [
             'below 70% of the {req_ram_gb:.1f} GB requested ({pct:.0f}%).'
         ),
         'fix': (
-            'Reduce --mem to peak RSS + 25% headroom:\n'
-            '  #SBATCH --mem={suggested_mem_gb:.0f}G'
+            'Reduce the memory request to peak RSS + 25% headroom:\n'
+            '  {mem_flag}'
         ),
     },
 ]
@@ -783,6 +833,24 @@ class ClusterDiagnostics:
                         max(1, m.n_lanes) + 1,
                         min(by_vram, MAX_SUGGESTED_LANES),
                     )
+                need_gb = tv['job_gpu_gb'] * SLICE_HEADROOM
+                fitting = [(gb, name) for name, gb in MIG_SLICES_GB.items() if gb >= need_gb]
+                if fitting:
+                    slice_gb, slice_name = min(fitting)
+                    tv['suggested_slice'], tv['slice_gb'] = slice_name, slice_gb
+
+            # Recipes name each knob the way the cluster they ran on takes it.
+            style = FLAG_STYLE.get(m.cluster_name, FLAG_STYLE['default'])
+            tv['cpus_flag'] = style['cpus'].format(v=tv['n_lanes'])
+            if 'suggested_time' in tv:
+                tv['time_flag'] = style['time'].format(v=tv['suggested_time'])
+            if 'suggested_mem_gb' in tv:
+                # Round UP: the suggestion is peak + 25%, and rounding 1.25 GB to the nearest GB asked for less than the peak.
+                tv['mem_flag'] = style['mem'].format(v=f"{math.ceil(tv['suggested_mem_gb'])}G")
+            if 'suggested_lanes' in tv:
+                tv['lanes_flag'] = style['lanes'].format(v=tv['suggested_lanes'])
+            if 'suggested_slice' in tv:
+                tv['slice_flag'] = style['slice'].format(v=tv['suggested_slice'])
 
             # `pct` is rule-specific. It used to be whichever block ran last, so the GPU-memory and
             # walltime warnings printed the RAM percentage: job 11012807 reported "used 0.65h of 12.00h
@@ -907,7 +975,14 @@ class ClusterDiagnostics:
                 f'(n={len(m.gpu_util_samples)} polls)'
             ))
         elif not m.nvidia_smi_available:
-            lines.append(_row('  [--] GPU Util : nvidia-smi not available'))
+            in_slice = bool(
+                m.cluster_name == 'narval' and m.total_gpu_mem_bytes
+                and m.total_gpu_mem_bytes / (1024 ** 3) <= FULL_GPU_MIN_GB
+            )
+            lines.append(_row(
+                '  [--] GPU Util : not measurable inside a MIG slice' if in_slice
+                else '  [--] GPU Util : nvidia-smi not available'
+            ))
 
         # ---- CPU / RAM ----
         if m.peak_rss_bytes > 0 and m.requested_ram_bytes and m.requested_ram_bytes > 0:
