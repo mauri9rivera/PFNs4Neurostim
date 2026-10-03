@@ -6,7 +6,7 @@
 #   bash scripts/submit_next.sh nhp         # 2. every NHP deliverable, canonical arm    (~52 GPU-h)
 #   bash scripts/submit_next.sh rat         # 3. 5d_rat stress + bench                   (~45 GPU-h)
 #   bash scripts/submit_next.sh hypc        # 4. Hyp C context sweeps C1-C3              (~13 GPU-h)
-#   bash scripts/submit_next.sh externals   # 5. PFN benchmark, non-v1 models            (~9 GPU-h)
+#   bash scripts/submit_next.sh externals   # 5. PFN benchmark                           (~9 GPU-h)
 #   bash scripts/submit_next.sh spinal --force   # 6. spinal P1-P14 (DEFERRED: needs --force)  (~141 GPU-h)
 #
 # `spinal` is DEFERRED and needs --force even on its first submission. It is 54 % of the remaining GPU
@@ -15,7 +15,6 @@
 # requeue. Decide it deliberately, and consider n_reps=10 instead of 20, which halves it.
 #
 # Gated sub-stages, waiting on a specific finished thing rather than on a rank:
-#   v1-test -> v1     one TabPFN v1 cell, then E7/E8/P16   (needs the v1 env, then that cell)
 #   tabfm-spinal      P15                                   (needs E3's TabFM cells)
 #   rat-demo1         S5b                                   (needs the Demo 1 collapse check, #10 Step 15)
 #   hypc-5drat        C4                                     (needs one hand-timed 5d_rat channel, #18 Step 5)
@@ -34,7 +33,6 @@ cd "$(dirname "$0")/.."
 STAGE="${1:-status}"
 FORCE="${2:-}"
 CELLS="output/cells"
-V1_ENV="pfns4neurostim-v1"
 
 # Run the unit lines of a generated submit script whose ID matches (keep) or does not match (drop) a regex.
 run_units() {
@@ -72,7 +70,6 @@ need_data() {   # need_data <subdir> <hint>
 source scripts/cluster.sh          # CLUSTER, cluster_env_python, cluster_setup_script
 SETUP="bash $(cluster_setup_script)"
 # Narval compute nodes have no outbound network, so envs are built on the login node there, not in a job.
-if [ "${CLUSTER}" = "narval" ]; then V1_BUILD="${SETUP} env v1"; else V1_BUILD="sbatch scripts/setup_env_job.sh v1"; fi
 read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"
 
 # gate_<stage> prints READY, or the reason it is not.
@@ -85,8 +82,6 @@ gate_spinal()    {   # deferred by decision, not by a missing prerequisite
   have_data spinal || { echo "needs data/spinal staged (#14 Step 3)"; return; }
   echo "DEFERRED - ready, but needs --force (54% of the remaining compute)"
 }
-gate_v1_test()   { env_exists "${V1_ENV}" && echo "READY" || echo "needs the v1 env (${V1_BUILD})"; }
-gate_v1()        { has_cell nhp tabpfn_v1 && echo "READY" || echo "needs a finished v1 cell (stage v1-test)"; }
 gate_tabfm()     { has_cell nhp tabfm && echo "READY" || echo "needs E3's TabFM cells (stage externals)"; }
 
 case "${STAGE}" in
@@ -106,8 +101,6 @@ rat 3 45gpu-h gate_rat
 hypc 4 9.5gpu-h gate_hypc
 externals 5 9gpu-h gate_externals
 spinal 6 141gpu-h gate_spinal
-v1-test - 1cell gate_v1_test
-v1 - ?gpu-h gate_v1
 tabfm-spinal - ?gpu-h gate_tabfm
 STAGES
     echo
@@ -171,10 +164,10 @@ STAGES
     record hypc-5drat
     ;;
 
-  # ---- 5. the PFN benchmark, minus the v1 arm ----
+  # ---- 5. the PFN benchmark ----
   externals)
     guard externals
-    run_units scripts/submit_externals.sh drop 'E7|E8'
+    run_units scripts/submit_externals.sh keep 'E[0-9]+'
     record externals
     ;;
 
@@ -189,30 +182,11 @@ STAGES
       echo "[submit_next] then: bash scripts/submit_next.sh spinal --force" >&2
       exit 1
     fi
-    run_units scripts/submit_spinal.sh drop 'P15|P16'
+    run_units scripts/submit_spinal.sh drop 'P15'
     record spinal
     ;;
 
   # ---- gated sub-stages ----
-  v1-test)
-    guard v1-test
-    env_exists "${V1_ENV}" || { echo "[submit_next] env ${V1_ENV} not built: ${V1_BUILD}" >&2; exit 1; }
-    # One cell of E7's grid (same identity), so E7 later reuses it as a cache hit rather than recomputing it.
-    CONDA_ENV="${V1_ENV}" sbatch ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v1]" "dataset.subjects=[1]" "dataset.emgs=[0]" n_reps=1 tag=v1-smoke
-    record v1-test
-    echo "[submit_next] when it finishes: bash scripts/submit_next.sh status   (v1 turns READY if the cell succeeded)"
-    ;;
-  v1)
-    guard v1
-    has_cell nhp tabpfn_v1 || { echo "[submit_next] no finished TabPFN v1 cell yet: run stage v1-test and read its log" >&2; exit 1; }
-    run_units scripts/submit_externals.sh keep 'E7|E8'
-    if have_data spinal; then
-      run_units scripts/submit_spinal.sh keep 'P16'
-    else
-      echo "[submit_next] P16 skipped: data/spinal is not staged"
-    fi
-    record v1
-    ;;
   tabfm-spinal)
     guard tabfm-spinal
     has_cell nhp tabfm || { echo "[submit_next] no TabFM cell from E3 yet (stage externals)" >&2; exit 1; }
@@ -222,6 +196,6 @@ STAGES
     ;;
 
   *)
-    echo "usage: bash scripts/submit_next.sh [status|audit|nhp|rat|hypc|externals|spinal|v1-test|v1|tabfm-spinal|rat-demo1|hypc-5drat] [--force]" >&2
+    echo "usage: bash scripts/submit_next.sh [status|audit|nhp|rat|hypc|externals|spinal|tabfm-spinal|rat-demo1|hypc-5drat] [--force]" >&2
     exit 2 ;;
 esac

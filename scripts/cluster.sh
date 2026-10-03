@@ -12,7 +12,7 @@
 # and Mila's `--partition=main` is an invalid partition on Narval (Alliance routes jobs to partitions itself). So the
 # dispatchers carry only portable directives and every submission adds `$(bash scripts/cluster.sh flags gpu|cpu)`.
 #
-# Environments keep their conda names everywhere (pfns4neurostim, pfns4neurostim-bench, pfns4neurostim-v1), so
+# Environments keep their conda names everywhere (pfns4neurostim, pfns4neurostim-bench, pfns4neurostim-latest), so
 # CONDA_ENV, ExternalSpec.env and portfolio.py stay unchanged. On Narval each name is a virtualenv under
 # $VENV_ROOT built by scripts/narval_setup.sh, because Alliance clusters ask users to use module Python + virtualenv
 # rather than Anaconda.
@@ -32,17 +32,19 @@ VENV_ROOT="${VENV_ROOT:-${HOME}/venvs}"
 NARVAL_ACCOUNT="${NARVAL_ACCOUNT:-def-bonizzat}"
 NARVAL_GPU="${NARVAL_GPU:-a100}"
 NARVAL_STDENV="${NARVAL_STDENV:-2023}"
-# Mila and local keep the main and v1 envs on Python 3.9 (CLAUDE.md section 3), but 3.9 is a reproducibility pin, not a
-# requirement: every pinned package declares >=3.9 with no cap, TabPFN v1 only mirrors the main env, the v1-prior dataset
-# generator declares >=3.10,<3.13, and Narval offers 3.9 only under StdEnv/2020. Narval therefore runs main and v1 on
+# Mila and local keep the main env on Python 3.9 (CLAUDE.md section 3), but 3.9 is a reproducibility pin, not a
+# requirement: every pinned package declares >=3.9 with no cap, the v1-prior dataset generator declares
+# >=3.10,<3.13, and Narval offers 3.9 only under StdEnv/2020. Narval therefore runs the main env on
 # Python 3.11 under StdEnv/2023 (decided 2026-10-02); record this before comparing Narval and Mila results.
 # Set PY_MAIN=3.9 NARVAL_STDENV=2020 to get the pinned interpreter back.
 PY_MAIN="${PY_MAIN:-3.11}"
 PY_BENCH="${PY_BENCH:-3.11}"
+PY_LATEST="${PY_LATEST:-3.11}"   # TabPFN-3.5 + Causilo (environment.latest.yml): python >= 3.10, torch >= 2.13
 
 cluster_python_version() {   # cluster_python_version <env name>
   case "$1" in
     *-bench) echo "${PY_BENCH}" ;;
+    *-latest) echo "${PY_LATEST}" ;;
     *) echo "${PY_MAIN}" ;;
   esac
 }

@@ -174,7 +174,7 @@ UPDATE_RULE_DEFAULTS: dict[str, Any] = {
     # lengthscale to ~0 and another to ~1e4 on a 10-point context, which makes the GP update a one-column stripe.
     "reference_gp": "mll",
     # Keep in step with configs/model/gp_naive.yaml by hand: the engines build the surrogate directly.
-    "fixed_gp_params": {"lengthscale": 0.2, "outputscale": 1.0, "noise": 0.01},
+    "fixed_gp_params": {"lengthscale": 0.6931471805599453, "outputscale": 1.0, "noise": 0.6931471805599453},
     "inference_seed": 0,
     "max_batch_tokens": 400000,
     # Secondary layer-wise arm. ``context_ts`` is a LIST since 2026-09-30: the layer profile is a property

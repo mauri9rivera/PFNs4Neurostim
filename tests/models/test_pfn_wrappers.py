@@ -14,7 +14,7 @@ from pfns4neurostim.models.pfn import external
 from pfns4neurostim.models.pfn.bar_distribution import BarDistribution, quantile_borders
 from pfns4neurostim.models.registry import MODEL_REGISTRY, build_surrogate
 
-EXTERNAL_KEYS = ("pfns4bo", "tabpfn_v1", "tabfm", "mitra", "tabflex", "tabicl")
+EXTERNAL_KEYS = ("pfns4bo", "tabfm", "mitra", "tabflex", "tabicl", "tabpfn_v3_5", "causilo")
 
 
 class TestBarDistribution:
@@ -95,7 +95,7 @@ class TestExternalRegistration:
         assert key in MODEL_REGISTRY
         assert MODEL_REGISTRY[key].version
 
-    @pytest.mark.parametrize("key", ("tabpfn_v1", "tabflex"))
+    @pytest.mark.parametrize("key", ("tabflex",))
     def test_classifier_models_are_labelled_as_adaptations(self, key: str) -> None:
         """The adaptation must be visible in the version string every table prints."""
         assert "classification-head adaptation" in MODEL_REGISTRY[key].version
@@ -119,8 +119,8 @@ class TestExternalRegistration:
 
     @pytest.mark.parametrize(
         "key, env",
-        (("pfns4bo", "main"), ("tabpfn_v1", "v1"), ("tabfm", "bench"), ("tabicl", "bench"),
-         ("tabflex", "main"), ("mitra", "mitra")),
+        (("pfns4bo", "main"), ("tabfm", "bench"), ("tabicl", "bench"),
+         ("tabflex", "main"), ("mitra", "mitra"), ("tabpfn_v3_5", "latest"), ("causilo", "latest")),
     )
     def test_every_model_declares_the_environment_it_runs_in(self, key: str, env: str) -> None:
         """Model -> env is data in one place, so no script has to name an env by hand."""
@@ -131,7 +131,7 @@ class TestExternalRegistration:
 
     def test_wrong_environment_names_the_environment_to_activate(self) -> None:
         """A model that cannot run here must say where it does run, not just that it failed."""
-        for key in ("tabpfn_v1", "tabfm", "tabicl"):
+        for key in ("tabpfn_v3_5", "tabfm", "tabicl"):
             ok, reason = external._backend_ok(external.EXTERNAL_SPECS[key])
             if not ok and "not installed" not in reason:
                 assert external.EXTERNAL_SPECS[key].conda_env in reason
@@ -140,14 +140,6 @@ class TestExternalRegistration:
         avail = external.availability()
         assert set(avail) == set(EXTERNAL_KEYS)
         assert all(isinstance(v, bool) for v in avail.values())
-
-    def test_tabpfn_v1_is_not_satisfied_by_v2(self) -> None:
-        """v1 and v2.5 share the module name; importability alone is not enough."""
-        import tabpfn  # noqa: F401 - the v2.5 package is installed in this env
-
-        assert external.availability()["tabpfn_v1"] is False
-        with pytest.raises(ImportError, match="major version"):
-            external.require_backend("tabpfn_v1")
 
     @pytest.mark.parametrize("key", EXTERNAL_KEYS)
     def test_unavailable_backend_says_how_to_get_it(self, key: str) -> None:
@@ -169,8 +161,8 @@ class TestExternalRegistration:
             surrogate.fit(np.zeros((4, 2)), np.arange(4.0))
 
     def test_implemented_wrappers_are_not_in_the_pending_list(self) -> None:
-        """TabFlex, TabICL and TabFM since 2026-09-20; PFNs4BO 2026-09-23; TabPFN v1 2026-09-25."""
-        assert set(self.PENDING).isdisjoint({"tabflex", "tabicl", "tabfm", "pfns4bo", "tabpfn_v1"})
+        """TabFlex, TabICL and TabFM since 2026-09-20; PFNs4BO 2026-09-23; TabPFN-3.5 and Causilo 2026-10-03."""
+        assert set(self.PENDING).isdisjoint({"tabflex", "tabicl", "tabfm", "pfns4bo", "tabpfn_v3_5", "causilo"})
 
     def test_tabfm_refuses_a_single_ensemble_member(self) -> None:
         """Its only uncertainty signal is ensemble spread, which is zero for one member."""
@@ -299,50 +291,179 @@ class TestTabFlexRuns:
         assert mean.shape == (40,) and std.shape == (40,)
         assert np.isfinite(mean).all() and (std > 0).all()
 
-class TestTabPFNv1Adaptation:
-    """The v1 classification-head adaptation, which is testable without the v1 backend."""
-
-    def test_bin_count_is_capped_at_the_architectural_class_ceiling(self) -> None:
-        """v1 emits at most 10 classes; asking for more must fail at construction."""
-        from pfns4neurostim.models.pfn.wrappers import TabPFNv1Surrogate
-
-        assert TabPFNv1Surrogate.MAX_CLASSES == 10
-        with pytest.raises(ValueError, match="exceeds the backend's ceiling of 10"):
-            TabPFNv1Surrogate(n_bins=32)
-
-    def test_default_bin_count_is_ten(self) -> None:
-        """The default must be v1's ceiling, not the 32 used for backends without one."""
-        import inspect
-
-        from pfns4neurostim.models.pfn.wrappers import TabPFNv1Surrogate
-
-        assert inspect.signature(TabPFNv1Surrogate.__init__).parameters["n_bins"].default == 10
-
-    def test_fit_hook_passes_v1_overwrite_warning(self) -> None:
-        """v1 refuses a context over its soft limit unless the flag is set."""
-        from pfns4neurostim.models.pfn.wrappers import TabPFNv1Surrogate
-
-        recorded: dict[str, object] = {}
-
-        class _Classifier:
-            def fit(self, X, y, overwrite_warning=False):  # noqa: ANN001, N803 - mirrors the v1 API
-                recorded["overwrite_warning"] = overwrite_warning
-
-        TabPFNv1Surrogate._fit_classifier(
-            object.__new__(TabPFNv1Surrogate), _Classifier(), np.zeros((4, 2)), np.arange(4)
-        )
-        assert recorded["overwrite_warning"] is True
-
-    def test_version_string_states_the_adaptation_and_its_resolution(self) -> None:
-        """Guardrail G3: the bin count travels with every v1 row."""
-        version = MODEL_REGISTRY["tabpfn_v1"].version
-        assert "classification-head adaptation" in version
-        assert "10" in version
-
-
 class TestExternalErrors:
     """Failures of the external layer itself."""
 
     def test_unknown_external_key_raises(self) -> None:
         with pytest.raises(KeyError, match="Unknown external model"):
             external.require_backend("not_a_model")
+
+class TestLatestEnvironmentModels:
+    """TabPFN-3.5 and Causilo (added 2026-10-03): both live in the ``latest`` environment."""
+
+    def test_tabpfn_v3_5_needs_a_newer_tabpfn_than_the_main_env_pins(self) -> None:
+        """Same module name as TabPFN-2.5: importability alone must not make it 'available'."""
+        spec = external.EXTERNAL_SPECS["tabpfn_v3_5"]
+        assert spec.module == "tabpfn" and spec.major_min == 9 and spec.env == "latest"
+        import importlib.metadata as md
+
+        if int(md.version("tabpfn").split(".")[0]) < 9:
+            ok, reason = external._backend_ok(spec)
+            # Either gate may fire first (Python < 3.10 in the py3.9 main env, else the version gate); both name the env.
+            assert not ok and spec.conda_env in reason
+            assert "needs Python >=" in reason or "major version >= 9" in reason
+            with pytest.raises(ImportError, match=r"needs Python >=|major version"):
+                external.require_backend("tabpfn_v3_5")
+
+    def test_both_models_share_one_environment(self) -> None:
+        envs = {external.EXTERNAL_SPECS[k].conda_env for k in ("tabpfn_v3_5", "causilo")}
+        assert envs == {"pfns4neurostim-latest"}
+
+    def test_version_strings_name_the_checkpoint_and_ensemble_size(self) -> None:
+        assert "n_estimators=1" in MODEL_REGISTRY["tabpfn_v3_5"].version
+        assert "n_estimators=1" in MODEL_REGISTRY["causilo"].version
+
+    def test_causilo_integrates_its_quantile_function(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """mean/std come from the quantile function; Thompson draws invert it."""
+        from scipy.stats import norm
+
+        from pfns4neurostim.models.pfn import wrappers
+
+        class _Regressor:
+            def __init__(self, device: str, n_estimators: int, **kw: object) -> None:
+                self.args = (device, n_estimators)
+
+            def fit(self, X: np.ndarray, y: np.ndarray) -> None:  # noqa: N803
+                self.fitted = True
+
+            def predict(self, X: np.ndarray, output_type: str, quantiles: list) -> np.ndarray:  # noqa: N803
+                assert output_type == "quantiles"
+                mu = X[:, 0:1]                                       # [N, 1]
+                return mu + 0.5 * norm.ppf(np.asarray(quantiles))[None, :]   # [N, Q]
+
+        class _Backend:
+            CausiloRegressor = _Regressor
+
+        monkeypatch.setattr(external, "require_backend", lambda key: _Backend)   # the base class calls this one
+        monkeypatch.setattr(wrappers, "require_backend", lambda key: _Backend)
+        model = wrappers.CausiloSurrogate(device="cpu")
+        model.fit(np.zeros((4, 2)), np.arange(4.0))
+        X = np.array([[0.0, 0.0], [2.0, 0.0]])
+        mean, std = model.predict_marginals(X)
+        np.testing.assert_allclose(mean, [0.0, 2.0], atol=1e-2)
+        assert (std > 0.4).all() and (std < 0.55).all()               # N(mu, 0.5^2), truncated to +-2.3 SD
+        draws = np.stack([model.sample_marginal(X, np.random.default_rng(s)) for s in range(400)])
+        assert draws.mean(axis=0) == pytest.approx([0.0, 2.0], abs=0.15)
+
+    def test_causilo_rejects_a_changed_upstream_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pfns4neurostim.models.pfn import wrappers
+
+        class _Regressor:
+            def __init__(self, **kw: object) -> None: ...
+            def fit(self, X, y) -> None: ...  # noqa: ANN001, N803
+            def predict(self, X, **kw):  # noqa: ANN001, ANN201, N803
+                return np.zeros((X.shape[0], 999))                    # the raw grid, not the requested levels
+
+        class _Backend:
+            CausiloRegressor = _Regressor
+
+        monkeypatch.setattr(external, "require_backend", lambda key: _Backend)
+        monkeypatch.setattr(wrappers, "require_backend", lambda key: _Backend)
+        model = wrappers.CausiloSurrogate()
+        model.fit(np.zeros((4, 2)), np.arange(4.0))
+        with pytest.raises(RuntimeError, match="expected"):
+            model.predict_marginals(np.zeros((3, 2)))
+
+
+class TestOwnPredictiveSampling:
+    """Thompson draws come from a model's OWN predictive, not a Gaussian fitted to its mean and std (2026-10-03).
+
+    Until then ``SurrogateAdapter.sample_marginal`` looked only for ``predict_ts_marginal`` / ``predict_ts``, so the
+    ``sample_marginal`` methods of TabICL, Causilo and the bucketized classifiers were never called.
+    """
+
+    def test_adapter_prefers_the_wrapped_models_own_sampler(self) -> None:
+        from pfns4neurostim.models.protocol import SurrogateAdapter
+
+        class _Model:
+            calls: list = []
+
+            def fit(self, X, y) -> None: ...  # noqa: ANN001, N803
+            def predict(self, X):  # noqa: ANN001, ANN201, N803
+                return np.zeros(len(X)), np.ones(len(X))
+            def sample_marginal(self, X, rng, temperature=1.0):  # noqa: ANN001, ANN201, N803
+                _Model.calls.append(temperature)
+                return np.full(len(X), 7.0)
+
+        adapter = SurrogateAdapter(_Model(), key="stub", family="pfn")
+        draws = adapter.sample_marginal(np.zeros((5, 2)), np.random.default_rng(0), temperature=2.0)
+        np.testing.assert_allclose(draws, 7.0)                # not a N(0, 1) draw
+        assert _Model.calls == [2.0]
+
+    def test_adapter_still_falls_back_to_a_gaussian_without_any_sampler(self) -> None:
+        from pfns4neurostim.models.protocol import SurrogateAdapter
+
+        class _Model:
+            def fit(self, X, y) -> None: ...  # noqa: ANN001, N803
+            def predict(self, X):  # noqa: ANN001, ANN201, N803
+                return np.full(len(X), 3.0), np.full(len(X), 0.01)
+
+        draws = SurrogateAdapter(_Model(), key="stub", family="pfn").sample_marginal(
+            np.zeros((200, 2)), np.random.default_rng(0)
+        )
+        assert abs(draws.mean() - 3.0) < 0.01
+
+    def test_inverse_cdf_draws_reproduce_a_skewed_predictive(self) -> None:
+        """A lognormal predictive: the Gaussian summary has the right mean/std but the wrong shape."""
+        from scipy.stats import lognorm
+
+        from pfns4neurostim.models.pfn import wrappers
+
+        levels = wrappers._midpoint_levels(200)
+        q = lognorm.ppf(np.asarray(levels), s=0.8)[None, :].repeat(4000, axis=0)        # [4000, 200]
+        draws = wrappers._inverse_cdf_draws(q, levels, np.random.default_rng(0), 1.0)    # [4000]
+        truth = lognorm.rvs(s=0.8, size=200_000, random_state=1)
+        for level in (0.1, 0.5, 0.9):
+            assert np.quantile(draws, level) == pytest.approx(np.quantile(truth, level), rel=0.08)
+        assert np.quantile(draws, 0.9) > 2.0 * np.quantile(draws, 0.1)                    # skewed, unlike a Gaussian draw
+
+    def test_temperature_scales_the_spread_around_the_mean(self) -> None:
+        from pfns4neurostim.models.pfn import wrappers
+
+        levels = wrappers._midpoint_levels(100)
+        q = np.tile(np.linspace(-1.0, 1.0, 100), (3000, 1))
+        cold = wrappers._inverse_cdf_draws(q, levels, np.random.default_rng(0), 0.25)
+        hot = wrappers._inverse_cdf_draws(q, levels, np.random.default_rng(0), 4.0)
+        assert hot.std() == pytest.approx(4.0 * cold.std(), rel=0.05)
+        with pytest.raises(ValueError, match="temperature"):
+            wrappers._inverse_cdf_draws(q, levels, np.random.default_rng(0), 0.0)
+
+    def test_tabicl_asks_for_the_dense_grid_when_sampling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Sampling must not reuse the 15-level summary grid, which collapses the outer 2 % of mass."""
+        from scipy.stats import norm
+
+        from pfns4neurostim.models.pfn import wrappers
+
+        seen: dict[str, int] = {}
+
+        class _Regressor:
+            def __init__(self, device: str, n_estimators: int, **kw: object) -> None: ...
+            def fit(self, X, y) -> None: ...  # noqa: ANN001, N803
+            def predict(self, X, output_type: str, alphas: list):  # noqa: ANN001, ANN201, N803
+                seen["n_levels"] = len(alphas)
+                return X[:, 0:1] + norm.ppf(np.asarray(alphas))[None, :]
+
+        class _Backend:
+            TabICLRegressor = _Regressor
+
+        monkeypatch.setattr(external, "require_backend", lambda key: _Backend)
+        monkeypatch.setattr(wrappers, "require_backend", lambda key: _Backend)
+        model = wrappers.TabICLSurrogate(n_sample_levels=120)
+        model.fit(np.zeros((4, 2)), np.arange(4.0))
+        draws = np.stack([model.sample_marginal(np.array([[0.0, 0.0], [5.0, 0.0]]), np.random.default_rng(s)) for s in range(300)])
+        assert seen["n_levels"] == 120
+        assert draws.mean(axis=0) == pytest.approx([0.0, 5.0], abs=0.2)
+        assert draws.std(axis=0)[0] == pytest.approx(1.0, abs=0.15)
+
+    def test_tabicl_version_string_changed_so_old_gaussian_cells_cannot_be_served(self) -> None:
+        assert "own quantile predictive" in MODEL_REGISTRY["tabicl"].version

@@ -34,13 +34,13 @@ git checkout scripts/mila_setup.sh && git pull          # drop the hand-copied f
 bash scripts/mila_setup.sh install                      # editable install into the MAIN env
 # 2. bench env (Python 3.11: TabICL, TabFM) - ~10-20 min, only needed for the D3 PFN benchmark
 sbatch scripts/setup_env_job.sh bench                 # NOT on the login node: conda is killed there (memory limit)
-# 2b. v1 env (tabpfn<2: TabPFN v1) - only needed for portfolio units E7/E8
-sbatch scripts/setup_env_job.sh v1
+# 2b. latest env (TabPFN-3.5 + Causilo; torch >= 2.13) - UNBUILT and unvalidated as of 2026-10-03; no portfolio unit uses it yet
+sbatch scripts/setup_env_job.sh latest
 bash scripts/mila_setup.sh submodules                   # libs/tabicl + libs/tabfm are used from the submodules via sys.path
 # 3. smoke-test the bench env on a login node (no GPU needed for the import checks)
 module load anaconda/3 && conda run -n pfns4neurostim-bench python -c "from pfns4neurostim.models.pfn.external import availability; print(availability())"
-#    the v1 env must report tabpfn_v1 True and tabpfn_v2_5's backend absent - if it reports the opposite, tabpfn 6.3.2 leaked in
-module load anaconda/3 && conda run -n pfns4neurostim-v1 python -c "from pfns4neurostim.models.pfn.external import availability; print(availability())"
+#    the latest env must report tabpfn_v3_5 and causilo True - tabpfn_v3_5 is False if tabpfn 6.3.2 (not >= 9) is installed
+module load anaconda/3 && conda run -n pfns4neurostim-latest python -c "from pfns4neurostim.models.pfn.external import availability; print(availability())"
 # 4. calibrate TabFM (unmeasured, GPU only): 2 reps of one channel
 CONDA_ENV=pfns4neurostim-bench sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabfm]" dataset.subjects=[1] dataset.emgs=[0] n_reps=2
 # 5. submit every deliverable but spinal (core), then the externals when you choose (TabICL, TabFM, PFNs4BO)
@@ -58,7 +58,7 @@ bash scripts/submit_externals.sh
 | `bo_benchmark` with TabPFN-2.5 / GP / Random (`hyp_a_*`, `hyp0_acq_table_*`) | `pfns4neurostim` (3.9) | pinned stack |
 | `stress_sweep` (K2, K5, K6) | `pfns4neurostim` (3.9) | pinned stack |
 | `bo_benchmark` with TabICL v2 / TabFM (`hyp0_pfn_bench_*`) | `pfns4neurostim-bench` (3.11) | TabICL needs >= 3.10, TabFM >= 3.11 (TabFlex dropped: dead weight host) |
-| `bo_benchmark` with TabPFN v1 (`hyp0_pfn_bench_*`, units E7/E8) | `pfns4neurostim-v1` | `tabpfn<2` and the pinned `tabpfn` 6.3.2 own the same module name |
+| `bo_benchmark` with TabPFN-3.5 / Causilo (`hyp0_pfn_bench_*`; no portfolio unit yet) | `pfns4neurostim-latest` (3.11) | `tabpfn >= 9` and the pinned `tabpfn` 6.3.2 own the same module name; Causilo needs torch >= 2.13 |
 | Mitra | not yet | deferred (AutoGluon) |
 
 `scripts/run_*.sh` select the env with `CONDA_ENV` (default `pfns4neurostim`). The authoritative

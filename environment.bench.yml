@@ -7,7 +7,6 @@
 #   TabICL v2  Python >= 3.10  no
 #   TabFM      Python >= 3.11  no
 #   TabFlex    Python >= 3.8   dropped: its weight host no longer resolves (microsoft/ticl issue #27)
-#   TabPFN v1  tabpfn < 2      no - collides with the pinned tabpfn 6.3.2 (own env, deferred)
 #
 # The external benchmark runs here and its cells are merged with the main run's through the shared cell cache.
 # The package code is identical in both; only the interpreter and the library pins differ.

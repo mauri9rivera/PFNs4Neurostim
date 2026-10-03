@@ -21,7 +21,7 @@ Groups (updated 2026-09-25; units whose results already exist were removed — s
                hits the 12 h limit loses its work: check the estimates before submitting, and split a unit
                by config rather than hoping.
     externals  the PFN benchmark: base models on 5d_rat (bench env), TabFM (bench env, 24 GB, <= 2 lanes, NHP rerun plus a
-               5d_rat calibration job), PFNs4BO 5d_rat (main env) and TabPFN v1 (v1 env, tabpfn<2).
+               5d_rat calibration job) and PFNs4BO 5d_rat (main env).
     spinal     every spinal deliverable (Hyp A, Hyp 0, PFN benchmark, all stress knobs); needs data/spinal
                staged on the cluster first. Hyp C (mechanism) is not included: NHP-scoped, and one
                non-resumable process per analysis would exceed the 12 h limit on 90 channels.
@@ -68,7 +68,6 @@ CPU_LANES = 8
 DEFAULT_JOB_MEM_GB = 7
 BENCH_ENV = "pfns4neurostim-bench"
 MAIN_ENV = "pfns4neurostim"
-V1_ENV = "pfns4neurostim-v1"    # tabpfn<2; cannot share an interpreter with the pinned 6.3.2
 #: Runners that run as one process and write their own deliverables (no lanes, no cell assembly).
 SINGLE_PROCESS: frozenset[str] = frozenset({"mechanism"})
 
@@ -158,13 +157,6 @@ UNITS: tuple[Unit, ...] = (
     _u("E6. PFNs4BO (native policy), 5d_rat", "bo_benchmark", "hyp0_pfn_bench_5d_rat", "5d_rat", ("pfns4bo",), (),
        group="externals", lanes=2,
        note="main env; cells land in the hyp0-pfn-bench run; ~10 min for 180 reps on 2 lanes (2026-09-24)"),
-    # TabPFN v1 joins the same PFN benchmark run from its own environment (2026-09-25).
-    _u("E7. TabPFN v1 (classification-head adaptation), NHP", "bo_benchmark", "hyp0_pfn_bench_nhp", "nhp",
-       ("tabpfn_v1",), (), group="externals", env=V1_ENV, lanes=2, hours=None,
-       note="cost UNMEASURED; v1 API unexecuted until the v1 env exists: build it and run ONE cell before submitting"),
-    _u("E8. TabPFN v1 (classification-head adaptation), 5d_rat", "bo_benchmark", "hyp0_pfn_bench_5d_rat", "5d_rat",
-       ("tabpfn_v1",), (), group="externals", env=V1_ENV, lanes=2, hours=None,
-       note="cost UNMEASURED; after E7"),
     # ---- spinal: every deliverable (2026-09-25). Stage data/spinal on the cluster first (runbook). Budget 64 =
     # the 8x8 grid. Subject 5 has one trial per site on every EMG (no noise floor), so the SNR-based stress
     # sweeps run on the other 10 subjects (90 channels); the benchmarks keep all 100.
@@ -195,9 +187,6 @@ UNITS: tuple[Unit, ...] = (
     _u("P15. TabFM, spinal (fixed wrapper)", "bo_benchmark", "hyp0_pfn_bench_spinal", "spinal", ("tabfm",), (),
        group="spinal", env=BENCH_ENV,
        note="cost UNMEASURED on spinal: run after E3 and read its per-rep time; sigma is constructed (G3)"),
-    _u("P16. TabPFN v1 (classification-head adaptation), spinal", "bo_benchmark", "hyp0_pfn_bench_spinal", "spinal",
-       ("tabpfn_v1",), (), group="spinal", env=V1_ENV, lanes=2, hours=None,
-       note="cost UNMEASURED; only after E7 has run one v1 cell successfully"),
     # ---- hypc: the mechanism analyses, one process each, context-size sweeps of task #18 (2026-09-30) ----
     # No cell cache: `mechanism` always recomputes, so these need no tag gymnastics -- but they are also NOT
     # resumable. Give a unit its own tag only to keep an older run directory; otherwise it is overwritten.

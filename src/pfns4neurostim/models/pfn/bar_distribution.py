@@ -1,7 +1,7 @@
 """Bucketized-regression adapter: read a classifier's class probabilities as a distribution.
 
-Two Hyp 0 benchmark models — **TabPFN v1** and **TabFlex** — are classification
-models. To use them as regression surrogates, the standardized response is
+The Hyp 0 benchmark model **TabFlex** is a classification
+model. To use it as a regression surrogate, the standardized response is
 discretized into K bins and the predicted class probabilities are read as a bar
 (piecewise-uniform) distribution over the response axis, giving mean, standard
 deviation, quantiles and samples.

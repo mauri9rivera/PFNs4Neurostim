@@ -182,9 +182,12 @@ class SurrogateAdapter:
     def sample_marginal(self, X: np.ndarray, rng: np.random.Generator, temperature: float = 1.0) -> np.ndarray:
         """Draw independent per-site samples from the predictive marginals.
 
-        Uses the model's native sampler when it has one (a PFN samples its bar
-        distribution, which is not Gaussian), and falls back to a Gaussian draw
-        from ``predict_marginals`` otherwise.
+        Uses the model's own sampler when it has one, and falls back to a Gaussian draw from
+        ``predict_marginals`` otherwise. In order of preference: ``sample_marginal(X, rng, temperature)``
+        (the external wrappers that invert a quantile function or sample a bar distribution: TabICL, Causilo,
+        the bucketized classifiers), ``predict_ts_marginal`` (the GP family), ``predict_ts`` (TabPFN's bar
+        distribution). Until 2026-10-03 only the last two were looked up, so the first group's own samplers
+        were never called and their Thompson draws were Gaussian from (mean, std).
 
         Args:
             X: Candidate coordinates, shape [N, D].
@@ -200,11 +203,14 @@ class SurrogateAdapter:
         """
         if temperature <= 0.0:
             raise ValueError(f"temperature must be > 0, got {temperature}.")
+        own = getattr(self._model, "sample_marginal", None)
         native = getattr(self._model, "predict_ts_marginal", None)
         if native is None and self.family != "gp":
             # PFN surrogates expose per-site draws under the plain name.
             native = getattr(self._model, "predict_ts", None)
-        if native is not None:
+        if own is not None:
+            samples = np.asarray(own(X, rng, temperature=temperature), dtype=np.float64)
+        elif native is not None:
             samples = np.asarray(native(X, temperature=temperature), dtype=np.float64)
         else:
             mean, std = self.predict_marginals(X)

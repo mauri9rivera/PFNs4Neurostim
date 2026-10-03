@@ -52,6 +52,5 @@ submit_unit "P11. Demo 1 K1 decoy, spinal twins" stress_sweep scripts/run_stress
 submit_unit "P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "8G"
 submit_unit "P14. PFNs4BO (native policy), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim "pfns4bo" "-" 2 "-"
 submit_unit "P15. TabFM, spinal (fixed wrapper)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabfm" "-" 2 "24G"
-submit_unit "P16. TabPFN v1 (classification-head adaptation), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-v1 "tabpfn_v1" "-" 2 "12G"
 
 echo "Done. Check with: squeue --me"

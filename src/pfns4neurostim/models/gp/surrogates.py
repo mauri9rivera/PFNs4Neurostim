@@ -92,6 +92,12 @@ RBF_IDENTITY_MAX_SCALED: float = 1e4
 #: Rows per chunk on the direct-difference path, which materialises a [rows, Q, D] intermediate.
 RBF_CHUNK_ROWS: int = 256
 
+#: What a freshly built gpytorch RBF kernel / Gaussian likelihood starts at: softplus(0) = ln 2, for the lengthscale and
+#: the noise alike. GP-fixed uses it (user decision 2026-10-03) as "what a practitioner with no knowledge of the data
+#: gets without choosing anything". Checked against gpytorch 1.11: lengthscale 0.6931472, noise 0.6932472 (the noise
+#: carries gpytorch's 1e-4 floor offset).
+GPYTORCH_DEFAULT_HYPERPARAMETER: float = 0.6931471805599453
+
 #: Spread of the negative log marginal likelihood across feasible restarts, in nats, below which the
 #: starts are taken to agree. Agreement between independent starts is the only cheap evidence about the
 #: GLOBAL optimum; a gradient says nothing about it. Measured 2026-10-01: a 250-step Adam fit reached a
@@ -1137,17 +1143,17 @@ class NaiveGPSurrogate(GPSurrogate):
 
     Args:
         device: PyTorch device string ('cpu' or 'cuda').
-        lengthscale: Fixed RBF lengthscale applied to every input dimension.
+        lengthscale: Fixed RBF lengthscale applied to every input dimension (default: gpytorch's ln 2).
         outputscale: Fixed signal variance (scale-kernel output scale).
-        noise: Fixed Gaussian observation noise variance.
+        noise: Fixed Gaussian observation noise variance (default: gpytorch's ln 2).
     """
 
     def __init__(
         self,
         device: str = 'cpu',
-        lengthscale: float = 0.2,
+        lengthscale: float = GPYTORCH_DEFAULT_HYPERPARAMETER,
         outputscale: float = 1.0,
-        noise: float = 1e-2,
+        noise: float = GPYTORCH_DEFAULT_HYPERPARAMETER,
     ) -> None:
         # n_opt_steps=0 → fit() skips the optimisation loop entirely.
         super().__init__(device=device, n_opt_steps=0)

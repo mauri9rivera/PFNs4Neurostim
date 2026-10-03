@@ -43,7 +43,7 @@ update_rule:
   # `gp_fixed_frozen` to show that arm next to the others (identical to the reference when reference_gp is fixed).
   reference_gp: mll
   # Keep in step with configs/model/gp_naive.yaml by hand.
-  fixed_gp_params: {lengthscale: 0.2, outputscale: 1.0, noise: 0.01}
+  fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.6931471805599453}
   inference_seed: 0
   gates: {positive_r: 0.7, lengthscale_tol: 0.25, icc_min: 0.75, linear_regime_tol: 0.25, null_quantile: 0.95, context_t: 25}
   positive_control: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10}

@@ -69,8 +69,9 @@ metrics.
 
 **Environment:** `conda activate pfns4neurostim` (see `environment.yml`). Two more exist for
 benchmark models whose pins cannot coexist with the main ones: `pfns4neurostim-bench`
-(`environment.bench.yml`, Python 3.11 — TabICL, TabFM) and `pfns4neurostim-v1`
-(`environment.v1.yml`, `tabpfn<2` — TabPFN v1). `ExternalSpec.env` in
+(`environment.bench.yml`, Python 3.11 — TabICL, TabFM) and `pfns4neurostim-latest`
+(`environment.latest.yml`, Python 3.11, torch >= 2.13 — TabPFN-3.5 with `tabpfn >= 9`, Causilo; unbuilt as of
+2026-10-03). `ExternalSpec.env` in
 `models/pfn/external.py` is the single record of which model runs where.
 
 **Experiment tracking:** Local CSV + pickle files under `output/runs/<tag>/`. No W&B or MLflow.

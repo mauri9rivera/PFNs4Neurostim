@@ -127,7 +127,6 @@ stage_rat()       { check_repo; check_data 5d_rat 5d_rat; }
 stage_hypc()      { check_repo; check_data nhp monkeys; check_submodules || true; }
 stage_externals() { check_repo; check_data nhp monkeys; check_data 5d_rat 5d_rat; echo "environments"; check_env pfns4neurostim-bench tabicl,tabfm; }
 stage_spinal()    { check_repo; check_data spinal spinal; }
-stage_v1()        { echo "environments"; check_env pfns4neurostim-v1 tabpfn_v1; }
 
 case "${STAGE_FILTER}" in
   all)
@@ -139,12 +138,11 @@ case "${STAGE_FILTER}" in
     echo "environments"
     check_env pfns4neurostim tabpfn_v2_5,gp_mll,pfns4bo
     check_env pfns4neurostim-bench tabicl,tabfm
-    check_env pfns4neurostim-v1 tabpfn_v1
     check_submodules || true
     check_space
     ;;
-  audit|nhp|rat|hypc|externals|spinal|v1) "stage_${STAGE_FILTER}" ;;
-  *) echo "usage: bash scripts/preflight.sh [all|audit|nhp|rat|hypc|externals|spinal|v1]" >&2; exit 2 ;;
+  audit|nhp|rat|hypc|externals|spinal) "stage_${STAGE_FILTER}" ;;
+  *) echo "usage: bash scripts/preflight.sh [all|audit|nhp|rat|hypc|externals|spinal]" >&2; exit 2 ;;
 esac
 
 echo

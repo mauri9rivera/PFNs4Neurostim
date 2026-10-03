@@ -1,7 +1,7 @@
 """Every experiment YAML in configs/experiment/ must load and validate (no data, no GPU).
 
-Guards against a config naming a group file that does not exist (2026-09-25: `tabpfn_v1` was added to the
-PFN-benchmark configs without `configs/model/tabpfn_v1.yaml`, so the configs failed only when a job started).
+Guards against a config naming a group file that does not exist (2026-09-25: a model was added to the
+PFN-benchmark configs without its `configs/model/<name>.yaml`, so the configs failed only when a job started).
 """
 from __future__ import annotations
 

@@ -16,10 +16,10 @@
 #   bash scripts/narval_setup.sh check-data   # verify shared_data/ against scripts/data_manifest.sha256; fails loudly on any change
 #   bash scripts/narval_setup.sh stage        # copy ONLY this project's datasets from shared_data/ to scratch, then verify the copy
 #   bash scripts/narval_setup.sh submodules   # git submodule update --init --recursive (+ ticl excludes)
-#   bash scripts/narval_setup.sh env [main|bench|v1]   # build/update the virtualenv from environment*.yml
-#   bash scripts/narval_setup.sh install [main|bench|v1]   # only pip install -e . --no-deps
+#   bash scripts/narval_setup.sh env [main|bench|latest]   # build/update the virtualenv from environment*.yml
+#   bash scripts/narval_setup.sh install [main|bench|latest]   # only pip install -e . --no-deps
 #   bash scripts/narval_setup.sh verify       # layout, quotas, imports
-#   bash scripts/narval_setup.sh weights [main|bench|v1] [models]   # pre-download checkpoints (compute nodes are offline)
+#   bash scripts/narval_setup.sh weights [main|bench|latest] [models]   # pre-download checkpoints (compute nodes are offline)
 #
 # The data master is shared_data/ next to the projects, and other projects write to it (additive_neurostim moved its datasets
 # there on 2026-10-02), so nothing here trusts it blindly: scripts/data_manifest.sha256 lists the sha256 of every file this
@@ -43,12 +43,12 @@ MANIFEST="${MANIFEST:-${CODE_DIR}/scripts/data_manifest.sha256}"
 
 log() { printf '[narval_setup] %s\n' "$*"; }
 
-env_name() {   # env_name <main|bench|v1>
+env_name() {   # env_name <main|bench|latest>
   case "${1:-main}" in
     main) echo "pfns4neurostim" ;;
     bench) echo "pfns4neurostim-bench" ;;
-    v1) echo "pfns4neurostim-v1" ;;
-    *) log "usage: env [main|bench|v1]"; exit 2 ;;
+    latest) echo "pfns4neurostim-latest" ;;
+    *) log "usage: env [main|bench|latest]"; exit 2 ;;
   esac
 }
 
@@ -56,7 +56,7 @@ env_file() {
   case "${1:-main}" in
     main) echo "environment.yml" ;;
     bench) echo "environment.bench.yml" ;;
-    v1) echo "environment.v1.yml" ;;
+    latest) echo "environment.latest.yml" ;;
   esac
 }
 
@@ -197,7 +197,7 @@ cmd_weights() {
   case "${which}" in
     main) models="${2:-tabpfn_v2_5}" ;;
     bench) models="${2:-tabpfn_v2_5,tabicl,tabfm}" ;;
-    v1) models="${2:-tabpfn_v1}" ;;
+    latest) models="${2:-tabpfn_v3_5,causilo}" ;;
   esac
   "${VENV_ROOT}/${env}/bin/python" - "${models}" <<'PYEOF'
 import sys
@@ -221,7 +221,7 @@ cmd_verify() {
   for d in "${CODE_DIR}"/data/*/; do [ -d "${d}" ] && printf '  %-12s %s files\n' "$(basename "${d}")" "$(find "${d}" -type f | wc -l)"; done
   log "--- environments ---"
   local which env py
-  for which in main bench v1; do
+  for which in main bench latest; do
     env="$(env_name "${which}")"; py="$(cluster_env_python "${env}")"
     if [ -z "${py}" ]; then printf '  %-22s not built\n' "${env}"; continue; fi
     printf '  %-22s ' "${env}"

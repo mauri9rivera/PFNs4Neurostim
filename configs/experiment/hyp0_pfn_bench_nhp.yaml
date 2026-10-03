@@ -1,4 +1,4 @@
-# Hypothesis 0 - PFN benchmark, nhp: TabPFN-2.5 vs TabICL v2.2.0 vs TabFM vs PFNs4BO vs TabPFN v1 vs GP-MLL.
+# Hypothesis 0 - PFN benchmark, nhp: TabPFN-2.5 vs TabICL v2.2.0 vs TabFM vs PFNs4BO vs TabPFN-3.5 vs Causilo vs GP-MLL.
 #
 # Every model runs its own policy: `_supported` pairs PFNs4BO (an end-to-end BO model) with `native` only and
 # every other model with `ts_marginal` only, so the acquisition list below adds no cross-product cells.
@@ -7,22 +7,21 @@
 #    sqrt(ensemble spread^2 + out-of-fold residual RMSE^2) (2026-09-25; before that the spread alone, which
 #    collapsed Thompson sampling to greedy). Guardrail G3: say "constructed sigma" in every table and caption.
 #  - PFNs4BO: HEBO+ prior, its own acquisition (`native`); runs in the MAIN env (py3.9, pins scikit-learn<1.2).
-#  - TabPFN v1: a CLASSIFIER. The wrapper bins the response into 10 equal-mass quantile bins and reads its
-#    class probabilities as a bar distribution, so its predictive SD cannot fall below ~range/(10*sqrt(12)).
-#    Label every v1 row "classification-head adaptation" and report its calibration next to the bin count,
-#    never ranked against v2.5's native bar distribution (docs/tabpfn_v1_adaptation.md). Runs in the V1 env:
-#    tabpfn<2 and tabpfn 6.3.2 own the same module name, so they cannot share one interpreter.
+#  - TabPFN-3.5: same bar-distribution predictive as TabPFN-2.5, newer checkpoint (tabpfn >= 9). Runs in the LATEST env:
+#    tabpfn >= 9 and the tabpfn 6.3.2 that provides TabPFN-2.5 own the same module name, so they cannot share one interpreter.
+#  - Causilo: native quantile predictive distribution (999 levels; Thompson draws invert it); needs torch >= 2.13, so the
+#    LATEST env too. Neither new model has run yet (2026-10-03): the first cell must confirm the wrapper against the real package.
 #  - TabFlex is dropped: upstream's weight host no longer resolves (microsoft/ticl issue #27).
-# Environments: TabICL and TabFM need the bench env (py3.11), PFNs4BO the main env, TabPFN v1 the v1 env. The portfolio submits each
+# Environments: TabICL and TabFM need the bench env (py3.11), PFNs4BO the main env, TabPFN-3.5 and Causilo the latest env. The portfolio submits each
 # model in its env against this ONE config, so every cell lands in this run and one assemble job (main env)
 # builds the tables and figures. Latency is descriptive only (guardrail G1).
 #
 #   CONDA_ENV=pfns4neurostim-bench LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v2_5,tabicl]"
 #   CONDA_ENV=pfns4neurostim LANES=2 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[pfns4bo]"
-#   CONDA_ENV=pfns4neurostim-v1 LANES=2 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v1]"
+#   CONDA_ENV=pfns4neurostim-latest LANES=2 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v3_5,causilo]"
 defaults:
   dataset: nhp
-  model: [tabpfn_v2_5, tabicl, tabfm, pfns4bo, tabpfn_v1, gp_mll]
+  model: [tabpfn_v2_5, tabicl, tabfm, pfns4bo, tabpfn_v3_5, causilo, gp_mll]
   acquisition: [ts_marginal, native]
 
 experiment: bo_benchmark

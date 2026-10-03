@@ -1,0 +1,7 @@
+# Causilo 1.0 (Nums AI, arXiv 2609.22866): native regressor with a quantile predictive distribution. Needs
+# torch >= 2.13 and Python >= 3.10 -> runs in the `latest` environment (environment.latest.yml).
+# Upstream's default is n_estimators=8; the BO loops use 1, one forward per step, like every other model here.
+name: causilo
+params:
+  device: null   # per-model override of the experiment `device`
+  n_estimators: 1

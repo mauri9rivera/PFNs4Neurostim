@@ -1,11 +1,11 @@
-# Hyp 0 PFN benchmark, spinal: TabPFN-2.5, TabICL, TabFM, PFNs4BO, TabPFN v1, GP-MLL.
+# Hyp 0 PFN benchmark, spinal: TabPFN-2.5, TabICL, TabFM, PFNs4BO, TabPFN-3.5, Causilo, GP-MLL.
 # Same design as hyp0_pfn_bench_nhp.yaml (see its header: envs, constructed TabFM sigma, G1/G3).
 #
 # Derived from the NHP config of the same name (2026-09-25); differences: dataset/tag spinal, budget 64
 # = the 8x8 grid (legacy spinal benchmark; NHP also uses budget = grid).
 defaults:
   dataset: spinal
-  model: [tabpfn_v2_5, tabicl, tabfm, pfns4bo, tabpfn_v1, gp_mll]
+  model: [tabpfn_v2_5, tabicl, tabfm, pfns4bo, tabpfn_v3_5, causilo, gp_mll]
   acquisition: [ts_marginal, native]
 
 experiment: bo_benchmark

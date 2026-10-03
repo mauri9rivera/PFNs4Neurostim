@@ -11,7 +11,7 @@
 #   bash scripts/narval.sh run -- <read-only cmd>
 #   bash scripts/narval.sh pull [subpath under output/]              # results Narval -> local (scripts/export_results.sh)
 #   bash scripts/narval.sh do pull                                   # git pull --ff-only + submodule update in the cluster checkout
-#   bash scripts/narval.sh do setup <layout|stage|submodules|check-data|env|install|weights|verify> [main|bench|v1] [models]
+#   bash scripts/narval.sh do setup <layout|stage|submodules|check-data|env|install|weights|verify> [main|bench|latest] [models]
 #   bash scripts/narval.sh do sbatch <gpu|cpu> [--lanes N] [--conda-env E] [--gpu-type T] [--mem M] [--cpus C] [--time T]
 #                                    [--dependency afterany:ID[:ID]] [--job-name N] -- <scripts/run_*.sh> <args...>
 #
@@ -52,7 +52,7 @@ do_pull() {
 }
 
 do_setup() {   # do_setup <subcommand> [env] [models]
-  local sub="${1:?usage: do setup <subcommand> [main|bench|v1] [models]}"; shift
+  local sub="${1:?usage: do setup <subcommand> [main|bench|latest] [models]}"; shift
   need subcommand "${sub}" '^(layout|stage|submodules|check-data|env|install|weights|verify)$'
   local args=""
   for a in "$@"; do need argument "${a}" '^[A-Za-z0-9_,.-]+$'; args+=" ${a}"; done
@@ -66,7 +66,7 @@ do_sbatch() {   # do_sbatch <gpu|cpu> [options] -- <script> <args...>
   while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
     case "$1" in
       --lanes) need lanes "$2" '^[0-9]{1,2}$'; lanes="$2" ;;
-      --conda-env) need env "$2" '^pfns4neurostim(-bench|-v1)?$'; conda_env="$2" ;;
+      --conda-env) need env "$2" '^pfns4neurostim(-bench|-latest)?$'; conda_env="$2" ;;
       --gpu-type) need gpu-type "$2" '^a100(_[0-9]g\.[0-9]+gb)?$'; gpu_type="$2" ;;
       --mem) need mem "$2" '^[0-9]{1,3}[MG]$'; extra+=("--mem=$2") ;;
       --cpus) need cpus "$2" '^[0-9]{1,2}$'; extra+=("--cpus-per-task=$2") ;;

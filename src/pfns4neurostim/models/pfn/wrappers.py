@@ -18,8 +18,6 @@ TabFM         py>=3.11   ``libs/tabfm``. Native regressor, but ``predict`` retur
 PFNs4BO       **yes**    Vendored checkpoint. An end-to-end BO model: it owns the query decision
                          (its acquisition criterion, computed inside the network), exposed as
                          a *native policy* that the ``native`` acquisition type delegates to.
-TabPFN v1     env v1     ``tabpfn<2``; classification-head adaptation capped at 10 bins.
-                         Own env (``environment.v1.yml``): v1 and 6.3.2 share the module name.
 Mitra         pending    Needs AutoGluon; predictive-distribution access unconfirmed.
 ============  =========  ==============================================================
 
@@ -41,7 +39,8 @@ from .external import BucketizedClassifierSurrogate, ExternalSurrogate, require_
 __all__ = [
     "PFNs4BOSurrogate",
     "TabICLSurrogate",
-    "TabPFNv1Surrogate",
+    "CausiloSurrogate",
+    "TabPFN35Surrogate",
     "TabFMSurrogate",
     "MitraSurrogate",
     "TabFlexSurrogate",
@@ -54,6 +53,60 @@ __all__ = [
 _QUANTILE_ALPHAS: tuple[float, ...] = (
     0.01, 0.025, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.975, 0.99,
 )
+
+
+def _midpoint_levels(n: int) -> tuple[float, ...]:
+    """Equally spaced probability levels ``(i + 0.5) / n`` -- the grid a Thompson draw inverts.
+
+    Args:
+        n: Number of levels.
+
+    Returns:
+        ``n`` increasing levels strictly inside (0, 1).
+
+    Raises:
+        ValueError: If ``n`` < 2.
+    """
+    if n < 2:
+        raise ValueError(f"need at least 2 sampling levels, got {n}.")
+    return tuple((i + 0.5) / n for i in range(n))
+
+
+def _inverse_cdf_draws(
+    quantiles: np.ndarray,
+    levels: tuple[float, ...],
+    rng: np.random.Generator,
+    temperature: float,
+) -> np.ndarray:
+    """One draw per row by inverting a predicted quantile function at a uniform level.
+
+    A draw ``u ~ U(0, 1)`` is mapped through the model's own quantile function (linear interpolation between
+    ``levels``; clamped to the end values outside them, i.e. at most ``0.5 / len(levels)`` of tail mass per side).
+
+    Args:
+        quantiles: Predicted quantiles, shape [N, Q], increasing along axis 1.
+        levels: The Q probability levels, increasing.
+        rng: Seeded generator.
+        temperature: Variance scaling around the predictive mean (1.0 = the exact predictive).
+
+    Returns:
+        Samples, shape [N].
+
+    Raises:
+        ValueError: If ``temperature`` is not positive or the shapes disagree.
+    """
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be > 0, got {temperature}.")
+    q = np.asarray(quantiles, dtype=np.float64)                  # [N, Q]
+    a = np.asarray(levels, dtype=np.float64)                     # [Q]
+    if q.ndim != 2 or q.shape[1] != a.size:
+        raise ValueError(f"quantiles {q.shape} do not match {a.size} levels.")
+    u = rng.random(q.shape[0])                                   # [N]
+    draws = np.array([np.interp(u[i], a, q[i]) for i in range(q.shape[0])])   # [N]
+    if temperature == 1.0:
+        return draws
+    mean, _ = _moments_from_quantiles(q, tuple(a))
+    return mean + np.sqrt(temperature) * (draws - mean)
 
 
 def _moments_from_quantiles(
@@ -103,12 +156,17 @@ class TabICLSurrogate(ExternalSurrogate):
     Args:
         device: Torch device string.
         n_estimators: Ensemble members; 1 keeps BO steps cheap.
+        n_sample_levels: Resolution of the quantile function a Thompson draw inverts (equally spaced
+            levels ``(i + 0.5) / n``). The mean/std summary keeps its own coarser grid.
         **backend_kwargs: Forwarded to ``TabICLRegressor``.
     """
 
-    def __init__(self, device: str = "cpu", n_estimators: int = 1, **backend_kwargs: Any) -> None:
+    def __init__(
+        self, device: str = "cpu", n_estimators: int = 1, n_sample_levels: int = 200, **backend_kwargs: Any
+    ) -> None:
         super().__init__("tabicl", device=device, **backend_kwargs)
         self.n_estimators = int(n_estimators)
+        self._sample_levels = _midpoint_levels(int(n_sample_levels))
         self._model: Any = None
 
     def _fit_backend(self, X: np.ndarray, y: np.ndarray) -> None:
@@ -144,10 +202,11 @@ class TabICLSurrogate(ExternalSurrogate):
     def sample_marginal(
         self, X: np.ndarray, rng: np.random.Generator, temperature: float = 1.0
     ) -> np.ndarray:
-        """Draw per-site Thompson samples by inverting the predicted quantile function.
+        """Draw per-site Thompson samples by inverting TabICL's own quantile function.
 
-        Sampling the model's own quantiles keeps the draw faithful to a skewed or
-        multi-modal predictive, which a Gaussian summary would flatten.
+        The quantile function is evaluated on ``n_sample_levels`` equally spaced levels (not the coarse 15-level
+        summary grid, which would collapse the outer 2 % of mass onto its end points), so a skewed or
+        multi-modal predictive is sampled faithfully rather than flattened into a Gaussian.
 
         Args:
             X: Candidate coordinates, shape [N, D].
@@ -163,18 +222,182 @@ class TabICLSurrogate(ExternalSurrogate):
         if temperature <= 0.0:
             raise ValueError(f"temperature must be > 0, got {temperature}.")
         quantiles = np.asarray(
-            self._model.predict(X, output_type="quantiles", alphas=list(_QUANTILE_ALPHAS)),
+            self._model.predict(X, output_type="quantiles", alphas=list(self._sample_levels)),
+            dtype=np.float64,
+        )                                                  # [N, n_sample_levels]
+        return _inverse_cdf_draws(np.sort(quantiles, axis=1), self._sample_levels, rng, temperature)
+
+
+class CausiloSurrogate(ExternalSurrogate):
+    """Causilo surrogate -- **native regression with a quantile predictive distribution**.
+
+    ``CausiloRegressor.predict(X, output_type='quantiles', quantiles=[...])`` returns the predicted
+    quantile function (its native grid is 999 levels, 0.001-0.999), which this wrapper integrates into a
+    mean and a standard deviation and samples by inverse-CDF, exactly as :class:`TabICLSurrogate` does.
+    No bucketization is involved, so Causilo is a first-class row of the Hyp 0 table.
+
+    Requires torch >= 2.13 and Python >= 3.10 (upstream declaration), i.e. the ``latest`` environment.
+    Not yet executed against the real package: the call signature is taken from upstream's
+    ``docs/inference.md``, so the first cell run must confirm it.
+
+    Args:
+        device: Torch device string (``'cpu'`` or ``'cuda'``; upstream's own default is ``'auto'``).
+        n_estimators: Ensemble members. Upstream defaults to 8; the BO loops use 1, one forward per step,
+            like every other model of the benchmark.
+        n_sample_levels: Resolution of the quantile function a Thompson draw inverts.
+        **backend_kwargs: Forwarded to ``CausiloRegressor``.
+    """
+
+    def __init__(
+        self, device: str = "cpu", n_estimators: int = 1, n_sample_levels: int = 200, **backend_kwargs: Any
+    ) -> None:
+        super().__init__("causilo", device=device, **backend_kwargs)
+        self.n_estimators = int(n_estimators)
+        self._sample_levels = _midpoint_levels(int(n_sample_levels))
+        self._model: Any = None
+
+    def _fit_backend(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Fit a fresh Causilo regressor on the observed context.
+
+        Args:
+            X: Observed coordinates, shape [n, D].
+            y: Observed responses, shape [n].
+        """
+        backend = require_backend("causilo")
+        self._model = backend.CausiloRegressor(
+            device=self.device, n_estimators=self.n_estimators, **self.backend_kwargs
+        )
+        self._model.fit(X, y)
+
+    def _quantiles(self, X: np.ndarray) -> np.ndarray:
+        """Predicted quantile function at the summary levels.
+
+        Args:
+            X: Candidate coordinates, shape [N, D].
+
+        Returns:
+            Quantiles, shape [N, Q], sorted along axis 1.
+
+        Raises:
+            RuntimeError: If upstream returns a shape other than [N, Q].
+        """
+        q = np.asarray(
+            self._model.predict(X, output_type="quantiles", quantiles=list(_QUANTILE_ALPHAS)),
             dtype=np.float64,
         )                                                  # [N, Q]
-        alphas = np.asarray(_QUANTILE_ALPHAS)              # [Q]
-        u = rng.random(quantiles.shape[0])                 # [N]
-        draws = np.array(
-            [np.interp(u[i], alphas, quantiles[i]) for i in range(quantiles.shape[0])]
-        )                                                  # [N]
-        if temperature == 1.0:
-            return draws
-        mean, _ = _moments_from_quantiles(quantiles)
-        return mean + np.sqrt(temperature) * (draws - mean)
+        if q.shape != (X.shape[0], len(_QUANTILE_ALPHAS)):
+            raise RuntimeError(
+                f"causilo returned quantiles of shape {q.shape}, expected "
+                f"({X.shape[0]}, {len(_QUANTILE_ALPHAS)}) (upstream API changed?)."
+            )
+        return np.sort(q, axis=1)
+
+    def _predict_backend(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Integrate the predicted quantile function into a mean and a standard deviation.
+
+        Args:
+            X: Candidate coordinates, shape [N, D].
+
+        Returns:
+            ``(mean, std)``, each shape [N].
+        """
+        return _moments_from_quantiles(self._quantiles(X))
+
+    def sample_marginal(
+        self, X: np.ndarray, rng: np.random.Generator, temperature: float = 1.0
+    ) -> np.ndarray:
+        """Draw per-site Thompson samples by inverting Causilo's own quantile function.
+
+        Args:
+            X: Candidate coordinates, shape [N, D].
+            rng: Seeded generator.
+            temperature: Variance scaling applied around the predictive mean.
+
+        Returns:
+            One sample per candidate, shape [N].
+
+        Raises:
+            ValueError: If ``temperature`` is not positive.
+            RuntimeError: If upstream returns a shape other than [N, n_sample_levels].
+        """
+        if temperature <= 0.0:
+            raise ValueError(f"temperature must be > 0, got {temperature}.")
+        q = np.asarray(
+            self._model.predict(X, output_type="quantiles", quantiles=list(self._sample_levels)),
+            dtype=np.float64,
+        )                                                  # [N, n_sample_levels]
+        if q.shape != (X.shape[0], len(self._sample_levels)):
+            raise RuntimeError(
+                f"causilo returned quantiles of shape {q.shape}, expected "
+                f"({X.shape[0]}, {len(self._sample_levels)}) (upstream API changed?)."
+            )
+        return _inverse_cdf_draws(np.sort(q, axis=1), self._sample_levels, rng, temperature)
+
+
+class TabPFN35Surrogate(ExternalSurrogate):
+    """TabPFN-3.5 surrogate: the same bar-distribution predictive as TabPFN-2.5, newer checkpoint.
+
+    Builds the regressor with ``TabPFNRegressor.create_default_for_version(ModelVersion.V3_5, ...)`` and
+    reads it through the existing :class:`~pfns4neurostim.models.pfn.tabpfn.TabPFNSurrogate` (public API
+    only: ``fit`` and ``predict(output_type='full')``), so TabPFN-2.5 and TabPFN-3.5 differ only in the
+    checkpoint. Needs ``tabpfn >= 9`` (``latest`` env); the main env pins 6.3.2 for TabPFN-2.5.
+    Not yet executed against the real package: ``output_type='full'`` keeping its ``logits`` /
+    ``criterion`` keys in 9.x is assumed, and the first cell run must confirm it.
+
+    Args:
+        device: Torch device string.
+        n_estimators: Ensemble members; 1 for BO loops, as for TabPFN-2.5.
+        **backend_kwargs: Forwarded to ``TabPFNRegressor.create_default_for_version``.
+    """
+
+    def __init__(self, device: str = "cpu", n_estimators: int = 1, **backend_kwargs: Any) -> None:
+        super().__init__("tabpfn_v3_5", device=device, **backend_kwargs)
+        self.n_estimators = int(n_estimators)
+        self._inner: Any = None
+
+    def _fit_backend(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Fit a fresh TabPFN-3.5 regressor on the observed context.
+
+        Args:
+            X: Observed coordinates, shape [n, D].
+            y: Observed responses, shape [n].
+        """
+        from tabpfn.constants import ModelVersion  # noqa: PLC0415 - V3_5 exists only in tabpfn >= 9
+
+        from .tabpfn import TabPFNSurrogate  # noqa: PLC0415 - imports tabpfn at module level
+
+        regressor = self._backend.TabPFNRegressor.create_default_for_version(
+            ModelVersion.V3_5,
+            device=self.device,
+            n_estimators=self.n_estimators,
+            ignore_pretraining_limits=True,
+            **self.backend_kwargs,
+        )
+        self._inner = TabPFNSurrogate(regressor)
+        self._inner.fit(X, y)
+
+    def _predict_backend(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Moments of the bar distribution.
+
+        Args:
+            X: Candidate coordinates, shape [N, D].
+
+        Returns:
+            ``(mean, std)``, each shape [N].
+        """
+        return self._inner.predict(X)
+
+    def predict_ts(self, X: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        """Per-site Thompson draw from the bar distribution (picked up by the surrogate adapter).
+
+        Args:
+            X: Candidate coordinates, shape [N, D].
+            temperature: Softmax temperature of the bar distribution.
+
+        Returns:
+            One sample per candidate, shape [N].
+        """
+        return self._inner.predict_ts(np.asarray(X, dtype=np.float64), temperature=temperature)
 
 
 class TabFlexSurrogate(BucketizedClassifierSurrogate):
@@ -555,92 +778,6 @@ class PFNs4BOSurrogate(ExternalSurrogate):
             mean = criterion.mean(logits).reshape(-1)                                         # [N]
             var = criterion.variance(logits).reshape(-1)                                      # [N]
         return mean.cpu().numpy(), var.clamp_min(1e-12).sqrt().cpu().numpy()
-
-
-class TabPFNv1Surrogate(BucketizedClassifierSurrogate):
-    """TabPFN v1 as a bucketized regressor (classification-head adaptation).
-
-    v1 is a **classifier**: no regression head and no bar distribution — those arrive
-    in v2. The standardized response is therefore binned into ``n_bins`` equal-mass
-    quantile bins, ``TabPFNClassifier`` is fitted on the bin labels, and its class
-    probabilities are read back as a piecewise-uniform density over the response axis
-    (:mod:`~pfns4neurostim.models.pfn.bar_distribution`). Full spec:
-    ``docs/tabpfn_v1_adaptation.md``.
-
-    **Every v1 row must be labelled "classification-head adaptation".** v1's
-    architecture emits at most :attr:`MAX_CLASSES` = 10 classes, so no prediction can
-    be sharper than one bin: on a standardized response the predictive SD cannot fall
-    below roughly ``range / (10 * sqrt(12)) ~ 0.03 * range``. That floor is a property
-    of ``n_bins``, not of the model, so v1's ECE and coverage are reported next to the
-    bin count and are **not** ranked against TabPFN v2.5's native bar distribution.
-    EI/UCB/Thompson need only a mean and an SD, both of which survive binning, so the
-    *optimization* comparison is the one to lead with.
-
-    **Environment.** v1 needs ``tabpfn<2``, which cannot coexist with the pinned
-    ``tabpfn==6.3.2``: both own the module name ``tabpfn``. It runs in
-    ``pfns4neurostim-v1`` (``environment.v1.yml``); ``external._backend_ok`` compares the
-    installed major version, so a v1 run launched in the wrong environment fails
-    immediately instead of silently benchmarking v2.5 twice.
-
-    Upstream keeps loaded checkpoints in a class-level ``models_in_memory`` cache keyed
-    by ``(model_index, device)``, so constructing one classifier per BO step re-reads
-    nothing from disk after the first.
-
-    Args:
-        device: Torch device string.
-        n_bins: Number of response bins K; at most :attr:`MAX_CLASSES`. Defaults to 10
-            (v1's ceiling) rather than the 32 used for backends without one.
-        n_ensemble_configurations: Upstream's ``N_ensemble_configurations`` — how many
-            feature/class permutations v1 averages over per prediction.
-        seed: Upstream's ``seed``, which drives those permutations. Fixed by default so
-            a repetition is reproducible.
-        **backend_kwargs: Forwarded verbatim to ``TabPFNClassifier``.
-    """
-
-    #: v1's architectural class ceiling (100 features, 1024 context rows, 10 classes).
-    MAX_CLASSES: int = 10
-
-    def __init__(
-        self,
-        device: str = "cpu",
-        n_bins: int = 10,
-        n_ensemble_configurations: int = 3,
-        seed: int = 0,
-        **backend_kwargs: Any,
-    ) -> None:
-        super().__init__("tabpfn_v1", device=device, n_bins=n_bins, **backend_kwargs)
-        self.n_ensemble_configurations = int(n_ensemble_configurations)
-        self.seed = int(seed)
-
-    def _make_classifier(self) -> Any:
-        """Construct the v1 classifier.
-
-        Returns:
-            A ``tabpfn.TabPFNClassifier`` (the v1 API; v2+ has no such class, which is
-            why the version gate in :mod:`~pfns4neurostim.models.pfn.external` runs first).
-        """
-        from tabpfn import TabPFNClassifier  # noqa: PLC0415 - the v1 API, isolated env
-
-        return TabPFNClassifier(
-            device=self.device,
-            N_ensemble_configurations=self.n_ensemble_configurations,
-            seed=self.seed,
-            **self.backend_kwargs,
-        )
-
-    def _fit_classifier(self, classifier: Any, X: np.ndarray, labels: np.ndarray) -> None:
-        """Fit v1 on the bin labels, silencing its soft context-size warning.
-
-        v1 refuses a context of more than 1024 rows unless ``overwrite_warning`` is set.
-        Our budgets are far below that, but the flag is passed explicitly so a larger
-        budget does not turn into a late failure inside a BO loop.
-
-        Args:
-            classifier: The ``TabPFNClassifier``.
-            X: Observed coordinates, shape [n, D].
-            labels: Bin indices, shape [n].
-        """
-        classifier.fit(X, labels, overwrite_warning=True)
 
 
 class MitraSurrogate(ExternalSurrogate):

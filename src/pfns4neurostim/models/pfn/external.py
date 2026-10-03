@@ -17,7 +17,8 @@ Integration routes (submodules vendored and APIs read 2026-09-20):
 Model                   Source                                     Regression route
 ======================  =========================================  ==================================
 PFNs4BO (HEBO prior)    ``libs/PFNs4BO`` submodule + ``pfns4bo``   native, BO-specific
-TabPFN v1               ``tabpfn<2`` in an isolated extra          classification-head adaptation
+TabPFN-3.5              ``tabpfn>=9`` (env ``latest``)             native bar distribution
+Causilo                 ``causilo`` (env ``latest``)               native quantile distribution
 Google TabFM            ``google-research/tabfm``                  native
 Mitra                   ``autogluon.tabular`` >= 1.4               native regressor
 TabFlex                 ``microsoft/ticl`` submodule               classification-head adaptation
@@ -64,9 +65,9 @@ class ExternalSpec:
         route: ``'native'`` or ``'classification-head adaptation'``.
         source: Official implementation URL.
         dist: Installed distribution name, when it differs from ``module``.
-        major_below: If set, the installed major version must be below this.
-            TabPFN v1 and v2.5 share the module name ``tabpfn``, so importability
-            alone would report v1 as available whenever v2.5 is installed.
+        major_min: If set, the installed major version must be at least this. TabPFN-3.5 needs
+            ``tabpfn>=9`` while the main env pins 6.3.2 (TabPFN-2.5), and both own the module name
+            ``tabpfn``, so importability alone would report it available in the wrong environment.
         python_min: Minimum Python version the upstream project declares. Checked
             *before* the import, because the failure is otherwise a confusing
             SyntaxError from inside someone else's package.
@@ -96,7 +97,7 @@ class ExternalSpec:
     route: str
     source: str
     dist: str = ""
-    major_below: int | None = None
+    major_min: int | None = None
     python_min: tuple[int, int] | None = None
     repo_subdir: str = ""
     env: str = "main"
@@ -136,23 +137,44 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         max_lanes=4,
         notes="Vendored weights in libs/PFNs4BO/pfns4bo/final_models/*.pt.gz; pip pkg installed (0.1.5).",
     ),
-    "tabpfn_v1": ExternalSpec(
-        key="tabpfn_v1",
+    "tabpfn_v3_5": ExternalSpec(
+        key="tabpfn_v3_5",
         module="tabpfn",
-        extra="tabpfn-v1",
-        route="classification-head adaptation",
-        source="https://github.com/automl/TabPFN",
+        extra="tabpfn-v3-5",
+        route="native",
+        source="https://github.com/PriorLabs/TabPFN",
         dist="tabpfn",
-        major_below=2,
-        python_min=(3, 8),
-        env="v1",
-        weights="",   # the checkpoint ships inside the wheel (tabpfn/models_diff/)
-        mem_per_lane_gb=3.0,
+        major_min=9,
+        python_min=(3, 10),
+        env="latest",
+        weights="",   # tabpfn-v3.5-20260909.safetensors is fetched from Hugging Face (Prior-Labs/tabpfn_3_5) on first use
+        mem_per_lane_gb=4.0,   # UNMEASURED: a placeholder until one cell has run
         max_lanes=4,
         notes=(
-            "Requires tabpfn<2, which cannot coexist with the pinned tabpfn 6.3.2 (both own "
-            "the module name 'tabpfn'), so it runs in its own environment built from "
-            "environment.v1.yml. The adaptation is specified in docs/tabpfn_v1_adaptation.md."
+            "TabPFN-3.5 (tabpfn 9.1.0; non-commercial research licence). Needs the newer `tabpfn`, which "
+            "cannot coexist with the 6.3.2 that provides TabPFN-2.5 (same module name), so it runs in the "
+            "`latest` environment (environment.latest.yml). Same bar-distribution predictive as v2.5, read "
+            "through the same TabPFNSurrogate. The weights are fetched from Hugging Face on first use: "
+            "pre-fetch them on a login node (`setup weights latest`), compute nodes are offline."
+        ),
+    ),
+    "causilo": ExternalSpec(
+        key="causilo",
+        module="causilo",
+        extra="causilo",
+        route="native (quantile predictive distribution)",
+        source="https://github.com/nums-ai/causilo",
+        python_min=(3, 10),
+        env="latest",
+        weights="",   # fetched from Hugging Face (nums-ai/causilo) on first use
+        mem_per_lane_gb=4.0,   # UNMEASURED: a placeholder until one cell has run
+        max_lanes=4,
+        notes=(
+            "Causilo 1.0.x (Nums AI, arXiv 2609.22866; Apache-2.0 code, non-commercial weights licence). "
+            "Requires torch >= 2.13 and Python 3.10-3.14, so it runs in the `latest` environment. "
+            "CausiloRegressor.predict(output_type='quantiles', quantiles=[...]) returns the predicted "
+            "quantile function (999 native levels), which the wrapper integrates exactly as for TabICL. "
+            "Upstream's default is n_estimators=8; the BO loops use 1, like every other model here."
         ),
     ),
     "tabfm": ExternalSpec(
@@ -251,7 +273,7 @@ def conda_env_for(key: str) -> str:
         key: Model key in :data:`EXTERNAL_SPECS`.
 
     Returns:
-        The environment name, e.g. ``'pfns4neurostim-v1'``.
+        The environment name, e.g. ``'pfns4neurostim-bench'``.
 
     Raises:
         KeyError: If the key is unknown.
@@ -321,7 +343,7 @@ def _backend_ok(spec: ExternalSpec) -> tuple[bool, str]:
             f"an importable package without weights is not a runnable model (see {spec.source})"
         )
 
-    if spec.major_below is not None:
+    if spec.major_min is not None:
         dist = spec.dist or spec.module
         try:
             from importlib.metadata import version as _dist_version  # noqa: PLC0415
@@ -330,10 +352,10 @@ def _backend_ok(spec: ExternalSpec) -> tuple[bool, str]:
         except Exception:  # noqa: BLE001 - absence or metadata failure both mean unknown
             return False, f"cannot read the installed version of {dist!r}"
         major = int(str(installed).split(".", 1)[0]) if str(installed)[:1].isdigit() else -1
-        if major < 0 or major >= spec.major_below:
+        if major < spec.major_min:
             return False, (
                 f"{dist} {installed} is installed but this model needs major version "
-                f"< {spec.major_below}; the two share the module name, so they cannot "
+                f">= {spec.major_min}; the two share the module name, so they cannot "
                 f"coexist in one environment - it runs in {spec.conda_env} "
                 f"(`conda activate {spec.conda_env}`)"
             )
@@ -466,15 +488,8 @@ class BucketizedClassifierSurrogate(ExternalSurrogate):
         **backend_kwargs: Passed to the backend constructor.
 
     Raises:
-        ValueError: If ``n_bins`` exceeds the backend's architectural class ceiling
-            (:attr:`MAX_CLASSES`) or is below 2.
+        ValueError: If ``n_bins`` is below 2.
     """
-
-    #: Architectural ceiling on the number of classes the backend can emit, when it
-    #: has one (TabPFN v1: 10). ``None`` means the backend imposes no such limit.
-    #: Checked at construction so a config asking for an impossible resolution fails
-    #: at load time rather than inside the first BO step.
-    MAX_CLASSES: int | None = None
 
     def __init__(self, key: str, device: str = "cpu", n_bins: int = 32, **backend_kwargs: Any) -> None:
         # Validated before the backend import: a config asking for an impossible
@@ -483,12 +498,6 @@ class BucketizedClassifierSurrogate(ExternalSurrogate):
         n_bins = int(n_bins)
         if n_bins < 2:
             raise ValueError(f"{type(self).__name__}: n_bins must be >= 2, got {n_bins}.")
-        if self.MAX_CLASSES is not None and n_bins > self.MAX_CLASSES:
-            raise ValueError(
-                f"{type(self).__name__}: n_bins={n_bins} exceeds the backend's ceiling of "
-                f"{self.MAX_CLASSES} classes. The bin count bounds the predictive "
-                "resolution, so it must be reported next to every calibration metric."
-            )
         super().__init__(key, device=device, **backend_kwargs)
         self.n_bins = n_bins
         self._bar: BarDistribution | None = None
@@ -499,19 +508,6 @@ class BucketizedClassifierSurrogate(ExternalSurrogate):
         raise NotImplementedError(
             f"{type(self).__name__} does not implement _make_classifier yet (task #8 Step 3)."
         )
-
-    def _fit_classifier(self, classifier: Any, X: np.ndarray, labels: np.ndarray) -> None:
-        """Fit the backend classifier on bin labels.
-
-        Overridden where the backend's ``fit`` needs extra arguments (TabPFN v1 takes
-        ``overwrite_warning``).
-
-        Args:
-            classifier: The object returned by :meth:`_make_classifier`.
-            X: Observed coordinates, shape [n, D].
-            labels: Bin indices, shape [n].
-        """
-        classifier.fit(X, labels)
 
     def _fit_backend(self, X: np.ndarray, y: np.ndarray) -> None:
         """Bin the responses and fit the backend classifier on the labels.
@@ -526,7 +522,7 @@ class BucketizedClassifierSurrogate(ExternalSurrogate):
         self._bar = BarDistribution(quantile_borders(y, n_bins))
         labels = self._bar.digitize(y)                      # [n]
         self._classifier = self._make_classifier()
-        self._fit_classifier(self._classifier, X, labels)
+        self._classifier.fit(X, labels)
 
     def _predict_backend(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Read the classifier's class probabilities as a bar distribution.

@@ -157,7 +157,7 @@ def _build_external(key: str) -> Callable[..., Any]:
     """Build a factory for one external Hyp 0 surrogate (task #8).
 
     Args:
-        key: External model key (``pfns4bo``, ``tabpfn_v1``, ``tabfm``,
+        key: External model key (``pfns4bo``, ``tabfm``,
             ``mitra``, ``tabflex``).
 
     Returns:
@@ -171,11 +171,12 @@ def _build_external(key: str) -> Callable[..., Any]:
 
         classes = {
             "pfns4bo": wrappers.PFNs4BOSurrogate,
-            "tabpfn_v1": wrappers.TabPFNv1Surrogate,
             "tabfm": wrappers.TabFMSurrogate,
             "mitra": wrappers.MitraSurrogate,
             "tabflex": wrappers.TabFlexSurrogate,
             "tabicl": wrappers.TabICLSurrogate,
+            "causilo": wrappers.CausiloSurrogate,
+            "tabpfn_v3_5": wrappers.TabPFN35Surrogate,
         }
         return classes[key](device=device, **params)
 
@@ -222,11 +223,11 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "gp_naive": ModelSpec(
         key="gp_naive",
-        version="gpytorch ExactGP (RBF), fixed hyperparameters",
+        version="gpytorch ExactGP (RBF), fixed hyperparameters = gpytorch defaults (ln 2, 1.0, ln 2)",
         family="gp",
         factory=_build_gp_naive,
         supports=("ei", "ucb", "ts_marginal", "ts_joint"),
-        notes="No tuning at all: fixed lengthscale 0.2, outputscale 1.0, noise 1e-2.",
+        notes="No tuning at all: gpytorch-default lengthscale and noise (ln 2), outputscale 1.0 (until 2026-10-03: 0.2 / 1.0 / 0.01).",
     ),
     "gp_oracle": ModelSpec(
         key="gp_oracle",
@@ -252,20 +253,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "(acquisition 'native'). Predictive summary from its bar distribution."
         ),
     ),
-    "tabpfn_v1": ModelSpec(
-        key="tabpfn_v1",
-        version="TabPFN v1 (classification-head adaptation, 10 quantile bins)",
-        family="pfn",
-        factory=_build_external("tabpfn_v1"),
-        supports=("ei", "ucb", "ts_marginal"),
-        notes=(
-            "Classifier binned into a bar distribution (docs/tabpfn_v1_adaptation.md). v1 emits "
-            "at most 10 classes, so its predictive resolution is bounded by the bin width: report "
-            "calibration next to the bin count, never ranked against v2.5's native bar "
-            "distribution. Runs in pfns4neurostim-v1 (environment.v1.yml); tabpfn<2 cannot "
-            "coexist with the pinned 6.3.2."
-        ),
-    ),
     "tabfm": ModelSpec(
         key="tabfm",
         version="Google TabFM v1.0.0 (raw-scale point prediction; sd = ensemble spread + out-of-fold residual)",
@@ -285,6 +272,28 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         supports=("ei", "ucb", "ts_marginal"),
         notes="Native regressor; predictive-distribution access to be confirmed.",
     ),
+    "tabpfn_v3_5": ModelSpec(
+        key="tabpfn_v3_5",
+        version="TabPFN-3.5 (tabpfn 9.x, default checkpoint, n_estimators=1)",
+        family="pfn",
+        factory=_build_external("tabpfn_v3_5"),
+        supports=("ei", "ucb", "ts_marginal"),
+        notes=(
+            "Native bar-distribution predictive, read like TabPFN-2.5. Needs tabpfn >= 9, which cannot "
+            "coexist with the 6.3.2 pin: runs in pfns4neurostim-latest (environment.latest.yml)."
+        ),
+    ),
+    "causilo": ModelSpec(
+        key="causilo",
+        version="Causilo 1.0 (default checkpoint, n_estimators=1, quantile predictive)",
+        family="pfn",
+        factory=_build_external("causilo"),
+        supports=("ei", "ucb", "ts_marginal"),
+        notes=(
+            "Native quantile predictive distribution (999 levels) integrated into mean/std and sampled by "
+            "inverse CDF. Needs torch >= 2.13 and Python >= 3.10: runs in pfns4neurostim-latest."
+        ),
+    ),
     "tabflex": ModelSpec(
         key="tabflex",
         version="TabFlex (classification-head adaptation)",
@@ -298,7 +307,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "tabicl": ModelSpec(
         key="tabicl",
-        version="TabICL v2.2.0",
+        version="TabICL v2.2.0 (Thompson draws from its own quantile predictive)",
         family="pfn",
         factory=_build_external("tabicl"),
         supports=("ei", "ucb", "ts_marginal"),

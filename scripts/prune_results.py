@@ -24,6 +24,12 @@ under its original relative path (reversible); ``--delete`` removes it instead. 
     python scripts/prune_results.py                      # dry run: what would go, and why
     python scripts/prune_results.py --apply              # move into output/archive/<stamp>-pruned/
     python scripts/prune_results.py --apply --delete     # remove permanently
+    python scripts/prune_results.py --only-model gp_naive --apply   # only stale-version cells of those models
+
+``--only-model`` (added 2026-10-03) restricts the pass to rule C3 for the named models and leaves every run directory
+alone. It exists because a stale version is not always garbage: the pre-2026-09-30 ``gp_mll`` cells are the *offline arm*
+the task plan keeps on purpose, and a plain ``--apply`` would archive them together with the cells that really are dead
+(the GP-fixed cells after its 2026-10-03 default change).
 """
 from __future__ import annotations
 
@@ -194,6 +200,10 @@ def main() -> None:
     parser.add_argument("--output", default="output")
     parser.add_argument("--apply", action="store_true", help="Act (default: dry run).")
     parser.add_argument("--delete", action="store_true", help="With --apply: delete instead of archiving.")
+    parser.add_argument(
+        "--only-model", nargs="+", default=None, metavar="MODEL",
+        help="Only rule C3 for these models (e.g. gp_naive); no run directories are touched.",
+    )
     args = parser.parse_args()
 
     cells_root = os.path.join(args.output, "cells")
@@ -201,6 +211,10 @@ def main() -> None:
     removed_knobs = {k for k in list(RENAMED_KNOBS) + [p.split()[-1] for _, p in dead_cells if p.startswith("C1 unreg")]}
     dead_knob_ok = {k: not any(f.startswith(f"{k}:") for f in kept_cells) for k in removed_knobs}
     dead_runs, notes = classify_runs(args.output, dead_knob_ok)
+    if args.only_model:
+        wanted = {f"C3 stale {m} version" for m in args.only_model}
+        dead_cells = [(p, r) for p, r in dead_cells if r in wanted]
+        dead_runs, notes = [], [f"--only-model {' '.join(args.only_model)}: run directories and other rules skipped"]
 
     by_rule = collections.Counter(rule.split(" (")[0] for _, rule in dead_cells)
     print(f"[prune] cells: {len(dead_cells)} dead")
