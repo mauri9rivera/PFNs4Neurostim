@@ -215,7 +215,7 @@ for name in sys.argv[1].split(","):
     mu, sigma = model.predict_marginals(X[:3])  # [3], [3]
     print(f"  {name:<14} ok  (weights cached, mu[0]={float(mu[0]):.3f})")
 PYEOF
-  conda run --no-capture-output -n "${CONDA_ENV}" python "${script}" "${models}"
+  conda run -n "${CONDA_ENV}" python "${script}" "${models}"
   rm -f "${script}"
 }
 
