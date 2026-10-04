@@ -384,6 +384,7 @@ def _f6_layer_alignment(layers: pd.DataFrame, run_dir: str) -> list[str]:
             ax.fill_between(med.index, agg.quantile(0.25).values, agg.quantile(0.75).values,
                             color=color, alpha=style.BAND_ALPHA, lw=0)
         ax.set_xlabel(style.axis_label("layer"))
+        style.set_integer_xaxis(ax)
         ax.set_ylabel(style.axis_label(col))
     peaks = layers[layers["is_peak"].astype(bool)]["layer"]
     if len(peaks):
@@ -488,6 +489,7 @@ def render_cka(run_dir: str) -> list[str]:
                 ax.axhline(0.0, color=style.NEUTRAL_GREY, lw=style.LINE_WIDTH / 2)
                 if r == 0:
                     ax.set_title(target.replace("_", " "))
+                style.set_integer_xaxis(ax)
                 if r == len(contexts) - 1:
                     ax.set_xlabel(style.axis_label("layer"))
                 if c == 0:
@@ -528,6 +530,7 @@ def render_cka(run_dir: str) -> list[str]:
                         transform=ax.transAxes, ha="right", va="bottom",
                         fontsize=style.FONT_SIZES["annotation"], alpha=0.8)
             ax.set_xlabel(style.axis_label("layer"))
+            style.set_integer_xaxis(ax)
             ax.set_ylabel(style.axis_label("placement"))
             ax.legend(loc="best", fontsize=style.FONT_SIZES["legend"])
             written += style.save_figure(fig, run_dir, "cka_placement")
@@ -564,6 +567,7 @@ def _cka_placement_surface(usable: pd.DataFrame, dropped: list[int], run_dir: st
     im = ax.pcolormesh(grid.columns.to_numpy(), grid.index.to_numpy(), grid.to_numpy(),
                        cmap=cmap, vmin=0.0, vmax=1.0, shading="nearest")
     ax.set_xlabel(style.axis_label("layer"))
+    style.set_integer_xaxis(ax)
     ax.set_ylabel(style.axis_label("context_t"))
     ax.set_yticks(grid.index.to_numpy(), [str(int(t)) for t in grid.index])
     cb = fig.colorbar(im, ax=ax, label=style.axis_label("placement"))

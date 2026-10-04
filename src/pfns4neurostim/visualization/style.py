@@ -747,6 +747,15 @@ def axis_label(key: str) -> str:
     return key.replace("_", " ").capitalize()
 
 
+def set_integer_xaxis(ax: plt.Axes) -> None:
+    """Force integer-only major ticks on the x-axis (discrete layer / block index).
+
+    Args:
+        ax: Axes whose x-axis indexes discrete blocks.
+    """
+    ax.xaxis.set_major_locator(mpl.ticker.MaxNLocator(integer=True))
+
+
 # ---------------------------------------------------------------------------
 # rcParams + helpers
 # ---------------------------------------------------------------------------

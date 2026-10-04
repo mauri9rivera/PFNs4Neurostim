@@ -25,13 +25,14 @@ cka:
   # operating point the surrogate actually ends at, not only the early steps. t must stay < n_sites.
   context_sizes: [5, 10, 20, 40, 80]
   stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
-  # Raised from 3 on 2026-09-27. RULE: pool at least TARGET x d_model embedding rows per cell, where
-  # d_model = 192 and each draw contributes n_sites rows, so
+  # Raised from 3 on 2026-09-27. Each cell is ONE context draw: TabPFN is conditioned on t known sites, all
+  # n_sites rows are embedded, and CKA is computed per draw and AVERAGED afterwards (paired design; rows are
+  # NOT pooled across draws). The draw count follows the rule
   #     n_context_draws = ceil(TARGET * 192 / n_sites)
-  # A rule and not a flat count, because a flat count gives datasets with different grid sizes different
-  # effective sample sizes and makes their placements non-comparable -- which is exactly what the
-  # cross-dataset claim must avoid. One draw gives 96 < 192 rows: the n << d regime debiased CKA only
-  # partly rescues.
+  # (TARGET x d_model rows' worth of draws, d_model = 192). A rule and not a flat count, because a flat count
+  # gives datasets with different grid sizes different amounts of averaging and makes their placements
+  # non-comparable -- which is exactly what the cross-dataset claim must avoid. One draw gives 96 < 192 rows:
+  # the n << d regime debiased CKA only partly rescues, which is why draws are averaged.
   #
   # TARGET = 5 (settled 2026-09-27 on measured cost, not on taste):
   #   * statistically, pooled n = 5 x 192 = 960 is the usual floor for a well-conditioned second-moment

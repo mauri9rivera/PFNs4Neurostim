@@ -2,7 +2,7 @@
 
 ## Session Start Protocol
 
-@.claude/task_plan.md
+@.research_assistant/task_plan.md
 
 The following files are loaded on demand:
 
