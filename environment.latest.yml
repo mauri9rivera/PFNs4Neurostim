@@ -12,10 +12,11 @@
 # Both fit one environment, so they share this one rather than getting two (user decision 2026-10-03).
 # TabPFN-2.5 stays in main/bench with tabpfn 6.3.2: bumping it would change the headline arm.
 #
-# STATUS: UNBUILT AND UNVALIDATED. The lower bounds below are what upstream declares; nothing was installed
-# when this file was written. After the first successful build, replace each `>=` with the exact version
-# that `pip freeze` reports (the other environment files are exact pins) and record `pip check` here.
-# `torch>=2.13` may need a CUDA wheel index that matches the cluster driver; check before building on Mila/Narval.
+# STATUS (2026-10-04): BUILT on Narval (virtualenv ~/venvs/pfns4neurostim-latest, Python 3.11.5, StdEnv/2023, Alliance wheelhouse).
+# Versions below are the exact ones `pip freeze` reported after the first build; `pip check`: No broken requirements found.
+# NOT YET VALIDATED: no model has been run in it (A2 Step 2). It resolved to pandas 3.0.5 and numpy 2.4.2 while main pins
+# pandas 2.3.3 / numpy 1.26.4, so the first one-cell runs also test the package itself under pandas 3. The Mila build has not
+# been attempted (check a torch >= 2.13 wheel exists for that cluster's CUDA driver).
 #
 #   bash scripts/mila_setup.sh env latest              # creates pfns4neurostim-latest + installs the package
 #   bash scripts/narval_setup.sh env latest            # same on Narval (virtualenv)
@@ -29,24 +30,24 @@ dependencies:
   - python=3.11
   - pip
   - pip:
-      - torch>=2.13
+      - torch==2.14.1
       # --- science stack (compatible with torch >= 2.13; pin after the first build) ---
-      - numpy>=2.2
-      - scipy>=1.13
-      - pandas>=2.3
-      - scikit-learn>=1.6.1
-      - matplotlib>=3.9
-      - seaborn>=0.13
-      - statsmodels>=0.14
-      - pyyaml>=6
-      - tqdm
-      - pytest>=8
+      - numpy==2.4.2
+      - scipy==1.17.1
+      - pandas==3.0.5
+      - scikit-learn==1.8.0
+      - matplotlib==3.11.1
+      - seaborn==0.13.2
+      - statsmodels==0.14.6
+      - pyyaml==6.0.3
+      - tqdm==4.70.1
+      - pytest==9.1.1
       # --- the project's own GP stack, so the GP arms are unchanged ---
       - gpytorch==1.11
       - linear-operator==0.5.1
       - botorch==0.10.0
       - pyro-ppl==1.9.1
       # --- the two models this environment exists for ---
-      - tabpfn>=9.1,<10
-      - causilo>=1.0.3
-      - huggingface-hub
+      - tabpfn==9.1.0
+      - causilo==1.0.3
+      - huggingface-hub==2.1.1
