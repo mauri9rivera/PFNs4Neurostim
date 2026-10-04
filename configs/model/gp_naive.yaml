@@ -6,9 +6,13 @@
 # gets without choosing anything. Previously 0.2 / 1.0 / 0.01 (an informed guess, not a library standard). The
 # 2026-10-03 NHP sweep (output/gp_fixed_sweep/nhp) showed regret depends strongly on the lengthscale, which is
 # why the blind default is the honest comparator. `outputscale` was already 1.0 and is kept.
+#
+# Changed 2026-10-04 (user decision): noise ln 2 -> 0.05. With y min-max scaled to [0, 1] (online_y_scaler: minmax)
+# GP-MLL fits noise ~0.02 and outputscale ~0.016; ln 2 noise with outputscale 1.0 made GP-fixed near-random on NHP
+# (Hyp A cumulative regret 83.6 vs GP-MLL 50.8, Random 85.7). Lengthscale and outputscale unchanged.
 name: gp_naive
 params:
   device: null   # per-model override of the experiment `device`
   lengthscale: 0.6931471805599453   # ln 2 = gpytorch default
   outputscale: 1.0              # kept from the previous GP-fixed (user decision)
-  noise: 0.6931471805599453         # ln 2 = gpytorch GaussianLikelihood default
+  noise: 0.05                       # 2026-10-04 (was ln 2 = gpytorch default)

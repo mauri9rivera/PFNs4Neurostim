@@ -87,12 +87,12 @@ def test_fixed_reference_runs_end_to_end_and_is_recorded(tmp_path, tiny) -> None
 
 
 def test_make_reference_and_fixed_engine_use_the_fixed_hyperparameters() -> None:
-    from pfns4neurostim.models.gp.surrogates import GPYTORCH_DEFAULT_HYPERPARAMETER, GPSurrogate, NaiveGPSurrogate
+    from pfns4neurostim.models.gp.surrogates import GP_FIXED_NOISE, GPYTORCH_DEFAULT_HYPERPARAMETER, GPSurrogate, NaiveGPSurrogate
 
     p = {**mechanism.UPDATE_RULE_DEFAULTS, "reference_gp": "fixed"}
     ref = mechanism._make_reference(p)
     assert isinstance(ref.gp, NaiveGPSurrogate)
-    assert (ref.gp._lengthscale, ref.gp._outputscale, ref.gp._noise) == (GPYTORCH_DEFAULT_HYPERPARAMETER, 1.0, GPYTORCH_DEFAULT_HYPERPARAMETER)
+    assert (ref.gp._lengthscale, ref.gp._outputscale, ref.gp._noise) == (GPYTORCH_DEFAULT_HYPERPARAMETER, 1.0, GP_FIXED_NOISE)
     arm = mechanism._make_engine("gp_fixed_frozen", p, "cpu", 0)
     assert isinstance(arm.gp, NaiveGPSurrogate)
     assert type(mechanism._make_reference({**p, "reference_gp": "mll"}).gp) is GPSurrogate

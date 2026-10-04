@@ -97,6 +97,10 @@ RBF_CHUNK_ROWS: int = 256
 #: gets without choosing anything". Checked against gpytorch 1.11: lengthscale 0.6931472, noise 0.6932472 (the noise
 #: carries gpytorch's 1e-4 floor offset).
 GPYTORCH_DEFAULT_HYPERPARAMETER: float = 0.6931471805599453
+#: GP-fixed observation-noise variance (user decision 2026-10-04). The gpytorch default ln 2 (used 2026-10-03) is ~30x the
+#: noise GP-MLL fits on min-max-scaled y (median 0.022 NHP, 0.019 5d_rat) and, with outputscale 1.0, turned GP-fixed into
+#: near-random search (NHP Hyp A cumulative regret 83.6 vs Random 85.7). 0.05 restores the interpolating regime.
+GP_FIXED_NOISE: float = 0.05
 
 #: Spread of the negative log marginal likelihood across feasible restarts, in nats, below which the
 #: starts are taken to agree. Agreement between independent starts is the only cheap evidence about the
@@ -1145,7 +1149,7 @@ class NaiveGPSurrogate(GPSurrogate):
         device: PyTorch device string ('cpu' or 'cuda').
         lengthscale: Fixed RBF lengthscale applied to every input dimension (default: gpytorch's ln 2).
         outputscale: Fixed signal variance (scale-kernel output scale).
-        noise: Fixed Gaussian observation noise variance (default: gpytorch's ln 2).
+        noise: Fixed Gaussian observation noise variance (default: ``GP_FIXED_NOISE``).
     """
 
     def __init__(
@@ -1153,7 +1157,7 @@ class NaiveGPSurrogate(GPSurrogate):
         device: str = 'cpu',
         lengthscale: float = GPYTORCH_DEFAULT_HYPERPARAMETER,
         outputscale: float = 1.0,
-        noise: float = GPYTORCH_DEFAULT_HYPERPARAMETER,
+        noise: float = GP_FIXED_NOISE,
     ) -> None:
         # n_opt_steps=0 → fit() skips the optimisation loop entirely.
         super().__init__(device=device, n_opt_steps=0)

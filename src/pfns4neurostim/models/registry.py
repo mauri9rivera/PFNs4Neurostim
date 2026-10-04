@@ -223,11 +223,11 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "gp_naive": ModelSpec(
         key="gp_naive",
-        version="gpytorch ExactGP (RBF), fixed hyperparameters = gpytorch defaults (ln 2, 1.0, ln 2)",
+        version="gpytorch ExactGP (RBF), fixed hyperparameters (ln 2, 1.0, 0.05)",
         family="gp",
         factory=_build_gp_naive,
         supports=("ei", "ucb", "ts_marginal", "ts_joint"),
-        notes="No tuning at all: gpytorch-default lengthscale and noise (ln 2), outputscale 1.0 (until 2026-10-03: 0.2 / 1.0 / 0.01).",
+        notes="No tuning at all: gpytorch-default lengthscale ln 2, outputscale 1.0, noise 0.05 (2026-10-04; 10-03: noise ln 2; until 10-03: 0.2 / 1.0 / 0.01).",
     ),
     "gp_oracle": ModelSpec(
         key="gp_oracle",
