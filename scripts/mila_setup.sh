@@ -21,6 +21,7 @@
 #   bash scripts/mila_setup.sh env bench  # same for pfns4neurostim-bench (Python 3.11) from environment.bench.yml
 #   bash scripts/mila_setup.sh env latest # same for pfns4neurostim-latest (TabPFN-3.5 + Causilo) from environment.latest.yml
 #   bash scripts/mila_setup.sh install    # only pip install -e . (reuse an existing env)
+#   bash scripts/mila_setup.sh weights [main|bench|latest] [models]  # pre-download checkpoints on a LOGIN node (compute nodes are offline)
 #   bash scripts/mila_setup.sh deps       # report which declared dependencies import
 #   bash scripts/mila_setup.sh verify     # print the whole layout + import check
 #   bash scripts/mila_setup.sh submodules # init libs/ and exclude downloaded weights
@@ -189,6 +190,35 @@ cmd_touch() {
   log "done"
 }
 
+cmd_weights() {
+  # Several PFNs fetch their checkpoints on first use (TabPFN, TabICL, Causilo, ...). Compute nodes have no internet, so the
+  # first cell of a job would fail. A tiny fit + predict here, on a login node, fills the caches under $HOME, which compute
+  # nodes mount. TabPFN-3.5 is licence-gated: set TABPFN_TOKEN for this one command (see environment.latest.yml).
+  load_conda
+  local which="${1:-main}" models
+  case "${which}" in
+    main) models="${2:-tabpfn_v2_5}" ;;
+    bench) CONDA_ENV="pfns4neurostim-bench"; models="${2:-tabpfn_v2_5,tabicl,tabfm}" ;;
+    latest) CONDA_ENV="pfns4neurostim-latest"; models="${2:-tabpfn_v3_5,causilo}" ;;
+    *) log "usage: weights [main|bench|latest] [models]"; exit 1 ;;
+  esac
+  local script; script="$(mktemp --suffix=.py)"
+  cat > "${script}" <<'PYEOF'
+import sys
+import numpy as np
+from pfns4neurostim.models.registry import build_surrogate
+rng = np.random.default_rng(0)
+X, y = rng.random((12, 2)), rng.random(12)  # [12, 2], [12]
+for name in sys.argv[1].split(","):
+    model = build_surrogate(name, device="cpu")
+    model.fit(X, y)
+    mu, sigma = model.predict_marginals(X[:3])  # [3], [3]
+    print(f"  {name:<14} ok  (weights cached, mu[0]={float(mu[0]):.3f})")
+PYEOF
+  conda run --no-capture-output -n "${CONDA_ENV}" python "${script}" "${models}"
+  rm -f "${script}"
+}
+
 case "${1:-}" in
   layout) cmd_layout ;;
   submodules) cmd_submodules ;;
@@ -198,6 +228,7 @@ case "${1:-}" in
   stage) cmd_stage ;;
   env) cmd_env "${2:-}" ;;
   verify) cmd_verify ;;
+  weights) cmd_weights "${2:-main}" "${3:-}" ;;
   touch) cmd_touch ;;
   *) sed -n '1,30p' "$0"; exit 1 ;;
 esac
