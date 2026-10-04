@@ -148,7 +148,7 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         python_min=(3, 10),
         env="latest",
         weights="",   # tabpfn-v3.5-20260909.safetensors is fetched from Hugging Face (Prior-Labs/tabpfn_3_5) on first use
-        mem_per_lane_gb=4.0,   # UNMEASURED: a placeholder until one cell has run
+        mem_per_lane_gb=4.8,   # measured 3.82 GB peak RSS, 0.84 GB VRAM, one NHP cell on Narval a100_1g.5gb (2026-10-04) + 25 %
         max_lanes=4,
         notes=(
             "TabPFN-3.5 (tabpfn 9.1.0; non-commercial research licence). Needs the newer `tabpfn`, which "
@@ -167,7 +167,7 @@ EXTERNAL_SPECS: dict[str, ExternalSpec] = {
         python_min=(3, 10),
         env="latest",
         weights="",   # fetched from Hugging Face (nums-ai/causilo) on first use
-        mem_per_lane_gb=4.0,   # UNMEASURED: a placeholder until one cell has run
+        mem_per_lane_gb=2.3,   # measured 1.84 GB peak RSS, 0.15 GB VRAM, one NHP cell on Narval a100_1g.5gb (2026-10-04) + 25 %
         max_lanes=4,
         notes=(
             "Causilo 1.0.x (Nums AI, arXiv 2609.22866; Apache-2.0 code, non-commercial weights licence). "

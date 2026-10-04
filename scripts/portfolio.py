@@ -47,7 +47,10 @@ from dataclasses import dataclass
 #: Adam steps): the GP arms run on the CPU lanes, so this moves the CPU column of every unit.
 REP_SECONDS: dict[str, dict[str, float]] = {
     "nhp": {"tabpfn_v2_5": 15.7, "gp_mll": 51.5, "gp_naive": 0.8, "random": 0.2, "tabicl": 30.0, "tabfm": 99.0,
-            "pfns4bo": 5.3},
+            "pfns4bo": 5.3,
+            # One cell each, one lane, Narval a100_1g.5gb (2026-10-04, tags a2-check-*): a single measurement on
+            # different hardware than the Mila figures above, so treat it as +-30 %. 5d_rat / spinal: unmeasured.
+            "tabpfn_v3_5": 31.4, "causilo": 26.2},
     "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 62.9, "gp_naive": 1.0, "random": 0.4, "tabicl": 33.0, "pfns4bo": 6.7},
     # Spinal (budget 64 on the 8x8 grid) is NOT measured on Mila: the NHP costs above scaled by a local
     # one-rep spinal/NHP timing (2026-09-25: TabPFN-2.5 x0.52, GP-MLL x0.60; the GP factor for the rest).
@@ -67,6 +70,7 @@ CPU_LANES = 8
 #: when its models need more than this.
 DEFAULT_JOB_MEM_GB = 7
 BENCH_ENV = "pfns4neurostim-bench"
+LATEST_ENV = "pfns4neurostim-latest"
 MAIN_ENV = "pfns4neurostim"
 #: Runners that run as one process and write their own deliverables (no lanes, no cell assembly).
 SINGLE_PROCESS: frozenset[str] = frozenset({"mechanism"})
@@ -157,6 +161,10 @@ UNITS: tuple[Unit, ...] = (
     _u("E6. PFNs4BO (native policy), 5d_rat", "bo_benchmark", "hyp0_pfn_bench_5d_rat", "5d_rat", ("pfns4bo",), (),
        group="externals", lanes=2,
        note="main env; cells land in the hyp0-pfn-bench run; ~10 min for 180 reps on 2 lanes (2026-09-24)"),
+    _u("E9. TabPFN-3.5 + Causilo, NHP", "bo_benchmark", "hyp0_pfn_bench_nhp", "nhp", ("tabpfn_v3_5", "causilo"), (),
+       group="externals", env=LATEST_ENV,
+       note="latest env; one cell each validated 2026-10-04 on Narval (a100_1g.5gb: 31 s / 26 s per cell, "
+            "3.8 / 1.8 GB RSS); 5d_rat and spinal units wait for their own measurement"),
     # ---- spinal: every deliverable (2026-09-25). Stage data/spinal on the cluster first (runbook). Budget 64 =
     # the 8x8 grid. Subject 5 has one trial per site on every EMG (no noise floor), so the SNR-based stress
     # sweeps run on the other 10 subjects (90 channels); the benchmarks keep all 100.
