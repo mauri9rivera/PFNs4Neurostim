@@ -24,8 +24,8 @@
 # The data master is shared_data/ next to the projects, and other projects write to it (additive_neurostim moved its datasets
 # there on 2026-10-02), so nothing here trusts it blindly: scripts/data_manifest.sha256 lists the sha256 of every file this
 # project loads (NHP, rat, the five 5d_rat noOutliers animals), `check-data` fails if any differs, and `stage` copies only
-# those datasets and re-verifies the copy. Spinal is deliberately not in the manifest: the copy in shared_data/ (1.6 GB)
-# differs from the local one (3.9 GB), and spinal is deferred; add it to the manifest once its canonical version is chosen.
+# those datasets and re-verifies the copy. Spinal joined the manifest on 2026-10-04: the shared_data/ copy and the local one
+# have identical sha256 for all 11 .pkl files (the 1.6 GB vs 3.9 GB of the plan was `du` disk usage against file size).
 #
 # Env: CODE_DIR, SCRATCH_ROOT, DATA_MASTER, plus everything scripts/cluster.sh reads (VENV_ROOT, NARVAL_STDENV,
 # PY_MAIN, PY_BENCH). Nothing in this script deletes anything.
