@@ -366,8 +366,14 @@ SPLIT_PLAN: tuple[Placement, ...] = (
     Placement("E9", "gpu", "narval", ("tabpfn_v3_5", "causilo"), "bulk", 2.0, 4, "20G", gpu_type="a100_2g.10gb",
               config="configs/experiment/hyp0_pfn_bench_5d_rat.yaml"),
     # ---- synthetic: only after the cross-cluster twin check (A3 Step 15) ----
-    Placement("N7", "gpu", "mila", ("tabpfn_v2_5",), "synthetic", 1.6, _M, MILA_GPU_MEM),
-    Placement("N6", "gpu", "mila", ("tabpfn_v2_5",), "synthetic", 2.8, _M, MILA_GPU_MEM),
+    # Both halves of every synthetic unit run on Narval: twins are refitted in each process and are not in the cell key,
+    # and the cross-cluster check failed -- all 35 NHP/5d_rat twins built on a Narval node differ bit-for-bit from a
+    # conda/Windows build (output/twins/synth_narval_4711545.json; different numpy/BLAS builds), so a TabPFN half on Mila
+    # and a GP half on Narval would run on different twins under the same keys. TabPFN on a 2g slice, 4 lanes, split by
+    # subject (NHP subjects 0, 1, 3 hold 6 / 8 / 4 channels); rate assumed ~400 cells/slice-h until the first part reports.
+    Placement("N7", "gpu", "narval", ("tabpfn_v2_5",), "synthetic", 4.5, 4, "8G", gpu_type="a100_2g.10gb"),
+    Placement("N6", "gpu", "narval", ("tabpfn_v2_5",), "synthetic", 3.6, 4, "8G", gpu_type="a100_2g.10gb",
+              parts=tuple(f"dataset.subjects=[{s}]" for s in (0, 1, 3))),
     Placement("N7", "cpu", "narval", ("gp_mll", "gp_naive"), "synthetic", 1.5, _NC, _NM),
     Placement("N6", "cpu", "narval", ("gp_mll",), "synthetic", 2.6, _NC, _NM),
     Placement("S5b", "cpu", "narval", ("gp_mll", "gp_naive"), "synthetic", 3.2, _RC, _RM),

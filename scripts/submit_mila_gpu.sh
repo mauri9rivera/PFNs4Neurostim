@@ -24,9 +24,7 @@ case "$wave" in
     CONDA_ENV=pfns4neurostim-bench LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=12G --time=02:00:00 --job-name=E1-gpu scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabicl]"
     ;;
   synthetic)
-    CONDA_ENV=pfns4neurostim LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=12G --time=02:00:00 --job-name=N7-gpu scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_nhp.yaml "models=[tabpfn_v2_5]"
-    CONDA_ENV=pfns4neurostim LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=12G --time=03:30:00 --job-name=N6-gpu scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_nhp.yaml "models=[tabpfn_v2_5]"
-    ;;
+    echo "nothing in this wave for this cluster" ;;
   *) echo "unknown wave: $wave (probe|bulk|synthetic)" >&2; exit 2 ;;
 esac
-echo "estimates for mila: GPU ~16 job-h, CPU ~0 core-h (all waves)"
+echo "estimates for mila: GPU ~11 job-h, CPU ~0 core-h (all waves)"

@@ -24,6 +24,10 @@ case "$wave" in
     bash scripts/narval.sh do sbatch gpu --lanes 4 --conda-env pfns4neurostim-latest --gpu-type a100_2g.10gb --cpus 4 --mem 20G --time 02:30:00 --job-name E9-gpu-rat -- scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabpfn_v3_5,causilo]"
     ;;
   synthetic)
+    bash scripts/narval.sh do sbatch gpu --lanes 4 --conda-env pfns4neurostim --gpu-type a100_2g.10gb --cpus 4 --mem 8G --time 05:45:00 --job-name N7-gpu -- scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_nhp.yaml "models=[tabpfn_v2_5]"
+    bash scripts/narval.sh do sbatch gpu --lanes 4 --conda-env pfns4neurostim --gpu-type a100_2g.10gb --cpus 4 --mem 8G --time 04:30:00 --job-name N6-gpu-p0 -- scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_nhp.yaml "models=[tabpfn_v2_5]" "dataset.subjects=[0]"
+    bash scripts/narval.sh do sbatch gpu --lanes 4 --conda-env pfns4neurostim --gpu-type a100_2g.10gb --cpus 4 --mem 8G --time 04:30:00 --job-name N6-gpu-p1 -- scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_nhp.yaml "models=[tabpfn_v2_5]" "dataset.subjects=[1]"
+    bash scripts/narval.sh do sbatch gpu --lanes 4 --conda-env pfns4neurostim --gpu-type a100_2g.10gb --cpus 4 --mem 8G --time 04:30:00 --job-name N6-gpu-p2 -- scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_nhp.yaml "models=[tabpfn_v2_5]" "dataset.subjects=[3]"
     bash scripts/narval.sh do sbatch cpu --conda-env pfns4neurostim --cpus 18 --mem 27G --time 02:00:00 --job-name N7-cpu -- scripts/run_cpu.sh stress_sweep configs/experiment/stress_k1_decoy_nhp.yaml "models=[gp_mll,gp_naive]"
     bash scripts/narval.sh do sbatch cpu --conda-env pfns4neurostim --cpus 18 --mem 27G --time 03:15:00 --job-name N6-cpu -- scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_channel_synthetic_nhp.yaml "models=[gp_mll]"
     bash scripts/narval.sh do sbatch cpu --conda-env pfns4neurostim --cpus 17 --mem 26G --time 04:00:00 --job-name S5b-cpu -- scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_channel_synthetic_5d_rat.yaml "models=[gp_mll,gp_naive]"
@@ -35,4 +39,4 @@ case "$wave" in
     ;;
   *) echo "unknown wave: $wave (probe|bulk|synthetic)" >&2; exit 2 ;;
 esac
-echo "estimates for narval: GPU ~36 job-h, CPU ~364 core-h (all waves)"
+echo "estimates for narval: GPU ~52 job-h, CPU ~364 core-h (all waves)"
