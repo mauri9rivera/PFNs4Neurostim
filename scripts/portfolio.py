@@ -339,7 +339,10 @@ SPLIT_PLAN: tuple[Placement, ...] = (
     # ---- probes: one per job class ----
     Placement("N9", "gpu", "mila", ("tabpfn_v2_5",), "probe", 1.6, _M, MILA_GPU_MEM),
     Placement("N13", "cpu", "narval", ("gp_mll", "gp_naive", "random"), "probe", 2.4, _NC, _NM),
-    Placement("E4", "gpu", "narval", ("tabfm",), "probe", 0.8, 1, "24G", gpu_type="a100_3g.20gb"),
+    # TabFM stays on Mila (2026-10-05): its bench env cannot be built on Narval (numpy==2.2.6 is not in the Alliance
+    # wheelhouse). 1 lane / 24G fits beside the N9 probe within Mila's caps (7 of 8 CPUs, 34 of 48 GB, 2 of 2 GPUs).
+    # The full TabFM 5d_rat run is placed once this calibration has measured it.
+    Placement("E4", "gpu", "mila", ("tabfm",), "probe", 0.8, 1, "24G"),
     # ---- bulk: Mila GPU, TabPFN / TabICL halves (one runs at a time) ----
     Placement("N2", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 4.1, _M, MILA_GPU_MEM),
     Placement("N3", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 3.1, _M, MILA_GPU_MEM),

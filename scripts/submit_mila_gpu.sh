@@ -14,6 +14,7 @@ wave="${1:?usage: bash $0 probe|bulk|synthetic}"
 case "$wave" in
   probe)
     CONDA_ENV=pfns4neurostim LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=10G --time=02:00:00 --job-name=N9-gpu scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_nhp.yaml "models=[tabpfn_v2_5]"
+    CONDA_ENV=pfns4neurostim-bench LANES=1 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=1 --mem=24G --time=01:00:00 --job-name=E4-gpu scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabfm]" "dataset.subjects=[1]" "dataset.emgs=[0]" "n_reps=2" "tag=5d_rat-tabfm-calibration"
     ;;
   bulk)
     CONDA_ENV=pfns4neurostim LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=10G --time=05:15:00 --job-name=N2-gpu scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_nhp.yaml "models=[tabpfn_v2_5]"
@@ -29,4 +30,4 @@ case "$wave" in
     ;;
   *) echo "unknown wave: $wave (probe|bulk|synthetic)" >&2; exit 2 ;;
 esac
-echo "estimates for mila: GPU ~23 job-h, CPU ~0 core-h (all waves)"
+echo "estimates for mila: GPU ~24 job-h, CPU ~0 core-h (all waves)"

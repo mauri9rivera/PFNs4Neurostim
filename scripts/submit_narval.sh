@@ -11,7 +11,6 @@ wave="${1:?usage: bash $0 probe|bulk|synthetic}"
 case "$wave" in
   probe)
     bash scripts/narval.sh do sbatch cpu --conda-env pfns4neurostim --cpus 18 --mem 27G --time 03:00:00 --job-name N13-cpu -- scripts/run_cpu.sh stress_sweep configs/experiment/stress_k7_nhp.yaml "models=[gp_mll,gp_naive,random]"
-    bash scripts/narval.sh do sbatch gpu --lanes 1 --conda-env pfns4neurostim-bench --gpu-type a100_3g.20gb --cpus 1 --mem 24G --time 01:00:00 --job-name E4-gpu -- scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabfm]" "dataset.subjects=[1]" "dataset.emgs=[0]" "n_reps=2" "tag=5d_rat-tabfm-calibration"
     ;;
   bulk)
     bash scripts/narval.sh do sbatch cpu --conda-env pfns4neurostim --cpus 18 --mem 27G --time 03:00:00 --job-name N2-cpu -- scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_global_nhp.yaml "models=[gp_mll,gp_naive]"
@@ -37,4 +36,4 @@ case "$wave" in
     ;;
   *) echo "unknown wave: $wave (probe|bulk|synthetic)" >&2; exit 2 ;;
 esac
-echo "estimates for narval: GPU ~37 job-h, CPU ~371 core-h (all waves)"
+echo "estimates for narval: GPU ~36 job-h, CPU ~371 core-h (all waves)"
