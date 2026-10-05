@@ -10,8 +10,7 @@ set -euo pipefail
 wave="${1:?usage: bash $0 probe|bulk|synthetic}"
 case "$wave" in
   probe)
-    bash scripts/narval.sh do sbatch cpu --conda-env pfns4neurostim --cpus 18 --mem 27G --time 03:00:00 --job-name N13-cpu -- scripts/run_cpu.sh stress_sweep configs/experiment/stress_k7_nhp.yaml "models=[gp_mll,gp_naive,random]"
-    ;;
+    echo "nothing in this wave for this cluster" ;;
   bulk)
     bash scripts/narval.sh do sbatch cpu --conda-env pfns4neurostim --cpus 18 --mem 27G --time 03:00:00 --job-name N2-cpu -- scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_global_nhp.yaml "models=[gp_mll,gp_naive]"
     bash scripts/narval.sh do sbatch cpu --conda-env pfns4neurostim --cpus 18 --mem 27G --time 02:15:00 --job-name N3-cpu -- scripts/run_cpu.sh stress_sweep configs/experiment/stress_k5_nhp.yaml "models=[gp_mll,gp_naive]"
@@ -36,4 +35,4 @@ case "$wave" in
     ;;
   *) echo "unknown wave: $wave (probe|bulk|synthetic)" >&2; exit 2 ;;
 esac
-echo "estimates for narval: GPU ~36 job-h, CPU ~371 core-h (all waves)"
+echo "estimates for narval: GPU ~36 job-h, CPU ~364 core-h (all waves)"

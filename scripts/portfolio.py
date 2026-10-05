@@ -285,7 +285,7 @@ UNITS: tuple[Unit, ...] = (
 #: utilisation at 4 lanes is ~30 %, so 6 lanes share ONE card (half the GPU-hours of two 4-lane jobs for most of the
 #: throughput). 6, not 8: sharding is per channel and 18 / 6 = 3 channels per lane, exactly the busiest lane of 8 lanes.
 MILA_GPU_LANES = 6
-MILA_GPU_MEM = "10G"          # 6 lanes x 1.4 GB (NHP TabPFN peak per lane, measured.md) x 1.2
+MILA_GPU_MEM = "12G"          # 6 lanes x 1.58 GB (peak per lane, N9 probe 11078548: 9.46 of 10G = 95 %) x 1.25
 #: Narval CPU halves: one lane per channel (no per-user cap), ~1.2 GB per GP lane measured on Narval (2026-10-04).
 NARVAL_CPU_MEM_PER_LANE_GB = 1.5
 WALL_MARGIN = 1.25            # --time = estimate x margin, rounded up to a quarter hour (sharded units requeue anyway)
@@ -302,7 +302,8 @@ class Placement:
         half: ``gpu`` or ``cpu``.
         cluster: ``mila`` (printed for the user) or ``narval`` (``narval.sh do sbatch`` lines for the agent).
         models: Only the models still missing for this unit (2026-10-05 cache scan); cached cells are skipped anyway.
-        wave: ``probe`` (first job of a class), ``bulk``, or ``synthetic`` (after the cross-cluster twin check).
+        wave: ``probe`` (first job of a class), ``bulk``, ``synthetic`` (after the cross-cluster twin check), or ``done``
+            (already ran; kept as the measured record, never emitted).
         hours: Wall-hour estimate at measured rates; ``--time`` adds :data:`WALL_MARGIN`.
         lanes: Lanes (= CPUs) of the job.
         mem: ``--mem`` of the job.
@@ -331,23 +332,24 @@ def _cpu_mem(lanes: int) -> str:
     return f"{int(lanes * NARVAL_CPU_MEM_PER_LANE_GB + 0.999)}G"
 
 
-# Rates: NHP TabPFN-2.5 ~700 cells/GPU-h at 6 lanes (measured 492-759 at 4 lanes; the N9 probe confirms), GP-MLL 51.5 s
-# (NHP) / 62.9 s (5d_rat) per rep on one core with one channel per CPU lane. Synthetic units wait for the twin check.
+# Rates: NHP TabPFN-2.5 ~1180 cells/GPU-h at 6 lanes (N9 probe 11078548: 720 cells in 0.61 h, GPU util 63 %, against
+# 492-759 at 4 lanes); GP-MLL ~60 s per rep on a Narval core (N13 probe 4692312: 18 lanes x 360 cells in 2.0 h, grade A),
+# one channel per CPU lane. Synthetic units wait for the twin check. Wave `done` = already ran, kept as the record.
 _M, _NC, _RC = MILA_GPU_LANES, CHANNELS["nhp"], CHANNELS["5d_rat"]
 _NM, _RM = _cpu_mem(CHANNELS["nhp"]), _cpu_mem(CHANNELS["5d_rat"])
 SPLIT_PLAN: tuple[Placement, ...] = (
     # ---- probes: one per job class ----
-    Placement("N9", "gpu", "mila", ("tabpfn_v2_5",), "probe", 1.6, _M, MILA_GPU_MEM),
-    Placement("N13", "cpu", "narval", ("gp_mll", "gp_naive", "random"), "probe", 2.4, _NC, _NM),
+    Placement("N9", "gpu", "mila", ("tabpfn_v2_5",), "done", 0.61, _M, MILA_GPU_MEM),
+    Placement("N13", "cpu", "narval", ("gp_mll", "gp_naive", "random"), "done", 2.0, _NC, _NM),
     # TabFM stays on Mila (2026-10-05): its bench env cannot be built on Narval (numpy==2.2.6 is not in the Alliance
     # wheelhouse). 1 lane / 24G fits beside the N9 probe within Mila's caps (7 of 8 CPUs, 34 of 48 GB, 2 of 2 GPUs).
     # The full TabFM 5d_rat run is placed once this calibration has measured it.
     Placement("E4", "gpu", "mila", ("tabfm",), "probe", 0.8, 1, "24G"),
     # ---- bulk: Mila GPU, TabPFN / TabICL halves (one runs at a time) ----
-    Placement("N2", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 4.1, _M, MILA_GPU_MEM),
-    Placement("N3", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 3.1, _M, MILA_GPU_MEM),
-    Placement("N4", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 2.6, _M, MILA_GPU_MEM),
-    Placement("N5", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 1.2, _M, MILA_GPU_MEM),
+    Placement("N2", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 2.5, _M, MILA_GPU_MEM),
+    Placement("N3", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 1.9, _M, MILA_GPU_MEM),
+    Placement("N4", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 1.6, _M, MILA_GPU_MEM),
+    Placement("N5", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 0.8, _M, MILA_GPU_MEM),
     Placement("N11", "gpu", "mila", ("tabicl",), "bulk", 1.6, _M, "12G"),
     Placement("E1", "gpu", "mila", ("tabicl",), "bulk", 1.6, _M, "12G"),
     # ---- bulk: Narval CPU, GP halves (one lane per channel) ----
@@ -364,8 +366,8 @@ SPLIT_PLAN: tuple[Placement, ...] = (
     Placement("E9", "gpu", "narval", ("tabpfn_v3_5", "causilo"), "bulk", 2.0, 4, "20G", gpu_type="a100_2g.10gb",
               config="configs/experiment/hyp0_pfn_bench_5d_rat.yaml"),
     # ---- synthetic: only after the cross-cluster twin check (A3 Step 15) ----
-    Placement("N7", "gpu", "mila", ("tabpfn_v2_5",), "synthetic", 2.6, _M, MILA_GPU_MEM),
-    Placement("N6", "gpu", "mila", ("tabpfn_v2_5",), "synthetic", 4.6, _M, MILA_GPU_MEM),
+    Placement("N7", "gpu", "mila", ("tabpfn_v2_5",), "synthetic", 1.6, _M, MILA_GPU_MEM),
+    Placement("N6", "gpu", "mila", ("tabpfn_v2_5",), "synthetic", 2.8, _M, MILA_GPU_MEM),
     Placement("N7", "cpu", "narval", ("gp_mll", "gp_naive"), "synthetic", 1.5, _NC, _NM),
     Placement("N6", "cpu", "narval", ("gp_mll",), "synthetic", 2.6, _NC, _NM),
     Placement("S5b", "cpu", "narval", ("gp_mll", "gp_naive"), "synthetic", 3.2, _RC, _RM),
