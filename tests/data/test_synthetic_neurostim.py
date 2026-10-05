@@ -1,5 +1,7 @@
-"""Tests for the synthetic synthetic generator (roadmap S0) and the K1 decoy knob (S1)."""
+"""Tests for the synthetic generator (roadmap S0) and the K1 decoy knob (S1)."""
 from __future__ import annotations
+
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -119,6 +121,33 @@ class TestFit:
         fitted = sn.fit_generator_to_channel(ch, n_hotspots=2, min_saturation_frac=0.5)
         assert floors[0] == -np.inf and np.isfinite(floors[1])
         assert np.var(sn.mean_map(fitted)) > 0.0 and fitted.noise_cv > 0.0
+
+    def test_near_collapsed_fit_is_refit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Regression (task plan A3 Step 15): a tiny but nonzero saturation leaves a round-off-size variance that
+        # `var > 0` accepted on one node and rejected on another; the relative criterion must refit it everywhere.
+        ch = sn.generate_neurostim_map(_params(noise_cv=0.3, n_trials=20), np.random.default_rng(0))
+        real = sn.optimize.least_squares
+        floors: list[float] = []
+
+        def nearly_collapse_first(fun, x0, bounds):  # noqa: ANN001, ANN202 - scipy's signature
+            floors.append(float(bounds[0][-1]))
+            fit = real(fun, x0, bounds=bounds)
+            if len(floors) == 1:
+                fit.x = fit.x.copy()
+                fit.x[-1] = -50.0                                          # s ~ 2e-22: finite, map ~ constant
+            return fit
+
+        monkeypatch.setattr(sn.optimize, "least_squares", nearly_collapse_first)
+        fitted = sn.fit_generator_to_channel(ch, n_hotspots=2, min_saturation_frac=0.5)
+        assert len(floors) == 2 and np.isfinite(floors[1])
+        gt = ch.to_raw(ch.y_gt)
+        assert np.var(sn.mean_map(fitted)) / np.var(gt) >= sn.MIN_TWIN_VAR_RATIO
+
+    def test_constant_ground_truth_is_a_data_error(self) -> None:
+        ch = sn.generate_neurostim_map(_params(), np.random.default_rng(0))
+        flat = replace(ch, y_gt=np.zeros_like(ch.y_gt))
+        with pytest.raises(ValueError, match="constant"):
+            sn.fit_generator_to_channel(flat)
 
     def test_fit_that_stays_collapsed_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ch = sn.generate_neurostim_map(_params(), np.random.default_rng(0))

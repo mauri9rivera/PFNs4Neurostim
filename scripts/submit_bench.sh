@@ -12,15 +12,19 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"
 read -r -a CPU_FLAGS <<< "$(bash scripts/cluster.sh flags cpu)"
 
-# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> [overrides...]
+# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> <parts|-> [overrides...]
+#   parts: '|'-separated compute-only overrides, one GPU job each; the assemble job never sees a part (full grid).
 submit_unit() {
-  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" deps="" id
-  shift 9
-  local extra=("$@") memflag=()
+  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" parts="${10}" deps="" id part
+  shift 10
+  local extra=("$@") memflag=() plist=()
   if [ "$mem" != "-" ]; then memflag=(--mem="$mem"); fi
+  if [ "$parts" = "-" ]; then plist=(""); else IFS="|" read -r -a plist <<< "$parts"; fi
   if [ "$gpu" != "-" ]; then
-    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})
-    deps="$deps:${id%%;*}"
+    for part in "${plist[@]}"; do
+      id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${part:+"$part"} ${extra[@]+"${extra[@]}"})
+      deps="$deps:${id%%;*}"
+    done
   fi
   if [ "$cpu" != "-" ]; then
     id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})
@@ -39,8 +43,8 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-submit_unit "B0. Hyp A (TabPFN vs GP), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
-submit_unit "B1. Acquisition core (ts/ei/ucb), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
-submit_unit "B2. UCB kappa grid, 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_ucb_kappa_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "-" 4 "-"
+submit_unit "B0. Hyp A (TabPFN vs GP), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-" "-"
+submit_unit "B1. Acquisition core (ts/ei/ucb), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-" "-"
+submit_unit "B2. UCB kappa grid, 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_ucb_kappa_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "-" 4 "-" "-"
 
 echo "Done. Check with: squeue --me"

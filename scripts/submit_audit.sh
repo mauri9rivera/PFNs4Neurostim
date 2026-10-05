@@ -12,15 +12,19 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"
 read -r -a CPU_FLAGS <<< "$(bash scripts/cluster.sh flags cpu)"
 
-# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> [overrides...]
+# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> <parts|-> [overrides...]
+#   parts: '|'-separated compute-only overrides, one GPU job each; the assemble job never sees a part (full grid).
 submit_unit() {
-  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" deps="" id
-  shift 9
-  local extra=("$@") memflag=()
+  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" parts="${10}" deps="" id part
+  shift 10
+  local extra=("$@") memflag=() plist=()
   if [ "$mem" != "-" ]; then memflag=(--mem="$mem"); fi
+  if [ "$parts" = "-" ]; then plist=(""); else IFS="|" read -r -a plist <<< "$parts"; fi
   if [ "$gpu" != "-" ]; then
-    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})
-    deps="$deps:${id%%;*}"
+    for part in "${plist[@]}"; do
+      id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${part:+"$part"} ${extra[@]+"${extra[@]}"})
+      deps="$deps:${id%%;*}"
+    done
   fi
   if [ "$cpu" != "-" ]; then
     id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})
@@ -39,8 +43,8 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-submit_unit "Y1. Online y = zscore sensitivity arm, Hyp A NHP (GP arms)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "-" "gp_mll,gp_naive" 4 "-" "online_y_scaler=zscore" "tag=nhp-onliney-z"
-submit_unit "Y3. Online y = zscore sensitivity arm, K2-channel NHP (GP arms)" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_nhp.yaml pfns4neurostim "-" "gp_mll,gp_naive" 4 "-" "online_y_scaler=zscore" "tag=nhp-onliney-k2z"
-submit_unit "Y4. TabPFN invariance check vs the archived offline cells" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "tabpfn_v2_5" "-" 1 "-" "online_y_scaler=none" "dataset.subjects=[0]" "dataset.emgs=[0,1]" "n_reps=3" "tag=nhp-offline-tpcheck"
+submit_unit "Y1. Online y = zscore sensitivity arm, Hyp A NHP (GP arms)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "-" "gp_mll,gp_naive" 4 "-" "-" "online_y_scaler=zscore" "tag=nhp-onliney-z"
+submit_unit "Y3. Online y = zscore sensitivity arm, K2-channel NHP (GP arms)" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_nhp.yaml pfns4neurostim "-" "gp_mll,gp_naive" 4 "-" "-" "online_y_scaler=zscore" "tag=nhp-onliney-k2z"
+submit_unit "Y4. TabPFN invariance check vs the archived offline cells" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "tabpfn_v2_5" "-" 1 "-" "-" "online_y_scaler=none" "dataset.subjects=[0]" "dataset.emgs=[0,1]" "n_reps=3" "tag=nhp-offline-tpcheck"
 
 echo "Done. Check with: squeue --me"

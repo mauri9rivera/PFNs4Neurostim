@@ -12,15 +12,19 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"
 read -r -a CPU_FLAGS <<< "$(bash scripts/cluster.sh flags cpu)"
 
-# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> [overrides...]
+# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> <parts|-> [overrides...]
+#   parts: '|'-separated compute-only overrides, one GPU job each; the assemble job never sees a part (full grid).
 submit_unit() {
-  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" deps="" id
-  shift 9
-  local extra=("$@") memflag=()
+  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" parts="${10}" deps="" id part
+  shift 10
+  local extra=("$@") memflag=() plist=()
   if [ "$mem" != "-" ]; then memflag=(--mem="$mem"); fi
+  if [ "$parts" = "-" ]; then plist=(""); else IFS="|" read -r -a plist <<< "$parts"; fi
   if [ "$gpu" != "-" ]; then
-    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})
-    deps="$deps:${id%%;*}"
+    for part in "${plist[@]}"; do
+      id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${part:+"$part"} ${extra[@]+"${extra[@]}"})
+      deps="$deps:${id%%;*}"
+    done
   fi
   if [ "$cpu" != "-" ]; then
     id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})
@@ -39,18 +43,18 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-submit_unit "N1. K2-channel, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "N2. K2-global, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "N3. K5 slot-fraction heavy tail, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "N4. K6 electrode failure, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_failure_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "N5. K6 budget, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "N6. synthetic K2-channel, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "N7. synthetic K1 decoy, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "N13. K7 spatial shuffle, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k7_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
-submit_unit "N8. Hyp A (TabPFN vs GP), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
-submit_unit "N9. Acquisition core (ts/ei/ucb), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
-submit_unit "N10. UCB kappa grid, NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_ucb_kappa_nhp.yaml pfns4neurostim "tabpfn_v2_5" "-" 4 "-"
-submit_unit "N11. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "8G"
-submit_unit "N12. PFNs4BO (native policy), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml pfns4neurostim "pfns4bo" "-" 2 "-"
+submit_unit "N1. K2-channel, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "N2. K2-global, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "N3. K5 slot-fraction heavy tail, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "N4. K6 electrode failure, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_failure_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "N5. K6 budget, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "N6. synthetic K2-channel, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "N7. synthetic K1 decoy, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "N13. K7 spatial shuffle, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k7_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-" "-"
+submit_unit "N8. Hyp A (TabPFN vs GP), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-" "-"
+submit_unit "N9. Acquisition core (ts/ei/ucb), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-" "-"
+submit_unit "N10. UCB kappa grid, NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_ucb_kappa_nhp.yaml pfns4neurostim "tabpfn_v2_5" "-" 4 "-" "-"
+submit_unit "N11. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "8G" "-"
+submit_unit "N12. PFNs4BO (native policy), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml pfns4neurostim "pfns4bo" "-" 2 "-" "-"
 
 echo "Done. Check with: squeue --me"

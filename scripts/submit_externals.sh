@@ -12,15 +12,19 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"
 read -r -a CPU_FLAGS <<< "$(bash scripts/cluster.sh flags cpu)"
 
-# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> [overrides...]
+# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> <parts|-> [overrides...]
+#   parts: '|'-separated compute-only overrides, one GPU job each; the assemble job never sees a part (full grid).
 submit_unit() {
-  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" deps="" id
-  shift 9
-  local extra=("$@") memflag=()
+  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" parts="${10}" deps="" id part
+  shift 10
+  local extra=("$@") memflag=() plist=()
   if [ "$mem" != "-" ]; then memflag=(--mem="$mem"); fi
+  if [ "$parts" = "-" ]; then plist=(""); else IFS="|" read -r -a plist <<< "$parts"; fi
   if [ "$gpu" != "-" ]; then
-    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})
-    deps="$deps:${id%%;*}"
+    for part in "${plist[@]}"; do
+      id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${part:+"$part"} ${extra[@]+"${extra[@]}"})
+      deps="$deps:${id%%;*}"
+    done
   fi
   if [ "$cpu" != "-" ]; then
     id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})
@@ -39,9 +43,10 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-submit_unit "E1. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "8G"
-submit_unit "E3. TabFM, NHP (fixed wrapper)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml pfns4neurostim-bench "tabfm" "-" 2 "24G"
-submit_unit "E4. TabFM 5d_rat CALIBRATION (1 channel, 2 reps)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml pfns4neurostim-bench "tabfm" "-" 1 "24G" "dataset.subjects=[1]" "dataset.emgs=[0]" "n_reps=2" "tag=5d_rat-tabfm-calibration"
-submit_unit "E6. PFNs4BO (native policy), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml pfns4neurostim "pfns4bo" "-" 2 "-"
+submit_unit "E1. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "8G" "-"
+submit_unit "E3. TabFM, NHP (fixed wrapper)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml pfns4neurostim-bench "tabfm" "-" 2 "24G" "-"
+submit_unit "E4. TabFM 5d_rat CALIBRATION (1 channel, 2 reps)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml pfns4neurostim-bench "tabfm" "-" 1 "24G" "-" "dataset.subjects=[1]" "dataset.emgs=[0]" "n_reps=2" "tag=5d_rat-tabfm-calibration"
+submit_unit "E6. PFNs4BO (native policy), 5d_rat" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml pfns4neurostim "pfns4bo" "-" 2 "-" "-"
+submit_unit "E9. TabPFN-3.5 + Causilo, NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml pfns4neurostim-latest "tabpfn_v3_5,causilo" "-" 4 "20G" "-"
 
 echo "Done. Check with: squeue --me"

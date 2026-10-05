@@ -38,6 +38,9 @@ job_run() {
   local experiment="${1:?experiment}" config="${2:?config}"
   shift 2
   export CLUSTER_DIAG="${CLUSTER_DIAG:-1}"
+  # Single-threaded BLAS, as in job_run_lanes: synthetic twins are refitted in every process and are not part of the
+  # cell key, so a 1-lane job must fit them with the same numerics as the lanes of the other half (A3 Step 15).
+  export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
   srun python -m pfns4neurostim "${experiment}" --config "${config}" --compute-only --set "dataset.data_root=${STAGED_ROOT}" "$@" &
   local pid=$!
   trap 'echo "[job] time-limit warning (USR1): stopping and requeueing"; kill -TERM ${pid} 2>/dev/null || true; wait ${pid} || true; scontrol requeue "${SLURM_JOB_ID}"; exit 0' USR1

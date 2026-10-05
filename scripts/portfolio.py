@@ -11,6 +11,12 @@ submission script that the USER runs on the login node:
     python scripts/portfolio.py --emit-bash --group spinal > scripts/submit_spinal.sh        # every spinal deliverable
     python scripts/portfolio.py --emit-bash --group nhp > scripts/submit_nhp.sh              # NHP re-run under the canonical y scaling
     python scripts/portfolio.py --emit-bash --group audit > scripts/submit_audit.sh          # y-scaling sensitivity arms
+    python scripts/portfolio.py --emit-split mila > scripts/submit_mila_gpu.sh     # GPU halves for Mila (you run it)
+    python scripts/portfolio.py --emit-split narval > scripts/submit_narval.sh     # CPU halves + overflow GPU (narval.sh do)
+
+``--emit-split`` follows ``SPLIT_PLAN`` (2026-10-05): each unit's GPU half and CPU half go to different clusters, cells meet
+in the local cache and are assembled locally with ``--only-cached``. Both scripts take a wave argument (``probe``, ``bulk``,
+``synthetic``), so every job class is reviewed on its probe before its siblings are submitted.
 
 Groups (updated 2026-09-25; units whose results already exist were removed — see task_plan.md "Your Mila portfolio"):
     stress     the 5d_rat stress sweeps on the noOutliers cohort (K2 channel/global, K5, K6 failure, synthetic K2).
@@ -99,6 +105,9 @@ class Unit:
         cpu_only: Single-process unit that needs no GPU, so it goes to ``run_single_cpu.sh`` on ``main-cpu``
             instead of holding one of the two GPUs the per-user cap allows (the placement analysis declares
             ``device: cpu``).
+        parts: Disjoint compute-only overrides (e.g. ``dataset.subjects=[0]``) that split the GPU half into one job per
+            part. The assemble job never receives a part, so it always assembles the full grid (a subset override that
+            reached the assemble job is what overwrote the 5d_rat PFN-bench tidy.csv on 2026-09-25).
     """
 
     name: str
@@ -117,6 +126,7 @@ class Unit:
     hours: float | None = None
     channels: int | None = None
     cpu_only: bool = False
+    parts: tuple[str, ...] = ()
 
 
 def _u(name: str, exp: str, cfg: str, ds: str, gpu: tuple[str, ...], cpu: tuple[str, ...], mult: float = 1.0, **kw: object) -> Unit:
@@ -268,6 +278,122 @@ UNITS: tuple[Unit, ...] = (
             "n_reps=3, so the real cost is ~1 min"),
 )
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Split deployment (2026-10-05): GPU halves on Mila, CPU halves on Narval, GPU overflow on Narval.
+# ---------------------------------------------------------------------------------------------------------------------
+#: Mila `main` allows 8 CPUs per user, so a second GPU job would only queue: one GPU job runs at a time. Measured GPU
+#: utilisation at 4 lanes is ~30 %, so 6 lanes share ONE card (half the GPU-hours of two 4-lane jobs for most of the
+#: throughput). 6, not 8: sharding is per channel and 18 / 6 = 3 channels per lane, exactly the busiest lane of 8 lanes.
+MILA_GPU_LANES = 6
+MILA_GPU_MEM = "10G"          # 6 lanes x 1.4 GB (NHP TabPFN peak per lane, measured.md) x 1.2
+#: Narval CPU halves: one lane per channel (no per-user cap), ~1.2 GB per GP lane measured on Narval (2026-10-04).
+NARVAL_CPU_MEM_PER_LANE_GB = 1.5
+WALL_MARGIN = 1.25            # --time = estimate x margin, rounded up to a quarter hour (sharded units requeue anyway)
+WALL_ROUND_MIN = 15
+WAVES = ("probe", "bulk", "synthetic")
+
+
+@dataclass(frozen=True)
+class Placement:
+    """One half of one unit, placed on one cluster for the split deployment.
+
+    Attributes:
+        unit_id: Unit id in :data:`UNITS` (the name's prefix, e.g. ``N2``).
+        half: ``gpu`` or ``cpu``.
+        cluster: ``mila`` (printed for the user) or ``narval`` (``narval.sh do sbatch`` lines for the agent).
+        models: Only the models still missing for this unit (2026-10-05 cache scan); cached cells are skipped anyway.
+        wave: ``probe`` (first job of a class), ``bulk``, or ``synthetic`` (after the cross-cluster twin check).
+        hours: Wall-hour estimate at measured rates; ``--time`` adds :data:`WALL_MARGIN`.
+        lanes: Lanes (= CPUs) of the job.
+        mem: ``--mem`` of the job.
+        gpu_type: Narval GPU slice (``a100``, ``a100_2g.10gb`` ...); empty for CPU or Mila jobs.
+        parts: Disjoint overrides, one job each (see :attr:`Unit.parts`).
+        overrides: Extra overrides for every job of this half (e.g. a calibration subset and its own tag).
+        config: Experiment YAML when it differs from the unit's (the 5d_rat twin of an NHP unit).
+    """
+
+    unit_id: str
+    half: str
+    cluster: str
+    models: tuple[str, ...]
+    wave: str
+    hours: float
+    lanes: int
+    mem: str
+    gpu_type: str = ""
+    parts: tuple[str, ...] = ()
+    overrides: tuple[str, ...] = ()
+    config: str = ""
+
+
+def _cpu_mem(lanes: int) -> str:
+    """``--mem`` for a Narval CPU half: lanes x measured per-lane footprint, rounded up."""
+    return f"{int(lanes * NARVAL_CPU_MEM_PER_LANE_GB + 0.999)}G"
+
+
+# Rates: NHP TabPFN-2.5 ~700 cells/GPU-h at 6 lanes (measured 492-759 at 4 lanes; the N9 probe confirms), GP-MLL 51.5 s
+# (NHP) / 62.9 s (5d_rat) per rep on one core with one channel per CPU lane. Synthetic units wait for the twin check.
+_M, _NC, _RC = MILA_GPU_LANES, CHANNELS["nhp"], CHANNELS["5d_rat"]
+_NM, _RM = _cpu_mem(CHANNELS["nhp"]), _cpu_mem(CHANNELS["5d_rat"])
+SPLIT_PLAN: tuple[Placement, ...] = (
+    # ---- probes: one per job class ----
+    Placement("N9", "gpu", "mila", ("tabpfn_v2_5",), "probe", 1.6, _M, MILA_GPU_MEM),
+    Placement("N13", "cpu", "narval", ("gp_mll", "gp_naive", "random"), "probe", 2.4, _NC, _NM),
+    Placement("E4", "gpu", "narval", ("tabfm",), "probe", 0.8, 1, "24G", gpu_type="a100_3g.20gb"),
+    # ---- bulk: Mila GPU, TabPFN / TabICL halves (one runs at a time) ----
+    Placement("N2", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 4.1, _M, MILA_GPU_MEM),
+    Placement("N3", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 3.1, _M, MILA_GPU_MEM),
+    Placement("N4", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 2.6, _M, MILA_GPU_MEM),
+    Placement("N5", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 1.2, _M, MILA_GPU_MEM),
+    Placement("N11", "gpu", "mila", ("tabicl",), "bulk", 1.6, _M, "12G"),
+    Placement("E1", "gpu", "mila", ("tabicl",), "bulk", 1.6, _M, "12G"),
+    # ---- bulk: Narval CPU, GP halves (one lane per channel) ----
+    Placement("N2", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 2.3, _NC, _NM),
+    Placement("N3", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 1.8, _NC, _NM),
+    Placement("N4", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 1.5, _NC, _NM),
+    Placement("N5", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 0.7, _NC, _NM),
+    Placement("N9", "cpu", "narval", ("gp_mll",), "bulk", 0.9, _NC, _NM),   # + ts_marginal: those cells sit on Mila only
+    Placement("S2b", "cpu", "narval", ("gp_naive",), "bulk", 0.1, _RC, _RM),
+    Placement("S3b", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 2.2, _RC, _RM),
+    Placement("S4b", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 1.8, _RC, _RM),
+    # ---- bulk: Narval GPU overflow (latest env built and measured there; its one-cell checks live there) ----
+    Placement("E9", "gpu", "narval", ("tabpfn_v3_5", "causilo"), "bulk", 2.0, 4, "20G", gpu_type="a100_2g.10gb"),
+    Placement("E9", "gpu", "narval", ("tabpfn_v3_5", "causilo"), "bulk", 2.0, 4, "20G", gpu_type="a100_2g.10gb",
+              config="configs/experiment/hyp0_pfn_bench_5d_rat.yaml"),
+    # ---- synthetic: only after the cross-cluster twin check (A3 Step 15) ----
+    Placement("N7", "gpu", "mila", ("tabpfn_v2_5",), "synthetic", 2.6, _M, MILA_GPU_MEM),
+    Placement("N6", "gpu", "mila", ("tabpfn_v2_5",), "synthetic", 4.6, _M, MILA_GPU_MEM),
+    Placement("N7", "cpu", "narval", ("gp_mll", "gp_naive"), "synthetic", 1.5, _NC, _NM),
+    Placement("N6", "cpu", "narval", ("gp_mll",), "synthetic", 2.6, _NC, _NM),
+    Placement("S5b", "cpu", "narval", ("gp_mll", "gp_naive"), "synthetic", 3.2, _RC, _RM),
+    Placement("S5b", "gpu", "narval", ("tabpfn_v2_5",), "synthetic", 6.5, 4, "8G", gpu_type="a100_2g.10gb",
+              parts=tuple(f"dataset.subjects=[{s}]" for s in range(5))),
+)
+
+
+def _unit(unit_id: str) -> Unit:
+    """Return the unit whose name starts with ``<unit_id>.``.
+
+    Args:
+        unit_id: Unit id, e.g. ``N2``.
+
+    Returns:
+        The matching :class:`Unit`.
+
+    Raises:
+        KeyError: If no unit has that id.
+    """
+    for unit in UNITS:
+        if unit.name.split(".", 1)[0] == unit_id:
+            return unit
+    raise KeyError(f"no unit {unit_id!r} in UNITS")
+
+
+def _walltime(hours: float) -> str:
+    """Return ``HH:MM:SS`` for ``hours`` x :data:`WALL_MARGIN`, rounded up to :data:`WALL_ROUND_MIN` minutes."""
+    minutes = int(-(-hours * WALL_MARGIN * 60 // WALL_ROUND_MIN) * WALL_ROUND_MIN)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}:00"
+
 
 def _resources(models: tuple[str, ...]) -> tuple[str, str, int]:
     """Environment, ``--mem`` and lane cap a set of models needs, read from their specs (#8 rule 5).
@@ -392,15 +518,19 @@ def emit_bash(group: str) -> None:
     print('read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"')
     print('read -r -a CPU_FLAGS <<< "$(bash scripts/cluster.sh flags cpu)"')
     print("")
-    print("# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> [overrides...]")
+    print("# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> <parts|-> [overrides...]")
+    print("#   parts: '|'-separated compute-only overrides, one GPU job each; the assemble job never sees a part (full grid).")
     print("submit_unit() {")
-    print('  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" deps="" id')
-    print("  shift 9")
-    print('  local extra=("$@") memflag=()')
+    print('  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" parts="${10}" deps="" id part')
+    print("  shift 10")
+    print('  local extra=("$@") memflag=() plist=()')
     print('  if [ "$mem" != "-" ]; then memflag=(--mem="$mem"); fi')
+    print('  if [ "$parts" = "-" ]; then plist=(""); else IFS="|" read -r -a plist <<< "$parts"; fi')
     print('  if [ "$gpu" != "-" ]; then')
-    print('    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})')
-    print('    deps="$deps:${id%%;*}"')
+    print('    for part in "${plist[@]}"; do')
+    print('      id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${part:+"$part"} ${extra[@]+"${extra[@]}"})')
+    print('      deps="$deps:${id%%;*}"')
+    print("    done")
     print("  fi")
     print('  if [ "$cpu" != "-" ]; then')
     print('    id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})')
@@ -435,10 +565,90 @@ def emit_bash(group: str) -> None:
         mem = unit.mem or derived_mem or "-"
         lanes = min(unit.lanes, derived_lanes)
         extra = " ".join(f'"{o}"' for o in unit.overrides)
+        parts = "|".join(unit.parts) or "-"
         print(f'submit_unit "{unit.name}" {unit.experiment} {_script(unit.experiment)} {unit.config} {unit.env} "{gm}" "{cm}" '
-              f'{lanes} "{mem}" {extra}'.rstrip())
+              f'{lanes} "{mem}" "{parts}" {extra}'.rstrip())
     print("")
     print('echo "Done. Check with: squeue --me"')
+
+
+def _split_lines(placement: Placement) -> list[str]:
+    """Submission lines of one placement (one per part).
+
+    Args:
+        placement: The half to submit.
+
+    Returns:
+        Shell lines: ``sbatch`` for Mila (the user runs them), ``narval.sh do sbatch`` for Narval (the agent runs them).
+    """
+    unit = _unit(placement.unit_id)
+    cfg = placement.config or unit.config
+    env, _mem, _lanes = _resources(placement.models)
+    name = f"{placement.unit_id}-{placement.half}"
+    if placement.config:
+        name += "-" + placement.config.rsplit("_", 1)[-1].removesuffix(".yaml")
+    script = "scripts/run_cpu.sh" if placement.half == "cpu" else _script(unit.experiment)
+    runner = (unit.experiment,) if placement.half == "cpu" else ()
+    models = f'"models=[{",".join(placement.models)}]"'
+    extra = " ".join(f'"{o}"' for o in unit.overrides + placement.overrides)
+    time = _walltime(placement.hours)
+    lines = []
+    for i, part in enumerate(placement.parts or ("",)):
+        job = f"{name}-p{i}" if placement.parts else name
+        args = " ".join([*runner, cfg, models] + ([f'"{part}"'] if part else []) + ([extra] if extra else []))
+        if placement.cluster == "mila":
+            flags = "${CPU_FLAGS[@]}" if placement.half == "cpu" else "${GPU_FLAGS[@]}"
+            lines.append(f'CONDA_ENV={env} LANES={placement.lanes} sbatch --parsable {flags} --cpus-per-task={placement.lanes} '
+                         f'--mem={placement.mem} --time={time} --job-name={job} {script} {args}')
+        else:
+            gpu = f" --gpu-type {placement.gpu_type}" if placement.gpu_type else ""
+            lanes = "" if placement.half == "cpu" else f" --lanes {placement.lanes}"
+            lines.append(f"bash scripts/narval.sh do sbatch {placement.half}{lanes} --conda-env {env}{gpu} --cpus {placement.lanes} "
+                         f"--mem {placement.mem} --time {time} --job-name {job} -- {script} {args}")
+    return lines
+
+
+def emit_split(cluster: str) -> None:
+    """Write the wave-gated submission script of one cluster's halves of :data:`SPLIT_PLAN` to stdout.
+
+    Args:
+        cluster: ``mila`` or ``narval``.
+    """
+    mine = [p for p in SPLIT_PLAN if p.cluster == cluster]
+    print("#!/bin/bash")
+    print(f"# GENERATED by `python scripts/portfolio.py --emit-split {cluster}` - edit SPLIT_PLAN in scripts/portfolio.py, not this file.")
+    print("#")
+    print("# Split deployment (2026-10-05): GPU halves on Mila, CPU halves and GPU overflow on Narval. These jobs only COMPUTE")
+    print("# cells; there is no assemble job here -- the halves meet in the LOCAL cache and are assembled locally with")
+    print("# --only-cached. Run one wave at a time and review its probe first:   bash <this script> probe|bulk|synthetic")
+    if cluster == "mila":
+        print("# YOU run this on the Mila login node (the agent never submits on Mila). `main` allows 8 CPUs per user, so with")
+        print(f"# {MILA_GPU_LANES}-lane jobs exactly one GPU job runs at a time and the rest wait (QOSMaxCpuPerUserLimit) -- intended.")
+    else:
+        print("# The agent runs these lines one by one after your approval (each is a `narval.sh do sbatch` call, audited in")
+        print("# output/logs/narval_audit.log). NARVAL_DRY_RUN=1 prints the remote commands without submitting.")
+    print("set -euo pipefail")
+    if cluster == "mila":
+        print('cd "${SLURM_SUBMIT_DIR:-$PWD}"')
+        print('read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"')
+        print('read -r -a CPU_FLAGS <<< "$(bash scripts/cluster.sh flags cpu)"')
+    print('wave="${1:?usage: bash $0 probe|bulk|synthetic}"')
+    print('case "$wave" in')
+    for wave in WAVES:
+        print(f"  {wave})")
+        rows = [p for p in mine if p.wave == wave]
+        if not rows:
+            print('    echo "nothing in this wave for this cluster" ;;')
+            continue
+        for p in rows:
+            for line in _split_lines(p):
+                print(f"    {line}")
+        print("    ;;")
+    print('  *) echo "unknown wave: $wave (probe|bulk|synthetic)" >&2; exit 2 ;;')
+    print("esac")
+    gpu_h = sum(p.hours * max(len(p.parts), 1) for p in mine if p.half == "gpu")
+    cpu_h = sum(p.hours * p.lanes for p in mine if p.half == "cpu")
+    print(f'echo "estimates for {cluster}: GPU ~{gpu_h:.0f} job-h, CPU ~{cpu_h:.0f} core-h (all waves)"')
 
 
 def main() -> None:
@@ -447,8 +657,11 @@ def main() -> None:
     parser.add_argument("--group", choices=["stress", "bench", "hypc", "externals", "spinal", "nhp", "audit", "all"],
                         default="all")
     parser.add_argument("--emit-bash", action="store_true", help="Write a submission script to stdout.")
+    parser.add_argument("--emit-split", choices=["mila", "narval"], help="Write one cluster's halves of SPLIT_PLAN to stdout.")
     args = parser.parse_args()
-    if args.emit_bash:
+    if args.emit_split:
+        emit_split(args.emit_split)
+    elif args.emit_bash:
         if args.group == "all":
             parser.error("--emit-bash needs one --group (stress, bench, hypc, externals, spinal, nhp or audit).")
         emit_bash(args.group)

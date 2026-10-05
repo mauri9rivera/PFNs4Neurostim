@@ -18,7 +18,8 @@
 #SBATCH --output=logs/single_cpu_%j.out
 #SBATCH --error=logs/single_cpu_%j.err
 # Partition/account/GPU type are cluster-specific and come from the command line: sbatch $(bash scripts/cluster.sh flags cpu) ...
-#SBATCH --signal=B:USR1@300
+# No --signal: these runners have no cell cache and no USR1 handler, so a warning signal only killed the job
+# 5 min early (both M10 runs of 2026-10-04 died at 5 h 55 min). The wall limit must cover the whole config.
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G

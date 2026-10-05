@@ -212,19 +212,31 @@ def _raw_trials_and_gt(channel: ChannelData) -> tuple[np.ndarray, np.ndarray]:
     return flat.reshape(channel.Y_trials.shape), gt                        # [N, R], [N]
 
 
-def _is_collapsed(theta: np.ndarray, unpack: Callable[[np.ndarray], GeneratorParams]) -> bool:
+#: A fitted twin whose mean map keeps less than this fraction of the real ground truth's variance is treated as
+#: collapsed and refitted with the saturation floor. Relative, not ``var > 0`` (task plan A3 Step 15): on 2026-09-24
+#: a near-collapsed twin had a round-off-size variance that one node kept and another reduced to exactly 0, so the two
+#: halves of one channel ran on different twins. A module constant, not a config key, because the twin is not part of
+#: the cell identity: a tunable tolerance would let cached cells be served for different twins. Every twin of the
+#: 2026-10-05 NHP / 5d_rat configs keeps >= 0.49 of the variance, so this moves none of them.
+MIN_TWIN_VAR_RATIO: float = 1e-6
+
+
+def _is_collapsed(theta: np.ndarray, unpack: Callable[[np.ndarray], GeneratorParams], var_gt: float) -> bool:
     """Whether fitted parameters give no usable map.
 
     Args:
         theta: Fitted parameter vector (last entry is log-saturation).
         unpack: Maps ``theta`` to :class:`GeneratorParams`.
+        var_gt: Variance of the real ground truth the twin is fitted to (> 0).
 
     Returns:
-        True if the saturation underflows to 0 or the mean map is constant.
+        True if the saturation underflows to 0 or the mean map keeps less than
+        ``MIN_TWIN_VAR_RATIO`` of the ground truth's variance.
     """
-    if not np.exp(theta[-1]) > 0.0:
-        return True
-    return not np.var(mean_map(unpack(theta))) > 0.0
+    with np.errstate(over="ignore"):
+        if not np.exp(theta[-1]) > 0.0:
+            return True
+    return float(np.var(mean_map(unpack(theta)))) / var_gt < MIN_TWIN_VAR_RATIO
 
 
 def fit_generator_to_channel(
@@ -258,11 +270,16 @@ def fit_generator_to_channel(
 
     Raises:
         ValueError: If ``n_hotspots < 1`` or the channel has no raw scale.
-        RuntimeError: If the fitted map is constant (no signal to match an SNR to).
+        ValueError: If the ground truth itself is constant.
+        RuntimeError: If the fitted map stays collapsed after the saturation-floor refit.
     """
     if n_hotspots < 1:
         raise ValueError(f"fit_generator_to_channel: n_hotspots must be >= 1, got {n_hotspots}.")
     _, gt = _raw_trials_and_gt(channel)                                    # [N]
+    # ptp, not var: np.var of identical values returns round-off (~5e-32), never exactly 0.
+    if not float(np.ptp(gt)) > 0.0:
+        raise ValueError(f"fit_generator_to_channel({channel.label}): the ground truth is constant; nothing to fit.")
+    var_gt = float(np.var(gt))
     coords = np.asarray(channel.ch2xy, dtype=np.float64)                   # [N, D]
     n, d = coords.shape
     span = np.ptp(coords, axis=0)                                          # [D]
@@ -310,15 +327,15 @@ def fit_generator_to_channel(
     theta = np.clip(theta, lower + 1e-9, upper - 1e-9)
     fit = optimize.least_squares(residual, theta, bounds=(lower, upper))
 
-    if _is_collapsed(fit.x, unpack):
+    if _is_collapsed(fit.x, unpack, var_gt):
         # Fallback only: a finite bound changes the solver's variable scaling, so bounding
         # every fit would move every twin (and orphan the cells cached against them).
         lower[-1] = np.log(min_saturation_frac * max(peak - floor, 1e-6))
         fit = optimize.least_squares(residual, np.clip(theta, lower + 1e-9, upper - 1e-9), bounds=(lower, upper))
-        if _is_collapsed(fit.x, unpack):
+        if _is_collapsed(fit.x, unpack, var_gt):
             raise RuntimeError(
-                f"fit_generator_to_channel({channel.label}, n_hotspots={n_hotspots}): fitted map is "
-                f"constant even with the saturation floor (log s = {fit.x[-1]:.3g})."
+                f"fit_generator_to_channel({channel.label}, n_hotspots={n_hotspots}): fitted map is collapsed "
+                f"(constant or near-constant) even with the saturation floor (log s = {fit.x[-1]:.3g})."
             )
 
     params = unpack(fit.x)
@@ -356,8 +373,8 @@ def synthetic_channels(
         params = fit_generator_to_channel(real, n_hotspots=n_hotspots)
         synth = generate_neurostim_map(
             params,
-            # FROZEN stream tag: it seeds the twin fit, and the cell key does not hash the twin, so renaming it (as the
-            # 2026-10-05 demo1 -> synthetic rename did everywhere else) would serve cached cells for different twins.
+            # FROZEN stream tag: it seeds the twin's trial noise, and the cell key does not hash the twin, so renaming it
+            # (as the 2026-10-05 demo1 -> synthetic rename did everywhere else) would serve cached cells for other twins.
             rng_for(real.label, "demo1_nominal", base_seed=seed),
             dataset=f"{SYNTHETIC_PREFIX}{real.dataset}",
             subject=real.subject,

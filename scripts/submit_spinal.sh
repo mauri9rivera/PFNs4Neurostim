@@ -12,15 +12,19 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 read -r -a GPU_FLAGS <<< "$(bash scripts/cluster.sh flags gpu)"
 read -r -a CPU_FLAGS <<< "$(bash scripts/cluster.sh flags cpu)"
 
-# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> [overrides...]
+# submit_unit <name> <experiment> <script> <config> <env> <gpu-models|-> <cpu-models|-> <lanes> <mem|-> <parts|-> [overrides...]
+#   parts: '|'-separated compute-only overrides, one GPU job each; the assemble job never sees a part (full grid).
 submit_unit() {
-  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" deps="" id
-  shift 9
-  local extra=("$@") memflag=()
+  local name="$1" exp="$2" script="$3" cfg="$4" env="$5" gpu="$6" cpu="$7" lanes="$8" mem="$9" parts="${10}" deps="" id part
+  shift 10
+  local extra=("$@") memflag=() plist=()
   if [ "$mem" != "-" ]; then memflag=(--mem="$mem"); fi
+  if [ "$parts" = "-" ]; then plist=(""); else IFS="|" read -r -a plist <<< "$parts"; fi
   if [ "$gpu" != "-" ]; then
-    id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${extra[@]+"${extra[@]}"})
-    deps="$deps:${id%%;*}"
+    for part in "${plist[@]}"; do
+      id=$(CONDA_ENV="$env" LANES="$lanes" sbatch --parsable ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} ${memflag[@]+"${memflag[@]}"} "$script" "$cfg" "models=[$gpu]" ${part:+"$part"} ${extra[@]+"${extra[@]}"})
+      deps="$deps:${id%%;*}"
+    done
   fi
   if [ "$cpu" != "-" ]; then
     id=$(CONDA_ENV="$env" sbatch --parsable ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} scripts/run_cpu.sh "$exp" "$cfg" "models=[$cpu]" ${extra[@]+"${extra[@]}"})
@@ -39,18 +43,18 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-submit_unit "P1. Hyp A (TabPFN vs GP), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
-submit_unit "P2. Acquisition core (ts/ei/ucb), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
-submit_unit "P3. UCB kappa grid, spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_ucb_kappa_spinal.yaml pfns4neurostim "tabpfn_v2_5" "-" 4 "-"
-submit_unit "P5. K2-channel, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "P6. K2-global, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "P7. K5 slot-fraction heavy tail, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "P8. K6 electrode failure, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_failure_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "P9. K6 budget, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "P10. synthetic K2-channel, spinal twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "P11. synthetic K1 decoy, spinal twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "8G"
-submit_unit "P14. PFNs4BO (native policy), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim "pfns4bo" "-" 2 "-"
-submit_unit "P15. TabFM, spinal (fixed wrapper)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabfm" "-" 2 "24G"
+submit_unit "P1. Hyp A (TabPFN vs GP), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-" "-"
+submit_unit "P2. Acquisition core (ts/ei/ucb), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-" "-"
+submit_unit "P3. UCB kappa grid, spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_ucb_kappa_spinal.yaml pfns4neurostim "tabpfn_v2_5" "-" 4 "-" "-"
+submit_unit "P5. K2-channel, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "P6. K2-global, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "P7. K5 slot-fraction heavy tail, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "P8. K6 electrode failure, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_failure_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "P9. K6 budget, spinal" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "P10. synthetic K2-channel, spinal twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "P11. synthetic K1 decoy, spinal twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_spinal.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-" "-"
+submit_unit "P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabpfn_v2_5,tabicl" "gp_mll" 4 "8G" "-"
+submit_unit "P14. PFNs4BO (native policy), spinal" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim "pfns4bo" "-" 2 "-" "-"
+submit_unit "P15. TabFM, spinal (fixed wrapper)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_spinal.yaml pfns4neurostim-bench "tabfm" "-" 2 "24G" "-"
 
 echo "Done. Check with: squeue --me"
