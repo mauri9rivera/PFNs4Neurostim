@@ -3,8 +3,8 @@
 Experiments are dispatched by name so a SLURM script never imports a module path::
 
     python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml
-    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml
-    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml --replot
+    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_draws_nhp.yaml
+    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_draws_nhp.yaml --replot
 
 Each runner owns its own argument parser; unknown experiment names list what is
 available rather than failing obscurely.

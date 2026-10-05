@@ -56,14 +56,14 @@ _MARKER = "STALE_COHORT.md"
 def cohort_datasets(dataset: str) -> tuple[str, ...]:
     """Return every dataset name whose results derive from one cohort's raw files.
 
-    Demo 1 twins are fitted to the recorded channels and are stored under their own
+    synthetic twins are fitted to the recorded channels and are stored under their own
     dataset name, so retiring a cohort must retire them too.
 
     Args:
         dataset: The recorded dataset name.
 
     Returns:
-        The recorded name and its Demo 1 twin name.
+        The recorded name and its synthetic twin name.
     """
     return (dataset, f"synthetic_{dataset}")
 

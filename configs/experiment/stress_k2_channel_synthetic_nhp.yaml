@@ -1,26 +1,26 @@
-# Hypothesis B - K2-channel SNR on Demo 1 (synthetic twins of every channel, exact ground truth).
-# Dataset: NHP (Demo 1: generator fitted to each recorded channel, roadmap S0). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
+# Hypothesis B - K2-channel SNR on synthetic (synthetic twins of every channel, exact ground truth).
+# Dataset: NHP (synthetic: generator fitted to each recorded channel, roadmap S0). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
 #
 # Knob:   y~[s,r] = y_gt[s] + alpha * (y[s,r] - y_gt[s]) on the trial bank only, so every
 #         channel receives the same *relative* damage (alpha < 1 = trial averaging).
 # x-axis: achieved SNR (dB); levels may and do reach SNR < 0 dB (restructure 2026-09-23).
 # Budget: total queries INCLUDING n_init (P0.3).
 #
-#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_demo1_nhp.yaml
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_synthetic_nhp.yaml
 defaults:
   dataset: nhp
   model: [tabpfn_v2_5, gp_mll, gp_naive]
   acquisition: ts_marginal   # headline (2026-09-20); EI/UCB compared in hyp0_acq_table_*
 
 experiment: stress_sweep
-family: stress-k2-channel-demo1
+family: stress-k2-channel-synthetic
 tag: nhp
 
-# Demo 1: fit the synthetic generator (K hotspots) to each selected channel and sweep the fitted maps.
-# The Demo 2 twin is stress_k2_channel_nhp.yaml; together they feed the S10 bridge:
-#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_demo1_nhp.yaml --replot --bridge output/stress/k2_channel/nhp/stress-k2-channel-nhp
+# synthetic: fit the synthetic generator (K hotspots) to each selected channel and sweep the fitted maps.
+# The draws twin is stress_k2_channel_draws_nhp.yaml; together they feed the S10 bridge:
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_synthetic_nhp.yaml --replot --bridge output/stress/k2_channel/nhp/stress-k2-channel-draws-nhp
 dataset:
-  demo: demo1
+  demo: synthetic
   generator_hotspots: 2
 
 knob:

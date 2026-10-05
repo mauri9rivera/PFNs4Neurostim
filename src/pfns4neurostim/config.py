@@ -66,10 +66,10 @@ class DatasetConfig:
         normalization: Preprocessing mode, a key of
             :data:`pfns4neurostim.data.preprocessing.NORMALIZATIONS`. Logged in
             the resolved config and in every tidy row.
-        demo: ``'demo2'`` runs on the recorded channels; ``'demo1'`` fits the
+        demo: ``'draws'`` runs on the recorded channels; ``'synthetic'`` fits the
             synthetic generator to each selected channel and runs on the fitted
             synthetic maps instead (exact ground truth; roadmap S0).
-        generator_hotspots: Hotspots per fitted synthetic map (``demo1`` only).
+        generator_hotspots: Hotspots per fitted synthetic map (``synthetic`` only).
     """
 
     name: str
@@ -77,7 +77,7 @@ class DatasetConfig:
     emgs: tuple[int, ...] | None = None
     data_root: str = "./data"
     normalization: str = DEFAULT_NORMALIZATION
-    demo: str = "demo2"
+    demo: str = "draws"
     generator_hotspots: int = 2
 
     def __post_init__(self) -> None:
@@ -88,8 +88,8 @@ class DatasetConfig:
                 ``generator_hotspots < 1``.
         """
         get_normalization(self.normalization)
-        if self.demo not in ("demo1", "demo2"):
-            raise ValueError(f"dataset.demo must be 'demo1' or 'demo2', got {self.demo!r}.")
+        if self.demo not in ("synthetic", "draws"):
+            raise ValueError(f"dataset.demo must be 'synthetic' or 'draws', got {self.demo!r}.")
         if self.generator_hotspots < 1:
             raise ValueError(f"dataset.generator_hotspots must be >= 1, got {self.generator_hotspots}.")
 
@@ -389,7 +389,7 @@ def dataset_config_from_raw(raw: dict[str, Any]) -> DatasetConfig:
         emgs=None if emgs in (None, "all") else tuple(int(e) for e in emgs),
         data_root=os.path.expandvars(str(ds.pop("data_root", "./data"))),
         normalization=str(ds.pop("normalization", DEFAULT_NORMALIZATION)),
-        demo=str(ds.pop("demo", "demo2")),
+        demo=str(ds.pop("demo", "draws")),
         generator_hotspots=int(ds.pop("generator_hotspots", 2)),
     )
     if ds:

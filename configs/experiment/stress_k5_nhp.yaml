@@ -1,5 +1,5 @@
 # Hypothesis B - K5 outlier contamination (Huber epsilon-contamination).
-# Dataset: NHP (Demo 2, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
+# Dataset: NHP (draws, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
 #
 # Knob:   a fraction epsilon of ALL valid trial slots (sites x repetitions) is replaced by
 #         y_gt[s] + scale * sigma_noise * t,  t ~ Student-t(df), sigma_noise = channel trial SD.

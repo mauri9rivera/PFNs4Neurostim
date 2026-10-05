@@ -4,7 +4,7 @@ The agent never submits jobs. This script PRINTS the plan, or with ``--emit-bash
 submission script that the USER runs on the login node:
 
     python scripts/portfolio.py                                                    # the plan (all groups)
-    python scripts/portfolio.py --emit-bash --group stress > scripts/submit_portfolio.sh     # Hyp B (restructured knobs, Demo 1)
+    python scripts/portfolio.py --emit-bash --group stress > scripts/submit_portfolio.sh     # Hyp B (restructured knobs, synthetic)
     python scripts/portfolio.py --emit-bash --group bench > scripts/submit_bench.sh          # Hyp 0/A leftovers
     python scripts/portfolio.py --emit-bash --group hypc > scripts/submit_hypc.sh            # Hyp C mechanism analyses
     python scripts/portfolio.py --emit-bash --group externals > scripts/submit_externals.sh  # TabFM, PFNs4BO
@@ -13,7 +13,7 @@ submission script that the USER runs on the login node:
     python scripts/portfolio.py --emit-bash --group audit > scripts/submit_audit.sh          # y-scaling sensitivity arms
 
 Groups (updated 2026-09-25; units whose results already exist were removed — see task_plan.md "Your Mila portfolio"):
-    stress     the 5d_rat stress sweeps on the noOutliers cohort (K2 channel/global, K5, K6 failure, Demo 1 K2).
+    stress     the 5d_rat stress sweeps on the noOutliers cohort (K2 channel/global, K5, K6 failure, synthetic K2).
     bench      Hyp A and the Hyp 0 acquisition tables on 5d_rat.
     hypc       the three NHP mechanism analyses plus the 5d_rat placement arm, re-run with the context-size
                sweeps of task #18 (2026-09-30). C1-C3 last ran locally on 2026-09-24/25 at a SINGLE context
@@ -132,11 +132,11 @@ UNITS: tuple[Unit, ...] = (
     # EVERY 5d_rat unit is a full recompute: the noOutliers cohort (2026-09-25) is part of each 5d_rat cell's
     # identity, so no 5d_rat cell of the old cohort can be reused. Clean the cluster first (runbook 3b).
     # ---- stress: 5d_rat on the new cohort, main env ----
-    _u("S1b. K2-channel, 5d_rat", "stress_sweep", "stress_k2_channel_5d_rat", "5d_rat", _TP, _GP, 9),
+    _u("S1b. K2-channel, 5d_rat", "stress_sweep", "stress_k2_channel_draws_5d_rat", "5d_rat", _TP, _GP, 9),
     _u("S2b. K2-global, 5d_rat", "stress_sweep", "stress_k2_global_5d_rat", "5d_rat", _TP, _GP, 8),
     _u("S3b. K5 slot-fraction heavy tail, 5d_rat", "stress_sweep", "stress_k5_5d_rat", "5d_rat", _TP, _GP, 6),
     _u("S4b. K6 electrode failure, 5d_rat", "stress_sweep", "stress_k6_failure_5d_rat", "5d_rat", _TP, _GP, 5),
-    _u("S5b. Demo 1 K2-channel, 5d_rat twins", "stress_sweep", "stress_k2_channel_demo1_5d_rat", "5d_rat", _TP, _GP, 9,
+    _u("S5b. synthetic K2-channel, 5d_rat twins", "stress_sweep", "stress_k2_channel_synthetic_5d_rat", "5d_rat", _TP, _GP, 9,
        note="twins inherit the source cohort; the s4-e2 collapse (2026-09-24) must be re-checked on the new cohort"),
     # ---- bench: Hyp 0 / A on 5d_rat, main env ----
     _u("B0. Hyp A (TabPFN vs GP), 5d_rat", "bo_benchmark", "hyp_a_5d_rat", "5d_rat", _TP, _BASE_CPU, 1, group="bench"),
@@ -173,7 +173,7 @@ UNITS: tuple[Unit, ...] = (
     _u("P2. Acquisition core (ts/ei/ucb), spinal", "bo_benchmark", "hyp0_acq_core_spinal", "spinal", _TP, _BASE_CPU, 3,
        group="spinal", note="ts_marginal cells are shared with P1 (same identity)"),
     _u("P3. UCB kappa grid, spinal", "bo_benchmark", "hyp0_ucb_kappa_spinal", "spinal", _TP, (), 5, group="spinal"),
-    _u("P5. K2-channel, spinal", "stress_sweep", "stress_k2_channel_spinal", "spinal", _TP, _GP, 9, group="spinal",
+    _u("P5. K2-channel, spinal", "stress_sweep", "stress_k2_channel_draws_spinal", "spinal", _TP, _GP, 9, group="spinal",
        channels=90),
     _u("P6. K2-global, spinal", "stress_sweep", "stress_k2_global_spinal", "spinal", _TP, _GP, 8, group="spinal",
        channels=90),
@@ -183,9 +183,9 @@ UNITS: tuple[Unit, ...] = (
        group="spinal", channels=90),
     _u("P9. K6 budget, spinal", "stress_sweep", "stress_k6_budget_spinal", "spinal", _TP, _GP, 2.5, group="spinal",
        channels=90, note="levels 10,20,30,50,64 = ~2.5x one full budget"),
-    _u("P10. Demo 1 K2-channel, spinal twins", "stress_sweep", "stress_k2_channel_demo1_spinal", "spinal", _TP, _GP, 9,
+    _u("P10. synthetic K2-channel, spinal twins", "stress_sweep", "stress_k2_channel_synthetic_spinal", "spinal", _TP, _GP, 9,
        group="spinal", channels=90, note="all 90 twins fit without collapse (checked 2026-09-25)"),
-    _u("P11. Demo 1 K1 decoy, spinal twins", "stress_sweep", "stress_k1_decoy_spinal", "spinal", _TP, _GP, 5,
+    _u("P11. synthetic K1 decoy, spinal twins", "stress_sweep", "stress_k1_decoy_spinal", "spinal", _TP, _GP, 5,
        group="spinal", channels=90, note="separation 3 pitches on an 8x8 grid: channels where it does not fit are skipped"),
     _u("P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal", "bo_benchmark", "hyp0_pfn_bench_spinal", "spinal",
        ("tabpfn_v2_5", "tabicl"), ("gp_mll",), group="spinal", env=BENCH_ENV,
@@ -226,15 +226,15 @@ UNITS: tuple[Unit, ...] = (
     # science. They are not waste -- fresh cells also carry the new gp_* fit diagnostics (P0.10 / G1), which is
     # why the separate "audit" recompute units D1/D2 are gone. The old `none` cells stay on disk untouched and
     # are the offline comparison arm; regret and R^2 may be compared across the two, calibration may NOT.
-    _u("N1. K2-channel, NHP", "stress_sweep", "stress_k2_channel_nhp", "nhp", _TP, _GP, 9, group="nhp"),
+    _u("N1. K2-channel, NHP", "stress_sweep", "stress_k2_channel_draws_nhp", "nhp", _TP, _GP, 9, group="nhp"),
     _u("N2. K2-global, NHP", "stress_sweep", "stress_k2_global_nhp", "nhp", _TP, _GP, 8, group="nhp"),
     _u("N3. K5 slot-fraction heavy tail, NHP", "stress_sweep", "stress_k5_nhp", "nhp", _TP, _GP, 6, group="nhp"),
     _u("N4. K6 electrode failure, NHP", "stress_sweep", "stress_k6_failure_nhp", "nhp", _TP, _GP, 5, group="nhp"),
     _u("N5. K6 budget, NHP", "stress_sweep", "stress_k6_budget_nhp", "nhp", _TP, _GP, 2.5, group="nhp",
        note="levels 10,20,30,50,96 = ~2.5x one full budget"),
-    _u("N6. Demo 1 K2-channel, NHP twins", "stress_sweep", "stress_k2_channel_demo1_nhp", "nhp", _TP, _GP, 9,
+    _u("N6. synthetic K2-channel, NHP twins", "stress_sweep", "stress_k2_channel_synthetic_nhp", "nhp", _TP, _GP, 9,
        group="nhp", note="then --replot --bridge on the N1 run directory for S10"),
-    _u("N7. Demo 1 K1 decoy, NHP twins", "stress_sweep", "stress_k1_decoy_nhp", "nhp", _TP, _GP, 5, group="nhp"),
+    _u("N7. synthetic K1 decoy, NHP twins", "stress_sweep", "stress_k1_decoy_nhp", "nhp", _TP, _GP, 5, group="nhp"),
     _u("N13. K7 spatial shuffle, NHP", "stress_sweep", "stress_k7_nhp", "nhp", _TP, _BASE_CPU, 6, group="nhp",
        note="NEW knob (2026-09-30), not a re-run: the only axis that removes spatial structure itself. Random "
             "search is an arm because it is the floor every model must meet at f = 1"),
@@ -255,7 +255,7 @@ UNITS: tuple[Unit, ...] = (
        overrides=("online_y_scaler=zscore", "tag=nhp-onliney-z"),
        note="the third mode, for the appendix panel: minmax (canonical) vs zscore vs the archived offline runs"),
     _u("Y3. Online y = zscore sensitivity arm, K2-channel NHP (GP arms)", "stress_sweep",
-       "stress_k2_channel_nhp", "nhp", (), ("gp_mll", "gp_naive"), 9, group="audit",
+       "stress_k2_channel_draws_nhp", "nhp", (), ("gp_mll", "gp_naive"), 9, group="audit",
        overrides=("online_y_scaler=zscore", "tag=nhp-onliney-k2z"),
        note="does the choice of causal scaler move the GP breakdown point?"),
     _u("Y4. TabPFN invariance check vs the archived offline cells", "bo_benchmark", "hyp_a_nhp", "nhp", _TP, (), 1,

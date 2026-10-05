@@ -1,5 +1,5 @@
 # Hypothesis B - K6 sparsity via electrode failure during the run.
-# Dataset: NHP (Demo 2, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
+# Dataset: NHP (draws, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
 #
 # Knob:   a fraction epsilon of the electrodes fails, each at its own uniformly random moment
 #         of the run; afterwards it returns 0.0 (z-scored, = channel mean) and stays queryable,

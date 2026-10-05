@@ -700,7 +700,7 @@ def gp_channel(
         outputscale: True signal variance.
 
     Returns:
-        A ``demo1`` channel whose ``meta['true_hyperparameters']`` records the truth.
+        A ``synthetic`` channel whose ``meta['true_hyperparameters']`` records the truth.
     """
     ax = np.arange(grid_side)
     coords = np.stack(np.meshgrid(ax, ax, indexing="ij"), axis=-1).reshape(-1, 2)  # [N, 2]
@@ -710,7 +710,7 @@ def gp_channel(
     f = np.linalg.cholesky(K) @ rng.normal(size=len(X))                            # [N]
     Y = f[:, None] + noise_sd * rng.normal(size=(len(X), n_trials))                # [N, R]
     return ChannelData(
-        "synthetic_neurostim", 0, 0, X, Y, f, coords, (grid_side, grid_side), demo="demo1",
+        "synthetic_neurostim", 0, 0, X, Y, f, coords, (grid_side, grid_side), demo="synthetic",
         meta={"true_hyperparameters": {
             "lengthscale": lengthscale, "outputscale": outputscale, "noise": noise_sd ** 2,
         }},

@@ -1,4 +1,4 @@
-"""Synthetic neurostimulation maps (Demo 1, roadmap S0).
+"""Synthetic neurostimulation maps (synthetic, roadmap S0).
 
 A synthetic channel is a map with **exact ground truth** built to look like a real one:
 
@@ -14,7 +14,7 @@ or the 5D condition set), so the geometry is never invented.
 
 **Nominal anchor.** :func:`fit_generator_to_channel` fits the parameters to a real
 channel (least squares on the raw ground-truth map, noise CV matched to its achieved SNR), so
-a Demo 1 sweep starts from maps statistically matched to Demo 2. :func:`meta_features`
+a synthetic sweep starts from maps statistically matched to draws. :func:`meta_features`
 computes the statistics the roadmap uses to validate that match (Moran's I, skewness,
 CV, mean-SD correlation).
 
@@ -47,7 +47,7 @@ __all__ = [
     "morans_i",
 ]
 
-#: Dataset-name prefix of Demo 1 channels; the source dataset follows (``synthetic_nhp``),
+#: Dataset-name prefix of synthetic channels; the source dataset follows (``synthetic_nhp``),
 #: so synthetic channels from different sources never share a cache identity.
 SYNTHETIC_PREFIX: str = "synthetic_"
 
@@ -124,7 +124,7 @@ def hotspot_drive(coords: np.ndarray, spot: Hotspot) -> np.ndarray:
 
 
 def mean_map(params: GeneratorParams, coords: np.ndarray | None = None) -> np.ndarray:
-    """Noise-free response ``mu(x)`` at every site (the Demo 1 ground truth, raw units).
+    """Noise-free response ``mu(x)`` at every site (the synthetic ground truth, raw units).
 
     Args:
         params: Generator parameters.
@@ -149,7 +149,7 @@ def generate_neurostim_map(
     emg: int = 0,
     normalization: str = DEFAULT_NORMALIZATION,
 ) -> ChannelData:
-    """Draw one synthetic channel (Demo 1) with exact ground truth.
+    """Draw one synthetic channel (synthetic) with exact ground truth.
 
     Args:
         params: Generator parameters.
@@ -160,7 +160,7 @@ def generate_neurostim_map(
         normalization: Preprocessing mode (same contract as the in-vivo data).
 
     Returns:
-        A :class:`ChannelData` with ``demo='demo1'``; ``y_gt`` is the noise-free map and
+        A :class:`ChannelData` with ``demo='synthetic'``; ``y_gt`` is the noise-free map and
         ``meta['generator']`` holds ``params``.
 
     Raises:
@@ -187,7 +187,7 @@ def generate_neurostim_map(
         y_gt=pre.y_gt,
         ch2xy=np.asarray(params.ch2xy),
         grid_shape=tuple(params.grid_shape),
-        demo="demo1",
+        demo="synthetic",
         normalization=normalization,
         meta={"scaler_y": pre.scaler_y, "generator": params},
     )
@@ -234,7 +234,7 @@ def fit_generator_to_channel(
     min_lengthscale: float = 0.3,
     min_saturation_frac: float = 0.5,
 ) -> GeneratorParams:
-    """Fit generator parameters to a real channel (the Demo 1 nominal anchor).
+    """Fit generator parameters to a real channel (the synthetic nominal anchor).
 
     Hotspots are added greedily at the largest remaining residual, then all parameters
     (centres, log-lengthscales, log-amplitudes, rotations, log-baseline, log-saturation)
@@ -335,7 +335,7 @@ def synthetic_channels(
     seed: int,
     normalization: str = DEFAULT_NORMALIZATION,
 ) -> Iterator[ChannelData]:
-    """Yield one nominal Demo 1 channel per real channel, fitted to it.
+    """Yield one nominal synthetic channel per real channel, fitted to it.
 
     The synthetic channel keeps the real channel's subject/EMG indices and electrode
     geometry and is labelled ``synthetic_<source dataset>``, so it pairs one-to-one
@@ -356,6 +356,8 @@ def synthetic_channels(
         params = fit_generator_to_channel(real, n_hotspots=n_hotspots)
         synth = generate_neurostim_map(
             params,
+            # FROZEN stream tag: it seeds the twin fit, and the cell key does not hash the twin, so renaming it (as the
+            # 2026-10-05 demo1 -> synthetic rename did everywhere else) would serve cached cells for different twins.
             rng_for(real.label, "demo1_nominal", base_seed=seed),
             dataset=f"{SYNTHETIC_PREFIX}{real.dataset}",
             subject=real.subject,

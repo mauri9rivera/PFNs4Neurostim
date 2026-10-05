@@ -3,7 +3,7 @@
 ``channels`` defines the single data object every experiment consumes
 (:class:`~pfns4neurostim.data.channels.ChannelData`); ``stress`` holds the Hyp B
 knobs; ``snr`` computes the achieved SNR used as the K2 x-axis;
-``synthetic_neurostim`` is the Demo 1 generator placeholder.
+``synthetic_neurostim`` is the synthetic generator placeholder.
 """
 from __future__ import annotations
 

@@ -66,7 +66,7 @@ def sweep(channel: ChannelData) -> pd.DataFrame:
                         run_tag="tiny",
                         experiment="stress_sweep",
                         dataset="nhp",
-                        demo="demo2",
+                        demo="draws",
                         subject=1,
                         emg=0,
                         model=model,
@@ -193,7 +193,7 @@ class TestDeliverables:
         written = stress_figs.render_all(sweep, str(tmp_path), knob="k2_channel", dataset="nhp", min_snr_db=None)
         names = {os.path.basename(p) for p in written}
         assert "robustness.csv" in names
-        assert "degradation_invivo.svg" in names
+        assert "degradation_draws.svg" in names
         for path in written:
             assert os.path.getsize(path) > 0
 
@@ -203,7 +203,7 @@ class TestDeliverables:
         assert not shard.empty and stress_figs.REFERENCE_MODEL not in set(shard["model"])
         written = stress_figs.render_all(shard, str(tmp_path), knob="k2_channel", dataset="nhp", min_snr_db=None)
         names = {os.path.basename(p) for p in written}
-        assert {"robustness.csv", "degradation_invivo.svg"} <= names
+        assert {"robustness.csv", "degradation_draws.svg"} <= names
         table = pd.read_csv(os.path.join(str(tmp_path), "robustness.csv"))
         assert table["breakdown_level"].isna().all(), "no reference means no breakdown to report"
 

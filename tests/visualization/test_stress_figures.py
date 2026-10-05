@@ -29,7 +29,7 @@ def _sweep(snr_of: "callable", r2_outlier: bool = False) -> pd.DataFrame:
                     if r2_outlier and model == "gp_naive" and ch == 0:
                         r2 = -50.0
                     rows.append({
-                        "demo": "demo2", "knob": "k2_channel", "level": level, "subject": ch, "emg": 0, "rep": rep,
+                        "demo": "draws", "knob": "k2_channel", "level": level, "subject": ch, "emg": 0, "rep": rep,
                         "model": model, "recommended_regret": 0.1 + 0.02 * level + 0.02 * rng.normal(),
                         "exploration_score": 0.8, "r2": r2, "achieved_snr_db": snr_of(ch, level), "n_init": 5,
                     })
@@ -95,7 +95,7 @@ class TestRenderAll:
         df = _sweep(lambda ch, lv: 12.0 - 2.0 * lv)
         written = stress_figs.render_all(df, str(tmp_path), knob="k2_channel", dataset="nhp")
         names = {os.path.basename(p) for p in written}
-        assert {"channel_counts.csv", "degradation_invivo.svg", "robustness.csv"} <= names
+        assert {"channel_counts.csv", "degradation_draws.svg", "robustness.csv"} <= names
         counts = pd.read_csv(tmp_path / "channel_counts.csv")
         assert {"level", "n_channels_total", "n_channels_kept", "kept"} <= set(counts.columns)
 
@@ -103,7 +103,7 @@ class TestRenderAll:
         """Since the 2026-09-23 restructure SNR < 0 dB is a regime, not a cell to drop."""
         df = _sweep(lambda ch, lv: -3.0 - lv)
         written = stress_figs.render_all(df, str(tmp_path), knob="k2_channel", dataset="nhp")
-        assert "degradation_invivo.svg" in {os.path.basename(p) for p in written}
+        assert "degradation_draws.svg" in {os.path.basename(p) for p in written}
 
     def test_opt_in_clip_can_still_drop_everything(self, tmp_path) -> None:
         df = _sweep(lambda ch, lv: -3.0)
@@ -117,7 +117,7 @@ class TestRenderAll:
             df = _sweep(lambda ch, lv: 10.0).assign(knob=knob)
             out = tmp_path / knob
             stress_figs.render_all(df, str(out), knob=knob, dataset="nhp", min_snr_db=None)
-            assert expected in (out / "degradation_invivo.svg").read_text(encoding="utf-8")
+            assert expected in (out / "degradation_draws.svg").read_text(encoding="utf-8")
 
 
 class TestTraceHelpers:

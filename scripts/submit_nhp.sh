@@ -39,13 +39,13 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-submit_unit "N1. K2-channel, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
+submit_unit "N1. K2-channel, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "N2. K2-global, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "N3. K5 slot-fraction heavy tail, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "N4. K6 electrode failure, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_failure_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "N5. K6 budget, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "N6. Demo 1 K2-channel, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_demo1_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "N7. Demo 1 K1 decoy, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
+submit_unit "N6. synthetic K2-channel, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
+submit_unit "N7. synthetic K1 decoy, NHP twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k1_decoy_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "N13. K7 spatial shuffle, NHP" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k7_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
 submit_unit "N8. Hyp A (TabPFN vs GP), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"
 submit_unit "N9. Acquisition core (ts/ei/ucb), NHP" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp0_acq_core_nhp.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive,random" 4 "-"

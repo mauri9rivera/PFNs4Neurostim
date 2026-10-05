@@ -40,7 +40,7 @@ submit_single() {
 }
 
 submit_unit "Y1. Online y = zscore sensitivity arm, Hyp A NHP (GP arms)" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "-" "gp_mll,gp_naive" 4 "-" "online_y_scaler=zscore" "tag=nhp-onliney-z"
-submit_unit "Y3. Online y = zscore sensitivity arm, K2-channel NHP (GP arms)" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_nhp.yaml pfns4neurostim "-" "gp_mll,gp_naive" 4 "-" "online_y_scaler=zscore" "tag=nhp-onliney-k2z"
+submit_unit "Y3. Online y = zscore sensitivity arm, K2-channel NHP (GP arms)" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_nhp.yaml pfns4neurostim "-" "gp_mll,gp_naive" 4 "-" "online_y_scaler=zscore" "tag=nhp-onliney-k2z"
 submit_unit "Y4. TabPFN invariance check vs the archived offline cells" bo_benchmark scripts/run_bo_benchmark.sh configs/experiment/hyp_a_nhp.yaml pfns4neurostim "tabpfn_v2_5" "-" 1 "-" "online_y_scaler=none" "dataset.subjects=[0]" "dataset.emgs=[0,1]" "n_reps=3" "tag=nhp-offline-tpcheck"
 
 echo "Done. Check with: squeue --me"

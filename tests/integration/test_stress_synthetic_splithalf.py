@@ -2,7 +2,7 @@
 
 * The S5 regime surface reads a budget-B run off longer runs' per-step traces; the shadow
   test checks that claim against real shorter-budget runs (same seed).
-* Demo 1 sweeps run on fitted synthetic twins; split-half ground truth runs repetition i
+* synthetic sweeps run on fitted synthetic twins; split-half ground truth runs repetition i
   on instance i mod 2R; both through the real runner with the GP models.
 """
 from __future__ import annotations
@@ -77,13 +77,13 @@ def _rows(cfg: Any, tmp_path: Any) -> tuple[list[Any], list[dict]]:
     return rows, extras
 
 
-def test_demo1_sweep_runs_on_fitted_twins(patched: list[ChannelData], tmp_path: Any) -> None:
+def test_synthetic_sweep_runs_on_fitted_twins(patched: list[ChannelData], tmp_path: Any) -> None:
     cfg = load_experiment_config(
         "configs/experiment/stress_k1_decoy_nhp.yaml",
         OVERRIDES + ["knob.levels=[0.0,0.8]", "knob.params.separation=2.0", f"output_root={tmp_path}"],
     )
     rows, _ = _rows(cfg, tmp_path)
-    assert {r.dataset for r in rows} == {"synthetic_nhp"} and {r.demo for r in rows} == {"demo1"}
+    assert {r.dataset for r in rows} == {"synthetic_nhp"} and {r.demo for r in rows} == {"synthetic"}
     assert len(rows) == 2 * 2 * 2 * 4                        # channels x levels x models x reps
     captured = [r.decoy_capture for r in rows if r.level == 0.8]
     assert all(c in (0.0, 1.0) for c in captured)
@@ -101,9 +101,9 @@ def test_split_half_reps_cycle_through_instances(patched: list[ChannelData], tmp
     assert all(r.gt_mode == "split_half" and r.gt_reliability is not None for r in rows)
 
 
-def test_split_half_is_refused_on_demo1(patched: list[ChannelData], tmp_path: Any) -> None:
+def test_split_half_is_refused_on_synthetic(patched: list[ChannelData], tmp_path: Any) -> None:
     cfg = load_experiment_config(
         "configs/experiment/stress_k1_decoy_nhp.yaml", OVERRIDES + ["gt_mode=split_half", f"output_root={tmp_path}"]
     )
-    with pytest.raises(ValueError, match="meaningless on Demo 1"):
+    with pytest.raises(ValueError, match="meaningless on synthetic"):
         _rows(cfg, tmp_path)

@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
-CONFIG="${CONFIG:-configs/experiment/stress_k2_channel_nhp.yaml}"
+CONFIG="${CONFIG:-configs/experiment/stress_k2_channel_draws_nhp.yaml}"
 MODELS="${MODELS:-tabpfn_v2_5}"
 LANES="${LANES:-4}"                    # one core per lane; matches the scripts' --cpus-per-task=4
 MEM="${MEM:-7G}"                       # NHP peaks at ~5.3 GB with 4 lanes (Mila 2026-10-01) x 1.25

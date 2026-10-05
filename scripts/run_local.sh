@@ -16,7 +16,7 @@
 #             the 2026-09-30 figure work with no recompute: A8 queries-to-target, A9 anytime regret, the
 #             chromatic floor/ceiling tokens, the context-faceted CKA panels.
 #   tables    the cross-run summary tables (scripts/export_summary_tables.py).
-#   bridge    the Demo 1 <-> Demo 2 synthetic/real bridge for any dataset whose Demo 1 K2 run exists.
+#   bridge    the synthetic <-> draws synthetic/real bridge for any dataset whose synthetic K2 run exists.
 #   verify    the fast test suite, plus the slow y-affine-invariance and mechanism tests that the fast suite
 #             deselects. This is the one step that wants the local GPU.
 #
@@ -72,15 +72,15 @@ step_tables() {
 }
 
 step_bridge() {
-  echo "== bridge: Demo 1 surface with the Demo 2 channels overlaid (S10) =="
+  echo "== bridge: synthetic surface with the draws channels overlaid (S10) =="
   local cfg dataset source ran=0
-  for cfg in configs/experiment/stress_k2_channel_demo1_*.yaml; do
+  for cfg in configs/experiment/stress_k2_channel_synthetic_*.yaml; do
     dataset=$("${PY}" -c "import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))['defaults']['dataset'])" "${cfg}")
-    # The Demo 1 run must exist too: --replot rebuilds the Demo 1 figures and overlays the Demo 2 source
+    # The synthetic run must exist too: --replot rebuilds the synthetic figures and overlays the draws source
     # on them, so without it the step fails on a missing tidy.csv rather than reporting nothing to do.
     target=$("${PY}" -c "import sys,yaml; c=yaml.safe_load(open(sys.argv[1])); print(c['tag'])" "${cfg}")
     if ! ls output/stress/k2_channel/"${dataset}"/*"${target}"*/tidy.csv >/dev/null 2>&1; then
-      echo "   skipped ${cfg}: its own Demo 1 run has not been produced yet"
+      echo "   skipped ${cfg}: its own synthetic run has not been produced yet"
       continue
     fi
     for source in output/stress/k2_channel/"${dataset}"/*/; do
@@ -90,7 +90,7 @@ step_bridge() {
       ran=1
     done
   done
-  [ "${ran}" = "1" ] || echo "   nothing to bridge yet: no Demo 2 K2-channel run under output/stress/k2_channel/"
+  [ "${ran}" = "1" ] || echo "   nothing to bridge yet: no draws K2-channel run under output/stress/k2_channel/"
 }
 
 step_hypc_gpu() {

@@ -1,4 +1,4 @@
-# Hyp B K6 in-run electrode failure, spinal (Demo 2).
+# Hyp B K6 in-run electrode failure, spinal (draws).
 #
 # Derived from the NHP config of the same name (2026-09-25); differences: dataset/tag spinal, budget 64
 # = the 8x8 grid (legacy spinal benchmark; NHP also uses budget = grid), subject 5 excluded (below).
@@ -13,7 +13,7 @@ tag: spinal
 
 dataset:
   # subject 5 excluded: one trial per site on all its EMGs, so no noise floor -> no achieved SNR,
-  # no K2/K5 noise scale, no Demo 1 SNR match (it stays in the Hyp A / Hyp 0 benchmarks).
+  # no K2/K5 noise scale, no synthetic SNR match (it stays in the Hyp A / Hyp 0 benchmarks).
   subjects: [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
 
 knob:

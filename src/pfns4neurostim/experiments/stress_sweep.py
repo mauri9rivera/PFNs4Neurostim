@@ -3,21 +3,21 @@
 Runs the grid **knob x level x model x channel x repetition** and writes one tidy
 CSV plus a trajectory pickle and the resolved config. The runner is knob-agnostic:
 it asks the knob for its levels, applies it, records whatever the knob reports as
-achieved, and lets the figure layer pick the x-axis. Adding K5 or the Demo 1
+achieved, and lets the figure layer pick the x-axis. Adding K5 or the synthetic
 generator therefore changes nothing here.
 
 Deliverables (roadmap S2, S9):
     tidy.csv                     one row per BO run
     trajectories.pkl             per-step data keyed by the tidy key columns
     config.yaml                  resolved configuration (P0.1/P0.2 logging)
-    degradation_invivo.svg       regret and R-squared vs achieved SNR
-    calibration_invivo.svg       coverage-90 and ECE vs achieved SNR
+    degradation_draws.svg        regret and R-squared vs achieved SNR
+    calibration_draws.svg        coverage-90 and ECE vs achieved SNR
     robustness.csv               breakdown point, degradation AUC, CVaR-10%
 
 CLI::
 
-    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml
-    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml --replot
+    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_draws_nhp.yaml
+    python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_draws_nhp.yaml --replot
 """
 from __future__ import annotations
 
@@ -52,8 +52,8 @@ __all__ = ["run_stress_sweep", "build_tidy_rows", "main"]
 def _channels(cfg: ExperimentConfig, shard: tuple[int, int] | None = None) -> Iterable[ChannelData]:
     """Yield the nominal channels selected by the config (always full-mean ground truth).
 
-    ``dataset.demo: demo1`` swaps each recorded channel for a synthetic map fitted to it
-    (roadmap S0), so a Demo 1 sweep runs on the same channel list as its Demo 2 twin.
+    ``dataset.demo: synthetic`` swaps each recorded channel for a synthetic map fitted to it
+    (roadmap S0), so a synthetic sweep runs on the same channel list as its draws twin.
 
     Args:
         cfg: Resolved experiment configuration.
@@ -63,7 +63,7 @@ def _channels(cfg: ExperimentConfig, shard: tuple[int, int] | None = None) -> It
         One :class:`~pfns4neurostim.data.channels.ChannelData` per (subject, EMG).
 
     Raises:
-        ValueError: For split-half ground truth on Demo 1, where the ground truth is exact.
+        ValueError: For split-half ground truth on synthetic, where the ground truth is exact.
     """
     real = iter_channels(
         cfg.dataset.name,
@@ -74,10 +74,10 @@ def _channels(cfg: ExperimentConfig, shard: tuple[int, int] | None = None) -> It
         normalization=cfg.dataset.normalization,
         shard=shard,
     )
-    if cfg.dataset.demo == "demo2":
+    if cfg.dataset.demo == "draws":
         return real
     if cfg.gt_mode != "full_mean":
-        raise ValueError("gt_mode='split_half' is meaningless on Demo 1: synthetic ground truth is exact.")
+        raise ValueError("gt_mode='split_half' is meaningless on synthetic: synthetic ground truth is exact.")
     return synthetic_channels(
         real, n_hotspots=cfg.dataset.generator_hotspots, seed=cfg.seed,
         normalization=cfg.dataset.normalization,
@@ -290,7 +290,7 @@ def _generator_validation(cfg: ExperimentConfig, shard: tuple[int, int] | None) 
     """Meta-features of every selected real channel and of its fitted synthetic twin (S0).
 
     Args:
-        cfg: Resolved Demo 1 configuration.
+        cfg: Resolved synthetic configuration.
         shard: Channel shard, as for the sweep.
 
     Returns:
@@ -309,13 +309,13 @@ def _generator_validation(cfg: ExperimentConfig, shard: tuple[int, int] | None) 
     return pd.DataFrame.from_records(records)
 
 
-def _render_bridge(target: str, demo2_dir: str, cfg: ExperimentConfig, df: pd.DataFrame) -> list[str]:
-    """Place the real channels of a Demo 2 run on this Demo 1 run's regime surface (S10).
+def _render_bridge(target: str, draws_dir: str, cfg: ExperimentConfig, df: pd.DataFrame) -> list[str]:
+    """Place the real channels of a draws run on this synthetic run's regime surface (S10).
 
     Args:
-        target: This (Demo 1) run directory.
-        demo2_dir: Run directory of the matching Demo 2 sweep.
-        cfg: Resolved Demo 1 configuration.
+        target: This (synthetic) run directory.
+        draws_dir: Run directory of the matching draws sweep.
+        cfg: Resolved synthetic configuration.
         df: This run's tidy frame.
 
     Returns:
@@ -327,7 +327,7 @@ def _render_bridge(target: str, demo2_dir: str, cfg: ExperimentConfig, df: pd.Da
     from ..visualization import stress as stress_figs  # noqa: PLC0415 - matplotlib import
     from ..visualization import traces as T  # noqa: PLC0415
 
-    real_path = os.path.join(demo2_dir, "tidy.csv")
+    real_path = os.path.join(draws_dir, "tidy.csv")
     frame = T.load_trace_frame(target)
     if frame is None or not os.path.exists(real_path):
         raise FileNotFoundError(f"--bridge needs {real_path} and this run's trajectories.pkl.")
@@ -372,7 +372,7 @@ def run_stress_sweep(
         compute_only: Compute (and cache) cells but write no ``tidy.csv`` or figures: only a
             provenance record in ``{run_dir}/shards/``. Every job of an experiment shares one run
             directory; assemble the union with a final ``--only-cached`` run without ``--shard``.
-        bridge: Run directory of the Demo 2 sweep matching this Demo 1 sweep; draws the real
+        bridge: Run directory of the draws sweep matching this synthetic sweep; draws the real
             channels on this run's regime surface (roadmap S10).
 
     Returns:
@@ -436,7 +436,7 @@ def run_stress_sweep(
     written = stress_figs.render_all(
         df, target, knob=cfg.knob.type, dataset=cfg.dataset.name, margin=cfg.equivalence_margin
     )
-    if cfg.dataset.demo == "demo1":
+    if cfg.dataset.demo == "synthetic":
         features_path = os.path.join(target, "generator_validation.csv")
         features = (
             pd.read_csv(features_path) if replot and os.path.exists(features_path)
@@ -496,8 +496,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Compute and cache cells; write only a shard provenance record (implied by --shard).",
     )
     parser.add_argument(
-        "--bridge", default=None, metavar="DEMO2_RUN_DIR",
-        help="Demo 1 runs only: overlay that Demo 2 run's real channels on the regime surface (S10).",
+        "--bridge", default=None, metavar="DRAWS_RUN_DIR",
+        help="synthetic runs only: overlay that draws run's real channels on the regime surface (S10).",
     )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 

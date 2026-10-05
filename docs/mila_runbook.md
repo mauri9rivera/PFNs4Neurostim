@@ -107,10 +107,10 @@ N-th channel (`--shard i/N`); the GP models need no GPU and run on `main-cpu`, o
 cd ~/projects/PFNs4Neurostim
 # GPU job: 4 lanes share one GPU (4 CPUs, 10 GB)
 LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp_a_5d_rat.yaml "models=[tabpfn_v2_5]"
-LANES=4 sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_nhp.yaml "models=[tabpfn_v2_5]"
+LANES=4 sbatch scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_nhp.yaml "models=[tabpfn_v2_5]"
 # CPU job: GP models + random on main-cpu, 8 single-thread lanes (device=cpu is forced)
 sbatch scripts/run_cpu.sh bo_benchmark configs/experiment/hyp_a_5d_rat.yaml "models=[gp_mll,gp_naive,random]"
-sbatch scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_channel_nhp.yaml "models=[gp_mll,gp_naive]"
+sbatch scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_channel_draws_nhp.yaml "models=[gp_mll,gp_naive]"
 # bench env (TabICL / TabFlex): select it with CONDA_ENV
 CONDA_ENV=pfns4neurostim-bench LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabpfn_v2_5,tabicl,tabflex]"
 ```
@@ -140,7 +140,7 @@ cells without computing.
 ```bash
 wsl -e bash -lc 'cd /mnt/c/workspace/PFNs4Neurostim && bash scripts/export_results.sh'   # benchmark/, stress/, cells/ into the SAME output/ tree
 # never overwrites local data: cells use --ignore-existing; other files only if newer, the replaced file goes to output/.pull_backup/
-python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml --replot
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_draws_nhp.yaml --replot
 ```
 
 Run directories are `output/benchmark/<dataset>/<family>-<tag>/` and

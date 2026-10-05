@@ -1,4 +1,4 @@
-# Hypothesis B - K6 sparsity via BO budget, NHP (Demo 2, in vivo).
+# Hypothesis B - K6 sparsity via BO budget, NHP (draws, in vivo).
 #
 # The level IS the budget, in total queries including n_init (P0.3): never a
 # percentage of the grid, so the numbers mean the same thing on a 96-site array

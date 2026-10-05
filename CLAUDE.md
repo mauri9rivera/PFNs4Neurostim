@@ -196,7 +196,7 @@ PFNs4Neurostim/
     │   ├── splits.py            ← HELD_OUT / TRAIN / ALL subjects
     │   ├── stress.py            ← StressKnob ABC + registry: K1, K2-channel, K2-global, K5, K6-budget, K6-failure live; K7 declared
     │   ├── snr.py               ← achieved SNR (dB) — the canonical K2 x-axis
-    │   ├── synthetic_neurostim.py ← Demo 1 generator: fitted, SNR-matched synthetic twins (S0)
+    │   ├── synthetic_neurostim.py ← synthetic generator: fitted, SNR-matched synthetic twins (S0)
     │   ├── ground_truth.py      ← full_mean | split_half GT instances + reliability (P0.7)
     │   ├── references/          ← prior bag + noise banks, on-grid interpolation (grid.py) for placement
     │   └── legacy_io.py         ← frozen pre-restructure loader (nhp · rat · spinal); 5d_rat carved out 2026-09-25
@@ -290,9 +290,9 @@ settings that produced it.
 
 ```bash
 pip install -e .
-python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_draws_nhp.yaml
 python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml --set n_reps=2
-python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_nhp.yaml --replot
+python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_draws_nhp.yaml --replot
 pytest tests -m "not slow and not gpu and not legacy" -q
 ```
 
@@ -337,7 +337,7 @@ or axis string. Settled with the user on 2026-09-18 for the JNE/IOP target:
   which are cropped or split before submission
 - **Model names:** compact code-like — `TabPFN-2.5`, `GP-MLL`, `GP-fixed`, `GP-oracle`, `Random`
 - **Stress vocabulary:** roadmap jargon is canonical in code, figures *and* text — `knob`, `level`,
-  `K1`/`K2`/`K5`/`K6`, `Demo 1 (synthetic)` / `Demo 2 (in vivo)`, `breakdown point`; K2's x-axis is
+  `K1`/`K2`/`K5`/`K6`, `Synthetic` / `Draws (in vivo)`, `breakdown point`; K2's x-axis is
   always **achieved SNR (dB)**, never the raw α
 - **Axes:** always label with units, via `style.axis_label(<column name>)`
 - **LaTeX rendering:** only when explicitly requested by the user (`plt.rc('text', usetex=True)`);

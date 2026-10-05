@@ -39,10 +39,10 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-submit_unit "S1b. K2-channel, 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
+submit_unit "S1b. K2-channel, 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_draws_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "S2b. K2-global, 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "S3b. K5 slot-fraction heavy tail, 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k5_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 submit_unit "S4b. K6 electrode failure, 5d_rat" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k6_failure_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
-submit_unit "S5b. Demo 1 K2-channel, 5d_rat twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_demo1_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
+submit_unit "S5b. synthetic K2-channel, 5d_rat twins" stress_sweep scripts/run_stress_sweep.sh configs/experiment/stress_k2_channel_synthetic_5d_rat.yaml pfns4neurostim "tabpfn_v2_5" "gp_mll,gp_naive" 4 "-"
 
 echo "Done. Check with: squeue --me"

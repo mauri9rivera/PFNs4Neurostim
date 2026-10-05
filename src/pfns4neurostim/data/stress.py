@@ -15,7 +15,7 @@ Implemented (stress design of 2026-09-23): **K2** in two settings (channel-relat
 residual amplification against each channel's floor, and one global absolute noise
 level for every channel), **K5** epsilon-contamination of the trial slots with a
 heavy tail, and **K6** sparsity (BO budget, and electrode failure during the run).
-**K1** decoy peak (Demo 1) and **K7** spatial shuffle (2026-09-30). No placeholder
+**K1** decoy peak (synthetic) and **K7** spatial shuffle (2026-09-30). No placeholder
 knobs remain; ``_PlaceholderKnob`` is kept for the next declared-but-pending one,
 which carries its name, levels and label key so configs, schemas and figures can
 reference it before it computes anything.
@@ -266,7 +266,7 @@ def available_knobs(*, implemented_only: bool = False) -> list[str]:
 # ---------------------------------------------------------------------------
 @register_knob
 class K2ChannelNoiseKnob(StressKnob):
-    """K2-channel: noise relative to each channel's own floor SNR (Demo 2).
+    """K2-channel: noise relative to each channel's own floor SNR (draws).
 
     Rescales each trial's deviation from its site's ground truth:
 
@@ -414,7 +414,7 @@ class _PlaceholderKnob(StressKnob):
 
 @register_knob
 class K1DecoyKnob(StressKnob):
-    """K1 decoy peak (Demo 1 only): a second hotspot competing with the true optimum.
+    """K1 decoy peak (synthetic only): a second hotspot competing with the true optimum.
 
     The level is the amplitude ratio ``a2 / a1`` of a decoy hotspot to the primary one
     (0 = no decoy, the nominal map). The decoy copies the primary's shape and sits at
@@ -424,7 +424,7 @@ class K1DecoyKnob(StressKnob):
     (streams keyed by the channel label, not the level: common random numbers), so across
     the ladder only the decoy's amplitude changes and the levels stay paired. The map is
     redrawn from the generator with the decoy added, so ground truth stays exact. A decoy cannot be injected into a measured map, which is
-    why the knob needs a channel carrying ``meta['generator']`` (Demo 1).
+    why the knob needs a channel carrying ``meta['generator']`` (synthetic).
 
     ``meta['decoy_basin']`` marks the sites closer to the decoy than to the primary;
     a run whose final recommendation lands there counts as a **decoy capture**.
@@ -465,7 +465,7 @@ class K1DecoyKnob(StressKnob):
         """Redraw the channel's map with a decoy hotspot of ratio ``level``.
 
         Args:
-            channel: Demo 1 channel with ``meta['generator']``.
+            channel: synthetic channel with ``meta['generator']``.
             level: Amplitude ratio ``a2 / a1``.
             rng: Unused: direction and noise come from channel-keyed streams (see above).
 
@@ -479,7 +479,7 @@ class K1DecoyKnob(StressKnob):
         params = channel.meta.get("generator")
         if params is None:
             raise KnobNotApplicable(
-                f"{channel.label}: K1 needs a Demo 1 channel (meta['generator']); a decoy "
+                f"{channel.label}: K1 needs a synthetic channel (meta['generator']); a decoy "
                 "cannot be injected into a measured map."
             )
         coords = np.asarray(params.ch2xy, dtype=np.float64)                   # [N, D]

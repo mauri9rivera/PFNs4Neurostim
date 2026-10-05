@@ -409,7 +409,7 @@ def plot_degradation_curves(
         Paths written.
     """
     x_col = _knob_axis(df, knob)
-    demo = str(df["demo"].iloc[0]) if "demo" in df.columns else "demo2"
+    demo = str(df["demo"].iloc[0]) if "demo" in df.columns else "draws"
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
     # A knob that does not record one of the default metrics simply loses that panel.
     metrics = [m for m in metrics if m in df.columns]
@@ -488,7 +488,7 @@ def plot_degradation_curves(
         x=0.01, ha="left", fontsize=S.FONT_SIZES["title"],
     )
     S.panel_letters(axes, x=0.0, y=1.06 if counts is not None else 1.02)
-    return S.save_figure(fig, out_dir, f"degradation_{'invivo' if demo == 'demo2' else 'synthetic'}")
+    return S.save_figure(fig, out_dir, f"degradation_{'draws' if demo == 'draws' else 'synthetic'}")
 
 
 def build_robustness_table(
@@ -814,18 +814,18 @@ def plot_bridge(
 ) -> list[str]:
     """Real channels placed on the synthetic regime surface (roadmap S10).
 
-    The background is the Demo 1 difference surface ``model - reference`` (non-inferior
+    The background is the synthetic difference surface ``model - reference`` (non-inferior
     cells outlined); each real channel is a point at its nominal achieved SNR and the
-    budget its Demo 2 run used, coloured by dataset. It answers where real
+    budget its draws run used, coloured by dataset. It answers where real
     neurostimulation sits relative to the synthetic breakdown boundary.
 
     Args:
-        synthetic_frame: Trace frame of the Demo 1 sweep.
-        synthetic_df: Tidy frame of the Demo 1 sweep (x-axis must be achieved SNR).
-        real_df: Tidy frame of the matching Demo 2 sweep; its nominal-level rows supply
+        synthetic_frame: Trace frame of the synthetic sweep.
+        synthetic_df: Tidy frame of the synthetic sweep (x-axis must be achieved SNR).
+        real_df: Tidy frame of the matching draws sweep; its nominal-level rows supply
             each channel's achieved SNR and budget.
         out_dir: Destination directory.
-        knob: Knob name of the Demo 1 sweep.
+        knob: Knob name of the synthetic sweep.
         margin: Non-inferiority margin.
         model: Model of the difference surface.
         reference: Reference model.
@@ -877,7 +877,7 @@ def plot_generator_validation(features: pd.DataFrame, out_dir: str) -> list[str]
     """
     names = ["morans_i", "skewness", "cv", "mean_sd_corr"]
     fig, axes = S.figure("double", ncols=len(names), layout=S.LAYOUT_ENGINE)
-    demos = [d for d in ("demo2", "demo1") if d in set(features["demo"])]
+    demos = [d for d in ("draws", "synthetic") if d in set(features["demo"])]
     for ax, name in zip(axes, names):
         data = [features.loc[features["demo"] == d, name].dropna().to_numpy() for d in demos]
         parts = ax.violinplot(data, showmedians=True)

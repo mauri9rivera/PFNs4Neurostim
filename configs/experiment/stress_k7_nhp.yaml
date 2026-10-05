@@ -1,5 +1,5 @@
 # Hypothesis B - K7 spatial shuffle: destroy the coordinate<->response binding, nothing else.
-# Dataset: NHP (Demo 2, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed vs Random.
+# Dataset: NHP (draws, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed vs Random.
 #
 # Knob:   a fraction f of sites have their response re-paired with another coordinate; a site's GT mean and
 #         its whole trial bank move together, so the response marginals, the GT range and the achieved SNR

@@ -1,4 +1,4 @@
-# Hypothesis B - K1 decoy peak on Demo 1 (synthetic twins of every NHP channel, exact ground truth).
+# Hypothesis B - K1 decoy peak on synthetic (synthetic twins of every NHP channel, exact ground truth).
 # Dataset: NHP geometry and fitted maps (roadmap S0/S1). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
 #
 # Knob:   a second hotspot, a copy of the primary at `separation` electrode pitches in a random in-array
@@ -19,7 +19,7 @@ family: stress-k1-decoy
 tag: nhp
 
 dataset:
-  demo: demo1
+  demo: synthetic
   generator_hotspots: 2
 
 knob:

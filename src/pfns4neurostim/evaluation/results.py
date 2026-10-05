@@ -142,8 +142,8 @@ class TidyRow:
             applicable. Heterogeneous stress knobs may be numeric or
             categorical, hence ``str | float | int | None``.
         gt_mode: Ground-truth mode, ``'full_mean'`` or ``'split_half'`` (P0.7).
-        demo: ``'demo2'`` for in-vivo channels, ``'demo1'`` for synthetic ones
-            (roadmap Hyp B Demo 1 / Demo 2).
+        demo: ``'draws'`` for in-vivo channels, ``'synthetic'`` for synthetic ones
+            (roadmap Hyp B synthetic / draws).
         rep: Integer BO-repetition index.
         acq_label: Name of the acquisition config (e.g. ``'ucb_k2'``); tells apart
             several configurations of one ``acq_type``. Defaults to ``acq_type``.
@@ -201,8 +201,8 @@ class TidyRow:
     gt_mode: str
     rep: int
 
-    # --- key column with a default (Demo 2 = in vivo is the common case) ---
-    demo: str = "demo2"
+    # --- key column with a default (draws = in vivo is the common case) ---
+    demo: str = "draws"
     normalization: str = "pfn"
     acq_label: str = ""
     device: str = ""

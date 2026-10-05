@@ -19,7 +19,7 @@ Decisions settled with the user on 2026-09-18 (JNE / IOP submission target):
 * Model labels: compact code-like (``TabPFN-2.5``, ``GP-MLL``, ``GP-fixed``,
   ``GP-oracle``, ``Random``).
 * Stress vocabulary: roadmap jargon is canonical in code, figures and text
-  (``knob``, ``level``, ``K2``, ``Demo 1``/``Demo 2``, ``breakdown point``).
+  (``knob``, ``level``, ``K2``, ``synthetic``/``draws``, ``breakdown point``).
 """
 from __future__ import annotations
 
@@ -707,8 +707,8 @@ def knob_x_label(knob: str, x_col: str) -> str:
 
 
 DEMO_LABELS: dict[str, str] = {
-    "demo1": "Demo 1 (synthetic)",
-    "demo2": "Demo 2 (in vivo)",
+    "synthetic": "Synthetic",
+    "draws": "Draws (in vivo)",
 }
 
 DATASET_LABELS: dict[str, str] = {

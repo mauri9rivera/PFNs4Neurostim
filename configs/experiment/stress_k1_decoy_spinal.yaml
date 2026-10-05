@@ -1,4 +1,4 @@
-# Hyp B K1 decoy on the Demo 1 synthetic twins of the spinal channels.
+# Hyp B K1 decoy on the synthetic synthetic twins of the spinal channels.
 #
 # Derived from the NHP config of the same name (2026-09-25); differences: dataset/tag spinal, budget 64
 # = the 8x8 grid (legacy spinal benchmark; NHP also uses budget = grid), subject 5 excluded (below).
@@ -13,9 +13,9 @@ tag: spinal
 
 dataset:
   # subject 5 excluded: one trial per site on all its EMGs, so no noise floor -> no achieved SNR,
-  # no K2/K5 noise scale, no Demo 1 SNR match (it stays in the Hyp A / Hyp 0 benchmarks).
+  # no K2/K5 noise scale, no synthetic SNR match (it stays in the Hyp A / Hyp 0 benchmarks).
   subjects: [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
-  demo: demo1
+  demo: synthetic
   generator_hotspots: 2
 
 knob:

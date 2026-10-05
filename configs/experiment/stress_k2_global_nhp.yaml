@@ -1,5 +1,5 @@
 # Hypothesis B - K2-global SNR: one absolute noise level for every channel.
-# Dataset: NHP (Demo 2, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
+# Dataset: NHP (draws, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
 #
 # Knob:   y~[s,r] = y[s,r] + alpha * e,  e ~ N(0, 1), on every valid trial of every channel.
 #         alpha is a noise SD in z-scored response units, identical across channels, so it is

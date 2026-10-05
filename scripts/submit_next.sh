@@ -16,7 +16,7 @@
 #
 # Gated sub-stages, waiting on a specific finished thing rather than on a rank:
 #   tabfm-spinal      P15                                   (needs E3's TabFM cells)
-#   rat-demo1         S5b                                   (needs the Demo 1 collapse check, #10 Step 15)
+#   rat-synthetic         S5b                                   (needs the synthetic collapse check, #10 Step 15)
 #   hypc-5drat        C4                                     (needs one hand-timed 5d_rat channel, #18 Step 5)
 #
 # The ranking is priority, not order: every stage is independent of the ones below it, so submit them in
@@ -108,7 +108,7 @@ STAGES
     echo "gp_mll of P0.10 -- audit 6.6, nhp 36, rat 31, spinal 110 CPU-h. Full table: python scripts/portfolio.py"
     echo
     echo "deferred by decision:       spinal (needs --force; 54% of the remaining compute)"
-    echo "held back by a code task:   rat-demo1 (S5b, #10 Step 15), hypc-5drat (C4, #18 Step 5)"
+    echo "held back by a code task:   rat-synthetic (S5b, #10 Step 15), hypc-5drat (C4, #18 Step 5)"
     echo "run locally, not here:      hypc (C1/C2/C3) -- bash scripts/run_local.sh hypc-gpu | hypc-cpu"
     echo "stage 0 needs no cluster:   bash scripts/run_local.sh"
     echo "a stage's gates in detail:  bash scripts/preflight.sh <stage>"
@@ -137,14 +137,14 @@ STAGES
     run_units scripts/submit_bench.sh drop '__none__'     # 5d_rat B0-B2
     record rat
     ;;
-  rat-demo1)
-    guard rat-demo1
+  rat-synthetic)
+    guard rat-synthetic
     if [ "${FORCE}" != "--force" ]; then
-      echo "[submit_next] S5b needs the Demo 1 collapse check first (#10 Step 15); confirm it, then --force" >&2
+      echo "[submit_next] S5b needs the synthetic collapse check first (#10 Step 15); confirm it, then --force" >&2
       exit 1
     fi
     run_units scripts/submit_portfolio.sh keep 'S5b'
-    record rat-demo1
+    record rat-synthetic
     ;;
 
   # ---- 4. Hyp C with the context sweeps (C2 is the long, non-resumable one) ----
@@ -196,6 +196,6 @@ STAGES
     ;;
 
   *)
-    echo "usage: bash scripts/submit_next.sh [status|audit|nhp|rat|hypc|externals|spinal|tabfm-spinal|rat-demo1|hypc-5drat] [--force]" >&2
+    echo "usage: bash scripts/submit_next.sh [status|audit|nhp|rat|hypc|externals|spinal|tabfm-spinal|rat-synthetic|hypc-5drat] [--force]" >&2
     exit 2 ;;
 esac

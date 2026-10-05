@@ -1,4 +1,4 @@
-"""Tests for the Demo 1 synthetic generator (roadmap S0) and the K1 decoy knob (S1)."""
+"""Tests for the synthetic synthetic generator (roadmap S0) and the K1 decoy knob (S1)."""
 from __future__ import annotations
 
 import numpy as np
@@ -41,7 +41,7 @@ class TestGenerator:
         params = _params()
         ch = sn.generate_neurostim_map(params, np.random.default_rng(0))
         np.testing.assert_allclose(ch.to_raw(ch.y_gt), sn.mean_map(params), rtol=1e-6)
-        assert ch.demo == "demo1" and ch.meta["generator"] is params
+        assert ch.demo == "synthetic" and ch.meta["generator"] is params
 
     def test_trials_are_positive_with_mean_mu_and_sd_cv_mu(self) -> None:
         params = _params(n_trials=4000, noise_cv=0.5)
@@ -196,7 +196,7 @@ class TestK1Decoy:
     def test_in_vivo_channel_is_not_applicable(self) -> None:
         ch = self._channel()
         real = ChannelData("nhp", 1, 0, ch.X_pool, ch.Y_trials, ch.y_gt, ch.ch2xy, ch.grid_shape)
-        with pytest.raises(KnobNotApplicable, match="Demo 1"):
+        with pytest.raises(KnobNotApplicable, match="synthetic"):
             stress.build_knob("k1_decoy").apply(real, 0.5, np.random.default_rng(0))
 
     def test_infeasible_separation_is_not_applicable(self) -> None:

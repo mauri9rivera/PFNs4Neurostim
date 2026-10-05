@@ -1,30 +1,38 @@
-# Hyp B K2-channel noise, spinal (Demo 2).
+# Hypothesis B - K2-channel SNR on synthetic (synthetic twins of every channel, exact ground truth).
+# Dataset: 5D rat (synthetic: generator fitted to each recorded channel, roadmap S0). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
 #
-# Derived from the NHP config of the same name (2026-09-25); differences: dataset/tag spinal, budget 64
-# = the 8x8 grid (legacy spinal benchmark; NHP also uses budget = grid), subject 5 excluded (below).
+# Knob:   y~[s,r] = y_gt[s] + alpha * (y[s,r] - y_gt[s]) on the trial bank only, so every
+#         channel receives the same *relative* damage (alpha < 1 = trial averaging).
+# x-axis: achieved SNR (dB); levels may and do reach SNR < 0 dB (restructure 2026-09-23).
+# Budget: total queries INCLUDING n_init (P0.3).
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_synthetic_5d_rat.yaml
 defaults:
-  dataset: spinal
+  dataset: 5d_rat
   model: [tabpfn_v2_5, gp_mll, gp_naive]
   acquisition: ts_marginal   # headline (2026-09-20); EI/UCB compared in hyp0_acq_table_*
 
 experiment: stress_sweep
-family: stress-k2-channel
-tag: spinal
+family: stress-k2-channel-synthetic
+tag: 5drat
 
+# synthetic: fit the synthetic generator (K hotspots) to each selected channel and sweep the fitted maps.
+# The draws twin is stress_k2_channel_draws_5d_rat.yaml; together they feed the S10 bridge:
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_synthetic_5d_rat.yaml --replot --bridge output/stress/k2_channel/5d_rat/stress-k2-channel-draws-5drat
 dataset:
-  # subject 5 excluded: one trial per site on all its EMGs, so no noise floor -> no achieved SNR,
-  # no K2/K5 noise scale, no Demo 1 SNR match (it stays in the Hyp A / Hyp 0 benchmarks).
-  subjects: [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
+  demo: synthetic
+  generator_hotspots: 2
 
 knob:
   type: k2_channel
   # alpha shifts every channel's SNR by exactly -20*log10(alpha) dB relative to its own floor:
   #   alpha  0.1  0.25  0.5   1   1.5    2     3     4     8
   #   dB   +20  +12   +6    0  -3.5  -6.0  -9.5  -12.0 -18.1
+  # alpha = 8 pushes every channel below 0 dB.
   # (knob.targets_db: [...] states the same ladder directly in dB instead.)
   levels: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0]
 
-budget: 64
+budget: 100
 n_init: 5
 n_reps: 20                 # raised 10 -> 20 on 2026-09-30: with the causal (online) y scaler the early
                            # steps of a run are genuinely harder, so per-cell variance is higher and 10

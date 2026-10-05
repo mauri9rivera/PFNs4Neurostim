@@ -67,7 +67,7 @@ class ChannelData:
         ch2xy: Integer grid position of each site. Shape [N, D].
         grid_shape: Shape of the electrode grid the sites live on.
         gt_mode: How ``y_gt`` was built (``'full_mean'`` or ``'split_half'``).
-        demo: ``'demo2'`` for in-vivo channels, ``'demo1'`` for synthetic ones.
+        demo: ``'draws'`` for in-vivo channels, ``'synthetic'`` for synthetic ones.
         normalization: Preprocessing mode that produced the arrays (a key of
             :data:`pfns4neurostim.data.preprocessing.NORMALIZATIONS`).
         failure_time: When each electrode fails, as a fraction of the run in
@@ -94,7 +94,7 @@ class ChannelData:
     ch2xy: np.ndarray        # [N, D]
     grid_shape: tuple[int, ...]
     gt_mode: str = "full_mean"
-    demo: str = "demo2"
+    demo: str = "draws"
     normalization: str = DEFAULT_NORMALIZATION
     failure_time: np.ndarray | None = None  # [N], run fraction; inf = never fails
     failure_value: float = 0.0
@@ -337,7 +337,7 @@ def load_channel(
         ch2xy=np.asarray(ch2xy, dtype=int),
         grid_shape=grid_shape,
         gt_mode=gt_mode,
-        demo="demo2",
+        demo="draws",
         normalization=pre.normalization,
         meta=_channel_meta(data, pre.scaler_y, data_root),
     )
