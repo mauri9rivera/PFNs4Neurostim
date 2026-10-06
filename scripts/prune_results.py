@@ -42,7 +42,10 @@ import json
 import os
 import re
 import shutil
-from typing import Any
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Iterator, TypeVar
 
 import pandas as pd
 import yaml
@@ -58,6 +61,50 @@ RETIRED_FAMILIES: dict[str, str] = {"hyp0-pfns4bo": "hyp0-pfn-bench"}
 SHARD_DIR = re.compile(r"-(cpu|gpu)-shard\d+of\d+$")
 #: Tidy columns that identify one repetition across runs (present in both benchmark and stress tidies).
 ROW_KEY: tuple[str, ...] = ("dataset", "subject", "emg", "model", "acq_label", "knob", "level", "rep")
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+def _parallel(
+    fn: Callable[[_T], _R],
+    items: list[_T],
+    workers: int,
+    progress_every: int,
+    what: str,
+) -> Iterator[_R]:
+    """Map ``fn`` over ``items`` with a thread pool, in order, printing progress to stderr.
+
+    Threads, not processes: every call here (open + read a small JSON, or rename a file) waits on the file system, not
+    the CPU. On Lustre each such call is a metadata/OST round trip, so a sequential loop is latency-bound -- measured
+    on Narval 2026-10-06: 111,478 cell JSONs at 7-13 files/s, 36 s of CPU in 1 h 29 min, the process sat in
+    ``cl_sync_io_wait``. Concurrent requests overlap those waits.
+
+    Args:
+        fn: Function to apply.
+        items: Inputs.
+        workers: Thread count; 1 reproduces the sequential loop.
+        progress_every: Print a progress line every this many items (0 = never).
+        what: Label for the progress line.
+
+    Yields:
+        ``fn(item)`` for each item, in input order.
+    """
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for i, result in enumerate(pool.map(fn, items), 1):
+            if progress_every and (i % progress_every == 0 or i == len(items)):
+                rate = i / max(time.time() - start, 1e-9)
+                eta = (len(items) - i) / rate
+                print(f"[prune] {what}: {i}/{len(items)} ({100 * i / len(items):.0f} %), {rate:.0f}/s, "
+                      f"ETA {eta / 60:.1f} min", file=sys.stderr, flush=True)
+            yield result
+
+
+def _read_identity(path: str) -> dict[str, Any]:
+    """The stored identity of one cell JSON."""
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)["identity"]
 
 
 def _accepted_params(knob: str) -> set[str] | None:
@@ -76,20 +123,26 @@ def _params_requestable(knob: str | None, params: dict[str, Any] | None) -> bool
     return accepted is not None and set(params or {}) <= accepted
 
 
-def classify_cells(cells_root: str) -> tuple[list[tuple[str, str]], collections.Counter]:
+def classify_cells(
+    cells_root: str,
+    workers: int = 1,
+    progress_every: int = 0,
+) -> tuple[list[tuple[str, str]], collections.Counter]:
     """Return the dead cells ``[(json_path, rule)]`` and a count of the kept-but-flagged ones.
 
     Args:
         cells_root: The cell-cache root (``output/cells``).
+        workers: Threads reading the cell JSONs (see :func:`_parallel`).
+        progress_every: Progress-line interval in cells (0 = silent).
 
     Returns:
         ``(dead, kept_flags)``; ``kept_flags`` counts cells a rule would target but that are kept for safety.
     """
     dead: list[tuple[str, str]] = []
     kept: collections.Counter = collections.Counter()
-    for path in glob.glob(os.path.join(cells_root, "*", "*", "*.json")):
-        with open(path, encoding="utf-8") as fh:
-            identity = json.load(fh)["identity"]
+    paths = glob.glob(os.path.join(cells_root, "*", "*", "*.json"))
+    identities = _parallel(_read_identity, paths, workers, progress_every, "cells read")
+    for path, identity in zip(paths, identities):
         knob, model = identity.get("knob"), identity.get("model")
         if knob in RENAMED_KNOBS:
             twin = {**identity, "knob": RENAMED_KNOBS[knob]}
@@ -204,17 +257,31 @@ def main() -> None:
         "--only-model", nargs="+", default=None, metavar="MODEL",
         help="Only rule C3 for these models (e.g. gp_naive); no run directories are touched.",
     )
+    parser.add_argument(
+        "--workers", type=int, default=16,
+        help="Threads for reading cell JSONs and moving files (I/O-bound; 1 = sequential). Default 16.",
+    )
+    parser.add_argument(
+        "--progress-every", type=int, default=5000, metavar="N",
+        help="Print a progress line to stderr every N cells (0 = silent). Default 5000.",
+    )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error(f"--workers must be >= 1, got {args.workers}")
 
     cells_root = os.path.join(args.output, "cells")
-    dead_cells, kept_cells = classify_cells(cells_root)
-    removed_knobs = {k for k in list(RENAMED_KNOBS) + [p.split()[-1] for _, p in dead_cells if p.startswith("C1 unreg")]}
-    dead_knob_ok = {k: not any(f.startswith(f"{k}:") for f in kept_cells) for k in removed_knobs}
-    dead_runs, notes = classify_runs(args.output, dead_knob_ok)
+    dead_cells, kept_cells = classify_cells(cells_root, args.workers, args.progress_every)
     if args.only_model:
+        # Run directories are never touched in this mode, so do not spend minutes classifying them.
         wanted = {f"C3 stale {m} version" for m in args.only_model}
         dead_cells = [(p, r) for p, r in dead_cells if r in wanted]
         dead_runs, notes = [], [f"--only-model {' '.join(args.only_model)}: run directories and other rules skipped"]
+    else:
+        removed_knobs = {
+            k for k in list(RENAMED_KNOBS) + [p.split()[-1] for _, p in dead_cells if p.startswith("C1 unreg")]
+        }
+        dead_knob_ok = {k: not any(f.startswith(f"{k}:") for f in kept_cells) for k in removed_knobs}
+        dead_runs, notes = classify_runs(args.output, dead_knob_ok)
 
     by_rule = collections.Counter(rule.split(" (")[0] for _, rule in dead_cells)
     print(f"[prune] cells: {len(dead_cells)} dead")
@@ -241,11 +308,16 @@ def main() -> None:
             if os.path.exists(path):
                 _move(path, args.output, archive)
                 fh.write(f"run\t{os.path.relpath(path, args.output)}\t{rule}\n")
-        for path, rule in dead_cells:
+        def move_cell(path: str) -> str:
+            """Move one cell's JSON and pickle; returns the JSON path for the manifest."""
             for part in (path, path[:-5] + ".pkl"):
                 if os.path.exists(part):
                     _move(part, args.output, archive)
-            fh.write(f"cell\t{os.path.relpath(path, args.output)}\t{rule}\n")
+            return path
+
+        rules = dict(dead_cells)
+        for path in _parallel(move_cell, [p for p, _ in dead_cells], args.workers, args.progress_every, "cells moved"):
+            fh.write(f"cell\t{os.path.relpath(path, args.output)}\t{rules[path]}\n")
     verb = "deleted" if args.delete else f"moved to {archive}"
     print(f"[prune] {len(dead_runs)} run dirs and {len(dead_cells)} cells {verb}; manifest {manifest}")
 
