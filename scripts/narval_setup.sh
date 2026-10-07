@@ -151,6 +151,28 @@ open(sys.argv[2], "w").write("\n".join(lines) + "\n")
 PY
 }
 
+# Narval-only substitutions for exact pins the Alliance wheelhouse does not carry as compiled wheels ("pin substitute").
+# The environment*.yml files stay the single validated spec for Mila and local; only the Narval build swaps these, and every
+# swap is logged. Pure-Python pins missing from the wheelhouse (botorch, jaxtyping, tabpfn) are not listed: pip fetches them
+# from PyPI on the login node, as the main env already does. Checked 2026-10-07 with `avail_wheels --python 3.11`: the bench
+# env could not be built (2026-10-05) because numpy==2.2.6 is absent; 2.2.2 is the same minor release.
+NARVAL_PIN_SUBSTITUTES=(
+  "numpy==2.2.6 numpy==2.2.2"
+  "matplotlib==3.11.2 matplotlib==3.11.1"
+  "statsmodels==0.15.0 statsmodels==0.14.6"
+)
+
+apply_pin_substitutes() {   # apply_pin_substitutes <requirements file>
+  local req="${1:?requirements file}" pair from to
+  for pair in "${NARVAL_PIN_SUBSTITUTES[@]}"; do
+    from="${pair%% *}"; to="${pair##* }"
+    if grep -qxF "${from}" "${req}"; then
+      awk -v f="${from}" -v t="${to}" '$0 == f {print t; next} {print}' "${req}" > "${req}.sub" && mv "${req}.sub" "${req}"
+      log "pin substitute (not in the Alliance wheelhouse): ${from} -> ${to}"
+    fi
+  done
+}
+
 cmd_env() {
   local which="${1:-main}" env file venv req
   env="$(env_name "${which}")"; file="$(env_file "${which}")"; venv="${VENV_ROOT}/${env}"
@@ -165,6 +187,7 @@ cmd_env() {
   pip install pyyaml                  # for the yml conversion below (Alliance wheelhouse or PyPI)
   req="$(mktemp)"
   yml_to_requirements "${file}" "${req}"
+  apply_pin_substitutes "${req}"
   log "installing $(grep -cv '^--' "${req}") pinned packages from ${file}"
   # Alliance's wheelhouse is searched first via its pip config; pins it does not carry come from PyPI / the torch
   # index on the login node. A pin that resolves to neither fails here, loudly, not inside a job.
