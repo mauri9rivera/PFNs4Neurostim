@@ -22,10 +22,9 @@ Groups (updated 2026-09-25; units whose results already exist were removed — s
     stress     the 5d_rat stress sweeps on the noOutliers cohort (K2 channel/global, K5, K6 failure, synthetic K2).
     bench      Hyp A and the Hyp 0 acquisition tables on 5d_rat.
     hypc       the three NHP mechanism analyses plus the 5d_rat placement arm, re-run with the context-size
-               sweeps of task #18 (2026-09-30). C1-C3 last ran locally on 2026-09-24/25 at a SINGLE context
-               size each. Each is ONE process (``scripts/run_single.sh``) with no cell cache, so a unit that
-               hits the 12 h limit loses its work: check the estimates before submitting, and split a unit
-               by config rather than hoping.
+               ladder (B3, 2026-10-06). Each is ONE process (``scripts/run_single.sh``), but every cell is cached
+               since 2026-10-06, so a unit that hits its limit resumes when resubmitted and a unit can be split over
+               several jobs (by subject, or C1's GP-refit arm onto CPU) and assembled with ``--only-cached``.
     externals  the PFN benchmark: base models on 5d_rat (bench env), TabFM (bench env, 24 GB, <= 2 lanes, NHP rerun plus a
                5d_rat calibration job) and PFNs4BO 5d_rat (main env).
     spinal     every spinal deliverable (Hyp A, Hyp 0, PFN benchmark, all stress knobs); needs data/spinal
@@ -54,13 +53,20 @@ from dataclasses import dataclass
 REP_SECONDS: dict[str, dict[str, float]] = {
     "nhp": {"tabpfn_v2_5": 15.7, "gp_mll": 51.5, "gp_naive": 0.8, "random": 0.2, "tabicl": 30.0, "tabfm": 99.0,
             "pfns4bo": 5.3,
-            # One cell each, one lane, Narval a100_1g.5gb (2026-10-04, tags a2-check-*): a single measurement on
-            # different hardware than the Mila figures above, so treat it as +-30 %. 5d_rat / spinal: unmeasured.
-            "tabpfn_v3_5": 31.4, "causilo": 26.2},
-    "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 62.9, "gp_naive": 1.0, "random": 0.4, "tabicl": 33.0, "pfns4bo": 6.7},
-    # Spinal (budget 64 on the 8x8 grid) is NOT measured on Mila: the NHP costs above scaled by a local
-    # one-rep spinal/NHP timing (2026-09-25: TabPFN-2.5 x0.52, GP-MLL x0.60; the GP factor for the rest).
-    "spinal": {"tabpfn_v2_5": 8.2, "gp_mll": 34.6, "gp_naive": 0.5, "random": 0.1, "tabicl": 16.5, "pfns4bo": 3.2},
+            # E9 (Narval 4712109, a100_2g.10gb, 4 lanes, both models mixed): ~42 s/cell/lane -> 17.9 s per cell as
+            # 3600 x GPU_LANE_GAIN / cells-per-job-hour, split in the ratio of the one-cell checks (31.4 : 26.2).
+            "tabpfn_v3_5": 19.5, "causilo": 16.3},
+    # 5d_rat TabPFN-3.5 / Causilo: E9 4712110 (~69 s/cell/lane, same split). TabFM: Mila A100-80GB / L40S, 2 lanes,
+    # ~40 cells/lane-h (11107427/31, 2026-10-07); needs a bf16-capable GPU (Ampere+), Turing/Volta ran ~16x slower.
+    "5d_rat": {"tabpfn_v2_5": 17.6, "gp_mll": 62.9, "gp_naive": 1.0, "random": 0.4, "tabicl": 33.0, "pfns4bo": 6.7,
+               "tabpfn_v3_5": 31.9, "causilo": 26.7, "tabfm": 77.0},
+    # Spinal (budget 64, 8x8 grid), measured on the 2026-10-07 wave as 3600 x GPU_LANE_GAIN / cells-per-job-hour:
+    # TabPFN-2.5 ~1160 cells/h per Narval a100_2g.10gb 4-lane job (P5-P10; Mila L40S did 1820/h, 3.4 s: P1 11112864);
+    # TabICL 515/h on a Mila RTX 8000 (P13 11112865); PFNs4BO 3000/h on a 2-lane slice (P14 4929918); TabPFN-3.5 +
+    # Causilo ~500/h mixed (P13b 4929916/17, split 31.4 : 26.2); TabFM 125/h on a 2-lane slice (P15 4929919-22).
+    # GP-MLL 41 s/rep on a Narval core (P1 probe 4898894); gp_naive / random unchanged (local timing).
+    "spinal": {"tabpfn_v2_5": 5.3, "gp_mll": 41.0, "gp_naive": 0.5, "random": 0.1, "tabicl": 11.9, "pfns4bo": 2.0,
+               "tabpfn_v3_5": 13.4, "causilo": 11.2, "tabfm": 49.0},
 }
 GUESSED: frozenset[str] = frozenset()   # every listed cost is measured (TabICL from the D3 runs: 0.43-0.52 s/step)
 #: Channels (subject x EMG) per dataset. 5d_rat dropped from 18 to 17 with the
@@ -174,7 +180,7 @@ UNITS: tuple[Unit, ...] = (
     _u("E9. TabPFN-3.5 + Causilo, NHP", "bo_benchmark", "hyp0_pfn_bench_nhp", "nhp", ("tabpfn_v3_5", "causilo"), (),
        group="externals", env=LATEST_ENV,
        note="latest env; one cell each validated 2026-10-04 on Narval (a100_1g.5gb: 31 s / 26 s per cell, "
-            "3.8 / 1.8 GB RSS); 5d_rat and spinal units wait for their own measurement"),
+            "3.8 / 1.8 GB RSS); costs from the full E9 runs (NHP, 5d_rat) and spinal P13b"),
     # ---- spinal: every deliverable (2026-09-25). Stage data/spinal on the cluster first (runbook). Budget 64 =
     # the 8x8 grid. Subject 5 has one trial per site on every EMG (no noise floor), so the SNR-based stress
     # sweeps run on the other 10 subjects (90 channels); the benchmarks keep all 100.
@@ -204,32 +210,40 @@ UNITS: tuple[Unit, ...] = (
        group="spinal", lanes=2, note="main env"),
     _u("P15. TabFM, spinal (fixed wrapper)", "bo_benchmark", "hyp0_pfn_bench_spinal", "spinal", ("tabfm",), (),
        group="spinal", env=BENCH_ENV,
-       note="cost UNMEASURED on spinal: run after E3 and read its per-rep time; sigma is constructed (G3)"),
-    # ---- hypc: the mechanism analyses, one process each, context-size sweeps of task #18 (2026-09-30) ----
-    # No cell cache: `mechanism` always recomputes, so these need no tag gymnastics -- but they are also NOT
-    # resumable. Give a unit its own tag only to keep an older run directory; otherwise it is overwritten.
-    _u("C1. M10 update rule (t = 10/25/50), NHP", "mechanism", "mechanism_update_rule_nhp", "nhp", _TP, (),
-       group="hypc", hours=4.0,
-       note="~7-8 min per channel (the GP-refit arm dominates) + gates; the layer arm now runs at THREE "
-            "context sizes instead of one, so budget ~1 h above the 2026-09-24 run; set "
-            "update_rule.link.tidy_csv afterwards for M8"),
-    _u("C2. CKA (a) + placement ladder (t = 10/25/50/80), NHP", "mechanism", "mechanism_cka_nhp", "nhp", _TP, (),
-       group="hypc", hours=5.5,
-       note="(a) ~4.4 h, permutation-null bound (~97% of it) + (b) ~20 min after the 2026-09-30 restructure "
-            "(banks, context sites, reference-map embeddings and the floor/ceiling are now shared across the "
-            "channels of one grid: ~3.5 h before) + controls. Still CANNOT resume, so if it ever times out, "
-            "drop cka.targets to [K_GT, K_GP] -- that halves (a)"),
-    _u("C3. Placement MMD / W2 (t = 10...96), NHP", "mechanism", "mechanism_placement_nhp", "nhp", (), ("placement",),
-       group="hypc", cpu_only=True, hours=6.8,
-       note="MEASURED 6.8 h locally 2026-10-01 (was estimated 3.0): formulation C dominates at ~430 s per "
-            "channel-level. Its known-shift gate FAILED for MMD (Spearman 0.900 vs > 0.9) and passed for "
-            "W2, so the MMD panels are not interpretable from that run. "
-            "CPU unit (device: cpu in the config). 6 context sizes instead of 4 and the ladder now reaches "
-            "the full 96-site map; needs libs/tabpfn-v1-prior (bash scripts/mila_setup.sh submodules)"),
-    _u("C4. Placement MMD / W2 (t = 10...200), 5d_rat", "mechanism", "mechanism_placement_5d_rat", "5d_rat", (),
-       ("placement",), group="hypc", cpu_only=True, hours=None,
-       note="cost UNMEASURED: the 5D LinearNDInterpolator on 2048 conditions has never been timed (#6 Step 8). "
-            "Run C3 first, then ONE 5d_rat channel by hand before submitting the unit"),
+       note="done 2026-10-07 (Narval 4929919-22, 4 subject parts); needs a bf16 GPU (Ampere+); sigma is constructed (G3)"),
+    # ---- hypc: the mechanism analyses on the shared context ladder (B3, 2026-10-06) ----
+    # Every mechanism cell is cached (output/cells/<ds>/mechanism_<analysis>/), so a unit that times out is RESUMED by
+    # submitting it again, and a unit can be split over several jobs (dataset.subjects / update_rule.engines) whose
+    # cells meet in one cache and are assembled once with `--only-cached` over the full config. Hours below are
+    # measured on the local RTX 3060 / 12-core box on 2026-10-06 (2-channel NHP smoke, per-cell timings).
+    _u("C1. M10 update rule + F6 readouts + F7 (ladder 10/25/50/80), NHP", "mechanism", "mechanism_update_rule_nhp",
+       "nhp", _TP, (), group="hypc", hours=7.0,
+       note="MEASURED per cell: GP-refit probe 33 s (CPU), TabPFN probe 1.6 s, layer-arm readout 2.2 s, GP frozen "
+            "0.2-0.9 s. 648 cells per engine -> the GP-refit arm is ~5.9 h of the ~7 h: split it off as a CPU half "
+            "(update_rule.engines=[gp_mll_refit,gp_mll_frozen,gp_fixed_frozen], one job per subject, 2-2.6 h each) "
+            "and run the TabPFN half (engines=[tabpfn_v2_5], ALL subjects -- the seed floor reads channels[:2]) "
+            "on a GPU in ~0.6 h; assemble with --only-cached and the full engine list"),
+    _u("C2. CKA (a) + (b), readouts feature_mean / label_token + decoder stages, NHP", "mechanism", "mechanism_cka_nhp",
+       "nhp", _TP, (), group="hypc", hours=1.7,
+       note="MEASURED: (a) 0.7 s per cell after the batched permutation null (4320 cells ~0.85 h, was 5.8 s per "
+            "cell); (b) ~47-50 s per (t, draw, readout) cell at 2 channels, ~1 min at 18 (40 cells ~0.7 h); "
+            "controls ~5 min. (b) cells are keyed by the grid's full channel list: never split this unit by subject"),
+    _u("C2b. CKA shadow run, per-feature-token readout (t = 25), NHP", "mechanism", "mechanism_cka_tokens_nhp", "nhp",
+       _TP, (), group="hypc", hours=0.3,
+       note="after C2 in the SAME cell store: its feature_mean cells (540) are then cache hits and only the 540 "
+            "feature_tokens cells compute (~1 s each); writes shadow_criterion.json (pre-registered IQR ratio < 0.75)"),
+    _u("C3. Placement MMD / W2 (ladder 10/25/50/80 + full map), NHP", "mechanism", "mechanism_placement_nhp", "nhp",
+       (), ("placement",), group="hypc", cpu_only=True, hours=4.9,
+       note="ESTIMATED from the 2026-10-01 local run (6.8 h at 6 sizes + full; formulation C dominates, ~430 s per "
+            "channel-level, linear in the number of sizes) -> ~4.9 h at 4 sizes + full. One C cell per channel, so "
+            "split by subject (6 / 8 / 4 channels -> ~1.6 / 2.2 / 1.1 h) and assemble with --only-cached (the M0 "
+            "ladder gate runs on channels[0] = the subject-0 job's). Its MMD gate FAILED in that run (0.900 vs > 0.9). "
+            "needs libs/tabpfn-v1-prior (bash scripts/mila_setup.sh submodules)"),
+    _u("C4. Placement MMD / W2 (ladder 10...200 + full), 5d_rat", "mechanism", "mechanism_placement_5d_rat", "5d_rat",
+       (), ("placement",), group="hypc", cpu_only=True, hours=None,
+       note="PARTLY MEASURED 2026-10-06 (local, 1 channel): the prior + noise banks on the 2048-condition 5D set take "
+            "~7 min (cached once per grid); the M0 ladder gate alone runs > 20 min at ~2.3 cores. Size the unit from "
+            "the full one-channel timing before submitting"),
     # ---- nhp: EVERY NHP deliverable, recomputed under the canonical online y scaling (2026-09-30) ----
     # `online_y_scaler: minmax` entered every experiment config on 2026-09-30, and it is part of each cell's
     # identity, so none of the 2026-09-24 NHP cells is addressable any more: these units are re-runs, not new
@@ -286,7 +300,8 @@ UNITS: tuple[Unit, ...] = (
 #: throughput). 6, not 8: sharding is per channel and 18 / 6 = 3 channels per lane, exactly the busiest lane of 8 lanes.
 MILA_GPU_LANES = 6
 MILA_GPU_MEM = "12G"          # 6 lanes x 1.58 GB (peak per lane, N9 probe 11078548: 9.46 of 10G = 95 %) x 1.25
-#: Narval CPU halves: one lane per channel (no per-user cap), ~1.2 GB per GP lane measured on Narval (2026-10-04).
+#: Narval CPU halves: one lane per channel (no per-user cap). GP lanes peak at 1.18 GB (NHP K7, 4692312) to 1.27 GB
+#: (spinal K6-failure, 4929910: OOM at 50G for 42 lanes); 1.5 keeps ~20 % headroom over the heaviest.
 NARVAL_CPU_MEM_PER_LANE_GB = 1.5
 WALL_MARGIN = 1.25            # --time = estimate x margin, rounded up to a quarter hour (sharded units requeue anyway)
 WALL_ROUND_MIN = 15

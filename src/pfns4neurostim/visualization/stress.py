@@ -876,18 +876,26 @@ def plot_generator_validation(features: pd.DataFrame, out_dir: str) -> list[str]
         Paths written (figure and ``generator_validation.csv``).
     """
     names = ["morans_i", "skewness", "cv", "mean_sd_corr"]
-    fig, axes = S.figure("double", ncols=len(names), layout=S.LAYOUT_ENGINE)
-    demos = [d for d in ("draws", "synthetic") if d in set(features["demo"])]
-    for ax, name in zip(axes, names):
-        data = [features.loc[features["demo"] == d, name].dropna().to_numpy() for d in demos]
-        parts = ax.violinplot(data, showmedians=True)
-        for body in parts["bodies"]:
-            body.set_facecolor(S.NEUTRAL_GREY)
-        ax.set_xticks(range(1, len(demos) + 1), [S.DEMO_LABELS[d] for d in demos])
-        ax.set_ylabel(S.axis_label(name))
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, "generator_validation.csv")
     features.to_csv(csv_path, index=False)
+    demos = [d for d in ("draws", "synthetic") if d in set(features["demo"])]
+    if not demos:   # e.g. K1 decoy runs, whose demos are the decoy maps: no real-vs-synthetic comparison to draw
+        return [csv_path]
+    fig, axes = S.figure("double", ncols=len(names), layout=S.LAYOUT_ENGINE)
+    for ax, name in zip(axes, names):
+        data = {d: features.loc[features["demo"] == d, name].dropna().to_numpy() for d in demos}
+        shown = [d for d in demos if data[d].size]      # a demo with no finite value has no violin
+        if shown:
+            parts = ax.violinplot([data[d] for d in shown], showmedians=True)
+            for body in parts["bodies"]:
+                body.set_facecolor(S.NEUTRAL_GREY)
+        ax.set_xticks(range(1, len(shown) + 1), [S.DEMO_LABELS[d] for d in shown])
+        missing = [S.DEMO_LABELS[d] for d in demos if d not in shown]
+        if missing:
+            ax.text(0.5, 0.98, f"no finite values: {', '.join(missing)}", transform=ax.transAxes, ha="center",
+                    va="top", fontsize=S.FONT_SIZES["annotation"])
+        ax.set_ylabel(S.axis_label(name))
     return [csv_path, *S.save_figure(fig, out_dir, "generator_validation")]
 
 

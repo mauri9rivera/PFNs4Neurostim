@@ -46,8 +46,7 @@
 #    # Config: configs/{dataset}_vanilla_benchmark.yaml
 #    # Also accepts VANILLA_CONFIG=<path> for backward compatibility
 #
-#  ── Family 8 — post-hoc aggregation (no GPU) ─────────────────────
-#    FAMILY=8 AGG_CONFIG=configs/legacy/nhp_vanilla_benchmark.yaml sbatch --gres='' --cpus-per-task=4 --mem=8G scripts/run_experiment.sh
+#  ── Family 8 — retired 2026-10-08: pool runs with scripts/aggregate_runs.py ──
 #
 #  ── Family 9 — dense CKA layer sweep ─────────────────────────────
 #    FAMILY=9 sbatch --gres=gpu:rtx8000:1 --mem-per-gpu=16G --cpus-per-task=4 --time=8:00:00 scripts/run_experiment.sh
@@ -159,9 +158,6 @@ elif [ "$FAMILY" = "7" ]; then
     # VANILLA_CONFIG accepted for backward compatibility alongside CONFIG.
     CFG=${VANILLA_CONFIG:-${CONFIG:-configs/${DATASET}_vanilla_benchmark.yaml}}
 
-elif [ "$FAMILY" = "8" ]; then
-    : "${AGG_CONFIG:?AGG_CONFIG must be set for FAMILY=8}"
-
 else
     echo "Unknown FAMILY=$FAMILY. Must be 0-9." >&2
     exit 1
@@ -200,12 +196,6 @@ elif [ "$FAMILY" = "7" ]; then
     [ -n "${N_REPS:-}" ] && VFLAGS="$VFLAGS --n_reps $N_REPS"
     srun python -m pfns4neurostim.legacy_code.vanilla_benchmark --config "$CFG" $VFLAGS
     echo "[$(date)] Done. Results in output/runs/"
-
-elif [ "$FAMILY" = "8" ]; then
-    echo "[$(date)] family=8 config=$AGG_CONFIG"
-    mkdir -p output/aggregated
-    srun python -m pfns4neurostim.legacy_code.aggregate --config "$AGG_CONFIG"
-    echo "[$(date)] Done. Results in output/aggregated/"
 
 else
     echo "[$(date)] family=$FAMILY task=$TASK_ID dataset=$DATASET split=$SPLIT mode=$MODE ${HELD_OUT_SUBJ:+subj=$HELD_OUT_SUBJ} ${HELD_OUT_EMG:+emg=$HELD_OUT_EMG} ${CFG:+config=$CFG}"
