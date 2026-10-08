@@ -6,9 +6,14 @@
 # linear-regime check) are written to gates.json; per research_design no real-data figure is
 # interpreted unless they pass.
 #
+# Context sizes come from the shared ladder configs/context/nhp.yaml ([10, 25, 50, 80], B3 Step 4); every cell
+# is cached under output/cells/nhp/mechanism_update_rule/, so a killed run resumes (B3 Step 3).
+#
 #   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_update_rule_nhp.yaml
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_update_rule_nhp.yaml --only-cached
 defaults:
   dataset: nhp
+  context: nhp
 
 analysis: update_rule
 tag: nhp
@@ -17,8 +22,8 @@ seed: 42
 output_root: output
 
 update_rule:
-  engines: [tabpfn_v2_5, gp_mll_frozen, gp_mll_refit]
-  context_sizes: [10, 25, 50]
+  # gp_fixed_frozen (2026-10-06): F7 draws both GPs and states its differences against GP-fixed (user decision).
+  engines: [tabpfn_v2_5, gp_mll_frozen, gp_mll_refit, gp_fixed_frozen]
   stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
   n_context_draws: 3
   n_anchors: 12
@@ -49,17 +54,34 @@ update_rule:
   positive_control: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10}
   seed_floor: {n_seeds: 10, n_channels: 2}
   link: {tidy_csv: null, model: tabpfn_v2_5, outcomes: [recommended_regret, cumulative_regret], predictors: [saturation_index_median, ell_adaptivity, rho_shape_median], n_boot: 2000}
-  # context_ts (2026-09-30): the layer arm and figure F1 now sweep the same three context sizes as the
-  # main grid -- 10 / 25 / 50 of the budget-96 NHP run (n_init 5) = early / quarter / half way. gates
+  # context_ts: the layer arm and figure F1 sweep the WHOLE shared ladder since 2026-10-07 (user) -- 10 / 25 / 50 / 80 of the
+  # budget-96 NHP run = early / quarter / half way / late (t = 80 was added; it leaves 16 unobserved sites). gates
   # .context_t = 25 stays inside the list, so the validation gates describe an operating point both
   # figures actually show. Cost is linear in the number of entries for the layer arm; F1 is free (the
   # arrays are already computed for every cell of the grid).
-  layer_arm: {enabled: true, context_ts: [10, 25, 50], level: 1.0, ridge: 1.0}
+  # Feature-token mean only: the label-token readout was dropped from every mechanism analysis on 2026-10-07.
+  layer_arm: {enabled: true, context_ts: [10, 25, 50, 80], level: 1.0, ridge: 1.0}
   # Figure F1 (exemplar delta-maps). Every field is explicit and written into update_rule_exemplar.npz, so
   # the panel can be captioned and reproduced; see UPDATE_RULE_DEFAULTS for why each value was chosen.
   # select: median_alignment picks the channel at the MEDIAN rho_shape_offanchor -- representative rather
   # than a best case, which is what makes the "TabPFN updates like a GP" reading defensible.
   # One COLUMN PER CONTEXT SIZE, one channel: the channel is selected once (median rho_shape_offanchor
   # across these contexts), so the columns differ only in how much evidence the surrogate was given.
-  exemplar: {context_ts: [10, 25, 50], level: 1.0, draw: 0, anchor_stratum: centre,
-             select: median_alignment, subject: null, emg: null}
+  # F1 compares TabPFN with GP-FIXED (user, 2026-10-07), whatever reference_gp the metrics use: the converged fit's ARD
+  # lengthscales collapse on small contexts and its update becomes a one-row / one-column stripe. One anchor site for every
+  # column (anchor: common), the most central site unobserved in all four contexts.
+  exemplar: {context_ts: [10, 25, 50, 80], level: 1.0, draw: 0, anchor_stratum: centre,
+             select: median_alignment, subject: null, emg: null, anchor: common, reference_gp: fixed}
+  # F7 update_vs_distance (B2 Step 11, decided 2026-10-06; layout of the 10-02 preview restored 2026-10-07): one
+  # radial-profile panel per t in panel_ts plus the cumulative-energy panel over the whole ladder, TabPFN vs GP-fixed vs GP-MLL
+  # (all three since 2026-10-07); the five controls and the far-field share vs t are in the supplement.
+  # Derived from the cached probe cells at assembly -- only the off-map and control cells compute.
+  profile:
+    enabled: true
+    bin_edges: [0.0, 0.5, 1.5, 2.5, 3.5, 4.5, 6.0, 8.0, 11.0]
+    far_pitch: 4.0
+    level: 1.0
+    panel_ts: [10, 50]
+    headline_gp: gp_fixed_frozen
+    offmap: {enabled: true, distance: 2.0}
+    controls: {known_gp: true, shuffled: true, context_t: 25, n_channels: 2}

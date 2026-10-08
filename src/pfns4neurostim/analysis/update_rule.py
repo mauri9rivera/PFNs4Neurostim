@@ -73,6 +73,14 @@ __all__ = [
     "seed_floor",
     "linear_regime_check",
     "layer_alignment",
+    "PROFILE_CELL_METRICS",
+    "site_distances",
+    "transfer",
+    "locality_index",
+    "offset_fit",
+    "distance_profile",
+    "surprise_profile",
+    "offmap_point",
 ]
 
 #: Surprise multipliers c (in units of the model's own predictive SD at the anchor).
@@ -337,6 +345,8 @@ class ProbeResult:
         noise_ratio: Reference GP noise / outputscale, used by the conditioned
             lengthscale estimator.
         extra: Engine-specific provenance (e.g. refitted lengthscales).
+        context_sites: Site indices of the context, shape [t] (``None`` for readouts that are not grid sites).
+            Needed by the F7 distance profile, which reports observed and unobserved sites separately.
     """
 
     engine: str
@@ -353,6 +363,7 @@ class ProbeResult:
     context_X: np.ndarray | None = None
     noise_ratio: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    context_sites: np.ndarray | None = None
 
 
 def run_probes(
@@ -408,7 +419,7 @@ def run_probes(
         engine=engine.name, anchors=np.asarray(anchors), strata=list(strata), surprises=c,
         base_mean=base_mean, base_sd=base_sd, y_star=y_star, d_mean=d_mean, d_sd=d_sd,
         d_gp=d_gp, gp_lengthscale=reference.lengthscale, context_X=np.asarray(context.X),
-        noise_ratio=reference.noise_ratio, extra=extra,
+        noise_ratio=reference.noise_ratio, extra=extra, context_sites=np.asarray(context.sites),
     )
 
 
@@ -932,6 +943,7 @@ def seed_floor(
     surprises: Sequence[float] = DEFAULT_SURPRISES,
     icc_min: float = 0.75,
     seed: int = 0,
+    extra_metrics: Callable[[ProbeResult], dict[str, float | None]] | None = None,
 ) -> dict[str, Any]:
     """Seed-floor gate: ICC over inference seeds of ``ell_hat`` and ``rho_shape`` per anchor.
 
@@ -947,16 +959,23 @@ def seed_floor(
         surprises: Surprise multipliers.
         icc_min: Pre-declared ICC threshold (0.75).
         seed: Seed of the context and anchors.
+        extra_metrics: Optional ``ProbeResult -> {name: value}`` evaluated per seed; each name gets a
+            ``seed_sd_<name>`` entry (the F7 far-field share uses it for its seed-floor band).
 
     Returns:
         Gate record; ``passed`` requires both ICCs >= ``icc_min``. The across-seed SD of the
         cell medians is the *seed floor* every reported effect must exceed.
     """
     ells, rhos, cells = [], [], []
+    extras: dict[str, list[float]] = {}
     for s in range(n_seeds):
-        rows, cell, _ = _probe_cell(
+        rows, cell, res = _probe_cell(
             channel, engine_factory(s), reference, t, n_anchors, surprises, np.random.default_rng(seed)
         )
+        if extra_metrics is not None:
+            for name, value in extra_metrics(res).items():
+                if value is not None and np.isfinite(value):
+                    extras.setdefault(name, []).append(float(value))
         ells.append([np.nan if r["ell_hat"] is None else r["ell_hat"] for r in rows])
         rhos.append([np.nan if r["rho_shape"] is None else r["rho_shape"] for r in rows])
         cells.append(cell)
@@ -975,6 +994,7 @@ def seed_floor(
         "icc_rho_shape": icc_rho,
         "seed_sd_rho_shape_median": float(np.std(meds)) if len(meds) > 1 else None,
         "seed_sd_ell_hat_median": float(np.std(ellm)) if len(ellm) > 1 else None,
+        **{f"seed_sd_{k}": float(np.std(v)) if len(v) > 1 else None for k, v in extras.items()},
         "passed": bool(
             icc_ell is not None and icc_rho is not None and icc_ell >= icc_min and icc_rho >= icc_min
         ),
@@ -1017,7 +1037,8 @@ def layer_alignment(
 
     For each anchor the antisymmetrized smallest-surprise representation change
     ``dZ_l(x) = (Z_l(x | C + (x*, +)) - Z_l(x | C + (x*, -))) / 2`` is read at every layer
-    (one hooked forward per probe). Two readouts per layer: the correlation over sites of
+    (one hooked forward per probe), from the feature-token mean (the label token is never read: decision
+    2026-10-07, see :mod:`analysis.embeddings`). Two readouts per layer: the correlation over sites of
     ``||dZ_l(x)||`` with ``|Delta_GP(x)|`` and the cross-validated ridge-probe R^2 from
     ``dZ_l`` to the PFN's own output change ``Delta_PFN``. ``layer_peak`` is the layer with
     the highest correlation.
@@ -1065,3 +1086,285 @@ def layer_alignment(
         for r in rows[-dZ.shape[0]:]:
             r["is_peak"] = r["layer"] == peak
     return rows
+
+
+# ---------------------------------------------------------------------------
+# F7: update magnitude against topographic distance (B2 Step 11, 2026-10-06)
+# ---------------------------------------------------------------------------
+# The M10 summaries cannot tell three departures from "TabPFN = GP" apart: a lower peak, a longer range, and a
+# flat far-field floor. rho_shape is a scale-free Pearson r, decay_rho a rank correlation with -distance (blind
+# to magnitude and offset), and ell_hat fits an RBF to the profile normalised by its anchor value with no offset
+# term, so a uniform shift inflates it. The functions below measure the profile in absolute, comparable units.
+#
+#   transfer   T(x | anchor) = g(x) / (c0 * s(anchor)): the antisymmetrised smallest-surprise update divided by
+#              the surprise that was injected (each engine's own predictive SD, so the same c0 for every engine);
+#              T = 1 means the full surprise moved the prediction at x.
+#   distance   Euclidean in electrode pitches, from the integer grid coordinates ``ch2xy``.
+#   observed / unobserved sites are always kept apart: context sites are pinned by their own observation.
+
+
+def site_distances(ch2xy: np.ndarray, anchors: np.ndarray) -> np.ndarray:
+    """Distance of every grid site from every anchor, in electrode pitches.
+
+    Args:
+        ch2xy: Integer grid coordinates, shape [M, 2].
+        anchors: Anchor site indices, shape [A].
+
+    Returns:
+        Distances, shape [A, M].
+    """
+    xy = np.asarray(ch2xy, dtype=np.float64)                                       # [M, 2]
+    return np.sqrt(((xy[None, :, :] - xy[np.asarray(anchors)][:, None, :]) ** 2).sum(-1))   # [A, M]
+
+
+def transfer(res: ProbeResult, c0: float | None = None) -> tuple[np.ndarray, float]:
+    """Transfer ``T = g / (c0 s_anchor)`` of every anchor's update over the readout sites.
+
+    Args:
+        res: Probe result.
+        c0: Surprise magnitude; ``None`` = the smallest symmetric one (the ``ell_hat`` estimator's).
+
+    Returns:
+        ``(T [A, M], c0)``.
+
+    Raises:
+        RuntimeError: If an anchor's predictive SD is not positive.
+    """
+    c = _symmetric_magnitudes(res.surprises)[0] if c0 is None else float(c0)
+    g = _antisym(res.d_mean, res.surprises, c)                                     # [A, M]
+    scale = c * np.asarray(res.base_sd)[np.asarray(res.anchors)]                  # [A]
+    if not (scale > 0).all():
+        raise RuntimeError(f"transfer({res.engine}): non-positive predictive SD at an anchor.")
+    return g / scale[:, None], c
+
+
+def locality_index(distance: np.ndarray, energy: np.ndarray) -> float | None:
+    """Locality of an update's energy: 0 = spread like a uniform field, 1 = all at the anchor.
+
+    With ``E(d)`` the share of energy within radius ``d`` and ``F(d)`` the share of *sites* within it, the
+    area ``AUC = sum_k w_k E(d_k)`` over the distinct distances (``w_k`` = share of sites at ``d_k``) is
+    compared with the uniform field's area ``AUC_u = sum_k w_k F(d_k)``:
+    ``(AUC - AUC_u) / (1 - AUC_u)``. Ties at one distance enter together, so a uniform field scores exactly 0;
+    negative values mean the energy sits further out than a uniform field's.
+
+    Args:
+        distance: Distance of each site from the anchor, shape [n].
+        energy: Non-negative energy at each site (``T^2``), shape [n].
+
+    Returns:
+        The index, or ``None`` when the field carries no energy or every site is at one distance.
+    """
+    total = float(energy.sum())
+    levels, inverse, counts = np.unique(distance, return_inverse=True, return_counts=True)
+    if total <= 0 or len(levels) < 2:
+        return None
+    e_cum = np.cumsum(np.bincount(inverse, weights=energy)) / total               # E(d_k)  [K]
+    f_cum = np.cumsum(counts) / len(distance)                                     # F(d_k)  [K]
+    w = counts / len(distance)                                                    # [K]
+    auc, auc_u = float((w * e_cum).sum()), float((w * f_cum).sum())
+    return (auc - auc_u) / (1.0 - auc_u)
+
+
+def offset_fit(
+    distance: np.ndarray,
+    t_values: np.ndarray,
+    *,
+    ell_bounds: tuple[float, float] = (0.25, 50.0),
+) -> tuple[float, float, float] | None:
+    """Least-squares offset decomposition ``T(d) = b + a exp(-d^2 / 2 l^2)`` of one anchor's profile.
+
+    ``b`` is the site-independent part of the update (a level shift), ``a`` the local bump, ``l`` its range in
+    pitches. Fitted on the *unobserved* sites. It is the supplement's test of whether ``ell_hat`` -- an RBF fit
+    with no offset term -- is inflated by a uniform shift.
+
+    Args:
+        distance: Distances, shape [n].
+        t_values: Signed transfer values, shape [n].
+        ell_bounds: Bounds of ``l`` in pitches (below a quarter pitch the bump is not resolvable on the grid;
+            above 50 pitches it is indistinguishable from the offset).
+
+    Returns:
+        ``(b, a, l)``, or ``None`` with fewer than four sites.
+    """
+    from scipy.optimize import least_squares  # noqa: PLC0415
+
+    d = np.asarray(distance, dtype=np.float64)
+    y = np.asarray(t_values, dtype=np.float64)
+    if len(d) < 4:
+        return None
+    far = d >= np.quantile(d, 0.75)
+    b0 = float(np.median(y[far]))
+    a0 = float(y[np.argmin(d)] - b0)
+    lo, hi = np.log(ell_bounds[0]), np.log(ell_bounds[1])
+    l0 = float(np.clip(np.log(1.5), lo, hi))
+
+    def resid(theta: np.ndarray) -> np.ndarray:
+        b, a, log_l = theta
+        return b + a * np.exp(-0.5 * d ** 2 / np.exp(2 * log_l)) - y
+
+    fit = least_squares(resid, x0=[b0, a0, l0], bounds=([-np.inf, -np.inf, lo], [np.inf, np.inf, hi]))
+    b, a, log_l = fit.x
+    return float(b), float(a), float(np.exp(log_l))
+
+
+#: Per-anchor F7 summaries that :func:`distance_profile` reduces to cell medians.
+PROFILE_CELL_METRICS: tuple[str, ...] = (
+    "far_field_share", "locality_index", "offset_share", "offset_fit_b", "offset_fit_a", "offset_fit_ell",
+    "transfer_anchor", "transfer_far_median", "transfer_far_observed_median",
+)
+
+
+def distance_profile(
+    res: ProbeResult,
+    ch2xy: np.ndarray,
+    *,
+    bin_edges: Sequence[float],
+    far_pitch: float,
+    c0: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """F7 radial transfer profile of one probe result, and its per-cell summaries.
+
+    Args:
+        res: Probe result whose readouts are the grid sites (``M == len(ch2xy)``).
+        ch2xy: Integer grid coordinates, shape [M, 2].
+        bin_edges: Increasing distance-bin edges in pitches; a final open bin ``[last, inf)`` is appended.
+        far_pitch: Distance from which a site is far field.
+        c0: Surprise magnitude (default: the smallest symmetric one).
+
+    Returns:
+        ``(rows, cell)``. ``rows``: one per (distance bin, observed) with the median over anchors of the
+        bin's median ``|T|``, its mean distance and -- for unobserved sites -- the cumulative energy and site
+        shares at the bin's upper edge. ``cell``: the medians over anchors of :data:`PROFILE_CELL_METRICS`.
+
+    Raises:
+        ValueError: If the readouts are not the grid sites.
+    """
+    T, c = transfer(res, c0)                                                       # [A, M]
+    if T.shape[1] != len(ch2xy):
+        raise ValueError(f"distance_profile: {T.shape[1]} readouts for {len(ch2xy)} grid sites.")
+    dist = site_distances(ch2xy, res.anchors)                                      # [A, M]
+    observed = np.zeros(T.shape[1], dtype=bool)
+    if res.context_sites is not None:
+        observed[np.asarray(res.context_sites, dtype=int)] = True
+    unobserved = ~observed
+    edges = np.append(np.asarray(bin_edges, dtype=np.float64), np.inf)            # [B+1]
+    per_bin: dict[tuple[int, bool], dict[str, list[float]]] = {}
+    per_anchor: dict[str, list[float]] = {k: [] for k in PROFILE_CELL_METRICS}
+    for i, a in enumerate(res.anchors):
+        d, t_row = dist[i], T[i]                                                   # [M], [M]
+        e_un = t_row[unobserved] ** 2
+        total = float(e_un.sum())
+        bin_of = np.digitize(d, edges) - 1                                         # [M]
+        for flag, mask in ((False, unobserved), (True, observed)):
+            for b in range(len(edges) - 1):
+                sel = mask & (bin_of == b)
+                if not sel.any():
+                    continue
+                acc = per_bin.setdefault((b, flag), {"abs_t": [], "dist": [], "n": [], "cum_e": [], "cum_f": []})
+                acc["abs_t"].append(float(np.median(np.abs(t_row[sel]))))
+                acc["dist"].append(float(d[sel].mean()))
+                acc["n"].append(float(sel.sum()))
+                if not flag:
+                    inside = unobserved & (d < edges[b + 1])
+                    acc["cum_e"].append(float((t_row[inside] ** 2).sum() / total) if total > 0 else np.nan)
+                    acc["cum_f"].append(float(inside.sum() / unobserved.sum()))
+        far_un = unobserved & (d >= far_pitch)
+        far_ob = observed & (d >= far_pitch)
+        per_anchor["far_field_share"].append(
+            float((t_row[far_un] ** 2).sum() / total) if total > 0 and far_un.any() else np.nan)
+        loc = locality_index(d[unobserved], e_un)
+        per_anchor["locality_index"].append(np.nan if loc is None else loc)
+        fit = offset_fit(d[unobserved], t_row[unobserved])
+        b_, a_, l_ = (np.nan, np.nan, np.nan) if fit is None else fit
+        per_anchor["offset_fit_b"].append(b_)
+        per_anchor["offset_fit_a"].append(a_)
+        per_anchor["offset_fit_ell"].append(l_)
+        # The energy of the constant term. A least-squares fit can push it above the field's own energy only by
+        # cancelling it against a negative bump, so it is clipped to [0, 1] as a share.
+        per_anchor["offset_share"].append(
+            float(np.clip(unobserved.sum() * b_ ** 2 / total, 0.0, 1.0)) if total > 0 and np.isfinite(b_)
+            else np.nan)
+        per_anchor["transfer_anchor"].append(float(t_row[int(a)]))
+        per_anchor["transfer_far_median"].append(float(np.median(np.abs(t_row[far_un]))) if far_un.any() else np.nan)
+        per_anchor["transfer_far_observed_median"].append(
+            float(np.median(np.abs(t_row[far_ob]))) if far_ob.any() else np.nan)
+    rows = []
+    for (b, flag), acc in sorted(per_bin.items()):
+        rows.append({
+            "engine": res.engine, "bin": b, "bin_lo": float(edges[b]), "bin_hi": float(edges[b + 1]),
+            "observed": flag, "distance_mean": float(np.median(acc["dist"])),
+            "transfer_abs_median": float(np.median(acc["abs_t"])), "n_sites": int(np.sum(acc["n"])),
+            "n_anchors": len(acc["abs_t"]),
+            "cum_energy_share": float(np.nanmedian(acc["cum_e"])) if acc["cum_e"] else None,
+            "cum_site_share": float(np.median(acc["cum_f"])) if acc["cum_f"] else None,
+            "c0": c,
+        })
+    cell: dict[str, Any] = {}
+    for k, v in per_anchor.items():
+        arr = np.asarray(v, dtype=np.float64)
+        cell[k] = float(np.nanmedian(arr)) if np.isfinite(arr).any() else None
+    return rows, cell
+
+
+def surprise_profile(
+    res: ProbeResult,
+    ch2xy: np.ndarray,
+    *,
+    far_pitch: float,
+) -> list[dict[str, Any]]:
+    """Far-field over anchor transfer at every symmetric surprise magnitude (F7 supplement, control 5).
+
+    A non-spatial level shift grows linearly with the surprise while the anchor response saturates, so a
+    far/anchor ratio that rises with ``|c|`` points at a level shift; a GP's ratio is flat in ``|c|``.
+
+    Args:
+        res: Probe result over the grid sites.
+        ch2xy: Integer grid coordinates, shape [M, 2].
+        far_pitch: Far-field distance threshold in pitches.
+
+    Returns:
+        One row per magnitude with the medians over anchors of ``transfer_anchor``, ``transfer_far_median``
+        (unobserved far sites) and ``far_peak_ratio``.
+    """
+    dist = site_distances(ch2xy, res.anchors)                                      # [A, M]
+    observed = np.zeros(len(ch2xy), dtype=bool)
+    if res.context_sites is not None:
+        observed[np.asarray(res.context_sites, dtype=int)] = True
+    rows = []
+    for c in _symmetric_magnitudes(res.surprises):
+        T, _ = transfer(res, c)                                                    # [A, M]
+        anchor_t, far_t, ratio = [], [], []
+        for i, a in enumerate(res.anchors):
+            far = ~observed & (dist[i] >= far_pitch)
+            if not far.any():
+                continue
+            at = float(T[i, int(a)])
+            ft = float(np.median(np.abs(T[i, far])))
+            anchor_t.append(at)
+            far_t.append(ft)
+            ratio.append(ft / abs(at) if at != 0 else np.nan)
+        if anchor_t:
+            rows.append({"engine": res.engine, "surprise_abs": float(c),
+                         "transfer_anchor": float(np.median(anchor_t)),
+                         "transfer_far_median": float(np.median(far_t)),
+                         "far_peak_ratio": float(np.nanmedian(ratio))})
+    return rows
+
+
+def offmap_point(X_pool: np.ndarray, distance: float) -> np.ndarray:
+    """A virtual anchor ``distance`` grid widths beyond the grid's edge along the first axis.
+
+    The F7 off-map control: a GP's update on the grid from an observation this far away is ~0, so any response
+    a model shows on the grid to it is a non-spatial level shift.
+
+    Args:
+        X_pool: Grid coordinates, shape [N, D].
+        distance: Offset beyond the maximum of the first axis, in units of that axis' extent.
+
+    Returns:
+        The point, shape [D] (the other coordinates sit at the grid's centroid).
+    """
+    X = np.asarray(X_pool, dtype=np.float64)
+    point = X.mean(axis=0)
+    point[0] = X[:, 0].max() + float(distance) * float(np.ptp(X[:, 0]))
+    return point

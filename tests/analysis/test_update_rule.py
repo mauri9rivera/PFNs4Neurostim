@@ -156,3 +156,90 @@ class TestTabPFN:
         print(pos, neg)
         assert pos["rho_shape_median"] is not None and pos["ell_hat_median"] is not None
         assert neg["passed"], neg
+
+
+# ---------------------------------------------------------------------------
+# F7 update_vs_distance (B2 Step 11)
+# ---------------------------------------------------------------------------
+class TestDistanceProfile:
+    def test_locality_index_bounds(self) -> None:
+        d = np.array([0.0, 1.0, 1.0, 2.0, 2.0, 3.0])
+        assert U.locality_index(d, np.ones_like(d)) == pytest.approx(0.0, abs=1e-12)      # uniform field
+        assert U.locality_index(d, np.eye(1, len(d)).ravel()) == pytest.approx(1.0)        # all at the anchor
+        assert U.locality_index(d, (d == 3.0).astype(float)) < 0                           # all at the far edge
+        assert U.locality_index(d, np.zeros_like(d)) is None
+
+    def test_offset_fit_recovers_a_shift_plus_bump(self) -> None:
+        d = np.linspace(0, 8, 60)
+        b, a, ell = U.offset_fit(d, 0.15 + 0.6 * np.exp(-0.5 * d ** 2 / 1.7 ** 2))
+        assert (b, a, ell) == pytest.approx((0.15, 0.6, 1.7), rel=1e-4)
+
+    def test_transfer_of_the_true_gp_is_the_analytic_kernel_slice(self, channel) -> None:
+        """T(x | x*) = k_C(x, x*) / (k_C(x*, x*) + s2) exactly for the GP that generated the probe."""
+        truth = _truth()
+        _, _, res = U._probe_cell(channel, truth, _truth(), 25, 6, U.DEFAULT_SURPRISES, np.random.default_rng(0))
+        T, c0 = U.transfer(res)
+        S = truth.gp.posterior_covariance(channel.X_pool)                                 # latent k_C
+        expected = S[:, res.anchors].T / (np.diag(S)[res.anchors] + NOISE_SD ** 2)[:, None]
+        np.testing.assert_allclose(T, expected, atol=1e-6)
+        assert c0 == 0.5
+
+    def test_profile_invariants_and_observed_split(self, channel) -> None:
+        _, _, res = U._probe_cell(channel, _truth(), _truth(), 25, 8, U.DEFAULT_SURPRISES, np.random.default_rng(0))
+        rows, cell = U.distance_profile(res, channel.ch2xy, bin_edges=[0, 0.5, 1.5, 2.5, 3.5, 5], far_pitch=4.0)
+        un = [r for r in rows if not r["observed"]]
+        cum = [r["cum_energy_share"] for r in sorted(un, key=lambda r: r["bin"])]
+        assert all(0 <= v <= 1 + 1e-12 for v in cum) and np.all(np.diff(cum) >= -1e-12)
+        assert cum[-1] == pytest.approx(1.0)
+        assert {r["observed"] for r in rows} == {False, True}
+        assert un[0]["bin"] == 0 and un[0]["distance_mean"] == 0.0                         # the anchor bin
+        assert 0 <= cell["far_field_share"] <= 1 and 0 < cell["locality_index"] <= 1
+        # A GP's update is a local bump: the anchor carries the largest transfer, the far field almost none.
+        assert cell["transfer_anchor"] > 10 * cell["transfer_far_median"]
+
+    def test_non_spatial_model_has_no_locality(self, channel) -> None:
+        """The local-only control moves its own site only: all energy at the anchor (locality 1, far field 0)."""
+        _, _, res = U._probe_cell(channel, _LocalOnlyEngine(), _truth(), 25, 6, U.DEFAULT_SURPRISES,
+                                  np.random.default_rng(0))
+        _, cell = U.distance_profile(res, channel.ch2xy, bin_edges=[0, 0.5, 1.5], far_pitch=3.0)
+        assert cell["locality_index"] == pytest.approx(1.0) and cell["far_field_share"] == pytest.approx(0.0)
+
+    def test_shuffled_coordinates_flatten_the_profile(self, channel) -> None:
+        """Control (4): in the true geometry, a GP shown shuffled coordinates loses its distance decay."""
+        cells = {}
+        for name, shown in (("original", channel),
+                            ("shuffled", U.shuffle_coordinates(channel, np.random.default_rng(3)))):
+            _, _, res = U._probe_cell(shown, _truth(), _truth(), 25, 8, U.DEFAULT_SURPRISES,
+                                      np.random.default_rng(0), readout_X=channel.X_pool)
+            cells[name] = U.distance_profile(res, channel.ch2xy, bin_edges=[0, 0.5, 1.5, 2.5], far_pitch=3.0)[1]
+        assert cells["shuffled"]["locality_index"] < 0.5 * cells["original"]["locality_index"]
+
+    def test_surprise_profile_of_a_gp_is_flat_in_c(self, channel) -> None:
+        """Control (5): a GP's update is linear in the surprise, so its far/anchor ratio does not move with |c|."""
+        _, _, res = U._probe_cell(channel, _truth(), _truth(), 25, 6, U.DEFAULT_SURPRISES, np.random.default_rng(0))
+        ratios = [r["far_peak_ratio"] for r in U.surprise_profile(res, channel.ch2xy, far_pitch=3.0)]
+        assert len(ratios) == 4 and np.ptp(ratios) < 1e-9
+
+    def test_offmap_point_lies_outside_the_grid(self, channel) -> None:
+        x = U.offmap_point(channel.X_pool, 2.0)
+        assert x[0] == pytest.approx(channel.X_pool[:, 0].max() + 2.0 * np.ptp(channel.X_pool[:, 0]))
+        assert x[1] == pytest.approx(channel.X_pool[:, 1].mean())
+
+
+@pytest.mark.slow
+@pytest.mark.gpu
+def test_layer_alignment_rows(channel) -> None:
+    """The layer arm reads the feature-token mean: one row per (anchor, layer), one peak per anchor."""
+    eng = U.PFNEngine(device="cuda")
+    ctx = U.draw_context(channel, 25, np.random.default_rng(0))
+    anchors, strata = U.select_anchors(channel, 3, np.random.default_rng(0), exclude=ctx.sites)
+    res = U.run_probes(eng, _fit(ctx), ctx, channel.X_pool, anchors, strata)
+    rows = U.layer_alignment(eng, res, channel.X_pool)
+    assert len(rows) == 3 * 18 and "readout" not in rows[0]
+    assert sum(bool(r["is_peak"]) for r in rows) == 3
+
+
+def _fit(ctx: U.Context) -> U.GPFrozenEngine:
+    ref = _truth()
+    ref.fit(ctx.X, ctx.y)
+    return ref

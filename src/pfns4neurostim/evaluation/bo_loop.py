@@ -44,7 +44,23 @@ from ..data.preprocessing import OnlineYScaler
 from ..models.protocol import marginals
 from .metrics import r2_score
 
-__all__ = ["BOTrajectory", "run_bo_loop", "draw_trial"]
+__all__ = ["BOTrajectory", "run_bo_loop", "draw_trial", "FIT_TRACE_KEYS"]
+
+#: Fit diagnostics recorded at EVERY surrogate fit of a run (added 2026-10-06), for any surrogate that exposes
+#: ``fit_diagnostics`` (today the GPs). The tidy row only keeps the last fit (N = budget), but early regret is decided by
+#: the fits at N = n_init .. ~20, which is where GP-MLL's hyperparameters were suspected of leaving the good lengthscale
+#: ridge of the GP-fixed sweep. Curated rather than "every gp_* key" because the trace lands in each run's
+#: ``trajectories.pkl``: these eight keys cost ~3 KB per cell as float32, all eighteen would cost ~7 KB.
+FIT_TRACE_KEYS: tuple[str, ...] = (
+    "gp_lengthscale",
+    "gp_lengthscale_min",
+    "gp_lengthscale_max",
+    "gp_outputscale",
+    "gp_noise",
+    "gp_mll_final",
+    "gp_restart_spread",
+    "gp_fit_degenerate",
+)
 
 
 @dataclass
@@ -66,6 +82,9 @@ class BOTrajectory:
         acq_params: Resolved acquisition parameters at each step.
         y_pred: Final predictive mean over the pool, shape [N].
         y_std: Final predictive standard deviation over the pool, shape [N].
+        fit_trace: ``key -> value at each fit`` for :data:`FIT_TRACE_KEYS`, one entry per surrogate fit (each
+            acquisition step, then the final refit), so it aligns with ``recommendations``. Empty for a
+            surrogate that exposes no fit diagnostics.
     """
 
     observed_indices: list[int] = field(default_factory=list)
@@ -77,6 +96,7 @@ class BOTrajectory:
     acq_params: list[dict[str, float]] = field(default_factory=list)
     y_pred: np.ndarray | None = None
     y_std: np.ndarray | None = None
+    fit_trace: dict[str, list[float]] = field(default_factory=dict)
 
     @property
     def recommended_index(self) -> int:
@@ -133,6 +153,32 @@ def _fit_scaled(
     if online_y is not None and online_y.active:
         y_obs = online_y.fit(y_obs).transform(y_obs)
     surrogate.fit(X_pool[idx], y_obs)
+    _record_fit(surrogate, traj)
+
+
+def _record_fit(surrogate: Any, traj: "BOTrajectory") -> None:
+    """Append the surrogate's diagnostics of the fit just made to ``traj.fit_trace``.
+
+    Args:
+        surrogate: Surrogate adapter that was just fitted.
+        traj: Trajectory to extend.
+
+    Raises:
+        RuntimeError: If the set of reported trace keys changes between fits of one run, which would
+            misalign the trace with the recommendations instead of failing visibly.
+    """
+    hyper = getattr(surrogate, "fit_diagnostics", None)
+    diagnostics = hyper() if callable(hyper) else {}
+    present = [k for k in FIT_TRACE_KEYS if k in diagnostics]
+    if not present and not traj.fit_trace:
+        return
+    if traj.fit_trace and set(present) != set(traj.fit_trace):
+        raise RuntimeError(
+            f"fit trace: fit {len(next(iter(traj.fit_trace.values())))} reported keys {sorted(present)}, "
+            f"earlier fits {sorted(traj.fit_trace)}."
+        )
+    for key in present:
+        traj.fit_trace.setdefault(key, []).append(float(diagnostics[key]))
 
 
 def _predict_unscaled(

@@ -198,5 +198,9 @@ def run_channel_bo(
         "y_gt": np.asarray(y_end, dtype=np.float64),
         "survivors": alive,
         "gt_range": y_range,
+        # Hyperparameters of every fit (2026-10-06), [T+1] each, aligned with best_rec_indices; None without a GP.
+        "fit_trace": (
+            {k: np.asarray(v, dtype=np.float32) for k, v in traj.fit_trace.items()} if traj.fit_trace else None
+        ),
     }
     return BOResult(row=row, trajectory=trajectory, diagnostics=diagnostics)

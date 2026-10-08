@@ -1,0 +1,14 @@
+# Shared context ladder of every NHP Hyp C mechanism analysis (B3 Step 4, user decision 2026-10-06).
+#
+# A context is t sites of a channel with one observed trial each (analysis/context.py). Every mechanism analysis
+# that composes this group -- the update rule (M10, + F6 layer arm, F7), CKA (a), CKA (b) and the MMD / W2
+# placement -- conditions on THESE sizes, and because context sites are keyed by (grid, t, draw) and trials by
+# (channel, level, t, draw), equal sizes mean literally the same contexts across analyses: M8 joins the same
+# cells, and the mechanism cell cache can serve one analysis' cells to a re-run of it.
+#
+# 10 / 25 / 50 / 80 are ~10 / 26 / 52 / 83 % of the budget-96 NHP run (early to late BO). It replaced four
+# per-analysis ladders (update rule [10, 25, 50]; CKA (a) [5, 10, 20, 40, 80]; CKA (b) [10, 25, 50, 80];
+# placement [10, 20, 40, 60, 80, 96]); t = 5 was dropped from CKA (a), t = 80 added to the update rule.
+# A size must stay below the grid's site count (96 on NHP); the placement analysis adds the full map itself.
+# Override for one run with: --set context.sizes=[25]
+sizes: [10, 25, 50, 80]

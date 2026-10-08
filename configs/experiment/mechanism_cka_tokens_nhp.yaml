@@ -1,0 +1,55 @@
+# B1 Step 5 - SHADOW RUN: per-feature-token CKA (a), NHP. Pre-registered 2026-10-06, BEFORE any run.
+#
+# Question. CKA (a) of the feature-token MEAN shows a wide between-channel band. Is part of that width an
+# artefact of averaging the tokens before the Gram matrix -- the mean of two token representations that encode
+# different input groups -- rather than real channel heterogeneity? The shadow readout `feature_tokens` computes
+# debiased CKA of EACH feature token's [N, 192] embedding against the target and averages the CKA values
+# (which is not the CKA of the averaged tokens). TabPFN-2.5 builds 2 feature tokens for NHP's 2 inputs (5
+# preprocessed features grouped by 3; measured 2026-10-06) plus the label token.
+#
+# PRE-REGISTERED SUCCESS CRITERION (user decision 2026-10-06; evaluated by experiments/mechanism.py::
+# shadow_criterion and written to shadow_criterion.json):
+#   For each target in {K_GT, K_GP}, at the nominal stress level (alpha = 1.0) and the run's context size:
+#     1. average cka_minus_null over the 10 draws within each channel;
+#     2. take the interquartile range across the 18 channels at every block (0-17);
+#     3. ratio = IQR(feature_tokens) / IQR(feature_mean) per block; take the MEDIAN over blocks.
+#   The per-token readout is said to narrow the band iff that median ratio is < 0.75 for BOTH targets.
+#   PASS -> report feature_tokens beside feature_mean in the headline CKA figure and re-examine the
+#           channel-heterogeneity reading of the band (B2 Step 9). FAIL -> the band is not a token-averaging
+#           artefact; feature_mean stays the reported feature readout and this run goes to the supplement.
+#   The threshold is fixed here and must not be changed after the run has been seen.
+#
+# RESULT (2026-10-06, 18 channels, t = 25): FAIL -- IQR ratio K_GT 0.756, K_GP 1.02 (shadow_criterion.json). The band
+# is not a token-averaging artefact; feature_mean stays the reported readout and this run is supplementary.
+#
+# Design. One context size (t = 25, ~26 % of the budget-96 run, on the shared ladder), all 18 channels, the
+# main run's stress ladder and draw count. Both readouts run in the SAME run so the comparison is paired; the
+# feature_mean cells have the main run's identity and are served from its cache when it has run first. CKA (b)
+# is off (the shadow question is about (a)'s band).
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_tokens_nhp.yaml
+defaults:
+  dataset: nhp
+  context: nhp
+
+context: {sizes: [25]}
+analysis: cka
+tag: nhp-tokens
+device: cuda
+seed: 42
+output_root: output
+
+cka:
+  layers: null
+  readouts: [feature_mean, feature_tokens]
+  targets: [K_X, K_GT, K_GT_linear, K_GP]
+  stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
+  n_context_draws: 10
+  n_perm: 1000
+  inference_seed: 0
+  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5, lengthscale_floor: 0.05}
+  controls: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10, t: 25, alpha: 0.05, n_seeds: 10, icc_min: 0.75, n_seed_channels: 1}
+  placement: {enabled: false, n_prior: 100, n_prior_holdout: 30, n_noise: 30,
+              n_draws: 5, min_gap: 0.02, bank_quantile: 0.10, n_dense: 1024, holdout_frac: 0.1,
+              rmse_threshold: 0.5, prior_type: prior_bag}
+  shadow: {readout: feature_tokens, baseline: feature_mean, targets: [K_GT, K_GP], level: 1.0, max_iqr_ratio: 0.75}

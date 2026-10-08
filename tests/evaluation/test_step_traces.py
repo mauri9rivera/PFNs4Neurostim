@@ -46,6 +46,29 @@ class TestTraces:
         assert res.row["recommended_regret"] == pytest.approx(t["recommended_regret_per_step"][-1])
         assert all(0.0 <= r <= 1.0 for r in t["recommended_regret_per_step"])
 
+    @pytest.mark.parametrize("model", ["gp_naive", "gp_mll"])
+    def test_fit_trace_aligns_with_recommendations(self, tiny_channel, model: str) -> None:
+        """Fit trace: one entry per fit (each step + the final refit); the last equals the tidy-row diagnostic."""
+        from pfns4neurostim.evaluation.bo_loop import FIT_TRACE_KEYS
+
+        res = run_channel_bo(model, tiny_channel, acq_fn="ei", budget=BUDGET, n_init=N_INIT, seed=1, device="cpu")
+        trace = res.trajectory["fit_trace"]
+        assert set(trace) == set(FIT_TRACE_KEYS)
+        n = len(res.trajectory["best_rec_indices"])
+        for key, values in trace.items():
+            assert values.shape == (n,)
+            assert values.dtype == np.float32
+            assert float(values[-1]) == pytest.approx(res.diagnostics[key], rel=1e-6, nan_ok=True)
+
+    def test_fixed_gp_trace_is_constant(self, tiny_channel) -> None:
+        res = run_channel_bo("gp_naive", tiny_channel, acq_fn="ei", budget=BUDGET, n_init=N_INIT, seed=1, device="cpu")
+        ls = res.trajectory["fit_trace"]["gp_lengthscale"]
+        assert np.allclose(ls, ls[0])
+
+    def test_no_fit_diagnostics_means_no_trace(self, tiny_channel) -> None:
+        res = run_channel_bo("random", tiny_channel, acq_fn="random", budget=BUDGET, n_init=N_INIT, seed=1)
+        assert res.trajectory["fit_trace"] is None
+
     def test_no_scaler_means_exploration_not_computed(self, tiny_channel) -> None:
         res = run_channel_bo("gp_naive", tiny_channel, acq_fn="ei", budget=BUDGET, n_init=N_INIT, seed=1, device="cpu")
         assert res.trajectory["exploration_per_step"] is None

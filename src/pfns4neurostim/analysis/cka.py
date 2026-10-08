@@ -19,7 +19,7 @@ standardized ground-truth response (median |dy| bandwidth; linear ``y y'`` as se
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -32,7 +32,14 @@ __all__ = [
     "median_distance",
     "target_kernels",
     "permutation_null",
+    "cka_null_draws",
+    "permutation_p",
+    "PERM_CHUNK",
 ]
+
+#: Permutations evaluated per vectorised chunk of :func:`cka_null_draws`. A memory bound, not a statistical
+#: setting: one chunk holds ``PERM_CHUNK x N x N`` float64 (19 MB at N = 96), whatever ``n_perm`` is.
+PERM_CHUNK: int = 256
 
 
 def biased_linear_cka(X: Any, Y: Any) -> float:
@@ -163,6 +170,80 @@ def target_kernels(
     return out
 
 
+def cka_null_draws(
+    Ks: Sequence[np.ndarray],
+    L: np.ndarray,
+    n_perm: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Observed debiased CKA of every ``K`` against ``L``, and its site-permutation null draws.
+
+    The null permutes the rows *and* columns of ``L`` jointly. Its permutations depend on the target
+    alone, so ONE set of ``n_perm`` permutations is drawn and shared by every ``K`` -- every layer and
+    decoder stage of a cell, every feature token. That is what makes the null cheap: the permuted
+    ``L~`` stack is gathered once per chunk and each ``K`` costs one contraction over it, instead of a
+    fresh gather per (layer, permutation) as before 2026-10-06 (~10x faster on the NHP grid, and the
+    95 %-of-cost term of CKA (a)). Sharing permutations across layers correlates their p-values;
+    Bonferroni over layers stays valid under any dependence.
+
+    The unbiased HSIC (Song et al. 2012, Eq. 5) of ``K`` with a permuted ``L`` needs only three terms:
+    ``tr(K~ L~_p) = sum(K~ * (L~')_p)``, the invariant ``(1'K~1)(1'L~1)`` and
+    ``1'K~ L~_p 1 = colsum(K~) . rowsum(L~)[p]``, so no matrix product is formed per permutation.
+
+    Args:
+        Ks: Gram matrices, each [N, N] (need not be symmetric).
+        L: Target Gram matrix, [N, N].
+        n_perm: Permutations. With a single ``K`` the draws match :func:`permutation_null`'s for the same
+            ``rng`` state (same permutation sequence).
+        rng: Generator (consumed: ``n_perm`` permutations).
+
+    Returns:
+        ``(observed, null)`` of shapes [k] and [k, n_perm].
+
+    Raises:
+        ValueError: For fewer than 4 sites.
+        RuntimeError: If a self-HSIC is non-positive (degenerate representation).
+    """
+    L = np.asarray(L, dtype=np.float64)
+    n = L.shape[0]
+    if n < 4:
+        raise ValueError(f"cka_null_draws needs n >= 4 sites, got {n}.")
+    ll = hsic_unbiased(L, L)
+    if ll <= 0:
+        raise RuntimeError(f"cka_null_draws: non-positive target self-HSIC ({ll:.3g}).")
+    Lt_T = L.T.copy()
+    np.fill_diagonal(Lt_T, 0.0)                                        # (L~)'  [N, N]
+    l_row = Lt_T.sum(axis=0)                                           # rowsum(L~) = colsum((L~)')  [N]
+    l_tot = float(l_row.sum())
+    Kts, k_col, kk, obs = [], [], [], []
+    for K in Ks:
+        K = np.asarray(K, dtype=np.float64)
+        Kt = K.copy()
+        np.fill_diagonal(Kt, 0.0)
+        k_self = hsic_unbiased(K, K)
+        if k_self <= 0:
+            raise RuntimeError(f"cka_null_draws: non-positive self-HSIC ({k_self:.3g}).")
+        Kts.append(Kt)
+        k_col.append(Kt.sum(axis=0))                                   # colsum(K~)  [N]
+        kk.append(k_self)
+        obs.append(hsic_unbiased(K, L) / np.sqrt(k_self * ll))
+    Kt_stack = np.stack(Kts)                                           # [k, N, N]
+    k_col_m = np.stack(k_col)                                          # [k, N]
+    k_tot = Kt_stack.sum(axis=(1, 2))                                  # [k]
+    denom = np.sqrt(np.asarray(kk) * ll)                               # [k]
+    term2 = k_tot * l_tot / ((n - 1) * (n - 2))                        # [k]
+    perms = np.stack([rng.permutation(n) for _ in range(int(n_perm))]) # [P, N]
+    null = np.empty((len(Ks), int(n_perm)))
+    for start in range(0, int(n_perm), PERM_CHUNK):
+        P = perms[start:start + PERM_CHUNK]                            # [c, N]
+        Lp = Lt_T[P[:, :, None], P[:, None, :]]                        # [c, N, N]  ((L~')_p)
+        term1 = np.einsum("kij,cij->kc", Kt_stack, Lp)                 # [k, c]
+        term3 = 2.0 / (n - 2) * (k_col_m @ l_row[P].T)                 # [k, c]
+        hsic = (term1 + term2[:, None] - term3) / (n * (n - 3))        # [k, c]
+        null[:, start:start + PERM_CHUNK] = hsic / denom[:, None]
+    return np.asarray(obs, dtype=np.float64), null
+
+
 def permutation_null(
     K: np.ndarray,
     L: np.ndarray,
@@ -180,12 +261,18 @@ def permutation_null(
     Returns:
         ``(observed, null_mean, p)`` with ``p = (1 + #{null >= observed}) / (n_perm + 1)``.
     """
-    obs = cka_debiased(K, L)
-    kk = hsic_unbiased(K, K)
-    ll = hsic_unbiased(L, L)       # invariant to a joint row/column permutation
-    null = np.empty(n_perm)
-    for b in range(n_perm):
-        perm = rng.permutation(len(L))
-        null[b] = hsic_unbiased(K, L[np.ix_(perm, perm)]) / np.sqrt(kk * ll)
-    p = (1.0 + float((null >= obs).sum())) / (n_perm + 1.0)
-    return obs, float(null.mean()), p
+    obs, null = cka_null_draws([K], L, n_perm, rng)
+    return float(obs[0]), float(null[0].mean()), permutation_p(float(obs[0]), null[0])
+
+
+def permutation_p(observed: float, null: np.ndarray) -> float:
+    """One-sided permutation p-value ``(1 + #{null >= observed}) / (n_perm + 1)``.
+
+    Args:
+        observed: Observed statistic.
+        null: Null draws, shape [n_perm].
+
+    Returns:
+        The p-value.
+    """
+    return (1.0 + float((np.asarray(null) >= observed).sum())) / (len(null) + 1.0)

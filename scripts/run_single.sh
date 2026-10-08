@@ -10,8 +10,11 @@
 #SBATCH --output=logs/single_%j.out
 #SBATCH --error=logs/single_%j.err
 # Partition/account/GPU type are cluster-specific and come from the command line: sbatch $(bash scripts/cluster.sh flags gpu) ...
-# No --signal: these runners have no cell cache and no USR1 handler, so a warning signal only killed the job
-# 5 min early (both M10 runs of 2026-10-04 died at 5 h 55 min). The wall limit must cover the whole config.
+# No --signal: the runner has no USR1 handler, so a warning signal only killed the job 5 min early (both M10 runs of
+# 2026-10-04 died at 5 h 55 min). Since 2026-10-06 (B3) every mechanism cell is persisted the moment it finishes
+# (output/cells/<dataset>/mechanism_<analysis>/), so a job that hits its wall limit is RESUMED by submitting the same
+# line again: finished cells are served from the cache and only the rest is computed. The limit no longer has to cover
+# the whole config, only make steady progress.
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1

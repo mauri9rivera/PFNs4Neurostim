@@ -433,10 +433,14 @@ def compose(path: str) -> dict[str, Any]:
                 group_cfg = _load_group("model", name)
                 params[name] = group_cfg.get("params", {})
             resolved["model_params"] = params
+        elif group == "context":
+            # The mechanism analyses' shared context ladder (B3 Step 4): one file per dataset, so every Hyp C
+            # analysis of that dataset conditions on the same context sizes.
+            resolved["context"] = _load_group("context", value)
         else:
             raise ValueError(
                 f"Unknown defaults group {group!r} in {path}; "
-                "expected one of dataset, model, acquisition."
+                "expected one of dataset, model, acquisition, context."
             )
     return _deep_merge(resolved, raw)
 

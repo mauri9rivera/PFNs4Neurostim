@@ -54,10 +54,14 @@ __all__ = [
     "LEVEL_CMAP",
     "ACQUISITION_ORDER",
     "ACQUISITION_LINESTYLES",
+    "READOUT_LINESTYLES",
+    "READOUT_LABELS",
+    "set_integer_xaxis",
     "derive_shade",
     "acquisition_style",
     "ModelStyle",
     "MODEL_STYLES",
+    "TRUE_GP_STYLE",
     "MODEL_ORDER",
     "AXIS_LABELS",
     "KNOB_LABELS",
@@ -170,8 +174,9 @@ NEUTRAL_GREY: str = "#999999"  # non-learning baselines
 #: with NEUTRAL_GREY (the non-learning baselines) and with every unlabelled line in a busy panel, so the
 #: references are now chromatic in the one hue region no other token occupies: ANCHOR_PFN is blue, ANCHOR_GP
 #: vermillion, and LEVEL_CMAP (viridis) runs blue-purple -> green -> yellow, leaving crimson/pink free. The
-#: two are told apart by lightness, an edge linestyle and a legend entry, and they are the two ends of the
-#: placement-surface colormap, so p = 0 and p = 1 mean the same colour wherever they appear.
+#: two are told apart by lightness, an edge linestyle and a legend entry. (They were also the two ends of the
+#: placement-surface colormap until 2026-10-07; that heatmap now uses SEQUENTIAL_CMAP, whose lightness range the
+#: crimson -> pink ramp lacked.)
 REFERENCE_FLOOR_COLOR: str = "#C2185B"
 REFERENCE_CEILING_COLOR: str = "#F48FB1"
 #: Fill alpha and edge style of those bands (a dark band at BAND_ALPHA is indistinguishable from a light one).
@@ -394,6 +399,9 @@ def _build_model_styles() -> dict[str, ModelStyle]:
 
 
 MODEL_STYLES: dict[str, ModelStyle] = _build_model_styles()
+
+#: The true GP of a known-GP synthetic channel (the analytic reference of the Hyp C positive controls).
+TRUE_GP_STYLE: ModelStyle = ModelStyle("True GP", OUTLINE_COLOR, ":", "o", "gp", 3)
 
 #: Aliases from legacy result-dict ``model_type`` strings to canonical keys.
 MODEL_ALIASES: dict[str, str] = {
@@ -655,6 +663,31 @@ AXIS_LABELS: dict[str, str] = {
     "layer": "Transformer layer",
     "layer_corr": r"Corr. of $\|\Delta Z_\ell\|$ with GP update",
     "layer_probe_r2": r"Ridge-probe $R^2$ ($\Delta Z_\ell \to \Delta_\mathrm{PFN}$)",
+    # F7 update_vs_distance (B2 Step 11, 2026-10-06). Distance is in electrode pitches (grid steps of ch2xy);
+    # transfer is the update divided by the injected surprise c0 * s(anchor), so 1 = the full surprise.
+    "distance_pitch": "Distance from anchor (electrode pitch)",
+    "transfer_abs": r"$|T|$, update / injected surprise",
+    "cum_energy_share": r"Cumulative share of update energy $\sum g^2$",
+    "far_field_share": "Far-field share of update energy",
+    "locality_index": "Locality index (0 = global shift, 1 = local)",
+    "offset_share": "Offset share of update energy",
+    "offset_fit_ell": "Offset-fit lengthscale (electrode pitch)",
+    "far_peak_ratio": "Far-field / anchor transfer",
+    "surprise_abs": r"Surprise magnitude $|c|$ (predictive SD)",
+    "offmap_transfer": r"Median $|T|$ on the grid",
+}
+
+#: Linestyle of each embedding readout (B1 Step 3). Readouts are told apart by linestyle so that colour stays
+#: free for the context size or stress level of the series; never a new hex colour.
+READOUT_LINESTYLES: dict[str, str] = {
+    "feature_mean": "-",
+    "feature_tokens": ":",
+}
+
+#: Legend text of each readout.
+READOUT_LABELS: dict[str, str] = {
+    "feature_mean": "Feature-token mean",
+    "feature_tokens": "Per feature token (avg. CKA)",
 }
 
 #: Canonical stress-knob names (roadmap jargon) and their axis strings.

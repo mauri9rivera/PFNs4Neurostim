@@ -330,8 +330,9 @@ or axis string. Settled with the user on 2026-09-18 for the JNE/IOP target:
   model anchors — they did until 2026-09-27, which made readers see the noise ceiling as GP-MLL. Those two
   tokens are a **crimson/pink pair** since 2026-09-30: the greys that replaced the anchors competed with
   `NEUTRAL_GREY` and with every unlabelled line, and crimson/pink is the one hue region no other token
-  occupies (PFN blue, GP vermillion, `LEVEL_CMAP` viridis). They are also the two ends of the
-  placement-surface colormap, so p = 0 and p = 1 read the same colour in every Hyp C figure
+  occupies (PFN blue, GP vermillion, `LEVEL_CMAP` viridis). The placement-surface heatmap
+  (`cka_placement_surface`) uses `SEQUENTIAL_CMAP` (viridis) since 2026-10-07 -- the crimson->pink ramp between
+  the two reference tokens had too little lightness range -- with p = 0 / 1 named on its colorbar
 - **Figure widths:** `single` / `onehalf` / `double` are the JNE print grid; `wide` (10 in) and `full` (13.5 in)
   are for multi-panel **analysis** figures only (Hyp C mechanism panels, the placement trajectory, regime heatmaps),
   which are cropped or split before submission

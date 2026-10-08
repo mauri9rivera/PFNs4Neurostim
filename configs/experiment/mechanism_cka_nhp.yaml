@@ -1,15 +1,30 @@
-# Task #5 - CKA redesign (P0.5), secondary to the update-rule analysis (#9).
+# Task #5 - CKA redesign (P0.5; B1, 2026-10-06), secondary to the update-rule analysis (#9).
 #
-# (a) debiased linear CKA between TabPFN-2.5 layer embeddings of all N sites (query rows,
-# feature-token mean) and target kernels on the same sites: K_X (geometry, a control), K_GT
-# (RBF on the standardized response), K_GT_linear (sensitivity), K_GP (MLL-GP posterior
-# covariance on the same context); site-permutation null. Controls: known-kernel map exceeds
-# the null, a pure-noise map does not, x10 inference seeds ICC >= 0.75.
-# (b) placement: row-by-row CKA against on-grid prior maps at the same context sites.
+# The CKA analyses ask how TabPFN-2.5 represents the ELECTRODE GEOMETRY given its evidence, so they read the
+# FEATURE tokens of every query row (the 2 feature-group tokens NHP's inputs become), never the label token.
+#
+# (a) debiased linear CKA between the layer-wise feature-token embeddings of all N sites (query rows) and target
+# kernels on the same sites: K_X (geometry, a control), K_GT (RBF on the standardized response), K_GT_linear
+# (sensitivity), K_GP (MLL-GP posterior covariance on the same context); site-permutation null. Controls: known-kernel
+# map exceeds the null, a pure-noise map does not, x10 inference seeds ICC >= 0.75.
+# (b) placement: row-by-row CKA of the feature-token mean against on-grid prior maps at the same context sites.
+#
+# Label token DROPPED 2026-10-07 (user decision): the decoder reads only that token, so it carries the prediction.
+# Its CKA against K_GT re-measures prediction accuracy (Hyp A's R^2) and its placement re-places the predicted map
+# among prior maps (what C3's MMD / W2 placement already does); neither speaks to the representation of the geometry.
+# The decoder stages that followed it (dec_hidden / dec_logits / dec_probs) went with it. Measured on the 18-channel
+# run before the drop: label-token CKA to K_GP 0.13-0.18 (the lowest of all targets), so it was not "GP-like" either.
+# Ladder: the shared NHP ladder configs/context/nhp.yaml = [10, 25, 50, 80].
+#
+# Cells and resume (B3): one cell per (channel, level, t, draw, readout) for (a), one per (grid, t, draw) for (b),
+# cached under output/cells/nhp/mechanism_cka/; the MLL-GP posterior of each context is a cached artifact. A killed
+# job resumes; --only-cached assembles what exists.
 #
 #   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml --only-cached
 defaults:
   dataset: nhp
+  context: nhp
 
 analysis: cka
 tag: nhp
@@ -18,77 +33,38 @@ seed: 42
 output_root: output
 
 cka:
-  layers: null                 # all 18
+  layers: null                 # all 18 blocks
   readouts: [feature_mean]
   targets: [K_X, K_GT, K_GT_linear, K_GP]
-  # Includes a LATE-BO context (80 of 96 sites, ~83% of the budget-96 run) so the layer curves cover the
-  # operating point the surrogate actually ends at, not only the early steps. t must stay < n_sites.
-  context_sizes: [5, 10, 20, 40, 80]
   stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
-  # Raised from 3 on 2026-09-27. Each cell is ONE context draw: TabPFN is conditioned on t known sites, all
-  # n_sites rows are embedded, and CKA is computed per draw and AVERAGED afterwards (paired design; rows are
-  # NOT pooled across draws). The draw count follows the rule
-  #     n_context_draws = ceil(TARGET * 192 / n_sites)
-  # (TARGET x d_model rows' worth of draws, d_model = 192). A rule and not a flat count, because a flat count
-  # gives datasets with different grid sizes different amounts of averaging and makes their placements
-  # non-comparable -- which is exactly what the cross-dataset claim must avoid. One draw gives 96 < 192 rows:
-  # the n << d regime debiased CKA only partly rescues, which is why draws are averaged.
-  #
-  # TARGET = 5 (settled 2026-09-27 on measured cost, not on taste):
-  #   * statistically, pooled n = 5 x 192 = 960 is the usual floor for a well-conditioned second-moment
-  #     estimate (n >~ 5d); TARGET = 10 is better but costs 2x.
-  #   * measured on this box: one 18-layer embedding of 96 sites is ~170 ms (CPU), and ONE
-  #     permutation_null at n_perm = 1000 is ~80 ms. Per cell that is 0.17 s of embedding against
-  #     18 layers x 4 targets x 0.08 = 5.8 s of permutations, so the permutation null -- NOT the draw
-  #     count -- is ~97% of the cost.
-  #   * cells = 18 channels x 3 levels x 5 context sizes x draws. At TARGET = 5 (10 draws) that is 2700
-  #     cells ~ 4.4 h; at TARGET = 10 (20 draws) 5400 cells ~ 8.9 h, which leaves no headroom under the
-  #     12 h wall clock.
-  #   * so if more precision is ever needed, the cheap lever is dropping K_X and K_GT_linear from
-  #     `targets` (halves the cost outright), not cutting draws.
+  # Each cell is ONE context draw: TabPFN is conditioned on t known sites, all n_sites rows are embedded, and
+  # CKA is computed per draw and AVERAGED afterwards (paired design: draws are averaged within a channel before
+  # the spread over channels is taken; rows are NOT pooled across draws). The draw count follows the rule
+  #     n_context_draws = ceil(TARGET * 192 / n_sites),  TARGET = 5  (settled 2026-09-27)
+  # so datasets with different grid sizes get the same amount of averaging. One draw gives 96 < 192 rows, the
+  # n << d regime debiased CKA only partly rescues, which is why draws are averaged.
   # => NHP 10 draws; spinal (64 sites) 15; rat (32 sites) 30.
+  #
+  # Cost (B1 Step 7, re-measured 2026-10-06). The site-permutation null was ~97 % of the cost: one
+  # permutation_null of 1000 draws took ~80 ms per (layer, target). Its permutations depend on the target only,
+  # so they are now drawn ONCE per target and shared by every layer of the cell (analysis/cka.cka_null_draws):
+  # 21 layers x 1000 permutations went 1.74 s -> 0.12 s (14x), identical to 1e-13. That removes the reason to
+  # cut targets, so all four stay at every context size; K_X remains a control and K_GT_linear a sensitivity
+  # check, neither is a headline panel. Cells: 18 ch x 3 levels x 4 t x 10 draws = 2160 (~0.7 s each).
   n_context_draws: 10
-  # Kept at 1000, deliberately. Measured 2026-09-27 (96 sites, d=192, 12 repeats per setting): the SD of the
-  # estimated null mean is 5.8e-4 at n_perm=1000 and 1.4e-4 at 8000, against observed cka_minus_null effects
-  # of 0.1-0.65 -- so the null is already ~1000x better resolved than the effect and more permutations buy
-  # nothing. The real constraint is p-value RESOLUTION: min p = 1/(n_perm+1) must clear the Bonferroni
-  # threshold alpha/L = 0.05/18 = 2.8e-3, which needs n_perm >= 359. 1000 clears it with margin.
+  # Kept at 1000: the null mean is already ~1000x better resolved than the effect, and min p = 1/(n_perm+1)
+  # must clear the Bonferroni threshold alpha/layers = 0.05/18 = 2.8e-3 (n_perm >= 359).
   n_perm: 1000
   inference_seed: 0
-  # Converged GP reference (2026-09-30, option A): these are the settings `gp_mll` itself now uses, so the
-  # GP this analysis measures TabPFN against is the SAME GP the rest of the paper compares against. The
-  # engines build GPSurrogate(**gp_params) directly, so they do not inherit the model group -- the settings
-  # have to be restated here, and they must be kept in step with configs/model/gp_mll.yaml by hand.
-  # NOTE the engines pass no `device`, so the GP arms run on CPU whatever `device` says above.
-  # lengthscale_floor (2026-10-01): MECHANISM ONLY -- the BO experiments leave it at 0.0, so no cached cell
-  # moves. Converged type-II ML on a 10-50 point context sometimes drives one ARD lengthscale to ~0, which
-  # switches that axis off entirely; the closed-form conditioning these analyses use then builds a kernel
-  # whose entries are wrong (catastrophic cancellation once 1/ell reaches ~1e8) and the analysis dies. Every
-  # sound fit measured on these contexts had a minimum lengthscale >= 7.1e-2, the two pathological ones were
-  # 2.7e-3 and 1.2e-4, and the floor of 0.05 is half the finest grid step (0.111 on NHP), so it binds on the
-  # degenerate fits and nothing else -- at no cost in marginal likelihood (-2.189 either way, measured).
+  # Converged GP reference (2026-09-30, option A): the settings `gp_mll` itself uses, restated by hand (the
+  # engines build GPSurrogate(**gp_params) directly). lengthscale_floor 0.05 is MECHANISM ONLY (2026-10-01): it
+  # binds on degenerate ARD fits (minimum lengthscale ~1e-4) and nothing else. The GP runs on CPU.
   gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5, lengthscale_floor: 0.05}
   controls: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10, t: 25, alpha: 0.05, n_seeds: 10, icc_min: 0.75, n_seed_channels: 1}
-  # CKA (b), rescaled 2026-09-27 from (t 25, n_prior 30, holdout 10, noise 10, ONE draw, k_nearest 5):
-  #   t: 25 -> 50. Half of the budget-96 NHP run, so the embeddings describe a mid-BO surrogate rather
-  #       than an early one. Must stay < n_sites.
-  #   bank_quantile REPLACES k_nearest. With an absolute k, raising n_prior could only pull the k nearest
-  #       maps closer, so the distance -- and the placement p -- drifted downward with bank size and two
-  #       runs at different n_prior were incomparable. A quantile converges as the bank grows, which is
-  #       what makes the numbers below safe to raise at all.
-  #   n_prior 30 -> 100 (70 bank + 30 holdout), n_noise 10 -> 30, n_draws 1 -> 10. Measured cost per
-  #       channel per draw: 34.6 s (22.3 s embeddings + 12.3 s CKA) => 18 channels x 10 draws ~ 1.7 h,
-  #       versus ~3.7 h for n_prior 300. The prior-bank sampling cost (v1 prior + 5D-style interpolation)
-  #       is NOT included in that figure and is unmeasured, so n_prior 300 is deliberately not taken yet.
-  #   min_gap drops the layers where the noise ceiling and the prior floor coincide (NHP layers 0-3 had
-  #       gaps of 0.0000-0.0024, some NEGATIVE) -- the cause of p ranging -8..+12.
-  #   ts REPLACES the single t (2026-09-30). The placement of a layer's embedding is conditioned on the
-  #       evidence it saw, so one context could not separate "this layer sits near the prior bag" from
-  #       "this layer had 50 observations". The ladder spans early to late BO for the budget-96 NHP run
-  #       (10 / 25 / 50 / 80 = ~10 / 26 / 52 / 83 % of the budget) and feeds the layer x context surface
-  #       figure. Cost is LINEAR in len(ts): measured 34.6 s per channel per draw, so 18 channels x 4
-  #       context sizes x 5 draws ~ 3.5 h; n_draws was cut 10 -> 5 to pay for the new axis, which trades
-  #       per-cell precision for a real second axis (the between-channel IQR dominates either way).
-  placement: {enabled: true, ts: [10, 25, 50, 80], n_prior: 100, n_prior_holdout: 30, n_noise: 30,
+  # CKA (b), rescaled 2026-09-27 (t, bank_quantile, n_prior 100, n_noise 30, min_gap) and swept over the shared
+  # ladder since 2026-09-30 (n_draws 5 pays for the context axis). Places the feature-token mean
+  # (mechanism.CKA_PLACEMENT_READOUT); figures cka_placement.svg and cka_placement_surface.svg.
+  placement: {enabled: true, n_prior: 100, n_prior_holdout: 30, n_noise: 30,
               n_draws: 5, min_gap: 0.02, bank_quantile: 0.10, n_dense: 1024, holdout_frac: 0.1,
               rmse_threshold: 0.5, prior_type: prior_bag}
+  shadow: null

@@ -9,6 +9,7 @@
 #   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_placement_5d_rat.yaml
 defaults:
   dataset: 5d_rat
+  context: 5d_rat
 
 analysis: placement
 tag: 5d_rat
@@ -35,8 +36,8 @@ placement:
   n_boot: 1000
   ladder_lambdas: [0.0, 0.25, 0.5, 0.75, 1.0]
   ladder_min_spearman: 0.9
-  # Context ladder (2026-09-30): 10 (the floor below which the neighbour-pair reading is draw noise) to 200
-  # = 2x the budget-100 run. Unlike NHP, 200 is far below the 2048 conditions, so no entry collapses onto
-  # the full map and the `full` row stays a separate, much larger reference point.
-  context: {sizes: [10, 20, 40, 60, 100, 200], n_draws: 10,
+  # Context sizes: the shared 5d_rat ladder (configs/context/5d_rat.yaml, [10, 20, 40, 60, 100, 200]), from 10
+  # (the floor below which the neighbour-pair reading is draw noise) to 200 = 2x the budget-100 run. Unlike NHP,
+  # 200 is far below the 2048 conditions, so the `full` row stays a separate, much larger reference point.
+  context: {n_draws: 10,
             stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}}

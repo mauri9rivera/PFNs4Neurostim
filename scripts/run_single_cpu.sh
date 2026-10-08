@@ -11,15 +11,16 @@
 #   sbatch scripts/run_single_cpu.sh mechanism configs/experiment/mechanism_placement_nhp.yaml
 #   sbatch scripts/run_single_cpu.sh mechanism configs/experiment/mechanism_placement_5d_rat.yaml tag=5d-ctx
 #
-# Everything after the config path is forwarded to `--set`. Single-process analyses write their own
-# deliverables (CSVs + figures) and have NO cell cache, so this job is not resumable: it either finishes
-# inside the time limit or its work is lost.
+# Everything after the config path is forwarded to `--set`. Since 2026-10-06 (B3) every mechanism cell is cached
+# under output/cells/<dataset>/mechanism_<analysis>/ the moment it finishes, so a job that hits its limit is resumed by
+# submitting the same line again; and a config can be split over several jobs (e.g. dataset.subjects=[0]) and
+# assembled once with `--only-cached` over the full config.
 #SBATCH --job-name=single-cpu
 #SBATCH --output=logs/single_cpu_%j.out
 #SBATCH --error=logs/single_cpu_%j.err
 # Partition/account/GPU type are cluster-specific and come from the command line: sbatch $(bash scripts/cluster.sh flags cpu) ...
-# No --signal: these runners have no cell cache and no USR1 handler, so a warning signal only killed the job
-# 5 min early (both M10 runs of 2026-10-04 died at 5 h 55 min). The wall limit must cover the whole config.
+# No --signal: the runner has no USR1 handler, so a warning signal only killed the job 5 min early (both M10 runs of
+# 2026-10-04 died at 5 h 55 min). Finished cells survive a timeout (see above).
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
