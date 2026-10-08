@@ -34,7 +34,7 @@ git checkout scripts/mila_setup.sh && git pull          # drop the hand-copied f
 bash scripts/mila_setup.sh install                      # editable install into the MAIN env
 # 2. bench env (Python 3.11: TabICL, TabFM) - ~10-20 min, only needed for the D3 PFN benchmark
 sbatch scripts/setup_env_job.sh bench                 # NOT on the login node: conda is killed there (memory limit)
-# 2b. latest env (TabPFN-3.5 + Causilo; torch >= 2.13) - UNBUILT and unvalidated as of 2026-10-03; no portfolio unit uses it yet
+# 2b. latest env (TabPFN-3.5 + Causilo; torch >= 2.13) - built and verified 2026-10-04 (see section 3a)
 sbatch scripts/setup_env_job.sh latest
 bash scripts/mila_setup.sh submodules                   # libs/tabicl + libs/tabfm are used from the submodules via sys.path
 # 3. smoke-test the bench env on a login node (no GPU needed for the import checks)
@@ -58,12 +58,27 @@ bash scripts/submit_externals.sh
 | `bo_benchmark` with TabPFN-2.5 / GP / Random (`hyp_a_*`, `hyp0_acq_table_*`) | `pfns4neurostim` (3.9) | pinned stack |
 | `stress_sweep` (K2, K5, K6) | `pfns4neurostim` (3.9) | pinned stack |
 | `bo_benchmark` with TabICL v2 / TabFM (`hyp0_pfn_bench_*`) | `pfns4neurostim-bench` (3.11) | TabICL needs >= 3.10, TabFM >= 3.11 (TabFlex dropped: dead weight host) |
-| `bo_benchmark` with TabPFN-3.5 / Causilo (`hyp0_pfn_bench_*`; no portfolio unit yet) | `pfns4neurostim-latest` (3.11) | `tabpfn >= 9` and the pinned `tabpfn` 6.3.2 own the same module name; Causilo needs torch >= 2.13 |
+| `bo_benchmark` with TabPFN-3.5 / Causilo (`hyp0_pfn_bench_*`; units E9, P13b) | `pfns4neurostim-latest` (3.11) | `tabpfn >= 9` and the pinned `tabpfn` 6.3.2 own the same module name; Causilo needs torch >= 2.13 |
 | Mitra | not yet | deferred (AutoGluon) |
 
 `scripts/run_*.sh` select the env with `CONDA_ENV` (default `pfns4neurostim`). The authoritative
 record of model -> env is `ExternalSpec.env` in `models/pfn/external.py`, not this table; an
 availability failure names the env to activate.
+
+## 3a. Verified environments (rule 8, closed 2026-10-08)
+
+Rule 8 asked for a `verify <env>` gate (availability + `pytest tests/models` + one cell per model) after every build. It was
+closed by evidence instead: every env has run a one-cell check and then full units on each cluster that hosts it, and every
+cell records its stack (`host`: interpreter, `pip freeze` hash). `mila_setup.sh verify` / `narval_setup.sh verify` still only
+check layout and the main-env import; after a **rebuild**, repeat the one-cell check of the table before any full unit.
+
+| Env | Cluster | Key pins | One-cell check | First full units | Notes |
+|---|---|---|---|---|---|
+| `pfns4neurostim` (main) | Mila, Narval | py 3.9 (Mila) / 3.11 venv (Narval); torch 2.5.1, tabpfn 6.3.2, gpytorch 1.11, numpy 1.26.4 | — (pre-sprint-2) | every TabPFN-2.5 / GP / Random / PFNs4BO unit, NHP · 5d_rat · spinal | |
+| `pfns4neurostim-bench` | Mila | py 3.11; torch 2.5.1, tabpfn 6.3.2, numpy 2.2.6, jax 0.10.2 | E4 11080589 (TabFM 5d_rat) | N11, E1, P13 (TabICL); E3, 5d_rat TabFM 11107427/31 | **TabFM needs a bf16 GPU (Ampere+)**: ~16x slower on RTX 8000 / V100 |
+| `pfns4neurostim-bench` | Narval | as Mila but numpy 2.2.2, matplotlib 3.11.1, statsmodels 0.14.6 (`0c3f35c`, wheelhouse substitutes) | 4902041 (TabFM spinal) | P15 4929919-22 | `a100_2g.10gb` slice; ~10 min warm-up per lane |
+| `pfns4neurostim-latest` | Narval | py 3.11; torch 2.14.1, tabpfn 9.1.0, causilo 1.0.3, numpy 2.4.2, pandas 3.0.5 | 4644111 / 4644125 | E9 4712109/10, P13b 4929916/17 | licence via cached `~/.cache/tabpfn/auth_token` on offline nodes |
+| `pfns4neurostim-latest` | Mila | as Narval (wheel `2.14.1+cu130`, driver 580.159.03) | 11071330 / 11071331 | — (units ran on Narval) | same cell differs across GPUs (G5) |
 
 ## 3b. Replacing a dataset cohort (5d_rat, 2026-09-25)
 
