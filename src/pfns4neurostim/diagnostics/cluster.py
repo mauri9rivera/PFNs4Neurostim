@@ -356,6 +356,12 @@ def _wrap_lines(text: str, width: int) -> List[str]:
 #: is only marked down for what the rubric says to act on. Before 2026-10-01 the grade scored GPU memory
 #: against ``--mem`` -- two unrelated resources -- which made every lane-parallel job an F.
 HEALTHY_BAND_LOW: Dict[str, float] = {'gpu_util': 0.70, 'memory': 0.60, 'walltime': 0.50}
+#: Top of the memory band: a job peaking at or above this share of ``--mem`` is one step from an OOM kill.
+#: Before 2026-10-08 nothing looked above the band, so Narval job 4929910 printed "[OK] Peak RSS ... 107%",
+#: "No warnings" and grade A while one of its lanes had been OOM-killed.
+MEMORY_TIGHT_FRAC: float = 0.90
+#: Grade credit of a memory-tight job, as in ``scripts/cluster_report.py``'s score.
+TIGHT_MEMORY_CREDIT: float = 0.5
 #: Most lanes the report will ever suggest. Each needs its own core, so the real ceiling is the CPU
 #: allocation; without a cap the arithmetic suggested 47 lanes for a 4-core job.
 MAX_SUGGESTED_LANES: int = 8
@@ -512,6 +518,27 @@ _WARNING_RULES: List[Dict[str, Any]] = [
             'One core per lane is what this workload uses:\n'
             '  {cpus_flag}\n'
             'Or keep the cores and raise LANES to match, which also lifts GPU utilisation.'
+        ),
+    },
+    {
+        'id': 'MEM_TIGHT',
+        # Judged on the job's footprint (lanes x per-process peak) like RAM_UNDERUSE. At >= 100% the kernel
+        # has already OOM-killed a process: with lanes, the surviving lanes still print this block, so the
+        # missing lane's cells are the thing to check (4929910 lost lane 15 this way, 2026-10-07).
+        'condition': lambda m: (
+            m.requested_ram_bytes is not None
+            and m.requested_ram_bytes > 0
+            and m.peak_rss_bytes > 0
+            and (m.job_peak_rss_bytes / m.requested_ram_bytes) >= MEMORY_TIGHT_FRAC
+        ),
+        'text': (
+            'MEM_TIGHT: {n_lanes} lane(s) x {peak_rss_gb:.2f} GB = {job_rss_gb:.1f} GB peak, {pct:.0f}% of the '
+            '{req_ram_gb:.1f} GB requested. At >= 100% a lane was likely OOM-killed: check every lane '
+            'finished its cells.'
+        ),
+        'fix': (
+            'Raise the memory request to peak RSS + 25% headroom:\n'
+            '  {mem_flag}'
         ),
     },
     {
@@ -726,7 +753,8 @@ class ClusterDiagnostics:
             total_weight += 40.0
 
         if (m.requested_ram_bytes and m.requested_ram_bytes > 0 and m.peak_rss_bytes > 0):
-            score += 30.0 * credit(m.job_peak_rss_bytes / m.requested_ram_bytes, 'memory')
+            mem_frac = m.job_peak_rss_bytes / m.requested_ram_bytes
+            score += 30.0 * (TIGHT_MEMORY_CREDIT if mem_frac >= MEMORY_TIGHT_FRAC else credit(mem_frac, 'memory'))
             total_weight += 30.0
 
         if m.slurm_timelimit_s and m.slurm_timelimit_s > 0:
@@ -862,7 +890,7 @@ class ClusterDiagnostics:
                 )
             elif rule['id'] == 'WALLTIME_OVERREQUEST' and m.slurm_timelimit_s:
                 tv['pct'] = m.elapsed_s / m.slurm_timelimit_s * 100
-            elif rule['id'] == 'RAM_UNDERUSE' and m.requested_ram_bytes:
+            elif rule['id'] in ('RAM_UNDERUSE', 'MEM_TIGHT') and m.requested_ram_bytes:
                 tv['pct'] = m.job_peak_rss_bytes / m.requested_ram_bytes * 100
 
             try:
@@ -990,7 +1018,8 @@ class ClusterDiagnostics:
             job_gb = m.job_peak_rss_bytes / (1024 ** 3)
             req_gb = m.requested_ram_bytes / (1024 ** 3)
             eff = m.job_peak_rss_bytes / m.requested_ram_bytes
-            tl = _tl(eff, 0.70, 0.40)
+            # A band, not "higher is better": above MEMORY_TIGHT_FRAC is a warning, at or above 100% critical.
+            tl = 'X ' if eff >= 1.0 else '! ' if eff >= MEMORY_TIGHT_FRAC else _tl(eff, 0.70, 0.40)
             lines.append(_row(
                 f'  [{tl}] Peak RSS : '
                 f'{rss_gb:.2f} GB/lane x {max(1, m.n_lanes)} = {job_gb:.2f} GB / {req_gb:.2f} GB req  '

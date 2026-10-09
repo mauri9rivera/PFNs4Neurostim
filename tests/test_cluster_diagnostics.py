@@ -624,3 +624,39 @@ class TestPerRulePercentages:
         )
         fired = {w['id']: w for w in diag._generate_warnings()}
         assert '(41%)' in fired['RAM_UNDERUSE']['rendered_text']
+
+
+class TestMemoryTight:
+    """Regression for Narval job 4929910 (2026-10-07): 42 lanes x 1.27 GB = 53.3 GB against --mem 50G, one lane
+    OOM-killed, yet the block printed "[OK] Peak RSS ... (107%)", "No warnings" and grade A."""
+    GB = 1024 ** 3
+
+    def _make_diag(self, peak_lane_gb: float, req_gb: float = 50.0) -> ClusterDiagnostics:
+        diag = ClusterDiagnostics(enabled=True)
+        diag._t0 = time.time()
+        m = diag._metrics
+        m.cluster_name, m.n_lanes = 'narval', 42
+        m.peak_rss_bytes, m.requested_ram_bytes = int(peak_lane_gb * self.GB), int(req_gb * self.GB)
+        m.elapsed_s, m.slurm_timelimit_s = 0.99 * 3600, 1.75 * 3600
+        return diag
+
+    def test_over_request_fires_mem_tight_with_a_raise(self):
+        fired = {w['id']: w for w in self._make_diag(1.27)._generate_warnings()}
+        assert '107% of the 50.0 GB' in fired['MEM_TIGHT']['rendered_text']
+        assert '--mem 67G' in fired['MEM_TIGHT']['rendered_fix']        # ceil(53.3 x 1.25)
+
+    def test_terminal_light_is_critical_not_ok(self):
+        report = self._make_diag(1.27).format_terminal_report()
+        assert '[X ] Peak RSS' in report and 'No warnings' not in report
+
+    def test_tight_but_under_is_a_warning_light(self):
+        report = self._make_diag(1.12).format_terminal_report()           # 47.0 of 50 GB = 94%
+        assert '[! ] Peak RSS' in report
+
+    def test_grade_no_longer_rewards_over_use(self):
+        tight, healthy = self._make_diag(1.27)._compute_grade(), self._make_diag(0.95)._compute_grade()  # 107% vs 80%
+        assert healthy == 'A' and tight != 'A'
+
+    def test_healthy_band_does_not_fire(self):
+        ids = [w['id'] for w in self._make_diag(0.95)._generate_warnings()]
+        assert 'MEM_TIGHT' not in ids

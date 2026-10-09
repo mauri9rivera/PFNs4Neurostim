@@ -8,7 +8,6 @@ The following files are loaded on demand:
 
 - `.research_assistant/roadmap.md` — load when ultrathink is specified
 - `.research_assistant/research_design.md` — load when the user explicitly requests it
-- `.research_assistant/research_design_log.md` — dated design decisions (formerly research_design.md §4); load alongside research_design.md when decision history matters
 
 ---
 
@@ -23,11 +22,12 @@ O(n³) complexity hinders real-time and large-scale use.
   task). R² of the surrogate's final prediction (after the BO loop) is reported
   as a secondary metric inside the same run; there is no standalone "fit task"
   (random-subset R² evaluation was removed on 2026-04-27).
-- **Headline acquisition function is `ts_marginal`** (as of 2026-09-20): independent per-site
-  Thompson draws from each model's predictive marginals, symmetric for GP and PFN. `ts_joint` (exact
-  joint draw) is a GP-only reference. EI, UCB (`auto_dim` schedule and the fixed-kappa grid) and the
-  rest are comparison rows of the formal acquisition experiment (`configs/experiment/hyp0_acq_table_*`),
-  to be run later. The legacy name `acq_fn: ts` no longer exists; `kappa_*` keys apply to `ucb` only.
+- **Headline acquisition function is `ts_marginal`** (since 2026-09-20; **settled 2026-10-08**):
+  independent per-site Thompson draws from each model's predictive marginals, symmetric for GP and PFN.
+  The choice rests on the NHP acquisition core (`hyp0_acq_core_nhp`: TS vs EI vs UCB) and the TabPFN
+  fixed-kappa grid (`hyp0_ucb_kappa_nhp`); the formal 11-acquisition table (`hyp0_acq_table_*`,
+  `ts_joint`, `greedy`) is retired. The legacy name `acq_fn: ts` no longer exists; `kappa_*` keys apply
+  to `ucb` only.
 
 **ID/OOD reference policy:** the in-distribution reference is the TabPFN prior *bag*
 (`prior_source: prior_bag`/`tabpfn_prior` — the GP+MLP mixture the network is pretrained
@@ -70,8 +70,8 @@ metrics.
 **Environment:** `conda activate pfns4neurostim` (see `environment.yml`). Two more exist for
 benchmark models whose pins cannot coexist with the main ones: `pfns4neurostim-bench`
 (`environment.bench.yml`, Python 3.11 — TabICL, TabFM) and `pfns4neurostim-latest`
-(`environment.latest.yml`, Python 3.11, torch >= 2.13 — TabPFN-3.5 with `tabpfn >= 9`, Causilo; unbuilt as of
-2026-10-03). `ExternalSpec.env` in
+(`environment.latest.yml`, Python 3.11, torch >= 2.13 — TabPFN-3.5 with `tabpfn >= 9`, Causilo; built and
+verified 2026-10-04, see `docs/mila_runbook.md` §3a). `ExternalSpec.env` in
 `models/pfn/external.py` is the single record of which model runs where.
 
 **Experiment tracking:** Local CSV + pickle files under `output/runs/<tag>/`. No W&B or MLflow.
@@ -181,7 +181,7 @@ PFNs4Neurostim/
 │   ├── dataset/                 ← nhp · 5d_rat · spinal
 │   ├── model/                   ← tabpfn_v2_5 · gp_mll · gp_naive · random
 │   ├── acquisition/             ← ei · ucb · pi · ts_marginal · ts_joint · greedy · random
-│   ├── experiment/              ← hyp_a_nhp · hyp0_acq_table_nhp · stress_k2_{nhp,5d_rat}
+│   ├── experiment/              ← hyp_a_nhp · hyp0_acq_core_nhp · stress_k2_{nhp,5d_rat}
 │   └── legacy/                  ← the 24 pre-restructure YAMLs
 ├── data/  output/  logs/        ← gitignored; symlinks into $SCRATCH on the cluster
 ├── libs/                        ← git submodules, READ-ONLY (PFNs, PFNs4BO, tabpfn-v1-prior)
@@ -379,7 +379,7 @@ or axis string. Settled with the user on 2026-09-18 for the JNE/IOP target:
 
 ## 10. Knowledge Transfer & Context Engineering
 
-@.claude/skills/take-notes.md
+@.claude/skills/note-taker/SKILL.md
 
 **`[take-notes]` flag** — invokes the note-taker skill inline (no subagent spawned).
 Claude reads the current conversation and updates the relevant documentation files directly.

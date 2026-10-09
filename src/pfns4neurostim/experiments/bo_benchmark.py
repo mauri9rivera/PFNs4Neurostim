@@ -18,7 +18,7 @@ Deliverables:
 CLI::
 
     python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml
-    python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_acq_table_nhp.yaml
+    python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp0_acq_core_nhp.yaml
 """
 from __future__ import annotations
 

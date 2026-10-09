@@ -1,8 +1,8 @@
 # Core acquisition experiment, NHP: ts_marginal (headline) vs EI vs UCB (auto_dim kappa schedule) for the model ladder.
 #
 # The ts_marginal and random cells are IDENTICAL to Deliverable 1's (same budget, reps, seeds and parameters), so they come
-# from the shared cell cache for free; only the EI and UCB cells are new compute. The full 11-acquisition table with the
-# fixed-kappa grid is configs/experiment/hyp0_acq_table_nhp.yaml.
+# from the shared cell cache for free; only the EI and UCB cells are new compute. With hyp0_ucb_kappa_nhp (TabPFN, fixed
+# kappa grid) this run is the evidence that settled ts_marginal (2026-10-08); the 11-acquisition table was retired.
 #
 # PRE-REGISTERED DECISION RULE (fixed before running): the acquisition with the lowest median RECOMMENDED regret over all
 # NHP channels, ties broken by cumulative regret; the full table is always reported next to the choice.

@@ -1,8 +1,8 @@
 # Hypothesis A - on-par-but-cheaper, NHP held-out subject.
 #
 # Headline acquisition: ts_marginal (independent per-site Thompson draws from each model's
-# predictive marginals; symmetric for GP and PFN). EI and UCB are compared later in the
-# formal acquisition experiment (hyp0_acq_table_*). The random-search baseline serves the
+# predictive marginals; symmetric for GP and PFN), settled 2026-10-08 from the NHP acquisition core and
+# UCB kappa runs (research_design §4). The random-search baseline serves the
 # `random` acquisition only, hence the two-entry list. Regrets are range-normalized (P0.9);
 # latency is descriptive only (guardrail G1).
 #

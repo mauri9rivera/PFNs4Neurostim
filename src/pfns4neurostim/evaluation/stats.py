@@ -416,6 +416,110 @@ def run_tost_on_results(
 
 
 # ---------------------------------------------------------------------------
+# TOST on tidy tables (pooled runs, task plan A8)
+# ---------------------------------------------------------------------------
+
+def holm_adjust(pvalues: np.ndarray) -> np.ndarray:
+    """Holm-Bonferroni step-down adjustment of a family of p-values.
+
+    Args:
+        pvalues: Raw p-values, shape [K].
+
+    Returns:
+        Adjusted p-values, shape [K], in the input order (monotone, capped at 1).
+    """
+    p = np.asarray(pvalues, dtype=float)                       # [K]
+    order = np.argsort(p)
+    k = p.size
+    stepped = np.maximum.accumulate((k - np.arange(k)) * p[order])
+    adjusted = np.empty(k)
+    adjusted[order] = np.minimum(stepped, 1.0)
+    return adjusted
+
+
+def paired_unit_values(
+    frame: pd.DataFrame,
+    model_a: str,
+    model_b: str,
+    metric: str,
+    unit: tuple[str, ...] = ('subject', 'emg'),
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Per-unit means of ``metric`` for two models, aligned on the units both have.
+
+    Repetitions share a channel's data, so they are averaged within the unit (by default a channel) before
+    any test: the unit, not the repetition, is the independent observation.
+
+    Args:
+        frame: Tidy rows of one comparison (one run / acquisition), both models.
+        model_a: Model whose values form ``a``.
+        model_b: Model whose values form ``b``.
+        metric: Metric column.
+        unit: Columns identifying the unit of pairing (``('subject',)`` for a subject-level analysis).
+
+    Returns:
+        ``(a, b, n_dropped)``: arrays of shape [U] over the shared units, and how many units only one model had.
+
+    Raises:
+        ValueError: If ``metric`` has a non-finite value.
+    """
+    sel = frame[frame['model'].isin([model_a, model_b])]
+    values = sel[metric].to_numpy(dtype=float)                 # [N]
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"paired_unit_values: non-finite {metric!r} for {model_a} / {model_b}.")
+    wide = sel.groupby([*unit, 'model'])[metric].mean().unstack('model')   # [U, 2]
+    both = wide.dropna()
+    return (both[model_a].to_numpy(), both[model_b].to_numpy(), int(len(wide) - len(both)))
+
+
+def tost_table(
+    frame: pd.DataFrame,
+    comparisons: list[tuple[str, str]],
+    metrics: list[str],
+    margin: float,
+    by: list[str],
+    unit: tuple[str, ...] = ('subject', 'emg'),
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Paired TOST of every comparison x metric within each ``by`` group, Holm-adjusted per group.
+
+    The family for the multiplicity correction is the set of metrics x comparisons of one group (e.g. one
+    dataset), matching the "TOST on each co-primary outcome, with multiplicity correction" design.
+
+    Args:
+        frame: Tidy rows; must hold ``by``, ``unit``, ``model`` and every metric column.
+        comparisons: ``(model_a, model_b)`` pairs; differences are ``a - b``.
+        metrics: Metric columns, all in the units of ``margin``.
+        margin: Pre-registered equivalence margin.
+        by: Grouping columns (e.g. ``['dataset']``).
+        unit: Unit of pairing, see :func:`paired_unit_values`.
+        alpha: One-sided level of each TOST (``1 - 2 alpha`` CI).
+
+    Returns:
+        One row per group x comparison x metric: :func:`tost_equivalence` fields, ``n_dropped``, ``tost_p_holm``
+        and ``equivalent_holm``.
+    """
+    rows: list[dict] = []
+    for keys, grp in frame.groupby(by, sort=True):
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        block: list[dict] = []
+        for model_a, model_b in comparisons:
+            for metric in metrics:
+                a, b, dropped = paired_unit_values(grp, model_a, model_b, metric, unit)
+                if a.size < 2:
+                    continue
+                res = tost_equivalence(a, b, margin, alpha)
+                block.append({**dict(zip(by, keys)), 'model_a': model_a, 'model_b': model_b, 'metric': metric,
+                              'unit': '+'.join(unit), 'n_dropped': dropped, **res})
+        if block:
+            adjusted = holm_adjust(np.array([r['tost_p'] for r in block]))
+            for r, p_adj in zip(block, adjusted):
+                r['tost_p_holm'] = float(p_adj)
+                r['equivalent_holm'] = bool(p_adj < alpha)
+            rows.extend(block)
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 

@@ -55,7 +55,7 @@ bash scripts/submit_externals.sh
 
 | Experiment | Env | Why |
 |---|---|---|
-| `bo_benchmark` with TabPFN-2.5 / GP / Random (`hyp_a_*`, `hyp0_acq_table_*`) | `pfns4neurostim` (3.9) | pinned stack |
+| `bo_benchmark` with TabPFN-2.5 / GP / Random (`hyp_a_*`, `hyp0_acq_core_*`) | `pfns4neurostim` (3.9) | pinned stack |
 | `stress_sweep` (K2, K5, K6) | `pfns4neurostim` (3.9) | pinned stack |
 | `bo_benchmark` with TabICL v2 / TabFM (`hyp0_pfn_bench_*`) | `pfns4neurostim-bench` (3.11) | TabICL needs >= 3.10, TabFM >= 3.11 (TabFlex dropped: dead weight host) |
 | `bo_benchmark` with TabPFN-3.5 / Causilo (`hyp0_pfn_bench_*`; units E9, P13b) | `pfns4neurostim-latest` (3.11) | `tabpfn >= 9` and the pinned `tabpfn` 6.3.2 own the same module name; Causilo needs torch >= 2.13 |

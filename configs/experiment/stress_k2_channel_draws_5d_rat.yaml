@@ -10,7 +10,7 @@
 defaults:
   dataset: 5d_rat
   model: [tabpfn_v2_5, gp_mll, gp_naive]
-  acquisition: ts_marginal   # headline (2026-09-20); EI/UCB compared in hyp0_acq_table_*
+  acquisition: ts_marginal   # headline (2026-09-20); settled 2026-10-08 (research_design §4)
 
 experiment: stress_sweep
 family: stress-k2-channel-draws
