@@ -19,7 +19,7 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-from .results import read_config
+from .results import LEGACY_DEMO_NAMES, canonical_demo_column, read_config
 
 __all__ = [
     "PROVENANCE_COLUMNS",
@@ -84,7 +84,10 @@ def load_run(run_dir: str, output_root: str) -> pd.DataFrame:
         scaler whenever it is active, so every cell a run serves was computed under the run's setting; the row
         field, however, was added to cached rows after some cells existed, and those rows read back the
         ``TidyRow`` default ``'none'`` (2026-10-08: 270 local NHP cells keyed ``minmax``). Disagreeing rows
-        are counted in a warning.
+        are counted in a warning. ``demo`` is normalised the same way and for the same reason: cells cached
+        before the 2026-09-27 rename recorded ``demo2``/``demo1``, which this function resolves to
+        ``draws``/``synthetic`` so the pooled table has one vocabulary. The cells themselves are never
+        rewritten.
 
     Raises:
         ValueError: If the tidy file is empty.
@@ -100,6 +103,13 @@ def load_run(run_dir: str, output_root: str) -> pd.DataFrame:
             warnings.warn(f"{run_dir}: {n_stale} rows carry a stale online_y_scaler label; using the config's "
                           f"{scaler!r} (the cell identity guarantees it).", stacklevel=2)
         tidy = tidy.drop(columns="online_y_scaler")
+    if "demo" in tidy.columns:
+        n_legacy = int(tidy["demo"].astype(str).isin(LEGACY_DEMO_NAMES).sum())
+        if n_legacy:
+            warnings.warn(f"{run_dir}: {n_legacy} rows carry a pre-2026-09-27 demo spelling "
+                          f"({sorted(set(tidy['demo'].astype(str)) & set(LEGACY_DEMO_NAMES))}); pooling the "
+                          f"current names. The cells keep what they recorded.", stacklevel=2)
+        tidy = tidy.assign(demo=canonical_demo_column(tidy["demo"]))
     provenance = pd.DataFrame({
         "run_dir": os.path.relpath(run_dir, output_root).replace(os.sep, "/"),
         "family": config.get("family"),

@@ -30,6 +30,10 @@ __all__ = [
     "KEY_COLUMNS",
     "METRIC_COLUMNS",
     "ALL_COLUMNS",
+    "DEMO_NAMES",
+    "LEGACY_DEMO_NAMES",
+    "canonical_demo",
+    "canonical_demo_column",
     "TidyRow",
     "flatten_acquisition_block",
     "rows_to_dataframe",
@@ -117,8 +121,48 @@ METRIC_COLUMNS: tuple[str, ...] = (
 #: including the offline arm's, which is the comparison this column exists to protect.
 PROVENANCE_COLUMNS: tuple[str, ...] = ("online_y_scaler",)
 
+#: The two arms a stress sweep can run: in-vivo trial draws, or a fitted SNR-matched synthetic twin.
+DEMO_NAMES: tuple[str, ...] = ("draws", "synthetic")
+
+#: Pre-2026-09-27 spellings of :data:`DEMO_NAMES`, mapped to what they meant. ``demo2`` was the in-vivo arm
+#: and ``demo1`` the synthetic one; the rename reached the code but not the cells already on disk, and a cell
+#: is never rewritten (translating its payload at load would make the cache lie about what it recorded). So
+#: the legacy spellings survive in cached rows and must be resolved wherever a *reader* needs the meaning --
+#: see :func:`canonical_demo`.
+LEGACY_DEMO_NAMES: dict[str, str] = {"demo2": "draws", "demo1": "synthetic"}
+
 #: Full tidy-table column order: key columns, provenance, then metric columns.
 ALL_COLUMNS: tuple[str, ...] = KEY_COLUMNS + PROVENANCE_COLUMNS + METRIC_COLUMNS
+
+
+def canonical_demo(demo: str) -> str:
+    """Resolve a tidy ``demo`` value to its current spelling.
+
+    Cells written before the 2026-09-27 rename carry ``demo2`` (in vivo) or ``demo1`` (synthetic). They are
+    left exactly as recorded on disk; this function is the read-time translation every consumer that branches
+    on the *meaning* of the arm must apply -- a figure title, a filename, a pooled column. Values already
+    canonical pass through, and so does anything unrecognised (a knob family may introduce an arm of its own,
+    and silently folding it into one of the two known names would be worse than showing it verbatim).
+
+    Args:
+        demo: Value of the tidy ``demo`` column.
+
+    Returns:
+        ``'draws'``, ``'synthetic'``, or ``demo`` unchanged.
+    """
+    return LEGACY_DEMO_NAMES.get(demo, demo)
+
+
+def canonical_demo_column(demo: "pd.Series") -> "pd.Series":
+    """Vectorised :func:`canonical_demo` for a tidy frame's ``demo`` column.
+
+    Args:
+        demo: The ``demo`` column of a tidy frame.
+
+    Returns:
+        A new series with the legacy spellings resolved; the input is not modified.
+    """
+    return demo.astype(str).replace(LEGACY_DEMO_NAMES)
 
 
 @dataclasses.dataclass(frozen=True)

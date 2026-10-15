@@ -84,6 +84,14 @@ class StressKnob(ABC):
         default_levels: Pre-registered level ladder, ordered from mildest to
             most severe stress.
         nominal_level: The level that must reproduce the unstressed channel.
+            A knob whose nominal level is not a fixed number (K6-budget: the
+            unstressed budget is whatever the config asked for) leaves this NaN
+            and overrides :meth:`nominal_in`.
+        symbol: Mathtext symbol of the knob's level, the canonical notation of
+            the manuscript (settled 2026-10-12). Every knob has its own letter:
+            ``gamma`` and ``eta`` for the two K2 settings rather than one
+            ``alpha``, and ``varepsilon`` / ``varphi`` for the two fractions, so
+            no symbol means two different things across figures.
         alters: Which part of the problem the knob touches — ``'trials'``,
             ``'pool'``, ``'budget'`` or ``'map'``. The runner uses this to know
             whether a level changes the BO budget rather than the data.
@@ -96,6 +104,7 @@ class StressKnob(ABC):
     name: ClassVar[str] = ""
     default_levels: ClassVar[tuple[float, ...]] = ()
     nominal_level: ClassVar[float] = 1.0
+    symbol: ClassVar[str] = ""
     alters: ClassVar[str] = "trials"
     implemented: ClassVar[bool] = True
     seed_key: ClassVar[str] = ""
@@ -149,6 +158,30 @@ class StressKnob(ABC):
             Columns merged into the tidy result row.
         """
         return {"achieved_snr_db": achieved_snr_db(channel)}
+
+    @classmethod
+    def nominal_in(cls, levels: Sequence[float]) -> float | None:
+        """Return the unstressed level of a realized ladder, or ``None`` if it has none.
+
+        The figure layer marks this level as the **default regime** of the
+        dataset, so it has to be resolvable from a run's tidy frame alone (the
+        ``--replot`` path never rebuilds the knob). Most knobs have a fixed
+        nominal level; K6-budget overrides this because its unstressed level is
+        the configured budget rather than a constant.
+
+        Args:
+            levels: The levels actually present in the run, in any order.
+
+        Returns:
+            The nominal level, or ``None`` when the ladder does not contain it
+            (a sweep that never visits the unstressed regime).
+        """
+        if not np.isfinite(cls.nominal_level):
+            return None
+        for level in levels:
+            if np.isclose(float(level), cls.nominal_level):
+                return float(level)
+        return None
 
     def solve_level(self, channel: ChannelData, target_db: float) -> float | None:
         """Return the level that shifts ``channel``'s SNR by exactly ``target_db``, if one exists.
@@ -288,6 +321,7 @@ class K2ChannelNoiseKnob(StressKnob):
     seed_key: ClassVar[str] = "k2_snr"   # pre-2026-09-23 name: keeps seeds and cached cells
     default_levels: ClassVar[tuple[float, ...]] = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
     nominal_level: ClassVar[float] = 1.0
+    symbol: ClassVar[str] = r"$\gamma$"
     alters: ClassVar[str] = "trials"
 
     def apply(self, channel: ChannelData, level: float, rng: np.random.Generator) -> ChannelData:
@@ -347,6 +381,7 @@ class K2GlobalNoiseKnob(StressKnob):
     name: ClassVar[str] = "k2_global"
     default_levels: ClassVar[tuple[float, ...]] = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)
     nominal_level: ClassVar[float] = 0.0
+    symbol: ClassVar[str] = r"$\eta$"
     alters: ClassVar[str] = "trials"
 
     def __init__(self, levels: Sequence[float] | None = None) -> None:
@@ -433,6 +468,7 @@ class K1DecoyKnob(StressKnob):
     name: ClassVar[str] = "k1_decoy"
     default_levels: ClassVar[tuple[float, ...]] = (0.0, 0.5, 0.7, 0.85, 0.95, 0.98)
     nominal_level: ClassVar[float] = 0.0
+    symbol: ClassVar[str] = r"$a_2/a_1$"
     alters: ClassVar[str] = "map"
 
     def __init__(
@@ -569,6 +605,7 @@ class K5OutlierKnob(StressKnob):
     name: ClassVar[str] = "k5_outliers"
     default_levels: ClassVar[tuple[float, ...]] = (0.0, 0.01, 0.02, 0.05, 0.1, 0.2)
     nominal_level: ClassVar[float] = 0.0
+    symbol: ClassVar[str] = r"$\varepsilon$"
     alters: ClassVar[str] = "trials"
 
     def __init__(
@@ -654,8 +691,31 @@ class K6BudgetKnob(StressKnob):
 
     name: ClassVar[str] = "k6_budget"
     default_levels: ClassVar[tuple[float, ...]] = (10.0, 20.0, 30.0, 50.0)
-    nominal_level: ClassVar[float] = 50.0
+    # The unstressed level is the configured budget (96 on NHP), not a constant, so the class attribute
+    # cannot name it and ``nominal_in`` resolves it from the realized ladder instead (2026-10-12).
+    nominal_level: ClassVar[float] = float("nan")
+    symbol: ClassVar[str] = r"$B$"
     alters: ClassVar[str] = "budget"
+
+    @classmethod
+    def nominal_in(cls, levels: Sequence[float]) -> float | None:
+        """Return the largest budget of the ladder: the unstressed regime.
+
+        Every other knob has a constant nominal level, but "no stress" here means
+        "the budget the experiment would have had anyway" — 96 on NHP, i.e. the
+        Hyp A budget — which only the realized ladder knows. The pre-2026-10-12
+        class constant of 50 named a *stressed* cell, so the robustness table's
+        nominal reference and the figures' default marker both pointed at the
+        wrong level for this knob alone.
+
+        Args:
+            levels: The levels actually present in the run.
+
+        Returns:
+            ``max(levels)``, or ``None`` for an empty ladder.
+        """
+        values = [float(level) for level in levels]
+        return max(values) if values else None
 
     def apply(self, channel: ChannelData, level: float, rng: np.random.Generator) -> ChannelData:
         """Return the channel unchanged, recording the budget as provenance.
@@ -743,6 +803,7 @@ class K6FailureKnob(StressKnob):
     name: ClassVar[str] = "k6_failure"
     default_levels: ClassVar[tuple[float, ...]] = (0.0, 0.1, 0.25, 0.5)
     nominal_level: ClassVar[float] = 0.0
+    symbol: ClassVar[str] = r"$\varphi$"
     alters: ClassVar[str] = "pool"
 
     def __init__(self, levels: Sequence[float] | None = None, *, dead_value: float = 0.0) -> None:
@@ -840,6 +901,7 @@ class K7ShuffleKnob(StressKnob):
     name: ClassVar[str] = "k7_shuffle"
     default_levels: ClassVar[tuple[float, ...]] = (0.0, 0.25, 0.5, 0.75, 1.0)
     nominal_level: ClassVar[float] = 0.0
+    symbol: ClassVar[str] = r"$f$"
     alters: ClassVar[str] = "map"
 
     def __init__(self, levels: Sequence[float] | None = None) -> None:

@@ -106,3 +106,57 @@ class TestTrialsArePerChannel:
         ctx = context_for(ch, 8, 0, base_seed=SEED)
         for site, value in zip(ctx.sites, ctx.y):
             assert value in set(ch.Y_trials[site].tolist())
+
+
+class TestTrialDraw:
+    """``trial_draw`` re-keys the trial stream only: same sites, independent readings."""
+
+    @staticmethod
+    def _rich_channel() -> ChannelData:
+        return _channel("0-0", n_sites=12, n_reps=12)
+
+    def test_trial_draw_keeps_the_sites_but_changes_the_trials(self) -> None:
+        ch = self._rich_channel()
+        base = context_for(ch, 6, 0, base_seed=SEED)
+        rekeyed = context_for(ch, 6, 0, base_seed=SEED, trial_draw=5)
+        assert np.array_equal(base.sites, rekeyed.sites)
+        assert not np.allclose(base.y, rekeyed.y)
+
+    def test_trial_draw_none_reproduces_the_default_exactly(self) -> None:
+        ch = self._rich_channel()
+        base = context_for(ch, 6, 3, base_seed=SEED, level=1.0)
+        explicit_none = context_for(ch, 6, 3, base_seed=SEED, level=1.0, trial_draw=None)
+        assert np.array_equal(base.sites, explicit_none.sites)
+        assert np.array_equal(base.y, explicit_none.y)
+
+    def test_trial_draw_equal_to_draw_reproduces_the_default_exactly(self) -> None:
+        ch = self._rich_channel()
+        base = context_for(ch, 6, 3, base_seed=SEED, level=1.0)
+        same = context_for(ch, 6, 3, base_seed=SEED, level=1.0, trial_draw=3)
+        assert np.array_equal(base.sites, same.sites)
+        assert np.array_equal(base.y, same.y)
+
+    def test_distinct_trial_draws_give_distinct_readings_on_identical_sites(self) -> None:
+        ch = self._rich_channel()
+        ctxs = [context_for(ch, 6, 0, base_seed=SEED, trial_draw=k) for k in (0, 1, 2, 100)]
+        for other in ctxs[1:]:
+            assert np.array_equal(ctxs[0].sites, other.sites)
+        assert len({tuple(c.y.tolist()) for c in ctxs}) == len(ctxs)
+
+    def test_trial_draw_is_reproducible(self) -> None:
+        ch = self._rich_channel()
+        a = context_for(ch, 6, 0, base_seed=SEED, trial_draw=7)
+        b = context_for(ch, 6, 0, base_seed=SEED, trial_draw=7)
+        assert np.array_equal(a.sites, b.sites) and np.array_equal(a.y, b.y)
+
+    def test_rekeyed_values_are_still_real_trials_of_the_shared_sites(self) -> None:
+        ch = self._rich_channel()
+        ctx = context_for(ch, 6, 0, base_seed=SEED, trial_draw=9)
+        for site, value in zip(ctx.sites, ctx.y):
+            assert value in set(ch.Y_trials[site].tolist())
+
+    def test_sites_stay_keyed_by_draw_not_trial_draw(self) -> None:
+        """Sites for (draw=1, trial_draw=0) are those of draw 1, not of draw 0."""
+        ch = self._rich_channel()
+        mixed = context_for(ch, 6, 1, base_seed=SEED, trial_draw=0)
+        assert np.array_equal(mixed.sites, context_sites(ch.X_pool, 6, 1, base_seed=SEED))

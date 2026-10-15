@@ -1,0 +1,125 @@
+# F6 - layer-depth mechanism analysis (sprint #3, F6-E / F6-0 / F6-1 first pass).
+#
+# Explains update_rule's F6 figure (output/mechanism/update_rule/nhp/nhp/layer_alignment.svg): why the
+# representation-change / GP-update alignment jumps at block 1, dips at block 5, and recovers with depth.
+# This config's `layer_dynamics.gates` block is the PRE-REGISTERED threshold table for every lettered
+# conjecture (C0.a-C6b) in task_plan.md's "Conjectures and decision rules": it is frozen before the first
+# run and copied verbatim into the F6-4 verdict table, never chosen after the fact.
+#
+# Subset (task_plan.md "Subsets"): Phases 0-1 and S1 use 18 NHP channels x t in {10, 25, 50, 80} x draw 0 x
+# 12 anchors (864 anchors). Engine is tabpfn_v2_5 only: the capture hooks need the transformer.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_layer_dynamics_nhp.yaml
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_layer_dynamics_nhp.yaml --only-cached
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_layer_dynamics_nhp.yaml --replot
+defaults:
+  dataset: nhp
+  context: nhp
+
+analysis: layer_dynamics
+tag: nhp
+device: cpu
+seed: 42
+output_root: output
+
+layer_dynamics:
+  engine: tabpfn_v2_5
+  # 45 uniformly sampled anchors (user decision 2026-10-12). The previous 12 stratified anchors
+  # allocated the four strata equally, which is NOT proportional to their population shares (the
+  # perimeter is 36 of 96 sites but took 25 % of the sample), so the unweighted pooled statistic was
+  # not an estimate of the grid-level quantity it was read as. Strata are recorded per anchor
+  # instead (update_rule.stratum_masks), so every conditional contrast is still available and the
+  # realized per-stratum counts are population-proportional.
+  anchor_selection: uniform
+  n_anchors: 45
+  reference_gp: mll
+  # Keep in step with mechanism_update_rule_nhp.yaml's update_rule.gp_params by hand (same reference GP).
+  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5, lengthscale_floor: 0.05}
+  fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.05}
+  stress: {knob: k2_channel, levels: [1.0]}
+  n_context_draws: 1
+  surprises: [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0]
+  inference_seed: 0
+  max_batch_tokens: 400000
+  context_ts: [10, 25, 50, 80]
+  # A3: one shared partition per anchor (seeded, not hardcoded), reused by every block AND every
+  # head stage. `spatial` adds a second fold scheme holding out contiguous grid patches: random site
+  # folds put near-neighbours on both sides of the split, and the monotone preference for the
+  # weakest penalty measured on 2026-10-09 is exactly what that leakage looks like. The spatial arm
+  # runs at one penalty and fewer repeats because the contrast of interest is scheme-vs-scheme, and
+  # a k-means partition of a fixed grid barely moves with its seed.
+  # The ladder now reaches 0.01 (user, 2026-10-12). The first three decreased monotonically, which
+  # located the optimum at or below 0.1 and left open how much of that was neighbour interpolation;
+  # the spatial fold scheme answered that more directly (leakage 0.31 at block 0, 0.05 at block 17),
+  # so these two extra points are confirmatory. Five values are baked in now rather than extended
+  # again later: lambda is part of the cell identity, so every addition re-runs the forward passes
+  # it does not need.
+  probe:
+    n_folds: 5
+    n_repeats: 10
+    lambda_rels: [0.01, 0.05, 0.1, 1.0, 10.0]
+    spatial: true
+    spatial_n_repeats: 5
+    spatial_lambda_rel: 1.0
+  # The geometry test. |Delta_GP| is proportional to the CONDITIONED kernel slice across sites, so a
+  # plain correlation with it cannot separate "updates like a GP" from "spreads the value by input
+  # similarity". Partialling out the PRIOR (context-blind) kernel at the same fitted lengthscales
+  # is what separates them; the fixed-kernel GP is the second reference the same rule names.
+  # stage_cka: debiased CKA between consecutive blocks' representations (C6b). Where consecutive
+  # blocks are least alike marks a change of character in the representation, which is the
+  # pre-registered signature of a boundary between stages of inference.
+  geometry: {enabled: true, fixed_reference: true, stage_cka: true}
+  # 'train' is the second arm of the fingerprint comparison (F6-A4); 'test' is the historical path.
+  injection_mode: test
+  # Which precision the main grid runs at. 'auto' = TabPFN's own choice (fp16 autocast on CUDA,
+  # fp32 on CPU); 'fp32' forces full precision. Part of the cell identity.
+  precision: auto
+  # C0.a, the precision gate. Three arms on identical contexts, anchors and injected values, so
+  # fp16-vs-fp32 on one device isolates precision and fp32-on-two-devices isolates the device.
+  # Needs CUDA for two of the three.
+  precision_check:
+    enabled: false
+    n_channels: 6
+    context_ts: [10, 25, 50, 80]
+    reference_arm: cpu_fp32
+  # The two causal tests, on their own smaller subset because each anchor costs extra forward
+  # passes (one per skipped block, four per swapped block).
+  #   skip   identity-skip a block and measure the change in the OUTPUT update (C6a block influence).
+  #   swap   exchange the injected row's state at a block between the two surprise signs (C2). A
+  #          reversal (cos = -1) means that row still carries the whole update at that depth; no
+  #          effect (cos = +1) means the query rows already hold it.
+  causal:
+    enabled: false
+    n_channels: 6
+    context_ts: [10, 80]
+    n_anchors: 12
+    skip_blocks: [0, 1, 2, 5, 12, 13, 14, 15, 16, 17]
+    swap_blocks: [0, 1, 2, 3, 5, 8, 12, 17]
+  # S4: the output-space curve, through the checkpoint's own decoder, zero fitted parameters. At
+  # block 17 it equals the model's real prediction by construction (verified to 1.5e-5, float32).
+  lens: {enabled: true}
+  # Pre-registered thresholds -- see task_plan.md "Conjectures and decision rules" for the derivation of
+  # each number. Copied verbatim into the F6-4 verdict table.
+  gates:
+    c0a_alignment_delta: 0.05
+    c0a_cosine_min: 0.9
+    c0b_margin: 0.10
+    c0c_spearman_max: -0.1
+    c0d_rho_shape: 0.065
+    c0d_ell_hat: 0.33
+    c0d_far_field_share: 0.135
+    c0d_locality: 0.20
+    c1_partial_r_max: 0.1
+    c1_gp_fixed_delta_max: 0.05
+    c1_gp_specific_min: 0.2
+    c1p_segment_gap: 0.15
+    c2_label_removed_min: 0.5
+    c2_feature_removed_max: 0.2
+    c3_axis_delta_r2: 0.05
+    c3_icc_max: 0.5
+    c4c_block5_lift: 0.1
+    c4c_far_field_cut_t10: 0.135
+    c5_relative_dip_max: 0.25
+    c5_norm_plateau_dip: 0.57
+    c6a_block0_delta: 0.2
+    c6a_mid_block_delta_max: 0.065

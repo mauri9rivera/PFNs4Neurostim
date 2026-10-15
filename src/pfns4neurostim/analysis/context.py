@@ -95,6 +95,7 @@ def context_for(
     *,
     base_seed: int,
     level: float | None = None,
+    trial_draw: int | None = None,
 ) -> Context:
     """The context one analysis cell is conditioned on: shared sites, this channel's own trials.
 
@@ -105,12 +106,19 @@ def context_for(
         base_seed: Experiment-wide base seed.
         level: Stress level of the cell, part of the trial stream's key so that two levels of the same
             channel draw different trials at the same sites. ``None`` for an unstressed cell.
+        trial_draw: Re-key the *trial* stream only, leaving the site set untouched (``None`` = use
+            ``draw`` for both, the default everywhere). Both streams are normally keyed by ``draw``,
+            so changing it moves the sites as well; a reference that needs the **same sites with
+            independent readings** -- the CKA noise ceiling of 2026-10-12, which asks how similar two
+            GP posterior covariances are when they differ only by measurement noise -- cannot be
+            built that way. This is the one knob that separates the two.
 
     Returns:
         The context, with ``sites`` from :func:`context_sites` and one valid trial drawn per site.
     """
     sites = context_sites(channel.X_pool, t, draw, base_seed=base_seed)      # [t]
     rng = rng_for(
-        channel.label, CONTEXT_TRIAL_STREAM, level, int(t), int(draw), base_seed=base_seed
+        channel.label, CONTEXT_TRIAL_STREAM, level, int(t),
+        int(draw if trial_draw is None else trial_draw), base_seed=base_seed,
     )
     return draw_context(channel, int(t), rng, sites=sites)

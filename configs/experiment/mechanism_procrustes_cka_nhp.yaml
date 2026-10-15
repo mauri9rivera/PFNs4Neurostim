@@ -1,0 +1,96 @@
+# M14 revived (2026-10-14): Procrustes disparity as the SPECTRUM-WEIGHTING COMPLEMENT of the CKA analysis.
+#
+# Same clouds, same loop, one more statistic. For one channel and one context draw, TabPFN-2.5 is conditioned on
+# t observed trials and all 96 NHP grid sites are embedded at every block -- exactly the clouds
+# configs/experiment/mechanism_cka_nhp.yaml forms (analysis/embeddings.py, feature-token mean). The disparity
+# between the cloud at `baseline_t` and the cloud at each t of the ladder is reported per layer, so a reader can
+# put the CKA curve and the Procrustes curve side by side on the SAME pairs (figure procrustes_vs_cka).
+#
+# WHY IT ADDS ANYTHING -- corrected 2026-10-14, see analysis/procrustes.py. The motivating claim was that CKA is
+# blind to anisotropy and Procrustes is not. That is FALSE: centred linear CKA and Procrustes have the SAME
+# invariance group (translation, isotropic scale, any orthogonal map), so an anisotropic stretch changes the Gram
+# matrix and CKA does see it. The real difference is the norm each puts on the cross-covariance spectrum: CKA is
+# a Frobenius (sum-of-squares) quantity dominated by the LEADING directions, while the Procrustes residual
+# 1 - (sum of singular values)^2 is a NUCLEAR-norm quantity that weights every direction equally. Neither
+# dominates: inflating the 95 weak directions of a 96-site cloud while leaving the dominant one alone moves the
+# disparity 0.17 and CKA < 0.01, and a 1->6 gain ramp goes the other way (CKA 0.20, disparity 0.06). Both are
+# measured in tests/analysis/test_procrustes.py. So the complementary channel is real but it is "change spread
+# across the weakly-populated directions", not "anisotropy". The reason this matters here is that every block
+# ends in a parameter-free post-LayerNorm -- each token lies on a sqrt(192) sphere, so the per-site norm readouts
+# (rho_shape, ||dZ||) are direction-blind; Procrustes and CKA are both direction-aware and disagree about which
+# directions count.
+#
+# CAVEAT 1 -- THE ROTATION QUOTIENT IS A CHOICE. The prediction head (Linear 192->384 -> GELU -> Linear 384->5000)
+# has fixed weights and is NOT rotation-equivariant, so a global rotation of all tokens genuinely changes what the
+# model predicts. Procrustes declares that rotation irrelevant. Defensible for "did the geometry change shape?",
+# indefensible for any claim connected to the output. Every number from this run is a representation-similarity
+# readout to be reported BESIDE an output-space readout, never instead of one, and never in a caption about the
+# prediction. Restated in analysis/procrustes.py and in headline.json of the run directory.
+#
+# CAVEAT 2 -- n < d, AND THE CONTROL THAT FIXES IT. 96 sites, 192 dimensions: two centred 96-row clouds each span
+# at most a 95-dimensional subspace of a 192-dimensional space, so an orthogonal map aligns them far better than
+# chance and a raw disparity is BIASED LOW. The legacy M14 code escaped that by subsampling 300 rows; a 96-site
+# grid cannot. The fix is the SHUFFLED-SITE NULL and it is not optional: the row correspondence of one cloud is
+# permuted (destroying the site matching, leaving both clouds' marginal geometry untouched) `n_perm` times, which
+# is what two unrelated 96-row clouds in 192 dimensions reach. It is computed inside the same primitive as the
+# disparity (analysis/procrustes.procrustes_with_null), so the two can never be computed apart.
+#
+#   PRE-DECLARED HEADLINE STATISTIC: the DIFFERENCE `disparity_minus_null` = disparity - null_mean.
+#   Chosen because (i) it mirrors CKA's `cka_minus_null`, so the complementary panels read on the same kind of
+#   axis; (ii) the ratio is unstable when the null sits near its ceiling (disparity is bounded in [0, 1]);
+#   (iii) the percentile saturates -- it cannot resolve finer than 1/(n_perm + 1) and the measurements are
+#   expected to sit below the entire null distribution. The ratio and the percentile are written anyway, as
+#   secondary readouts, in procrustes.csv.
+#
+# THE TWO AXES ARE NOT THE SAME CONTROL, and the write-up must keep them apart:
+#   * the t LADDER tests whether the geometric drift depends on how much evidence the network has;
+#   * the NULL tests whether a disparity number means anything at all at 96 rows in 192 dimensions.
+# Raising t cannot fix Caveat 2: the cloud's rows are the 96 readout SITES, so the context size does not change
+# the row count. (And t > 96 is impossible -- analysis/context.context_sites draws DISTINCT sites without
+# replacement and raises unless 2 <= t <= N.)
+#
+# LADDER. 10 / 25 / 50 / 80 are the shared NHP ladder (configs/context/nhp.yaml), kept verbatim so the Procrustes
+# and CKA curves are comparable cell for cell; t = 2 is added as the disparity baseline (the least-informed
+# context TabPFN accepts) and t = 96 as the grid cap (the fully-observed end). Unlike CKA this analysis does not
+# skip t == n_sites.
+#
+# COST. Each shuffled-site replicate is one [95, 95] SVD, ~0.8 ms, and cannot be collapsed into a single
+# contraction the way CKA's null can -- hence n_perm 200 here against cka.n_perm 1000. Per cell: 6 hooked forward
+# passes + 18 layers x 6 context sizes x 201 disparities. Cells: 18 channels x 1 level x 3 draws = 54.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_procrustes_cka_nhp.yaml
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_procrustes_cka_nhp.yaml --only-cached
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_procrustes_cka_nhp.yaml --replot
+defaults:
+  dataset: nhp
+  context: nhp
+
+analysis: procrustes
+tag: nhp
+device: cpu
+seed: 42
+output_root: output
+
+# Output: output/mechanism/procrustes/cka/nhp/nhp/ (user requirement 2026-10-14; the nesting under `cka` says on
+# disk that this is that analysis' complement -- experiments/mechanism.ANALYSIS_SUBDIR).
+
+# The shared NHP ladder [10, 25, 50, 80] plus the t = 2 baseline and the t = 96 grid cap. Overriding this group
+# inline rather than editing configs/context/nhp.yaml keeps every other NHP mechanism analysis on its ladder.
+context:
+  sizes: [2, 10, 25, 50, 80, 96]
+
+procrustes:
+  layers: null                 # all 18 blocks
+  readouts: [feature_mean]     # the readout CKA (b) places; feature_tokens is rejected (per-token null undefined)
+  baseline_t: 2                # must be in context.sizes
+  n_context_draws: 3           # draws are averaged WITHIN a channel before the spread over channels is taken
+  n_perm: 200                  # shuffled-site replicates (Caveat 2); see COST above
+  inference_seed: 0
+  stress: {knob: k2_channel, levels: [1.0]}   # unstressed: the question is evidence, not signal quality
+  # null = every one of the 96 sites. Subsampling cannot help at n < d here (it lowers n further); the key exists
+  # for larger grids, and because setting it is the direct way to SHOW the bias -- the same cell at n_rows: 48
+  # has a HIGHER null. Indices are drawn once per cell and shared by every layer and context size, so the row
+  # correspondence survives.
+  subsample: {n_rows: null}
+  cka_companion: true          # debiased linear CKA of the SAME two clouds, for the side-by-side panel
+  figures: {context_layers: [0, 1, 5, 11, 17]}   # every layer is in the CSV; an 18-trace legend is unreadable

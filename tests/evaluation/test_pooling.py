@@ -92,3 +92,28 @@ def test_channel_summary_fails_on_nan() -> None:
     frame.loc[0, "recommended_regret"] = np.nan
     with pytest.raises(ValueError, match="non-finite"):
         channel_summary(frame, ["model"], "recommended_regret", robust=False)
+
+
+class TestLegacyDemoSpellings:
+    """Cells cached before the 2026-09-27 rename recorded ``demo2``/``demo1`` (fixed at read time 2026-10-13).
+
+    The cell is never rewritten -- ``pooled.csv`` would otherwise carry four names for two arms, so any
+    ``demo == 'draws'`` filter would silently drop a third of the in-vivo pool.
+    """
+
+    def test_pooled_demo_column_uses_the_current_names(self, tmp_path) -> None:
+        run = _write_run(str(tmp_path / "r"), {"family": "f", "tag": "t"}, _tidy(demo="demo2"))
+        with pytest.warns(UserWarning, match="4 rows carry a pre-2026-09-27 demo spelling"):
+            out = load_run(run, str(tmp_path))
+        assert set(out["demo"]) == {"draws"}
+
+    def test_demo1_is_the_synthetic_arm(self, tmp_path) -> None:
+        run = _write_run(str(tmp_path / "r"), {"family": "f", "tag": "t"}, _tidy(demo="demo1"))
+        with pytest.warns(UserWarning, match="demo spelling"):
+            assert set(load_run(run, str(tmp_path))["demo"]) == {"synthetic"}
+
+    def test_current_names_pass_through_without_a_warning(self, tmp_path, recwarn) -> None:
+        run = _write_run(str(tmp_path / "r"), {"family": "f", "tag": "t"}, _tidy(demo="draws"))
+        out = load_run(run, str(tmp_path))
+        assert set(out["demo"]) == {"draws"}
+        assert not [w for w in recwarn if "demo spelling" in str(w.message)]

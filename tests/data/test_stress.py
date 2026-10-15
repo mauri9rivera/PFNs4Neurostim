@@ -250,3 +250,94 @@ class TestChannelValidation:
         ch = _channel()
         assert ch.gt_range == pytest.approx(float(ch.y_gt.max() - ch.y_gt.min()))
         assert ch.best_site == int(np.argmax(ch.y_gt))
+
+
+class TestStressParameterNotation:
+    """The canonical stress-parameter symbols (settled with the user 2026-10-12).
+
+    Two symbols were doing double duty before: ``alpha`` meant both K2-channel's residual gain and
+    K2-global's added-noise SD, and ``epsilon`` both K5's contaminated-slot fraction and K6-failure's
+    failed-electrode fraction. A manuscript cannot carry that, so every knob now owns one letter, and
+    ``alpha`` / ``sigma`` / ``kappa`` / ``lambda`` / ``rho`` / ``delta`` are left to the GP, the acquisition
+    functions and the Hyp C update-rule statistics.
+    """
+
+    def test_every_implemented_knob_declares_a_symbol(self) -> None:
+        for name in stress.available_knobs(implemented_only=True):
+            assert stress.KNOB_REGISTRY[name].symbol, f"{name} declares no stress-parameter symbol."
+
+    def test_no_symbol_is_used_twice(self) -> None:
+        symbols = [stress.KNOB_REGISTRY[n].symbol for n in stress.available_knobs(implemented_only=True)]
+        assert len(set(symbols)) == len(symbols), f"a stress symbol is reused: {sorted(symbols)}"
+
+    def test_the_two_k2_settings_and_the_two_fractions_differ(self) -> None:
+        assert stress.KNOB_REGISTRY["k2_channel"].symbol != stress.KNOB_REGISTRY["k2_global"].symbol
+        assert stress.KNOB_REGISTRY["k5_outliers"].symbol != stress.KNOB_REGISTRY["k6_failure"].symbol
+
+    def test_symbols_match_the_figure_layer(self) -> None:
+        """``style.KNOB_SYMBOLS`` mirrors the registry, so a figure never contradicts the definition."""
+        from pfns4neurostim.visualization import style
+
+        for name in stress.available_knobs(implemented_only=True):
+            assert style.KNOB_SYMBOLS[name] == stress.KNOB_REGISTRY[name].symbol
+
+
+class TestNominalIn:
+    """Resolving the unstressed level of a realized ladder (the figures' default marker)."""
+
+    @pytest.mark.parametrize(
+        "name,levels,expected",
+        [
+            ("k2_channel", [0.5, 1.0, 2.0], 1.0),
+            ("k2_global", [0.0, 0.5, 1.0], 0.0),
+            ("k5_outliers", [0.0, 0.1], 0.0),
+            ("k6_failure", [0.0, 0.5], 0.0),
+            ("k7_shuffle", [0.0, 1.0], 0.0),
+            ("k1_decoy", [0.0, 0.5], 0.0),
+        ],
+    )
+    def test_fixed_nominal_levels(self, name: str, levels: list[float], expected: float) -> None:
+        assert stress.KNOB_REGISTRY[name].nominal_in(levels) == pytest.approx(expected)
+
+    def test_k6_budget_resolves_to_the_full_budget_not_the_old_constant(self) -> None:
+        """K6-budget's unstressed level is the configured budget (96 on NHP), never a class constant.
+
+        Until 2026-10-12 ``nominal_level`` was 50, which names a *stressed* cell of the NHP ladder, so the
+        robustness table's nominal reference and the default marker both pointed at the wrong level.
+        """
+        assert stress.KNOB_REGISTRY["k6_budget"].nominal_in([10, 20, 30, 50, 96]) == pytest.approx(96.0)
+        assert np.isnan(stress.KNOB_REGISTRY["k6_budget"].nominal_level)
+
+    def test_a_ladder_without_the_unstressed_level_has_no_nominal(self) -> None:
+        assert stress.KNOB_REGISTRY["k2_channel"].nominal_in([2.0, 4.0]) is None
+        assert stress.KNOB_REGISTRY["k6_budget"].nominal_in([]) is None
+
+
+class TestDefaultRegimeSnrIsOneNumberPerChannel:
+    """The invariant the 2026-10-12 figure work rests on.
+
+    The default marker is comparable across figures only because the unstressed cell is the *same channel*
+    whichever knob is swept: applying any knob at its nominal level must leave achieved SNR at the channel's
+    floor, exactly. K5 and K6-failure are the two that could plausibly drift (they draw from ``rng`` and
+    rewrite the bank or the pool), so they are tested like the rest rather than assumed.
+    """
+
+    @pytest.mark.parametrize(
+        "name,kwargs",
+        [
+            ("k2_channel", {}),
+            ("k2_global", {}),
+            ("k5_outliers", {}),
+            ("k6_budget", {}),
+            ("k6_failure", {}),
+            ("k7_shuffle", {}),
+        ],
+    )
+    def test_nominal_level_leaves_the_floor_snr_untouched(self, name: str, kwargs: dict) -> None:
+        ch = _channel()
+        levels = [10.0, 20.0, 96.0] if name == "k6_budget" else None
+        knob = stress.build_knob(name, levels, **kwargs)
+        nominal = type(knob).nominal_in(levels if levels is not None else knob.levels)
+        assert nominal is not None, f"{name}: its default ladder contains no unstressed level."
+        stressed = knob.apply(ch, nominal, np.random.default_rng(0))
+        assert snr.achieved_snr_db(stressed) == pytest.approx(stress.floor_snr_db(ch), abs=1e-9)

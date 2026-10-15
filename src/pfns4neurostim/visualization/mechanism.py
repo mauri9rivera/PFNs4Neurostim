@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from typing import Any, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -23,11 +23,15 @@ __all__ = [
     "render_update_rule",
     "render_placement",
     "render_cka",
+    "render_procrustes",
 ]
 
 #: Legend title over the stress-level series of the placement trajectory, so the lines are not an
-#: unlabelled ladder of colours (the levels are the K2 residual-amplification factor alpha).
-PLACEMENT_LEVEL_LEGEND_TITLE: str = "K2 noise level (alpha)"
+#: unlabelled ladder of colours. The series were labelled by the raw K2 level (``1 / 2 / 4``) until
+#: 2026-10-12; they are now the **absolute achieved SNR** of the level, the same quantity and the same
+#: numbers as the x-axis of every Hyp B stress figure, so a reader can place a mechanism panel against a
+#: degradation curve (user decision 2026-10-12).
+PLACEMENT_LEVEL_LEGEND_TITLE: str = "Achieved SNR (dB)"
 
 #: Half-width of the floor / ceiling reference bands, in placement units.
 REFERENCE_BAND_HALF_WIDTH: float = 0.05
@@ -40,6 +44,38 @@ REFERENCE_BAND_HALF_WIDTH: float = 0.05
 #: ``cka.csv`` and in the config's ``targets``, so the control and the sensitivity check remain auditable;
 #: they are simply not headline panels. The targets of interest are the response and the GP posterior.
 CKA_PLOTTED_TARGETS: tuple[str, ...] = ("K_GT", "K_GP")
+
+
+def _level_snr_labels(df: pd.DataFrame) -> dict[float, str]:
+    """Map each stress level of a mechanism frame to its achieved-SNR legend entry.
+
+    Every mechanism cell records ``achieved_snr_db`` of the stressed channel it ran on, so the stress ladder
+    can be reported in the same units as the Hyp B figures instead of as raw knob levels. The level that
+    applies no stress is named "default", which is the per-dataset anchor the two hypotheses share.
+
+    Args:
+        df: Mechanism frame carrying ``level`` and, ideally, ``achieved_snr_db`` and ``knob``.
+
+    Returns:
+        Mapping level -> legend entry. Falls back to the knob's own symbol and the raw level when the frame
+        carries no SNR column, so a missing column is visible rather than silently mislabelled.
+    """
+    from ..data.stress import KNOB_REGISTRY  # noqa: PLC0415 - avoids a data -> visualization import cycle
+
+    levels = sorted(float(level) for level in df["level"].unique())
+    knob = str(df["knob"].iloc[0]) if "knob" in df.columns and len(df) else ""
+    cls = KNOB_REGISTRY.get(knob)
+    nominal = cls.nominal_in(levels) if cls is not None else None
+    if "achieved_snr_db" not in df.columns:
+        symbol = style.KNOB_SYMBOLS.get(knob, "level")
+        return {level: f"{symbol} = {level:g}" for level in levels}
+    snr = df.groupby("level")["achieved_snr_db"].mean()
+    return {
+        level: style.snr_series_label(
+            float(snr.loc[level]), is_default=nominal is not None and np.isclose(level, nominal)
+        )
+        for level in levels
+    }
 
 
 def _has_rows(path: str) -> bool:
@@ -249,6 +285,7 @@ def _f2_shape_vs_context(cell: pd.DataFrame, run_dir: str, gates: list[dict[str,
 def _f3_surprise(surprise: pd.DataFrame, run_dir: str) -> list[str]:
     """F3: update at the anchor vs surprise, one panel per stress level (H10.2)."""
     levels = sorted(surprise["level"].unique())
+    snr_labels = _level_snr_labels(surprise)
     fig, axes = style.figure("wide", ncols=len(levels), sharey=True)
     axes = np.atleast_1d(axes)
     df = surprise.assign(
@@ -264,7 +301,7 @@ def _f3_surprise(surprise: pd.DataFrame, run_dir: str) -> list[str]:
         ref = sub.groupby("c")["d_gp_norm"].median()
         ax.plot(ref.index, ref.values, color=style.NEUTRAL_GREY, ls="--", label="GP update (linear)")
         knob = str(sub["knob"].iloc[0]) if "knob" in sub and len(sub) else ""
-        ax.set_title(f"{style.KNOB_LABELS.get(knob, knob)} level {level:g}")
+        ax.set_title(f"{style.KNOB_LABELS.get(knob, knob)}, {snr_labels.get(float(level), f'{level:g}')}")
         ax.set_xlabel(style.axis_label("surprise_c"))
     axes[0].set_ylabel(style.axis_label("update_at_anchor"))
     axes[0].legend(loc="best")
@@ -363,6 +400,419 @@ def _f6_layer_alignment(layers: pd.DataFrame, run_dir: str) -> list[str]:
                    fontsize=style.FONT_SIZES["legend"], title_fontsize=style.FONT_SIZES["legend"])
     style.panel_letters(axes)
     return style.save_figure(fig, run_dir, "layer_alignment")
+
+
+def render_layer_dynamics(run_dir: str) -> list[str]:
+    """F6-0/F6-1 preview: per-block alignment, common-mode share and the rebuilt ridge probe.
+
+    First-pass figure for :mod:`pfns4neurostim.experiments.mechanism_layers` -- a working preview
+    of A2/A3 while the Phase-0 gate is open, not the redesigned, captioned F6 of F6-4 (G6: no
+    layer-wise claim is drawn from this before that item lands).
+
+    Args:
+        run_dir: Layer-dynamics run directory.
+
+    Returns:
+        Written paths.
+    """
+    align_path = os.path.join(run_dir, "layer_dynamics.csv")
+    probe_path = os.path.join(run_dir, "layer_probe.csv")
+    written: list[str] = []
+    if os.path.exists(align_path) and _has_rows(align_path):
+        align = pd.read_csv(align_path)
+        written += _layer_dynamics_alignment(align, run_dir)
+        written += _layer_dynamics_geometry(align, run_dir)
+        written += _layer_dynamics_robust(align, run_dir)
+        written += _layer_dynamics_direction(align, run_dir)
+    if os.path.exists(probe_path) and _has_rows(probe_path):
+        written += _layer_dynamics_probe(pd.read_csv(probe_path), run_dir)
+    for name, fn in (("layer_precision", _layer_dynamics_precision),
+                     ("layer_causal", _layer_dynamics_causal)):
+        path = os.path.join(run_dir, f"{name}.csv")
+        if os.path.exists(path) and _has_rows(path):
+            written += fn(pd.read_csv(path), run_dir)
+    return written
+
+
+#: Head stages appended to the layer axis after block 17, in order, behind a visual break. They are
+#: deterministic functions of the block-17 label token, so they are positions on the depth axis
+#: rather than further blocks; H2 is the first state not under a parameter-free LayerNorm.
+HEAD_STAGES: tuple[str, ...] = ("H1", "H2", "H3")
+
+#: Gap (in x units) between block 17 and the first head stage, where the axis break is drawn.
+HEAD_BREAK_GAP: float = 1.6
+
+
+def _stage_positions(stages: Sequence[str]) -> dict[str, float]:
+    """x position of every stage: blocks at their own index, head stages past a gap."""
+    pos = {s: float(s[len("block"):]) for s in stages if s.startswith("block")}
+    last = max(pos.values(), default=-1.0)
+    for i, name in enumerate(h for h in HEAD_STAGES if h in stages):
+        pos[name] = last + HEAD_BREAK_GAP + i
+    return pos
+
+
+def _layer_dynamics_alignment(align: pd.DataFrame, run_dir: str) -> list[str]:
+    """F6 two-curve figure: representation alignment per context size, plus the output-space curve.
+
+    Panel (a) carries both curves on one y-axis, because both are the same statistic -- a
+    correlation across sites against the reference GP's update -- read off two different things:
+
+    * **representation geometry** (solid, one shade per context size): the size of the change in the
+      feature-token mean. Defined at every block and, past the break, at the three head stages.
+    * **output space** (dashed, the largest context only): the change in the prediction the network
+      *would* make if it stopped at that block, read through the checkpoint's own decoder with zero
+      fitted parameters. Drawn for one context only because two curves per context size is
+      unreadable (user decision 2026-10-12); at block 17 it equals the real prediction.
+
+    Panel (b) is the share of each stage's change carried by a site-independent shift.
+
+    Args:
+        align: ``layer_dynamics.csv``.
+        run_dir: Run directory.
+
+    Returns:
+        Written paths.
+    """
+    fig, axes = style.figure("wide", ncols=2)
+    st = arm_style("tabpfn_v2_5")
+    contexts = sorted(align["context_t"].unique())
+    stages = [s for s in align["stage"].unique()] if "stage" in align.columns else []
+    pos = _stage_positions(stages) if stages else {}
+
+    def _x(frame: pd.DataFrame) -> pd.Series:
+        return frame["stage"].map(pos) if pos else frame["layer"].astype(float)
+
+    for ax, col in zip(axes, ("pearson", "common_mode_share")):
+        for i, t in enumerate(contexts):
+            color = st.color if len(contexts) == 1 else style.derive_shade(st.color, i, len(contexts))
+            sub = align[align["context_t"] == t].copy()
+            sub["_x"] = _x(sub)
+            agg = sub.groupby("_x")[col]
+            med = agg.median()
+            ax.plot(med.index, med.values, color=color, marker=st.marker, label=f"$t$ = {int(t)}")
+            ax.fill_between(med.index, agg.quantile(0.25).values, agg.quantile(0.75).values,
+                            color=color, alpha=style.BAND_ALPHA, lw=0)
+        ax.set_xlabel(style.axis_label("layer"))
+        ax.set_ylabel("Pearson $r$ with $|\\Delta_{GP}|$" if col == "pearson" else "Common-mode share")
+
+    # The output-space curve: largest context only, dashed, same axis as the representation curve.
+    if "lens_pearson" in align.columns and contexts:
+        t_max = max(contexts)
+        sub = align[(align["context_t"] == t_max) & align["lens_pearson"].notna()].copy()
+        if len(sub):
+            sub["_x"] = _x(sub)
+            med = sub.groupby("_x")["lens_pearson"].median()
+            axes[0].plot(med.index, med.values, color=st.color, ls="--", lw=1.4, marker="s",
+                         ms=style.MARKER_SIZE, mfc="none",
+                         label=f"output space, $t$ = {int(t_max)}")
+
+    # Mark the break and name the head stages.
+    head_pos = [pos[h] for h in HEAD_STAGES if h in pos]
+    for ax in axes:
+        if head_pos:
+            ax.axvline(min(head_pos) - HEAD_BREAK_GAP / 2.0, color=style.NEUTRAL_GREY, lw=0.8, ls=":")
+            block_ticks = [v for k, v in pos.items() if k.startswith("block") and int(k[5:]) % 4 == 0]
+            ax.set_xticks(block_ticks + head_pos)
+            ax.set_xticklabels([f"{int(v)}" for v in block_ticks] + [h for h in HEAD_STAGES if h in pos])
+        else:
+            style.set_integer_xaxis(ax)
+    axes[0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    style.panel_letters(axes)
+    return style.save_figure(fig, run_dir, "layer_dynamics_alignment")
+
+
+def _layer_dynamics_probe(probe: pd.DataFrame, run_dir: str) -> list[str]:
+    """Rebuilt ridge-probe R^2 vs block: penalty sensitivity, and random vs spatial fold schemes.
+
+    The spatial arm holds out contiguous grid patches instead of random sites. Because the
+    representation change is spatially smooth, a random split lets a weakly penalised probe
+    interpolate between neighbours; the gap between the two schemes is the size of that effect.
+    """
+    fig, axes = style.figure("wide", ncols=2)
+    st = arm_style("tabpfn_v2_5")
+    has_scheme = "fold_scheme" in probe.columns
+    rnd = probe[probe["fold_scheme"] == "random"] if has_scheme else probe
+    lambdas = sorted(rnd["lambda_rel"].unique())
+    for i, lam in enumerate(lambdas):
+        color = st.color if len(lambdas) == 1 else style.derive_shade(st.color, i, len(lambdas))
+        agg = rnd[rnd["lambda_rel"] == lam].groupby("layer")["ridge_r2"]
+        med = agg.median()
+        axes[0].plot(med.index, med.values, color=color, marker=st.marker,
+                     label=f"$\\lambda_{{rel}}$ = {lam:g}")
+        axes[0].fill_between(med.index, agg.quantile(0.25).values, agg.quantile(0.75).values,
+                             color=color, alpha=style.BAND_ALPHA, lw=0)
+    axes[0].legend(loc="best", fontsize=style.FONT_SIZES["legend"], title="random folds",
+                   title_fontsize=style.FONT_SIZES["legend"])
+
+    if has_scheme and (probe["fold_scheme"] == "spatial").any():
+        lam_s = float(probe[probe["fold_scheme"] == "spatial"]["lambda_rel"].iloc[0])
+        for scheme, ls, label in (("random", "-", "random sites"), ("spatial", "--", "spatial patches")):
+            sub = probe[(probe["fold_scheme"] == scheme) & np.isclose(probe["lambda_rel"], lam_s)]
+            if not len(sub):
+                continue
+            agg = sub.groupby("layer")["ridge_r2"]
+            med = agg.median()
+            axes[1].plot(med.index, med.values, color=st.color, ls=ls, marker=st.marker,
+                         mfc="none" if scheme == "spatial" else st.color, label=label)
+            axes[1].fill_between(med.index, agg.quantile(0.25).values, agg.quantile(0.75).values,
+                                 color=st.color, alpha=style.BAND_ALPHA, lw=0)
+        axes[1].legend(loc="best", fontsize=style.FONT_SIZES["legend"],
+                       title=f"held-out groups ($\\lambda_{{rel}}$ = {lam_s:g})",
+                       title_fontsize=style.FONT_SIZES["legend"])
+    for ax in axes:
+        ax.set_xlabel(style.axis_label("layer"))
+        style.set_integer_xaxis(ax)
+        ax.set_ylabel("ridge $R^2$ (rebuilt probe)")
+    style.panel_letters(axes)
+    return style.save_figure(fig, run_dir, "layer_dynamics_probe")
+
+
+def _layer_dynamics_geometry(align: pd.DataFrame, run_dir: str) -> list[str]:
+    """The geometry test: does the conditioned kernel explain anything the prior kernel does not?
+
+    ``|Delta_GP|`` is proportional, across sites, to the *conditioned* kernel slice, so the headline
+    alignment cannot by itself separate GP-like updating from similarity smearing. Panel (a) shows
+    the plain correlations against the conditioned and the prior kernel together; panel (b) shows the
+    partial correlation with the conditioned kernel once the prior one is partialled out, which is
+    the quantity that carries the Bayesian content.
+    """
+    cols = ("pearson", "pearson_prior_kernel", "partial_r_gp_given_prior")
+    if not all(c in align.columns for c in cols):
+        return []
+    blocks = align[align["stage"].str.startswith("block")].copy() if "stage" in align.columns else align.copy()
+    blocks["_x"] = blocks["layer"].astype(float)
+    fig, axes = style.figure("wide", ncols=2)
+    st = arm_style("tabpfn_v2_5")
+    gp_st = arm_style("gp_mll_frozen")
+    for col, color, ls, label in (
+        ("pearson", st.color, "-", "conditioned kernel ($|\\Delta_{GP}|$)"),
+        ("pearson_prior_kernel", gp_st.color, "--", "prior kernel $k(x, x^*)$"),
+        ("pearson_gp_fixed", style.NEUTRAL_GREY, ":", "fixed-kernel GP"),
+    ):
+        if col not in blocks.columns or blocks[col].isna().all():
+            continue
+        med = blocks.groupby("_x")[col].median()
+        axes[0].plot(med.index, med.values, color=color, ls=ls, marker=st.marker, label=label)
+    axes[0].set_ylabel("Pearson $r$ with $\\|\\Delta Z_\\ell\\|$")
+    axes[0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+
+    agg = blocks.groupby("_x")["partial_r_gp_given_prior"]
+    med = agg.median()
+    axes[1].plot(med.index, med.values, color=st.color, marker=st.marker)
+    axes[1].fill_between(med.index, agg.quantile(0.25).values, agg.quantile(0.75).values,
+                         color=st.color, alpha=style.BAND_ALPHA, lw=0)
+    axes[1].axhline(0.0, color=style.NEUTRAL_GREY, lw=0.8)
+    axes[1].set_ylabel("partial $r$, conditioned | prior")
+    for ax in axes:
+        ax.set_xlabel(style.axis_label("layer"))
+        style.set_integer_xaxis(ax)
+    style.panel_letters(axes)
+    return style.save_figure(fig, run_dir, "layer_dynamics_geometry")
+
+
+def _layer_dynamics_robust(align: pd.DataFrame, run_dir: str) -> list[str]:
+    """C0.b: does the early peak survive excluding the injected site and the observed sites?
+
+    Panel (a) puts the four alignment variants on one axis, so the reader can see which exclusion
+    moves the curve and by how much. Panel (b) is the pre-registered test itself: the margin by
+    which the second block exceeds the average over blocks 3-17, per context size, against the
+    frozen 0.10 threshold -- the statistic the rule names is the one that drops *both* the injected
+    site and the observed sites, and it is drawn last so it reads on top.
+
+    Args:
+        align: ``layer_dynamics.csv``.
+        run_dir: Run directory.
+
+    Returns:
+        Written paths.
+    """
+    variants = [
+        ("pearson", "all sites", "-"),
+        ("pearson_unobserved", "observed dropped", "--"),
+        ("pearson_off_anchor", "injected site dropped", ":"),
+        ("pearson_unobserved_off_anchor", "both dropped (the named rule)", "-."),
+    ]
+    present = [(c, lab, ls) for c, lab, ls in variants if c in align.columns and align[c].notna().any()]
+    if not present:
+        return []
+    blocks = align[align["stage"].str.startswith("block")].copy()
+    blocks["L"] = blocks["layer"].astype(float)
+    fig, axes = style.figure("wide", ncols=2)
+    st = arm_style("tabpfn_v2_5")
+    for i, (col, label, ls) in enumerate(present):
+        color = st.color if len(present) == 1 else style.derive_shade(st.color, i, len(present))
+        med = blocks.groupby("L")[col].median()
+        axes[0].plot(med.index, med.values, color=color, ls=ls, marker=st.marker, label=label)
+    axes[0].axhline(0.0, color=style.NEUTRAL_GREY, lw=0.8)
+    axes[0].set_ylabel("Pearson $r$ with $|\\Delta_{GP}|$")
+    axes[0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+
+    contexts = sorted(blocks["context_t"].unique())
+    width = 0.8 / max(len(present), 1)
+    for i, (col, label, _ls) in enumerate(present):
+        color = st.color if len(present) == 1 else style.derive_shade(st.color, i, len(present))
+        margins = []
+        for t in contexts:
+            g = blocks[blocks["context_t"] == t]
+            margins.append(g[g["L"] == 1][col].median() - g[g["L"].between(3, 17)][col].median())
+        axes[1].bar(np.arange(len(contexts)) + i * width, margins, width=width, color=color, label=label)
+    axes[1].axhline(0.10, color=style.NEUTRAL_GREY, ls="--", lw=1.0)
+    axes[1].set_xticks(np.arange(len(contexts)) + 0.4 - width / 2)
+    axes[1].set_xticklabels([str(int(t)) for t in contexts])
+    axes[1].set_xlabel(style.axis_label("context_t"))
+    axes[1].set_ylabel("block 1 $-$ blocks 3–17")
+    axes[0].set_xlabel(style.axis_label("layer"))
+    style.set_integer_xaxis(axes[0])
+    style.panel_letters(axes)
+    return style.save_figure(fig, run_dir, "layer_dynamics_robust")
+
+
+def _layer_dynamics_direction(align: pd.DataFrame, run_dir: str) -> list[str]:
+    """C5 and C6b: the direction-aware readouts, and similarity between consecutive blocks.
+
+    Panel (a) normalises each readout by its own maximum over blocks, because they live on
+    different scales and the pre-registered question is *relative*: whether the mid-depth dip is
+    shallower for a direction-aware statistic than for the size-only one. Panel (b) is the
+    consecutive-block similarity whose minima were predicted to mark stage boundaries.
+
+    Args:
+        align: ``layer_dynamics.csv``.
+        run_dir: Run directory.
+
+    Returns:
+        Written paths.
+    """
+    cols = [("pearson", "size only"), ("vector_cka", "GP-shaped component"),
+            ("signed_pc_r", "signed leading direction")]
+    present = [(c, lab) for c, lab in cols if c in align.columns and align[c].notna().any()]
+    if len(present) < 2:
+        return []
+    blocks = align[align["stage"].str.startswith("block")].copy()
+    blocks["L"] = blocks["layer"].astype(float)
+    fig, axes = style.figure("wide", ncols=2)
+    st = arm_style("tabpfn_v2_5")
+    for i, (col, label) in enumerate(present):
+        color = st.color if len(present) == 1 else style.derive_shade(st.color, i, len(present))
+        med = blocks.groupby("L")[col].median()
+        peak = med.max()
+        if peak <= 0:
+            continue
+        axes[0].plot(med.index, med.values / peak, color=color, marker=st.marker,
+                     ls="-" if i == 0 else "--", label=label)
+    axes[0].axhline(0.75, color=style.NEUTRAL_GREY, ls=":", lw=1.0)
+    axes[0].set_ylabel("share of each readout's own peak")
+    axes[0].set_xlabel(style.axis_label("layer"))
+    axes[0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    style.set_integer_xaxis(axes[0])
+
+    if "cka_next_block" in blocks.columns and blocks["cka_next_block"].notna().any():
+        agg = blocks.groupby("L")["cka_next_block"]
+        med = agg.median().dropna()
+        axes[1].plot(med.index, med.values, color=st.color, marker=st.marker)
+        axes[1].fill_between(med.index, agg.quantile(0.25).reindex(med.index).values,
+                             agg.quantile(0.75).reindex(med.index).values,
+                             color=st.color, alpha=style.BAND_ALPHA, lw=0)
+        lows = med.nsmallest(3)
+        axes[1].plot(lows.index, lows.values, "v", color=style.NEUTRAL_GREY,
+                     ms=style.MARKER_SIZE * 2, label="three lowest")
+        axes[1].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    axes[1].set_ylabel("similarity, block $\\ell$ vs $\\ell+1$")
+    axes[1].set_xlabel(style.axis_label("layer"))
+    style.set_integer_xaxis(axes[1])
+    style.panel_letters(axes)
+    return style.save_figure(fig, run_dir, "layer_dynamics_direction")
+
+
+def _layer_dynamics_precision(prec: pd.DataFrame, run_dir: str) -> list[str]:
+    """C0.a: the three-arm precision comparison.
+
+    Panel (a) is the agreement between arms: the cosine between the half- and full-precision
+    representation changes isolates precision, the cosine between the two full-precision devices
+    isolates hardware, and the frozen 0.9 threshold is drawn. Panel (b) is what that does to the
+    reported statistic -- the arms' alignment side by side, where only the first block separates.
+
+    Args:
+        prec: ``layer_precision.csv``.
+        run_dir: Run directory.
+
+    Returns:
+        Written paths.
+    """
+    if not {"cos_precision", "cos_device"} <= set(prec.columns):
+        return []
+    fig, axes = style.figure("wide", ncols=2)
+    st = arm_style("tabpfn_v2_5")
+    gp = arm_style("gp_mll_frozen")
+    for col, color, label in (("cos_precision", st.color, "half vs full precision (same GPU)"),
+                              ("cos_device", gp.color, "GPU vs CPU (both full precision)")):
+        med = prec.groupby("layer")[col].median()
+        axes[0].plot(med.index, med.values, color=color, marker=st.marker, label=label)
+    axes[0].axhline(0.9, color=style.NEUTRAL_GREY, ls="--", lw=1.0)
+    axes[0].set_ylabel("median cosine between arms")
+    axes[0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+
+    arms = [("align_cuda_fp16", "half precision, GPU", "--"),
+            ("align_cuda_fp32", "full precision, GPU", "-"),
+            ("align_cpu_fp32", "full precision, CPU", ":")]
+    for i, (col, label, ls) in enumerate(a for a in arms if a[0] in prec.columns):
+        color = style.derive_shade(st.color, i, 3)
+        med = prec.groupby("layer")[col].median()
+        axes[1].plot(med.index, med.values, color=color, ls=ls, marker=st.marker, label=label)
+    axes[1].axhline(0.0, color=style.NEUTRAL_GREY, lw=0.8)
+    axes[1].set_ylabel("Pearson $r$ with $|\\Delta_{GP}|$")
+    axes[1].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    for ax in axes:
+        ax.set_xlabel(style.axis_label("layer"))
+        style.set_integer_xaxis(ax)
+    style.panel_letters(axes)
+    return style.save_figure(fig, run_dir, "layer_dynamics_precision")
+
+
+def _layer_dynamics_causal(causal: pd.DataFrame, run_dir: str) -> list[str]:
+    """C6a and C2: the two causal interventions.
+
+    Panel (a) is block influence -- how much the output update changes when one block is skipped,
+    with both frozen thresholds drawn (0.20 for the first block, 0.065 for the middle ones). Panel
+    (b) is the routing hand-off: the share of the update still carried by the injected row when its
+    state is swapped at that block, one line per context size. A share near 1 means the sites being
+    predicted are still reading the value from that row rather than holding it themselves.
+
+    Args:
+        causal: ``layer_causal.csv``.
+        run_dir: Run directory.
+
+    Returns:
+        Written paths.
+    """
+    if "intervention" not in causal.columns:
+        return []
+    fig, axes = style.figure("wide", ncols=2)
+    st = arm_style("tabpfn_v2_5")
+
+    skip = causal[causal["intervention"] == "skip"].copy()
+    if len(skip):
+        skip["d_rho"] = (skip["rho_shape_plain"] - skip["rho_shape"]).abs()
+        med = skip.groupby("block")["d_rho"].median()
+        axes[0].bar(med.index.astype(int), med.values, color=st.color, width=0.7)
+        axes[0].axhline(0.20, color=style.NEUTRAL_GREY, ls="--", lw=1.0)
+        axes[0].axhline(0.065, color=style.NEUTRAL_GREY, ls=":", lw=1.0)
+        axes[0].set_ylabel("change in output alignment when skipped")
+
+    swap = causal[causal["intervention"] == "swap"]
+    if len(swap) and "injected_row_share" in swap.columns:
+        contexts = sorted(swap["context_t"].unique())
+        for i, t in enumerate(contexts):
+            color = st.color if len(contexts) == 1 else style.derive_shade(st.color, i, len(contexts))
+            med = swap[swap["context_t"] == t].groupby("block")["injected_row_share"].median()
+            axes[1].plot(med.index, med.values, color=color, marker=st.marker, label=f"$t$ = {int(t)}")
+        axes[1].set_ylabel("share still carried by the injected row")
+        axes[1].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    for ax in axes:
+        ax.set_xlabel(style.axis_label("layer"))
+        style.set_integer_xaxis(ax)
+    style.panel_letters(axes)
+    return style.save_figure(fig, run_dir, "layer_dynamics_causal")
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +1164,7 @@ def render_placement(run_dir: str) -> list[str]:
     metrics = sorted(pd.read_csv(path_b)["metric"].unique()) if os.path.exists(path_b)         else sorted(ctx["metric"].unique())
     ctx = ctx[~ctx["is_full"].astype(bool)]
     levels = sorted(ctx["level"].unique())
+    snr_labels = _level_snr_labels(ctx)
     cmap = plt.get_cmap(style.LEVEL_CMAP)
     fig, axes = style.figure("wide", ncols=len(metrics), squeeze=False)
     for ax, metric in zip(axes[0], metrics):
@@ -724,7 +1175,8 @@ def render_placement(run_dir: str) -> list[str]:
             # hue region viridis never reaches.
             color = cmap(0.1 + 0.8 * (i / max(len(levels) - 1, 1)))
             agg = sub[sub["level"] == level].groupby("context_t")["p"].median()
-            ax.plot(agg.index, agg.values, color=color, marker="o", label=f"{level:g}")
+            ax.plot(agg.index, agg.values, color=color, marker="o",
+                    label=snr_labels.get(float(level), f"{level:g}"))
         _reference_bands(ax, "h", label_it=False, lines_only=True)
         ax.set_xscale("log")
         # Ticks at the measured context sizes only; the default log locator crowds them together.
@@ -748,6 +1200,7 @@ _CKA_PANEL_ASPECT: float = 0.45
 def _cka_a_figure(df: pd.DataFrame, readout: str, targets: list[str], run_dir: str) -> list[str]:
     """CKA (a) of one feature readout: rows = context sizes, columns = targets, colour = stress level."""
     levels = sorted(df["level"].unique())
+    snr_labels = _level_snr_labels(df)
     # ONE ROW PER CONTEXT SIZE (2026-09-30): the figure's subject is what the network does with its evidence.
     contexts = sorted(df["context_t"].unique())
     fig, axes = style.figure("wide", nrows=len(contexts), ncols=len(targets), panel_aspect=_CKA_PANEL_ASPECT,
@@ -766,7 +1219,7 @@ def _cka_a_figure(df: pd.DataFrame, readout: str, targets: list[str], run_dir: s
                 agg = per_channel.groupby("layer")["cka_minus_null"]
                 med, q1, q3 = agg.median(), agg.quantile(0.25), agg.quantile(0.75)
                 ax.plot(med.index, med.values, color=color, ls=style.READOUT_LINESTYLES.get(readout, "-"),
-                        label=f"level {level:g}")
+                        label=snr_labels.get(float(level), f"{level:g}"))
                 ax.fill_between(med.index, q1.values, q3.values, color=color, alpha=style.BAND_ALPHA, lw=0)
             ax.axhline(0.0, color=style.NEUTRAL_GREY, lw=style.LINE_WIDTH / 2)
             if r == 0:
@@ -808,25 +1261,52 @@ def render_cka(run_dir: str) -> list[str]:
     return written
 
 
-def _cka_placement_figures(pl: pd.DataFrame, run_dir: str) -> list[str]:
-    """CKA (b): placement of the feature-token mean vs layer (one trace per context size), and its surface."""
-    # Layers whose floor/ceiling gap is degenerate are DROPPED, not clipped: placement is
-    # (d - floor) / (ceiling - floor), so a ~0 (or negative) denominator makes the ratio explode and
-    # inverts its sign (decision 2026-09-27). The excluded layers are named on the figure instead.
-    usable = pl[pl["gap_ok"].astype(bool)]
-    dropped = sorted(set(pl["layer"]) - set(usable["layer"]))
-    if usable.empty:
-        return []
-    contexts = sorted(usable["context_t"].unique())
+#: Style key of each placement statistic's axis label. The CSV column name is NOT the key: the ratio's label is
+#: registered as ``placement`` (it predates the column), and ``p`` alone is the permutation p-value in ``cka.csv``,
+#: so looking the column up directly silently falls back to a title-cased "P".
+PLACEMENT_AXIS_KEYS: dict[str, str] = {"p": "placement", "p_rank": "p_rank"}
+
+
+def _placement_vs_layer(
+    pl: pd.DataFrame,
+    column: str,
+    run_dir: str,
+    name: str,
+    *,
+    dropped: list[int],
+    rank_reading: bool,
+) -> list[str]:
+    """One placement-vs-layer figure: median over channels per layer, one trace per context size.
+
+    Args:
+        pl: Rows of ``cka_placement.csv`` already filtered to what this statistic can use.
+        column: Statistic to plot (``p_rank`` or the frozen ratio ``p``).
+        run_dir: Run directory.
+        name: Output basename.
+        dropped: Layers excluded for a degenerate floor/ceiling gap; named on the figure when non-empty.
+        rank_reading: ``True`` draws the rank's between-references guide at 0.5 and clamps the axis to the
+            statistic's own bounds; ``False`` draws the ratio's floor / ceiling reference bands.
+
+    Returns:
+        Written paths.
+    """
+    contexts = sorted(pl["context_t"].unique())
     base = style.model_color("tabpfn_v2_5")
     fig, ax = style.figure("onehalf")
-    _reference_bands(ax, "h", label_it=True)
+    if rank_reading:
+        # The rank's 0 and 1 mean "below / above every reference map", not "at the prior / noise median", so the
+        # ratio's reference bands would misread it. The one meaningful landmark is 0.5 = between the two clouds.
+        mid, label = style.RANK_PLACEMENT_TICKS[1][0], style.RANK_PLACEMENT_MIDLINE_LABEL
+        ax.axhline(mid, color=style.NEUTRAL_GREY, lw=style.LINE_WIDTH / 2,
+                   ls=style.REFERENCE_CEILING_LINESTYLE, label=label, zorder=0)
+    else:
+        _reference_bands(ax, "h", label_it=True)
     for i, t in enumerate(contexts):
         # One trace per context size (2026-09-30): placement is conditioned on the evidence the embedding saw.
         color = base if len(contexts) == 1 else style.derive_shade(base, i, len(contexts))
-        per_channel = (usable[usable["context_t"] == t]
-                       .groupby(["subject", "emg", "layer"])["p"].mean().reset_index())
-        agg = per_channel.groupby("layer")["p"]
+        per_channel = (pl[pl["context_t"] == t]
+                       .groupby(["subject", "emg", "layer"])[column].mean().reset_index())
+        agg = per_channel.groupby("layer")[column]
         med = agg.median()
         ax.plot(med.index, med.values, color=color, marker="o", label=f"$t$ = {int(t)}")
         ax.fill_between(med.index, agg.quantile(0.25).values, agg.quantile(0.75).values,
@@ -837,49 +1317,274 @@ def _cka_placement_figures(pl: pd.DataFrame, run_dir: str) -> list[str]:
                 fontsize=style.FONT_SIZES["annotation"], alpha=0.8)
     ax.set_xlabel(style.axis_label("layer"))
     style.set_integer_xaxis(ax)
-    ax.set_ylabel(style.axis_label("placement"))
+    ax.set_ylabel(style.axis_label(PLACEMENT_AXIS_KEYS[column]))
+    if rank_reading:
+        # The statistic cannot leave [0, 1], so the axis says so instead of auto-scaling to the data's span
+        # and leaving a reader to wonder whether values outside it were clipped away.
+        lo, hi = style.RANK_PLACEMENT_TICKS[0][0], style.RANK_PLACEMENT_TICKS[-1][0]
+        ax.set_ylim(lo, hi)
     ax.legend(loc="best", fontsize=style.FONT_SIZES["legend"])
-    written = style.save_figure(fig, run_dir, "cka_placement")
-    return written + _cka_placement_surface(usable, dropped, run_dir)
+    return style.save_figure(fig, run_dir, name)
 
 
-def _cka_placement_surface(usable: pd.DataFrame, dropped: list[int], run_dir: str) -> list[str]:
-    """Layer x context-size heatmap of the CKA placement p of the feature-token mean (2026-09-30).
+# ---------------------------------------------------------------------------
+# procrustes (M14 revived, 2026-10-14): the spectrum-weighting complement of CKA
+# ---------------------------------------------------------------------------
+#: Linestyle of the shuffled-site null reference in every Procrustes figure. The null is drawn in
+#: :data:`style.NEUTRAL_GREY` -- the token for a non-learning baseline, which is exactly what a row-permutation
+#: reference is -- and never in a model anchor or in the prior/noise reference colours (those mean something else
+#: in this project's figures).
+PROCRUSTES_NULL_LINESTYLE: tuple[int, tuple[int, int]] = (0, (3, 2))
 
-    The flat view of the layer / evidence / placement volume: a 3D surface of the same numbers reads worse in print
-    (occlusion, one fixed viewing angle, no way to read a value off it), so the third axis is colour. The colormap is
-    the package's sequential map (:data:`style.SEQUENTIAL_CMAP`, viridis) since 2026-10-07 (user): the earlier
-    two-stop ramp between the crimson / pink reference tokens had too little lightness range to read values off.
-    The scale is fixed to [0, 1] -- 0 = prior floor, 1 = noise ceiling, both named on the colorbar -- and values
-    outside it saturate, shown by the colorbar's extension arrows, rather than redefining the scale.
+#: Aggregation of a Procrustes panel: the context draws of a channel are averaged FIRST and the spread is taken
+#: over channels, so the band is between-channel heterogeneity (a finding) and not draw noise (an artefact).
+PROCRUSTES_CHANNEL_KEYS: tuple[str, ...] = ("subject", "emg")
+
+
+def _procrustes_context_layers(run_dir: str, available: Sequence[int]) -> list[int]:
+    """Layers to draw in the disparity-vs-context figure, from the run's own resolved config.
 
     Args:
-        usable: Rows of ``cka_placement.csv`` with a usable floor/ceiling gap.
-        dropped: Layers excluded for a degenerate gap, named on the figure.
+        run_dir: Procrustes run directory (holds ``config.yaml``).
+        available: Layers present in ``procrustes.csv``.
+
+    Returns:
+        The configured subset, or every available layer when the config does not pin one. Honours ``--replot``:
+        the resolved config written by the run is part of the run directory, so nothing is recomputed.
+    """
+    path = os.path.join(run_dir, "config.yaml")
+    wanted: Sequence[int] | None = None
+    if os.path.exists(path):
+        import yaml  # noqa: PLC0415 - only needed when a config is present
+
+        with open(path, encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh) or {}
+        wanted = ((doc.get("procrustes") or {}).get("figures") or {}).get("context_layers")
+    if not wanted:
+        return sorted(int(v) for v in available)
+    return sorted(int(v) for v in wanted if int(v) in set(int(a) for a in available))
+
+
+def _procrustes_median(df: pd.DataFrame, column: str, by: str) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Median and interquartile band of ``column`` over channels, after averaging each channel's draws.
+
+    Args:
+        df: Rows of ``procrustes.csv`` (already filtered to one series).
+        column: Value column.
+        by: Grouping axis (``'layer'`` or ``'context_t'``).
+
+    Returns:
+        ``(median, q1, q3)``, each indexed by ``by``.
+    """
+    per_channel = df.groupby([*PROCRUSTES_CHANNEL_KEYS, by])[column].mean().reset_index()
+    agg = per_channel.groupby(by)[column]
+    return agg.median(), agg.quantile(0.25), agg.quantile(0.75)
+
+
+def _procrustes_vs_context(df: pd.DataFrame, run_dir: str) -> list[str]:
+    """Disparity along the context ladder, per layer, with the shuffled-site null drawn as its reference.
+
+    The two axes of this figure answer different questions and must not be conflated: the **ladder** asks whether
+    the geometric drift depends on how much evidence the network has, while the **null** asks whether a disparity
+    number means anything at all at 96 rows in 192 dimensions. The null is a property of the clouds' marginal
+    geometry, not of the context size.
+    """
+    layers = _procrustes_context_layers(run_dir, sorted(df["layer"].unique()))
+    if not layers:
+        return []
+    base = style.model_color("tabpfn_v2_5")
+    fig, ax = style.figure("onehalf")
+    for i, layer in enumerate(layers):
+        sub = df[df["layer"] == layer]
+        color = base if len(layers) == 1 else style.derive_shade(base, i, len(layers))
+        med, q1, q3 = _procrustes_median(sub, "disparity", "context_t")
+        ax.plot(med.index, med.values, color=color, marker="o", label=rf"$\ell$ = {int(layer)}")
+        ax.fill_between(med.index, q1.values, q3.values, color=color, alpha=style.BAND_ALPHA, lw=0)
+        null_med, _, _ = _procrustes_median(sub, "null_mean", "context_t")
+        ax.plot(null_med.index, null_med.values, color=style.NEUTRAL_GREY, ls=PROCRUSTES_NULL_LINESTYLE,
+                lw=style.LINE_WIDTH, label="Shuffled-site null" if i == 0 else None)
+    ax.set_xlabel(style.axis_label("context_t"))
+    ax.set_ylabel(style.axis_label("procrustes_disparity"))
+    ax.legend(loc="best", fontsize=style.FONT_SIZES["legend"], ncol=2)
+    return style.save_figure(fig, run_dir, "procrustes_vs_context")
+
+
+def _procrustes_vs_layer(df: pd.DataFrame, run_dir: str) -> list[str]:
+    """The headline statistic (disparity minus the shuffled-site null) over layers, one trace per context size.
+
+    The baseline context size is dropped: it is each cloud compared with itself, so its disparity is 0 by
+    construction and the statistic degenerates to minus the null.
+    """
+    moved = df[~df["is_baseline"].astype(bool)]
+    if moved.empty:
+        return []
+    contexts = sorted(moved["context_t"].unique())
+    base = style.model_color("tabpfn_v2_5")
+    fig, ax = style.figure("onehalf")
+    for i, t in enumerate(contexts):
+        color = base if len(contexts) == 1 else style.derive_shade(base, i, len(contexts))
+        med, q1, q3 = _procrustes_median(moved[moved["context_t"] == t], "disparity_minus_null", "layer")
+        ax.plot(med.index, med.values, color=color, marker="o", label=f"$t$ = {int(t)}")
+        ax.fill_between(med.index, q1.values, q3.values, color=color, alpha=style.BAND_ALPHA, lw=0)
+    ax.axhline(0.0, color=style.NEUTRAL_GREY, ls=PROCRUSTES_NULL_LINESTYLE, lw=style.LINE_WIDTH,
+               label="Shuffled-site null")
+    ax.set_xlabel(style.axis_label("layer"))
+    style.set_integer_xaxis(ax)
+    ax.set_ylabel(style.axis_label("disparity_minus_null"))
+    ax.legend(loc="best", fontsize=style.FONT_SIZES["legend"], ncol=2)
+    baseline = int(df["baseline_t"].iloc[0])
+    ax.set_title(rf"vs the $t$ = {baseline} cloud", fontsize=style.FONT_SIZES["base"])
+    return style.save_figure(fig, run_dir, "procrustes_vs_layer")
+
+
+def _procrustes_vs_cka(df: pd.DataFrame, run_dir: str) -> list[str]:
+    """Procrustes and CKA over layers **on the same pairs of clouds** -- the comparison this analysis exists for.
+
+    Top: the disparity with its shuffled-site null. Bottom: debiased linear CKA of the same two clouds. The two
+    statistics share an invariance group (translation, isotropic scale, orthogonal maps) but weight the
+    cross-covariance spectrum differently -- CKA by a Frobenius norm, so the leading directions dominate, the
+    disparity by a nuclear norm, so every direction counts equally (see
+    :mod:`pfns4neurostim.analysis.procrustes`). A layer where the two curves disagree is a layer whose change
+    sits in the weakly-populated directions CKA discounts. Neither panel speaks to the model's prediction:
+    Procrustes declares a global rotation irrelevant and the prediction head is not rotation-equivariant.
+    """
+    moved = df[~df["is_baseline"].astype(bool)]
+    if moved.empty or "cka" not in moved.columns or moved["cka"].isna().all():
+        return []
+    contexts = sorted(moved["context_t"].unique())
+    base = style.model_color("tabpfn_v2_5")
+    fig, axes = style.figure("onehalf", nrows=2, sharex=True, squeeze=False)
+    top, bottom = axes[0][0], axes[1][0]
+    for i, t in enumerate(contexts):
+        color = base if len(contexts) == 1 else style.derive_shade(base, i, len(contexts))
+        sub = moved[moved["context_t"] == t]
+        for ax, column in ((top, "disparity"), (bottom, "cka")):
+            med, q1, q3 = _procrustes_median(sub, column, "layer")
+            ax.plot(med.index, med.values, color=color, marker="o", label=f"$t$ = {int(t)}")
+            ax.fill_between(med.index, q1.values, q3.values, color=color, alpha=style.BAND_ALPHA, lw=0)
+        null_med, _, _ = _procrustes_median(sub, "null_mean", "layer")
+        top.plot(null_med.index, null_med.values, color=style.NEUTRAL_GREY, ls=PROCRUSTES_NULL_LINESTYLE,
+                 lw=style.LINE_WIDTH, label="Shuffled-site null" if i == 0 else None)
+    top.set_ylabel(style.axis_label("procrustes_disparity"))
+    bottom.set_ylabel(style.axis_label("cka_pairwise"))
+    bottom.set_xlabel(style.axis_label("layer"))
+    style.set_integer_xaxis(bottom)
+    top.legend(loc="best", fontsize=style.FONT_SIZES["legend"], ncol=2)
+    style.panel_letters([top, bottom])
+    return style.save_figure(fig, run_dir, "procrustes_vs_cka")
+
+
+def render_procrustes(run_dir: str) -> list[str]:
+    """Figures of the Procrustes complement: disparity vs context, vs layer, and against CKA on the same pairs.
+
+    Args:
+        run_dir: Procrustes run directory (``output/mechanism/procrustes/cka/<dataset>/<tag>/``).
+
+    Returns:
+        Written paths.
+    """
+    path = os.path.join(run_dir, "procrustes.csv")
+    if not _has_rows(path):
+        return []
+    df = pd.read_csv(path)
+    written = _procrustes_vs_context(df, run_dir)
+    written += _procrustes_vs_layer(df, run_dir)
+    return written + _procrustes_vs_cka(df, run_dir)
+
+
+def _cka_placement_figures(pl: pd.DataFrame, run_dir: str) -> list[str]:
+    """CKA (b): placement of the feature-token mean vs layer (one trace per context size), and its surface.
+
+    The **reported** statistic is the rank placement ``p_rank`` (user decision 2026-10-12): it needs no
+    denominator and is bounded in [0, 1] by construction, so every layer is plotted -- there is nothing to drop
+    and nothing to clip. The ratio ``p`` stays on disk and is replotted beside it as the frozen reference, still
+    under its own (different) axis label and still with the degenerate-gap layers dropped, so the two readings
+    are never mixed on one axis.
+
+    Args:
+        pl: Rows of ``cka_placement.csv``.
         run_dir: Run directory.
 
     Returns:
         Written paths.
     """
-    grid = usable.pivot_table(index="context_t", columns="layer", values="p", aggfunc="median")
+    if pl.empty:
+        return []
+    written: list[str] = []
+    # Layers whose floor/ceiling gap is degenerate are DROPPED from the RATIO panel, not clipped: p is
+    # (d - floor) / (ceiling - floor), so a ~0 (or negative) denominator makes the ratio explode and inverts its
+    # sign (decision 2026-09-27). The excluded layers are named on that figure instead. The rank has no
+    # denominator, so this filter does not apply to it.
+    usable = pl[pl["gap_ok"].astype(bool)]
+    dropped = sorted(set(pl["layer"]) - set(usable["layer"]))
+    if "p_rank" in pl.columns:
+        ranks = pl.dropna(subset=["p_rank"])
+        if not ranks.empty:
+            written += _placement_vs_layer(ranks, "p_rank", run_dir, "cka_placement",
+                                           dropped=[], rank_reading=True)
+            written += _cka_placement_surface(ranks, [], run_dir, "p_rank",
+                                              "cka_placement_surface", rank_reading=True)
+    if not usable.empty:
+        written += _placement_vs_layer(usable, "p", run_dir, "cka_placement_ratio",
+                                       dropped=dropped, rank_reading=False)
+        written += _cka_placement_surface(usable, dropped, run_dir, "p",
+                                          "cka_placement_ratio_surface", rank_reading=False)
+    return written
+
+
+def _cka_placement_surface(
+    usable: pd.DataFrame,
+    dropped: list[int],
+    run_dir: str,
+    column: str,
+    name: str,
+    *,
+    rank_reading: bool,
+) -> list[str]:
+    """Layer x context-size heatmap of the CKA placement of the feature-token mean (2026-09-30).
+
+    The flat view of the layer / evidence / placement volume: a 3D surface of the same numbers reads worse in print
+    (occlusion, one fixed viewing angle, no way to read a value off it), so the third axis is colour. The colormap is
+    the package's sequential map (:data:`style.SEQUENTIAL_CMAP`, viridis) since 2026-10-07 (user): the earlier
+    two-stop ramp between the crimson / pink reference tokens had too little lightness range to read values off.
+    The scale is fixed to [0, 1] either way, but the two statistics' endpoints mean different things and are
+    labelled accordingly: for the frozen ratio 0 is the prior floor and 1 the noise ceiling, and values outside
+    the scale saturate (shown by the colorbar's extension arrows) rather than redefining it; for the rank the
+    endpoints are "below / above every reference map" (:data:`style.RANK_PLACEMENT_TICKS`) and nothing can fall
+    outside, so no extension arrows are drawn.
+
+    Args:
+        usable: Rows of ``cka_placement.csv`` this statistic can use (a usable floor/ceiling gap for the ratio).
+        dropped: Layers excluded for a degenerate gap, named on the figure.
+        run_dir: Run directory.
+        column: Statistic to map (``p_rank`` or the frozen ratio ``p``).
+        name: Output basename.
+        rank_reading: ``True`` labels the colorbar with the rank's endpoints and drops the saturation arrows.
+
+    Returns:
+        Written paths.
+    """
+    grid = usable.pivot_table(index="context_t", columns="layer", values=column, aggfunc="median")
     if grid.empty or grid.shape[0] < 2:
         return []   # a single context size is the line figure, not a surface
     fig, ax = style.figure("onehalf")
     # Context sizes are rows of EQUAL height (the ladder is not evenly spaced, so a numeric axis would let the
     # widest gap dominate the picture); cells without a usable gap at that (layer, t) stay blank.
     rows = np.arange(len(grid.index))                                        # [T]
+    ticks = style.RANK_PLACEMENT_TICKS if rank_reading else style.RATIO_PLACEMENT_TICKS
     im = ax.pcolormesh(grid.columns.to_numpy(), rows, grid.to_numpy(),
-                       cmap=style.SEQUENTIAL_CMAP, vmin=0.0, vmax=1.0, shading="nearest")
+                       cmap=style.SEQUENTIAL_CMAP, vmin=ticks[0][0], vmax=ticks[-1][0], shading="nearest")
     ax.set_xlabel(style.axis_label("layer"))
     style.set_integer_xaxis(ax)
     ax.set_ylabel(style.axis_label("context_t"))
     ax.set_yticks(rows, [str(int(t)) for t in grid.index])
-    cb = fig.colorbar(im, ax=ax, label=style.axis_label("placement"), extend="both")
-    cb.set_ticks([0.0, 0.5, 1.0], labels=["0 (prior floor)", "0.5", "1 (noise ceiling)"])
+    cb = fig.colorbar(im, ax=ax, label=style.axis_label(PLACEMENT_AXIS_KEYS[column]),
+                      extend="neither" if rank_reading else "both")
+    cb.set_ticks([v for v, _ in ticks], labels=[lab for _, lab in ticks])
     notes = [f"layers omitted: {', '.join(str(d) for d in dropped)}"] if dropped else []
     if grid.isna().to_numpy().any():
         notes.append("blank: no usable prior/noise gap")
     if notes:
         ax.text(0.98, 1.02, "; ".join(notes), transform=ax.transAxes, ha="right", va="bottom",
                 fontsize=style.FONT_SIZES["annotation"], alpha=0.8)
-    return style.save_figure(fig, run_dir, "cka_placement_surface")
+    return style.save_figure(fig, run_dir, name)

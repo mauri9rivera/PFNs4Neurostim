@@ -226,6 +226,71 @@ class TestDistanceProfile:
         assert x[1] == pytest.approx(channel.X_pool[:, 1].mean())
 
 
+# ---------------------------------------------------------------------------
+# conditioned_profile / fit_conditioned_lengthscale (F6-E: conditioned_profile factored out
+# of fit_conditioned_lengthscale's local closure into a top-level function, now in __all__,
+# so analysis.layer_dynamics's template bank (B1) can evaluate it at a ladder of ell values).
+# ---------------------------------------------------------------------------
+class TestConditionedProfile:
+    def test_fit_conditioned_lengthscale_unchanged_on_a_synthetic_grid(self) -> None:
+        """The refactor must not change what the fit recovers: a profile generated from a
+        known-ell RBF GP (via conditioned_profile itself) is fit back to the same ell --
+        the same positive-control shape as TestGates.test_positive_control_true_gp_passes,
+        but exercised directly against the extracted function rather than through the probe.
+        """
+        Q = np.linspace(0, 10, 11)[:, None]
+        context_X = np.array([[2.0], [5.0], [8.0]])
+        anchor = 5
+        true_ell = 1.3
+        noise_ratio = 0.1
+        g = U.conditioned_profile(true_ell, Q, anchor, context_X, noise_ratio)
+        fitted = U.fit_conditioned_lengthscale(g, Q, anchor, context_X, noise_ratio)
+        assert fitted == pytest.approx(true_ell, rel=1e-3)
+
+    def test_conditioned_profile_matches_a_brute_force_gp_posterior_covariance(self) -> None:
+        """Cross-check against a direct matrix-inverse GP posterior-covariance computation
+        (independent of conditioned_profile's own Cholesky-solve implementation) on a tiny
+        2D context, so a bug in the vectorized solve path cannot hide behind a self-consistent
+        rewrite of the same math.
+        """
+        rng = np.random.default_rng(1)
+        Q = rng.uniform(0, 10, size=(9, 2))
+        context_X = rng.uniform(0, 10, size=(4, 2))
+        anchor = 3
+        ell = 2.1
+        noise_ratio = 0.25
+
+        def rbf(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+            d2 = ((a[:, None, :] - b[None, :, :]) ** 2).sum(-1)
+            return np.exp(-0.5 * d2 / ell ** 2)
+
+        K_CC = rbf(context_X, context_X) + noise_ratio * np.eye(len(context_X))
+        K_CC_inv = np.linalg.inv(K_CC)
+        x_star = Q[anchor][None, :]
+        k_C_Q = rbf(Q, context_X)                        # [M, t]
+        k_C_star = rbf(context_X, x_star)                 # [t, 1]
+        k_Q_star = rbf(Q, x_star)[:, 0]                    # [M]
+        post_cov = k_Q_star - (k_C_Q @ K_CC_inv @ k_C_star)[:, 0]
+        post_var_star = 1.0 - (k_C_star.T @ K_CC_inv @ k_C_star)[0, 0]
+        expected = post_cov / post_var_star
+
+        got = U.conditioned_profile(ell, Q, anchor, context_X, noise_ratio)
+        np.testing.assert_allclose(expected, got, atol=1e-8)
+
+    def test_conditioned_profile_is_symmetric_and_monotone_on_an_isotropic_grid(self) -> None:
+        """On a symmetric 1D grid with a single, centred context point, the profile must be
+        symmetric about the anchor and decay monotonically with distance from it -- an
+        isotropic-kernel sanity check independent of the brute-force cross-check above.
+        """
+        Q = np.linspace(-6, 6, 13)[:, None]
+        context_X = np.array([[0.0]])
+        anchor = 6  # Q[6] == 0.0, coincides with the sole context point
+        g = U.conditioned_profile(1.5, Q, anchor, context_X, noise_ratio=0.2)
+        np.testing.assert_allclose(g, g[::-1], atol=1e-10)
+        half = g[6:]
+        assert np.all(np.diff(half) <= 1e-12)
+
+
 @pytest.mark.slow
 @pytest.mark.gpu
 def test_layer_alignment_rows(channel) -> None:
@@ -243,3 +308,67 @@ def _fit(ctx: U.Context) -> U.GPFrozenEngine:
     ref = _truth()
     ref.fit(ctx.X, ctx.y)
     return ref
+
+
+class TestStratumMasksAndUniformAnchors:
+    """``stratum_masks`` labels and ``select_anchors_uniform`` samples; both on the 10 x 10 fixture."""
+
+    def test_stratum_masks_names_match_anchor_strata(self, channel) -> None:
+        masks = U.stratum_masks(channel)
+        assert set(masks) == set(U.ANCHOR_STRATA)
+
+    def test_stratum_masks_are_boolean_per_site(self, channel) -> None:
+        for mask in U.stratum_masks(channel).values():
+            assert mask.dtype == bool and mask.shape == (channel.n_sites,)
+
+    def test_stratum_masks_sizes(self, channel) -> None:
+        masks = U.stratum_masks(channel)
+        q = channel.n_sites // 4
+        assert masks["high"].sum() == masks["low"].sum() == masks["centre"].sum() == q
+        assert masks["edge"].sum() == 4 * 10 - 4                      # perimeter of a 10 x 10 grid
+        assert not (masks["high"] & masks["low"]).any()
+
+    def test_strata_are_overlapping_labels_not_a_partition(self, channel) -> None:
+        """Make the response peak sit at a grid corner: that site is both high and edge."""
+        import dataclasses
+
+        X = channel.X_pool
+        tilted = dataclasses.replace(channel, y_gt=X[:, 0] + X[:, 1])
+        masks = U.stratum_masks(tilted)
+        assert (masks["high"] & masks["edge"]).any()
+
+    def test_uniform_anchors_respect_n_anchors_and_are_distinct_and_sorted(self, channel) -> None:
+        anchors, labels = U.select_anchors_uniform(channel, 12, np.random.default_rng(0))
+        assert anchors.shape == (12,) and len(labels) == 12
+        assert len(set(anchors.tolist())) == 12
+        assert np.array_equal(anchors, np.sort(anchors))
+
+    def test_uniform_anchors_avoid_the_excluded_context_sites(self, channel) -> None:
+        exclude = np.random.default_rng(3).choice(channel.n_sites, size=40, replace=False)
+        for seed in range(5):
+            anchors, _ = U.select_anchors_uniform(channel, 12, np.random.default_rng(seed), exclude)
+            assert set(anchors.tolist()).isdisjoint(set(exclude.tolist()))
+
+    def test_uniform_anchors_are_reproducible_per_seed(self, channel) -> None:
+        a1, l1 = U.select_anchors_uniform(channel, 12, np.random.default_rng(7))
+        a2, l2 = U.select_anchors_uniform(channel, 12, np.random.default_rng(7))
+        a3, _ = U.select_anchors_uniform(channel, 12, np.random.default_rng(8))
+        assert np.array_equal(a1, a2) and l1 == l2
+        assert not np.array_equal(a1, a3)
+
+    def test_labels_are_the_plus_joined_membership_of_stratum_masks(self, channel) -> None:
+        masks = U.stratum_masks(channel)
+        anchors, labels = U.select_anchors_uniform(channel, 30, np.random.default_rng(1))
+        for a, label in zip(anchors, labels):
+            expected = "+".join(n for n in U.ANCHOR_STRATA if masks[n][a]) or "none"
+            assert label == expected
+            assert set(label.split("+")) <= set(U.ANCHOR_STRATA) | {"none"}
+
+    def test_falls_back_to_the_whole_grid_when_too_few_unobserved_sites_remain(self, channel) -> None:
+        exclude = np.arange(channel.n_sites - 5)                      # only 5 selectable sites
+        anchors, labels = U.select_anchors_uniform(channel, 12, np.random.default_rng(0), exclude)
+        assert anchors.shape == (12,) and len(labels) == 12
+
+    def test_n_anchors_is_clamped_to_the_grid_size(self, channel) -> None:
+        anchors, _ = U.select_anchors_uniform(channel, channel.n_sites + 50, np.random.default_rng(0))
+        assert anchors.shape == (channel.n_sites,)

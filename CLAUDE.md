@@ -241,19 +241,25 @@ package, so it can never introduce a cycle.
 ```python
 HELD_OUT_SUBJECTS = {'rat': (0, 5), 'nhp': (1,), 'spinal': (0, 2, 5, 9), '5d_rat': (0, 3, 4)}
 TRAIN_SUBJECTS    = {'rat': (1, 2, 3, 4), 'nhp': (0, 3), ..., '5d_rat': (1, 2)}
-ALL_SUBJECTS      = {'rat': (0, 1, 2, 3, 4, 5), 'nhp': (0, 1, 3), ..., '5d_rat': (0, 1, 2, 3, 4)}
-# NHP subject 2 excluded — pure noise signal
+ALL_SUBJECTS      = {'rat': (0, 1, 2, 3, 4, 5), 'nhp': (0, 1, 2, 3), ..., '5d_rat': (0, 1, 2, 3, 4)}
+# NHP subject 2 (Macaque1) restored to ALL_SUBJECTS 2026-10-09 (roadmap DS1): it was excluded as a
+# "pure-noise signal" without a pre-declared threshold. HELD_OUT_SUBJECTS/TRAIN_SUBJECTS still
+# mirror the legacy train/held-out partition, which predates subject 2 and is unused by the
+# current no-split policy, so for NHP alone TRAIN | HELD_OUT no longer covers ALL_SUBJECTS.
+# Per-channel split-half reliability / SNR for subject 2, and the exclusion rule to check it
+# against, are still open and must be pre-declared before any BO result is read (DS1, 2nd item).
 # 5d_rat indices are positions in data/loaders/rat_5d.py::SUBJECTS (cohort noOutliers-2026-09-25):
 # 0 rCer1.5, 1 BCI00, 2 rCer1.12, 3 rCer1.14, 4 rCer1.15 — 17 channels. rData03 left the cohort
 # on 2026-09-25, so every index below it shifted down by one.
 ```
 
 **Policy change (2026-09-20): there is no train/held-out split any more.** Every valid subject
-(`ALL_SUBJECTS`: NHP without subject 2, and the five `5d_rat` animals of the current cohort) is evaluated and the
-dataset configs list them all. Because choices made by looking at results (primary acquisition, knob
-ranges, equivalence margins) are then made on the data that is reported, pre-register the decision rule
-in the config header and always report the full comparison table next to the chosen setting. The
-constants above are kept only as a regression reference.
+(`ALL_SUBJECTS`: all four NHP subjects since 2026-10-09, and the five `5d_rat` animals of the
+current cohort) is evaluated and the dataset configs list them all. Because choices made by
+looking at results (primary acquisition, knob ranges, equivalence margins) are then made on the
+data that is reported, pre-register the decision rule in the config header and always report the
+full comparison table next to the chosen setting. The constants above are kept only as a
+regression reference.
 
 ---
 
@@ -383,5 +389,15 @@ or axis string. Settled with the user on 2026-09-18 for the JNE/IOP target:
 
 **`[take-notes]` flag** — invokes the note-taker skill inline (no subagent spawned).
 Claude reads the current conversation and updates the relevant documentation files directly.
+
+@.claude/skills/grill-me/SKILL.md
+
+**`/grill-me`** — user-invoked only (`disable-model-invocation: true`; never self-triggered). Reasoning
+partner for a raw ask or idea, run as three gated processes — `[interview-me]` → `[refine-idea]` →
+`[doubt-me]` — with no tag running all three in order. Deliverables land under
+`.research_assistant/docs/intent/<topic>.md` and `.research_assistant/docs/ideas/<idea-name>.md`
+(created on first use), separate from the `task_plan.md` / `research_design.md` / `roadmap.md` trio above.
+Use it for framing a new experiment, hypothesis or sprint idea *before* it becomes a task-plan entry —
+not for implementation planning once scope is already settled.
 
 

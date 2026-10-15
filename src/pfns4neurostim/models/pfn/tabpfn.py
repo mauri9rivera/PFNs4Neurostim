@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import math
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -282,6 +282,12 @@ class FrozenTabPFN:
             same preprocessing is used across all fits (no hidden sampling).
         max_batch_tokens: Soft cap on ``B * N_rows`` per internal forward; larger batches
             are split into sub-batches to bound GPU memory.
+        precision: ``'auto'`` (TabPFN's own autocast heuristic) or ``'fp32'`` (forces
+            ``inference_precision=torch.float32``, disabling autocast even on CUDA). ``forward``
+            already runs in fp32 on CPU regardless of this flag (pinned ``tabpfn==6.3.2``
+            ``FrozenTabPFN.forward``/``base.py:determine_precision``), so the flag only changes
+            CUDA runs -- added so a CUDA arm can hold the device fixed while precision changes
+            (F6-E, sprint #3 A1).
     """
 
     def __init__(
@@ -289,11 +295,15 @@ class FrozenTabPFN:
         device: str = "cuda",
         random_state: int = 0,
         max_batch_tokens: int = 400_000,
+        precision: Literal["auto", "fp32"] = "auto",
     ) -> None:
         check_tabpfn_version()
+        if precision not in ("auto", "fp32"):
+            raise ValueError(f"FrozenTabPFN precision must be 'auto' or 'fp32', got {precision!r}.")
         self.device = torch.device(device)
         self.random_state = random_state
         self.max_batch_tokens = max_batch_tokens
+        self.precision = precision
         self._reg = TabPFNRegressor(
             device=device,
             n_estimators=1,
@@ -301,6 +311,7 @@ class FrozenTabPFN:
             ignore_pretraining_limits=True,
             fit_mode="fit_preprocessors",
             random_state=random_state,
+            inference_precision=torch.float32 if precision == "fp32" else "auto",
         )
         self._fitted = False
 
@@ -319,6 +330,7 @@ class FrozenTabPFN:
             raise RuntimeError("FrozenTabPFN.fit received NaN/Inf inputs.")
         if np.unique(y).size == 1:
             raise RuntimeError("FrozenTabPFN.fit: constant target is not supported.")
+        self._X_ctx_raw = np.asarray(X, dtype=np.float64).copy()  # [n, D] -- for transform_x(as_train=True)
         self._reg.fit(X, y)
         executor = self._reg.executor_
         members = getattr(executor, "ensemble_members", None)
@@ -384,18 +396,73 @@ class FrozenTabPFN:
         self._fitted = True
 
     # --------------------------------------------------------------- transforms
-    def transform_x(self, X: np.ndarray) -> torch.Tensor:
+    def transform_x(self, X: np.ndarray, *, as_train: bool = False) -> torch.Tensor:
         """Apply the frozen feature preprocessing.
 
         Args:
             X: Raw inputs, shape [q, D].
+            as_train: ``False`` (default) routes through the normal test-time path
+                (``member.transform_X_test``), which hashes the fingerprint feature (if
+                the config has one) as ``row + 2*salt`` with no collision check -- the
+                injected row of an update-rule probe gets the exact fingerprint of the
+                anchor's own query row (`add_fingerprint_features_step.py:59-64`), which no
+                real refit could produce. ``True`` instead replays this fitted pipeline's
+                steps up to and including the fingerprint step in **train mode**
+                (``row + salt`` plus the uniqueness increment against the context's own
+                fingerprint values, `:65-91`), then finishes the remaining steps normally --
+                reproducing what a refit on ``context ∪ {X}`` would assign the new row(s)
+                (F6-E, sprint #3 A4 / C0.d).
+
+        Returns:
+            Model-space features, shape [q, F].
+
+        Raises:
+            RuntimeError: If ``as_train`` is requested but this config has no fingerprint
+                feature step (nothing to replay in train mode).
+        """
+        self._check_fitted()
+        if not as_train:
+            Xt = self._member.transform_X_test(np.asarray(X, dtype=np.float64))
+            return torch.as_tensor(np.asarray(Xt), dtype=torch.float32, device=self.device)
+        Xt = self._train_mode_fingerprint_transform(np.asarray(X, dtype=np.float64))
+        return torch.as_tensor(np.asarray(Xt), dtype=torch.float32, device=self.device)
+
+    def _train_mode_fingerprint_transform(self, X: np.ndarray) -> np.ndarray:
+        """Replay ``cpu_preprocessor`` with the fingerprint step forced to train mode.
+
+        Pinned to tabpfn==6.3.2's pipeline shape (`preprocessing/pipeline.py:build_pipeline`):
+        every step before the fingerprint step is replayed via its normal (test-mode)
+        ``.transform``, since only ``AddFingerprintFeaturesStep`` distinguishes train from
+        test; the fingerprint step is then called directly on ``context ∪ X`` with
+        ``is_test=False`` so its collision-avoidance loop sees the real context hashes; the
+        remaining steps (e.g. the feature-shuffle step) run normally on the new row(s) alone.
+
+        Args:
+            X: Raw probe-row inputs, shape [q, D].
 
         Returns:
             Model-space features, shape [q, F].
         """
-        self._check_fitted()
-        Xt = self._member.transform_X_test(np.asarray(X, dtype=np.float64))
-        return torch.as_tensor(np.asarray(Xt), dtype=torch.float32, device=self.device)
+        from tabpfn.preprocessing.steps import AddFingerprintFeaturesStep  # noqa: PLC0415 - pinned internal
+
+        steps = list(self._member.cpu_preprocessor.steps)
+        fp_idx = [i for i, s in enumerate(steps) if isinstance(s, AddFingerprintFeaturesStep)]
+        if not fp_idx:
+            raise RuntimeError(
+                "FrozenTabPFN.transform_x(as_train=True): this config has no "
+                "AddFingerprintFeaturesStep; there is nothing to replay in train mode."
+            )
+        i = fp_idx[0]
+        ctx_pre, probe_pre = self._X_ctx_raw, X
+        for step in steps[:i]:
+            ctx_pre, _ = step.transform(ctx_pre)
+            probe_pre, _ = step.transform(probe_pre)
+        combined = np.concatenate([ctx_pre, probe_pre], axis=0)
+        combined_fp = steps[i]._transform(combined, is_test=False)  # noqa: SLF001 - pinned internal
+        probe_fp = combined_fp[len(ctx_pre):]
+        for step in steps[i + 1:]:
+            probe_fp, _ = step.transform(probe_fp)
+        return probe_fp
 
     def transform_y(self, y: torch.Tensor) -> torch.Tensor:
         """Map raw-unit targets into the model's target space (frozen normalisation).
@@ -466,18 +533,40 @@ class FrozenTabPFN:
                     categorical_inds=[self._cat_ix] * b,
                 )  # [q, b, bars]
             outs.append(raw.float().transpose(0, 1))  # [b, q, bars]
+        return self.decode_logits(torch.cat(outs, dim=0))  # [B, q, bars]
+
+    def decode_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Turn raw head logits into the log-probabilities :meth:`moments` consumes.
+
+        The post-head chain of :meth:`forward`, factored out so a *partially decoded* state can be
+        pushed through exactly the same steps the real forward pass uses: the logit-cancel mask of
+        the target transform, the fixed re-binning onto the z-normalised borders, and the log. The
+        logit lens of :mod:`pfns4neurostim.analysis.layer_dynamics` applies the checkpoint's own
+        ``decoder_dict`` to an intermediate block's label token and then calls this, so the lens
+        prediction and the real prediction differ only in which block's token was decoded.
+
+        Args:
+            logits: Raw head logits, shape [..., bars] (as the transformer's decoder emits them,
+                before the temperature division).
+
+        Returns:
+            Log-probabilities over the raw-space bar distribution, same leading shape.
+
+        Raises:
+            RuntimeError: If the result contains NaN.
+        """
+        self._check_fitted()
         from tabpfn.utils import translate_probs_across_borders  # noqa: PLC0415 - pinned internal
 
-        logits = torch.cat(outs, dim=0)  # [B, q, bars]
         if self._logit_cancel_mask is not None:
             logits = logits.clone()
             logits[..., self._logit_cancel_mask] = float("-inf")
         probs = translate_probs_across_borders(
             logits, frm=self._borders_t, to=self._znorm_borders
-        )  # [B, q, bars]
+        )  # [..., bars]
         out = probs.log()
         if torch.isnan(out).any():
-            raise RuntimeError("FrozenTabPFN.forward produced NaN log-probabilities.")
+            raise RuntimeError("FrozenTabPFN.decode_logits produced NaN log-probabilities.")
         return out
 
     def moments(self, log_probs: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:

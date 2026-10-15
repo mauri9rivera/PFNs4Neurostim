@@ -34,7 +34,14 @@ update_rule           ``probe`` (channel, level, t, draw, engine) -- the full pr
 cka                   ``a`` (channel, level, t, draw, readout); ``b`` (grid, t, draw; feature mean);
                       ``gate`` (controls, per readout)
 placement             ``B`` (channel); ``C`` (channel: every level and context size); ``gate`` (M0 ladder)
+procrustes            ``trajectory`` (channel, level, draw, readout): the whole context ladder of one draw,
+                      every layer, disparity + shuffled-site null + the CKA companion on the same pairs
 ====================  ===================================================================================
+
+One analysis does **not** follow the ``{analysis}`` output path: ``procrustes`` writes under
+``{output_root}/mechanism/procrustes/cka/{dataset}/{tag}/`` (:data:`ANALYSIS_SUBDIR`, user requirement
+2026-10-14). It is the CKA analysis' complement -- the same clouds, the same pairs, one statistic that keeps the
+anisotropy CKA quotients out -- and the nesting says so on disk.
 
 **Artifacts** (same store, ``kind`` in the identity): ``bank`` / ``noise_bank`` per grid and ``gpfit``
 (the ``K_GP`` posterior covariance per context). Embeddings are deliberately *not* cached: at 18 blocks x
@@ -70,8 +77,14 @@ __all__ = [
     "run_mechanism",
     "main",
     "ANALYSES",
+    "ANALYSIS_SUBDIR",
     "MECHANISM_CACHE_VERSION",
 ]
+
+#: Output sub-path of an analysis under ``{output_root}/mechanism/``, when it is not the analysis name.
+#: ``procrustes`` is nested under ``cka`` because it is that analysis' complement on the same clouds and the
+#: same pairs (user requirement, 2026-10-14): a reader who opens the CKA tree finds the Procrustes curve in it.
+ANALYSIS_SUBDIR: dict[str, str] = {"procrustes": os.path.join("procrustes", "cka")}
 
 #: Invalidation stamp of every mechanism cell and artifact; bump it to discard them all.
 MECHANISM_CACHE_VERSION: int = 1
@@ -85,7 +98,7 @@ class MechanismConfig:
     """Resolved mechanism-analysis configuration.
 
     Attributes:
-        analysis: ``'update_rule'``, ``'placement'`` or ``'cka'``.
+        analysis: ``'update_rule'``, ``'placement'``, ``'cka'``, ``'procrustes'`` or ``'layer_dynamics'``.
         tag: Run tag.
         dataset: Dataset selection.
         device: Torch device for TabPFN.
@@ -108,8 +121,9 @@ class MechanismConfig:
 
     @property
     def run_dir(self) -> str:
-        """Output directory of this analysis."""
-        return os.path.join(self.output_root, "mechanism", self.analysis, self.dataset.name, self.tag)
+        """Output directory of this analysis (see :data:`ANALYSIS_SUBDIR` for the one nested exception)."""
+        sub = ANALYSIS_SUBDIR.get(self.analysis, self.analysis)
+        return os.path.join(self.output_root, "mechanism", sub, self.dataset.name, self.tag)
 
     @property
     def cell_root(self) -> str:
@@ -486,8 +500,14 @@ def _make_engine(name: str, p: dict[str, Any], device: str, inference_seed: int)
     from ..models.gp.surrogates import GPSurrogate, NaiveGPSurrogate  # noqa: PLC0415
 
     if name == "tabpfn_v2_5":
+        # injection_mode defaults to 'test', the historical path, so adding the key here cannot move
+        # any cached update_rule cell: it is deliberately NOT part of ``_engine_params`` (which
+        # feeds the cell identity of the M10 grid) and the layer-dynamics runner records it in its
+        # own identity instead.
         return U.PFNEngine(device=device, random_state=inference_seed,
-                           max_batch_tokens=int(p["max_batch_tokens"]), name=name)
+                           max_batch_tokens=int(p["max_batch_tokens"]), name=name,
+                           injection_mode=str(p.get("injection_mode", "test")),
+                           precision=str(p.get("precision", "auto")))
     if name == "gp_mll_frozen":
         return U.GPFrozenEngine(GPSurrogate(**p["gp_params"]), name=name)
     if name == "gp_mll_refit":
@@ -1522,6 +1542,12 @@ def run_placement(cfg: MechanismConfig, opts: RunOptions) -> str:
 #: between the prior and noise references; the per-token shadow readout is a CKA (a) question only.
 CKA_PLACEMENT_READOUT: str = "feature_mean"
 
+#: Statistic set the placement (``b``) cell payload carries. A ``b`` cell caches its finished rows, so an older
+#: cell cannot serve a column it never computed; this stamp is part of the cell identity, so bumping it supersedes
+#: the previous generation without discarding it (the expensive ``a`` / ``gpfit`` cells are untouched). Bumped to 2
+#: on 2026-10-14, when ``rank_vs_floor`` / ``rank_vs_ceiling`` / ``p_rank`` and the reference counts joined the rows.
+CKA_PLACEMENT_STATS_VERSION: int = 2
+
 CKA_DEFAULTS: dict[str, Any] = {
     "layers": None,
     # Feature-token readouts (analysis/embeddings.READOUTS): ``feature_mean``, and ``feature_tokens`` -- the
@@ -1556,6 +1582,16 @@ CKA_DEFAULTS: dict[str, Any] = {
     # B1 Step 5: the pre-registered success criterion of a shadow readout, evaluated at assembly and written to
     # ``shadow_criterion.json``; ``null`` disables it. See configs/experiment/mechanism_cka_tokens_nhp.yaml.
     "shadow": None,
+    # The CKA **ceiling** (user, 2026-10-12). Debiased CKA against a structured target is bounded well below 1 even
+    # under a perfect monotone relationship, because the two Gram matrices have different spectra -- so an absolute
+    # value like "TabPFN scores 0.23 against K_GP" is uninterpretable on its own, and the permutation null only
+    # supplies a FLOOR. This computes the reachable ceiling instead: ``noise_ceiling`` is the CKA between two GP
+    # posterior covariances fitted on the SAME sites with INDEPENDENT trial draws (so they differ only by measurement
+    # noise, which is the best any method could score against a noisily estimated target), and ``gp_vs_gt`` is the CKA
+    # between the GP's posterior covariance and the ground-truth response kernel (how well the comparator models the
+    # surface at all). Reported so a measured CKA can be read as a fraction of what is achievable.
+    #   trial_draw_offset  re-keys the trial stream only (analysis/context.context_for), holding the sites fixed.
+    "ceiling": {"enabled": True, "trial_draw_offset": 100},
 }
 
 #: Keys of a ``cka.shadow`` block.
@@ -1631,6 +1667,7 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
     from ..analysis import update_rule as U  # noqa: PLC0415
     from ..analysis.cka import linear_gram, target_kernels  # noqa: PLC0415
     from ..analysis.embeddings import READOUTS, readout_embeddings  # noqa: PLC0415
+    from ..analysis import placement as P  # noqa: PLC0415
     from ..analysis.placement import placement as place  # noqa: PLC0415
     from ..data.snr import achieved_snr_db  # noqa: PLC0415
     from ..data.stress import build_knob  # noqa: PLC0415
@@ -1641,6 +1678,7 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
     p = _check_keys(cfg.params, CKA_DEFAULTS, "cka")
     p["controls"] = _check_keys(p["controls"], CKA_DEFAULTS["controls"], "cka.controls")
     p["placement"] = _check_keys(p["placement"], CKA_DEFAULTS["placement"], "cka.placement")
+    p["ceiling"] = _check_keys(p["ceiling"], CKA_DEFAULTS["ceiling"], "cka.ceiling")
     if p["shadow"] is not None:
         p["shadow"] = _check_keys(p["shadow"], CKA_SHADOW_KEYS, "cka.shadow")
     bad = [r for r in p["readouts"] if r not in READOUTS]
@@ -1728,6 +1766,12 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
                                 })
             print(f"[mechanism] cka {ch.label} done", flush=True)
         _write_csv(rows, out, "cka.csv")
+
+        # --- the reachable CKA ceiling (user, 2026-10-12) ---
+        if p["ceiling"]["enabled"] and "K_GP" in p["targets"]:
+            ceil_rows = _cka_ceiling(cfg, p, cells, channels, knob)
+            if ceil_rows:
+                _write_csv(ceil_rows, out, "cka_ceiling.csv")
 
         # --- M0 controls (Step 4), per readout ---
         c = p["controls"]
@@ -1840,8 +1884,13 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
                             return float(np.quantile(d, q))
 
                         n_lay = len(bank[0])
-                        floors = [float(np.median([dist(h, s) for h in hold])) for s in range(n_lay)]
-                        ceilings = [float(np.median([dist(z, s) for z in nz])) for s in range(n_lay)]
+                        # The per-map distances are kept, not just their medians: the rank placement
+                        # (2026-10-12) needs the reference *distributions*, and the ratio placement's
+                        # floor/ceiling are still their medians, so both can be reported side by side.
+                        floor_refs = [np.array([dist(h, s) for h in hold]) for s in range(n_lay)]
+                        ceil_refs = [np.array([dist(z, s) for z in nz]) for s in range(n_lay)]
+                        floors = [float(np.median(f)) for f in floor_refs]
+                        ceilings = [float(np.median(c)) for c in ceil_refs]
                         out_rows = []
                         for ch in grid_channels:
                             ctx = context_for(ch, t_ctx, draw, base_seed=cfg.seed)
@@ -1857,11 +1906,15 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
                                     "gap_ok": bool(abs(gap) >= min_gap and gap > 0.0),
                                     "min_gap": min_gap, "p": place(d, fl, ce), "grid_id": grid,
                                     "prior_rejection_rate": prior.rejection_rate,
+                                    "n_floor_refs": int(floor_refs[s].size),
+                                    "n_ceiling_refs": int(ceil_refs[s].size),
+                                    **P.rank_placement(d, floor_refs[s], ceil_refs[s]),
                                 })
                         return {"rows": out_rows}, {}
 
                     ident = {"grid_id": grid, "channels": [cells.channel(ch) for ch in grid_channels],
-                             "t": int(t_ctx), "draw": draw, **embed_ident(readout),
+                             "t": int(t_ctx), "draw": draw,
+                             "stats_version": CKA_PLACEMENT_STATS_VERSION, **embed_ident(readout),
                              **{key: pl[key] for key in ("n_prior", "n_prior_holdout", "n_noise", "bank_quantile",
                                                           "min_gap", "n_dense", "holdout_frac", "rmse_threshold",
                                                           "prior_type")}}
@@ -1932,11 +1985,322 @@ def shadow_criterion(df: pd.DataFrame, spec: dict[str, Any]) -> dict[str, Any]:
             "ratios": ratios, "max_iqr_ratio": float(spec["max_iqr_ratio"]), "passed": passed}
 
 
+def _layer_dynamics(cfg: MechanismConfig, opts: RunOptions) -> str:
+    """Dispatch to the F6 layer-dynamics analysis (its own module: experiments/mechanism_layers.py)."""
+    from .mechanism_layers import run_layer_dynamics  # noqa: PLC0415 - lazy (heavy import)
+
+    return run_layer_dynamics(cfg, opts)
+
+
+def _cka_ceiling(
+    cfg: MechanismConfig,
+    p: dict[str, Any],
+    cells: _Cells,
+    channels: list[ChannelData],
+    knob: Any,
+) -> list[dict[str, Any]]:
+    """The reachable CKA ceiling per (channel, level, context size): what a perfect method could score.
+
+    Debiased CKA between two Gram matrices with different spectra is bounded well below 1 even when one
+    is a perfect monotone function of the other, so an absolute CKA against ``K_GP`` cannot be read
+    without a ceiling, and the site-permutation null only supplies a floor. Two references are computed,
+    both from closed-form GP fits (no transformer forward passes, so this is cheap):
+
+    * ``noise_ceiling`` -- CKA between two GP posterior covariances fitted on the **same sites** with
+      **independent trial draws**. They differ only by measurement noise, so this is the most any
+      method could score against a target that is itself estimated from noisy data.
+    * ``gp_vs_gt`` -- CKA between the GP's posterior covariance and the ground-truth response kernel:
+      how well the comparator models the surface at all.
+
+    Args:
+        cfg: Resolved config.
+        p: Resolved ``cka`` block.
+        cells: Cell namespace.
+        channels: Loaded channels.
+        knob: Built stress knob.
+
+    Returns:
+        One row per (channel, level, context size, draw).
+    """
+    from ..analysis.cka import cka_debiased, target_kernels  # noqa: PLC0415
+    from ..data.snr import achieved_snr_db  # noqa: PLC0415
+    from ..models.gp.surrogates import GPSurrogate  # noqa: PLC0415
+
+    offset = int(p["ceiling"]["trial_draw_offset"])
+    rows: list[dict[str, Any]] = []
+    for ch in channels:
+        for level in knob.levels:
+            st = knob.apply(ch, level, rng_for(ch.label, "cka", level, base_seed=cfg.seed))
+            snr = achieved_snr_db(st)
+            for t in cfg.context_sizes:
+                if t >= st.n_sites:
+                    continue
+                for rep in range(int(p["n_context_draws"])):
+                    ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
+                             "draw": rep, "gp_params": p["gp_params"], "trial_draw_offset": offset}
+
+                    def compute(ch: ChannelData = ch, st: ChannelData = st, t: int = t, rep: int = rep,
+                                level: float = level) -> tuple[dict[str, Any], dict[str, Any]]:
+                        covs = []
+                        for trial_draw in (rep, rep + offset):
+                            ctx = context_for(st, int(t), rep, base_seed=cfg.seed, level=float(level),
+                                              trial_draw=trial_draw)
+                            gp = GPSurrogate(**p["gp_params"])
+                            gp.fit(ctx.X, ctx.y)
+                            covs.append(gp.posterior_covariance(st.X_pool))
+                        k_gt = target_kernels(st.X_pool, st.y_gt)["K_GT"]
+                        return {
+                            "noise_ceiling": cka_debiased(covs[0], covs[1]),
+                            "gp_vs_gt": cka_debiased(covs[0], k_gt),
+                        }, {}
+
+                    hit = cells.run("ceiling", ident, f"ceiling {ch.label} a={level:g} t={t} d={rep}", compute)
+                    if hit is not None:
+                        rows.append({
+                            "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
+                            "knob": knob.name, "level": float(level), "achieved_snr_db": snr,
+                            "context_t": int(t), "rep": rep,
+                            **{k: v for k, v in hit[0].items() if k != "host"},
+                        })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# procrustes (M14 revived, 2026-10-14): the spectrum-weighting complement of the CKA analysis
+# ---------------------------------------------------------------------------
+#: Readouts this analysis accepts. ``feature_tokens`` is deliberately excluded: Procrustes is a statistic of one
+#: ``[n_sites, d]`` cloud, and a per-token variant would need a per-token null whose averaging rule is a separate
+#: design question (CKA (a)'s shadow readout, B1 Step 5). The feature-token *mean* is the readout CKA (b) places,
+#: so the two analyses compare the same clouds.
+PROCRUSTES_READOUTS: tuple[str, ...] = ("feature_mean",)
+
+PROCRUSTES_DEFAULTS: dict[str, Any] = {
+    "layers": None,                      # None = all 18 blocks
+    "readouts": list(PROCRUSTES_READOUTS),
+    # The disparity baseline: the cloud every other context size is compared against. 2 is the smallest context
+    # TabPFN accepts (analysis/context.context_sites refuses t < 2), so it is the least-informed geometry.
+    # It must be IN the shared ladder, so the cell it needs exists (the loader's _subset_of_ladder rule).
+    "baseline_t": 2,
+    "n_context_draws": 3,
+    # Shuffled-site null replicates (CAVEAT 2). Each costs one [r, r] SVD with r = min(n_sites - 1, d), so the
+    # null runs ~0.8 ms per replicate on the 96-site NHP grid -- unlike CKA's null it cannot be collapsed into a
+    # single contraction, which is why this is 200 while cka.n_perm is 1000. The headline statistic is the
+    # DIFFERENCE disparity - null_mean (analysis/procrustes.HEADLINE_STATISTIC), which 200 replicates resolve far
+    # better than the between-channel spread; only the secondary percentile readout is limited to 1/(n_perm + 1).
+    "n_perm": 200,
+    "inference_seed": 0,
+    # Unstressed by default: this analysis asks how the geometry moves with EVIDENCE, and a stress level would
+    # confound that with signal quality. The knob is still a config key, so a stressed sweep needs no code change.
+    "stress": {"knob": "k2_channel", "levels": [1.0]},
+    # Row subsampling. The legacy M14 code subsampled 300 rows to escape the n < d bias; the NHP grid has 96
+    # sites, so there is nothing to subsample and ``n_rows: null`` (every site) is the only honest setting here.
+    # Kept configurable for larger grids, and because a smaller n is the direct way to SHOW the bias: the same
+    # cell at n_rows = 48 has a higher null. Indices are drawn once per cell and shared by every layer and every
+    # context size, so the row correspondence Procrustes depends on survives.
+    "subsample": {"n_rows": None},
+    # Debiased linear CKA between the SAME two clouds, so a Procrustes panel and a CKA panel are read on
+    # identical pairs (that comparison is the point of the analysis). Cheap: one Gram pair per (layer, t).
+    "cka_companion": True,
+    # Layers drawn in the disparity-vs-context figure (every layer is in the CSV; an 18-trace legend is
+    # unreadable). Must be a subset of the computed layers.
+    "figures": {"context_layers": [0, 1, 5, 11, 17]},
+}
+
+
+def _procrustes_rows(
+    clouds: dict[int, Any],
+    baseline_t: int,
+    n_perm: int,
+    rng: np.random.Generator,
+    *,
+    cka_companion: bool,
+) -> list[dict[str, Any]]:
+    """Disparity + shuffled-site null (and the CKA companion) for every (layer, context size) of one cell.
+
+    Args:
+        clouds: ``{context_t: LayerEmbeddings}`` of one channel, level, draw and readout; all share the layer set
+            and the site rows, so row ``i`` is the same electrode everywhere.
+        baseline_t: The context size whose cloud every other one is compared against.
+        n_perm: Shuffled-site replicates per pair.
+        rng: Generator for the null (keyed per cell by the caller).
+        cka_companion: Also report debiased linear CKA between the same two clouds.
+
+    Returns:
+        Rows with ``layer``, ``context_t``, ``is_baseline`` and every field of
+        :class:`~pfns4neurostim.analysis.procrustes.ProcrustesNull` (plus ``cka`` when requested).
+
+    Raises:
+        KeyError: If ``baseline_t`` was not embedded.
+    """
+    from ..analysis.cka import cka_debiased, linear_gram  # noqa: PLC0415
+    from ..analysis.procrustes import procrustes_with_null  # noqa: PLC0415
+
+    base = clouds[int(baseline_t)]
+    rows: list[dict[str, Any]] = []
+    for t in sorted(clouds):
+        emb = clouds[t]
+        for i, layer in enumerate(emb.layers):
+            X = base.arrays[i]                                             # [n_sites, d]
+            Y = emb.arrays[i]                                              # [n_sites, d]
+            row: dict[str, Any] = {"layer": int(layer), "context_t": int(t),
+                                   "is_baseline": int(t) == int(baseline_t)}
+            row.update(procrustes_with_null(X, Y, n_perm=n_perm, rng=rng).as_row())
+            if cka_companion:
+                row["cka"] = cka_debiased(linear_gram(X), linear_gram(Y))
+            rows.append(row)
+    return rows
+
+
+def run_procrustes(cfg: MechanismConfig, opts: RunOptions) -> str:
+    """M14 revived: Procrustes disparity of the layer-wise site geometry along the context ladder.
+
+    For one channel and one context draw, TabPFN is conditioned on ``t`` observations and all N grid sites are
+    embedded at every block -- exactly the clouds :func:`run_cka` forms. The disparity between the cloud at
+    ``baseline_t`` and the cloud at each ``t`` is then reported **against a shuffled-site null**, per layer, with
+    debiased linear CKA on the same pair beside it.
+
+    Two things the reporting must keep apart (they answer different questions):
+
+    * the **t ladder** tests whether the geometric drift depends on how much evidence the network has;
+    * the **shuffled-site null** tests whether a disparity number means anything at all at ``n < d``
+      (96 rows in 192 dimensions). It is not a context-size control, and the ladder is not a null.
+
+    Procrustes quotients out rotation, which the fixed, non-rotation-equivariant prediction head does not: these
+    numbers are representation-similarity readouts to be read beside the output-space ones, never a claim about
+    the model's prediction (Caveat 1, :mod:`pfns4neurostim.analysis.procrustes`).
+
+    Args:
+        cfg: Resolved config.
+        opts: Cache policy.
+
+    Returns:
+        The run directory.
+    """
+    from ..analysis.embeddings import READOUTS, readout_embeddings  # noqa: PLC0415
+    from ..analysis.procrustes import HEADLINE_STATISTIC  # noqa: PLC0415
+    from ..data.snr import achieved_snr_db  # noqa: PLC0415
+    from ..data.stress import build_knob  # noqa: PLC0415
+    from ..models.pfn.tabpfn import FrozenTabPFN  # noqa: PLC0415
+    from ..visualization import mechanism as figs  # noqa: PLC0415
+
+    p = _check_keys(cfg.params, PROCRUSTES_DEFAULTS, "procrustes")
+    p["stress"] = _check_keys(p["stress"], PROCRUSTES_DEFAULTS["stress"], "procrustes.stress")
+    p["subsample"] = _check_keys(p["subsample"], PROCRUSTES_DEFAULTS["subsample"], "procrustes.subsample")
+    p["figures"] = _check_keys(p["figures"], PROCRUSTES_DEFAULTS["figures"], "procrustes.figures")
+    bad = [r for r in p["readouts"] if r not in READOUTS]
+    if bad:
+        raise ValueError(f"procrustes.readouts: unknown {bad}; expected a subset of {READOUTS}.")
+    unsupported = [r for r in p["readouts"] if r not in PROCRUSTES_READOUTS]
+    if unsupported:
+        raise ValueError(
+            f"procrustes.readouts: {unsupported} is not supported here (only {list(PROCRUSTES_READOUTS)}); a "
+            "per-token Procrustes would need a per-token null whose averaging rule is undefined."
+        )
+    _subset_of_ladder([p["baseline_t"]], cfg.context_sizes, "procrustes.baseline_t")
+    if int(p["n_perm"]) < 1:
+        raise ValueError(f"procrustes.n_perm must be >= 1, got {p['n_perm']}.")
+    out = cfg.run_dir
+    if not opts.replot:
+        set_seed(cfg.seed)
+        _write_config(cfg, p, out)
+        cells = _Cells(cfg, opts)
+        engine_box: dict[str, Any] = {}
+
+        def engine() -> Any:
+            if "e" not in engine_box:
+                engine_box["e"] = FrozenTabPFN(device=cfg.device, random_state=int(p["inference_seed"]))
+            return engine_box["e"]
+
+        def embed(ctx: Any, X_sites: np.ndarray, readout: str) -> Any:
+            eng = engine()
+            eng.fit(ctx.X, ctx.y)
+            return readout_embeddings(eng, X_sites, readouts=(readout,), layers=p["layers"])[readout]
+
+        channels = _channels(cfg)
+        knob = build_knob(p["stress"]["knob"], p["stress"]["levels"])
+        rows: list[dict[str, Any]] = []
+        for ch in channels:
+            for level in knob.levels:
+                st = knob.apply(ch, level, rng_for(ch.label, "procrustes", level, base_seed=cfg.seed))
+                snr = achieved_snr_db(st)
+                # t == n_sites is allowed here (CKA skips it): the fully-observed grid is the informed end of the
+                # ladder, and context_sites accepts t up to N. It is NOT a fix for n < d -- the cloud's rows are
+                # the readout sites, so no context size changes how many rows it has (that is the null's job).
+                ladder = tuple(int(t) for t in cfg.context_sizes if t <= st.n_sites)
+                if int(p["baseline_t"]) not in ladder:
+                    raise ValueError(
+                        f"procrustes: baseline_t={p['baseline_t']} exceeds {st.label}'s {st.n_sites} sites."
+                    )
+                for rep in range(int(p["n_context_draws"])):
+                    for readout in p["readouts"]:
+                        ident = {
+                            **cells.channel(ch), "knob": knob.name, "level": float(level), "draw": rep,
+                            "readout": readout, "layers": p["layers"], "ladder": list(ladder),
+                            "baseline_t": int(p["baseline_t"]), "n_perm": int(p["n_perm"]),
+                            "subsample": p["subsample"], "cka_companion": bool(p["cka_companion"]),
+                            "inference_seed": int(p["inference_seed"]),
+                        }
+
+                        def compute(level: float = level, rep: int = rep, readout: str = readout,
+                                    st: ChannelData = st, ladder: tuple[int, ...] = ladder,
+                                    ) -> tuple[dict[str, Any], dict[str, Any]]:
+                            # One row subsample per cell, shared by every layer and every context size, so the
+                            # site-to-row correspondence holds across the whole cell.
+                            n_rows = p["subsample"]["n_rows"]
+                            sel: np.ndarray | None = None
+                            if n_rows is not None:
+                                if not 3 <= int(n_rows) <= st.n_sites:
+                                    raise ValueError(
+                                        f"procrustes.subsample.n_rows={n_rows} must be in [3, {st.n_sites}]."
+                                    )
+                                sub_rng = rng_for(st.label, "procrustes-subsample", level, rep, base_seed=cfg.seed)
+                                sel = np.sort(sub_rng.choice(st.n_sites, size=int(n_rows), replace=False))
+                            X_sites = st.X_pool if sel is None else st.X_pool[sel]    # [n_rows, D]
+                            clouds: dict[int, Any] = {}
+                            for t in ladder:
+                                ctx = context_for(st, int(t), rep, base_seed=cfg.seed, level=float(level))
+                                clouds[int(t)] = embed(ctx, X_sites, readout)
+                            null_rng = rng_for(st.label, "procrustes-null", level, rep, readout, base_seed=cfg.seed)
+                            return {"rows": _procrustes_rows(
+                                clouds, int(p["baseline_t"]), int(p["n_perm"]), null_rng,
+                                cka_companion=bool(p["cka_companion"]),
+                            )}, {}
+
+                        hit = cells.run("trajectory", ident, f"{ch.label} a={level:g} d={rep} {readout}", compute)
+                        if hit is None:
+                            continue
+                        for r in hit[0]["rows"]:
+                            rows.append({
+                                "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
+                                "model": MECHANISM_MODEL, "readout": readout, "knob": knob.name,
+                                "level": float(level), "achieved_snr_db": snr, "rep": rep,
+                                "baseline_t": int(p["baseline_t"]), **r,
+                            })
+            print(f"[mechanism] procrustes {ch.label} done", flush=True)
+        _write_csv(rows, out, "procrustes.csv")
+        with open(os.path.join(out, "headline.json"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "headline_statistic": HEADLINE_STATISTIC,
+                "null": "shuffled-site (the row correspondence of one cloud is permuted)",
+                "n_perm": int(p["n_perm"]),
+                "rotation_quotient_caveat": (
+                    "Procrustes quotients out rotation; the prediction head is not rotation-equivariant. "
+                    "Representation-similarity readout only -- never a claim about the model's output."
+                ),
+            }, fh, indent=2)
+        cells.report()
+    for path in figs.render_procrustes(out):
+        print(f"[mechanism] wrote {path}", flush=True)
+    return out
+
+
 #: Analysis runners by name.
 ANALYSES: dict[str, Callable[[MechanismConfig, RunOptions], str]] = {
     "update_rule": run_update_rule,
     "placement": run_placement,
     "cka": run_cka,
+    "procrustes": run_procrustes,
+    "layer_dynamics": _layer_dynamics,
 }
 
 

@@ -211,7 +211,16 @@ def test_cka_runner_end_to_end(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) 
     for _keys, part in pl.groupby(["context_t", "draw", "layer"]):
         assert part["floor1"].nunique() == 1 and part["ceiling1"].nunique() == 1
     assert "readout" not in pl                                                 # CKA (b) = feature-token mean
-    for name in ("cka_placement", "cka_placement_surface"):
+    # The rank placement is the REPORTED statistic (2026-10-12) and the ratio ``p`` stays on disk as the frozen
+    # reference it is compared against. The rank is bounded in [0, 1] by construction -- the whole reason it
+    # replaced the ratio, whose denominator ``gap`` has a median of 0.049 on the real NHP run.
+    assert {"rank_vs_floor", "rank_vs_ceiling", "p_rank", "p"} <= set(pl.columns)
+    for col in ("rank_vs_floor", "rank_vs_ceiling", "p_rank"):
+        assert pl[col].between(0.0, 1.0).all(), f"{col} left [0, 1]"
+    assert np.allclose(pl["p_rank"], 0.5 * (pl["rank_vs_floor"] + pl["rank_vs_ceiling"]))
+    assert (pl["n_floor_refs"] > 0).all() and (pl["n_ceiling_refs"] > 0).all()
+    for name in ("cka_placement", "cka_placement_surface",
+                 "cka_placement_ratio", "cka_placement_ratio_surface"):
         assert os.path.exists(os.path.join(out, f"{name}.svg"))
     # Resume (B3 Step 3): a second run is served entirely from the cell cache and reproduces the tables.
     keys = ["readout", "subject", "emg", "level", "context_t", "rep", "layer", "target"]   # cka.csv columns
@@ -365,3 +374,39 @@ def test_exemplar_gp_row_can_differ_from_the_metric_reference(tmp_path, tiny) ->
     assert set(pd.read_csv(os.path.join(out, "update_rule_cell.csv"))["reference_gp"]) == {"mll"}
     with pytest.raises(ValueError, match="anchor: common"):
         mechanism.run_mechanism(_config(tmp_path, body.replace("anchor: common", "anchor: per_cell")))
+
+
+class TestStressSeriesAreLabelledInSnr:
+    """Hyp C stress series read as achieved SNR, not as raw knob levels (user, 2026-10-12).
+
+    The mechanism panels used to label their K2 ladder ``level 1 / 2 / 4``, which no reader could place
+    against the Hyp B x-axis; both are now the same quantity in the same units, and the unstressed level is
+    named "default" so the per-dataset anchor is visible in either hypothesis.
+    """
+
+    @staticmethod
+    def _frame() -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {"knob": "k2_channel", "level": level, "achieved_snr_db": snr}
+                for level, snr in ((1.0, 3.98), (2.0, -2.05), (4.0, -8.07))
+            ]
+        )
+
+    def test_labels_are_snr_with_the_default_named(self) -> None:
+        from pfns4neurostim.visualization import mechanism as figs
+
+        labels = figs._level_snr_labels(self._frame())
+        assert labels == {1.0: "4.0 dB (default)", 2.0: "-2.0 dB", 4.0: "-8.1 dB"}
+
+    def test_falls_back_to_the_knob_symbol_without_an_snr_column(self) -> None:
+        """A missing column must be visible as the raw parameter, never silently mislabelled as dB."""
+        from pfns4neurostim.visualization import mechanism as figs
+
+        labels = figs._level_snr_labels(self._frame().drop(columns=["achieved_snr_db"]))
+        assert labels == {1.0: r"$\gamma$ = 1", 2.0: r"$\gamma$ = 2", 4.0: r"$\gamma$ = 4"}
+
+    def test_the_placement_legend_title_is_the_snr_axis(self) -> None:
+        from pfns4neurostim.visualization import mechanism as figs
+
+        assert "SNR" in figs.PLACEMENT_LEVEL_LEGEND_TITLE and "alpha" not in figs.PLACEMENT_LEVEL_LEGEND_TITLE

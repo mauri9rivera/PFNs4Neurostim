@@ -59,6 +59,7 @@ __all__ = [
     "prepare_bank",
     "distance_to_bank",
     "placement",
+    "rank_placement",
     "bootstrap_placement",
     "known_shift_ladder",
 ]
@@ -395,6 +396,52 @@ def placement(d: float, floor: float, ceiling: float) -> float | None:
     """
     gap = ceiling - floor
     return None if gap <= 0 else float((d - floor) / gap)
+
+
+def rank_placement(
+    d: float,
+    floor_refs: np.ndarray,
+    ceiling_refs: np.ndarray,
+) -> dict[str, float | None]:
+    """Rank (percentile) placement: where ``d`` sits *within* the two reference distributions.
+
+    Replaces the ratio placement :func:`placement` as the reported quantity (user decision
+    2026-10-12). The ratio divides by ``ceiling - floor``, and on the NHP CKA run that gap has a
+    median of 0.049 against a numerator whose own spread is comparable, with 5 % of rows at a gap of
+    ~0. A ratio with a small, noisy denominator is heavy-tailed and effectively unbounded: the
+    measured ``p`` ran from -322 to +336 with only 49 % of values inside [0, 1], and its spread grew
+    with depth (inter-quartile range 0.42 at block 4 to 1.59 at block 17). That is a conditioning
+    failure of the estimator, not a property of the data, and no number of bootstrap replicates
+    fixes it.
+
+    A rank needs no denominator and is bounded by construction. Both reference sets are used as
+    *distributions* rather than collapsed to two medians, and each is reported separately so the
+    combined score cannot hide a disagreement between them.
+
+    Note the reading differs from :func:`placement` and must be relabelled wherever it is plotted:
+    ``p_rank`` is 0.5 when ``d`` falls between the two reference clouds, 0 when it is below every
+    reference, 1 when above every one -- it is not "0 at the prior median, 1 at the noise median".
+
+    Args:
+        d: Channel distance.
+        floor_refs: Floor reference distances (one per held-out prior map), shape [nf].
+        ceiling_refs: Ceiling reference distances (one per noise map), shape [nc].
+
+    Returns:
+        ``{'rank_vs_floor', 'rank_vs_ceiling', 'p_rank'}`` -- the fraction of each reference set
+        that ``d`` exceeds (mid-ranks for ties), and their equally weighted mean, which keeps the
+        combined score independent of how many maps each bank happens to hold. Values are ``None``
+        for an empty reference set.
+    """
+    def _frac_below(ref: np.ndarray) -> float | None:
+        r = np.asarray(ref, dtype=np.float64).ravel()
+        if r.size == 0:
+            return None
+        return float(((r < d).sum() + 0.5 * (r == d).sum()) / r.size)
+
+    lo, hi = _frac_below(floor_refs), _frac_below(ceiling_refs)
+    combined = None if lo is None or hi is None else float(0.5 * (lo + hi))
+    return {"rank_vs_floor": lo, "rank_vs_ceiling": hi, "p_rank": combined}
 
 
 def bootstrap_placement(

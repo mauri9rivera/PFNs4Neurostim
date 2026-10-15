@@ -51,6 +51,9 @@ __all__ = [
     "REFERENCE_FLOOR_COLOR",
     "REFERENCE_CEILING_COLOR",
     "REFERENCE_BAND_ALPHA",
+    "RANK_PLACEMENT_TICKS",
+    "RANK_PLACEMENT_MIDLINE_LABEL",
+    "RATIO_PLACEMENT_TICKS",
     "LEVEL_CMAP",
     "ACQUISITION_ORDER",
     "ACQUISITION_LINESTYLES",
@@ -66,6 +69,12 @@ __all__ = [
     "AXIS_LABELS",
     "KNOB_LABELS",
     "KNOB_X_AXIS",
+    "KNOB_SYMBOLS",
+    "KNOB_PARAM_LABELS",
+    "NOMINAL_MARKER_COLOR",
+    "NOMINAL_MARKER_LABEL",
+    "mark_nominal",
+    "snr_series_label",
     "DEMO_LABELS",
     "DATASET_LABELS",
     "GT_MODE_LABELS",
@@ -183,9 +192,37 @@ REFERENCE_CEILING_COLOR: str = "#F48FB1"
 REFERENCE_BAND_ALPHA: float = 0.25
 REFERENCE_FLOOR_LINESTYLE: str = "-"
 REFERENCE_CEILING_LINESTYLE: str = "--"
+#: Named tick positions of a **rank**-placement colourbar or axis, as ``(value, label)`` pairs. The rank's
+#: endpoints are not the ratio's: 0 means the channel sits below *every* reference map and 1 above every one,
+#: while 0.5 means it falls between the two reference clouds -- so the ratio's "prior floor" / "noise ceiling"
+#: wording cannot be reused here. Lives in style.py because it is an axis string (G4).
+RANK_PLACEMENT_TICKS: tuple[tuple[float, str], ...] = (
+    (0.0, "0 (below all refs.)"),
+    (0.5, "0.5 (between)"),
+    (1.0, "1 (above all refs.)"),
+)
+#: Legend label of the between-clouds guide line at 0.5 on a rank-placement axis.
+RANK_PLACEMENT_MIDLINE_LABEL: str = "Between references (rank = 0.5)"
+#: Named tick positions of the frozen **ratio** placement's colourbar, kept distinct from the rank's above.
+RATIO_PLACEMENT_TICKS: tuple[tuple[float, str], ...] = (
+    (0.0, "0 (prior floor)"),
+    (0.5, "0.5"),
+    (1.0, "1 (noise ceiling)"),
+)
 #: Sequential colormap for an ordered *stress level* series (the K2 ladder in the placement trajectory).
 #: Replaces grey shades, which collided with the achromatic reference bands above.
 LEVEL_CMAP: str = "viridis"
+
+#: Colour of the **default-regime marker**: the vertical slice naming the unstressed level of the dataset in
+#: every stress figure (user, 2026-10-12). A deep violet, the last hue region no other token occupies --
+#: ANCHOR_PFN is blue, ANCHOR_GP vermillion, REFERENCE_* crimson/pink, LEVEL_CMAP viridis. It is chromatically
+#: closest to viridis's dark end, so a level series drawn with LEVEL_CMAP must start above its floor (the
+#: mechanism figures sample ``0.1 + 0.8 * i / (n - 1)``, which is still blue-violet: the marker is told apart
+#: from it by being a dashed *vertical* line with an arrow and a label, never a data series).
+NOMINAL_MARKER_COLOR: str = "#6A1B9A"
+#: Linestyle and width of that marker, so every figure draws the same line.
+NOMINAL_MARKER_LINESTYLE: str = (0, (4, 2))
+NOMINAL_MARKER_LINEWIDTH: float = 1.0
 
 #: Lightness band (HLS) that derived shades walk; bounded so shades stay mutually
 #: distinguishable, lighter than either anchor, and never wash out on white.
@@ -659,7 +696,23 @@ AXIS_LABELS: dict[str, str] = {
     "psd_neg_mass": "Implied-kernel negative-eigenvalue mass",
     "ell_cv_anchor": "Lengthscale CV across anchors",
     "placement": "Placement $p$ (0 = floor, 1 = ceiling)",
+    # Rank placement (2026-10-14). A DIFFERENT reading from ``placement`` above, and the two must never share a
+    # label: the ratio is 0 at the prior floor and 1 at the noise ceiling, whereas the rank is the fraction of the
+    # reference maps the channel exceeds -- 0 below every reference, 1 above every one, and 0.5 when the channel
+    # falls BETWEEN the two reference clouds. Bounded in [0, 1] by construction, so no clipping and no dropped
+    # layers; the ratio's denominator (median gap 0.049 on NHP) is what put 51 % of its values outside [0, 1].
+    "p_rank": "Rank placement (fraction of references exceeded)",
+    "rank_vs_floor": "Rank vs prior floor (fraction exceeded)",
+    "rank_vs_ceiling": "Rank vs noise ceiling (fraction exceeded)",
     "cka_minus_null": "Debiased CKA minus permutation null",
+    # Procrustes complement of the CKA analysis (M14 revived, 2026-10-14). The disparity is the residual of the
+    # best rigid alignment of two row-matched site clouds, so it keeps the anisotropy CKA is invariant to; the
+    # headline axis is the DIFFERENCE against the shuffled-site null, because a raw disparity is biased low at
+    # 96 rows in 192 dimensions (analysis/procrustes.py, Caveat 2).
+    "procrustes_disparity": "Procrustes disparity (0-1)",
+    "disparity_minus_null": "Procrustes disparity\nminus shuffled-site null",
+    "disparity_ratio": "Procrustes disparity / null mean",
+    "cka_pairwise": "Debiased CKA of the same two clouds",
     "layer": "Transformer layer",
     "layer_corr": r"Corr. of $\|\Delta Z_\ell\|$ with GP update",
     "layer_probe_r2": r"Ridge-probe $R^2$ ($\Delta Z_\ell \to \Delta_\mathrm{PFN}$)",
@@ -690,14 +743,41 @@ READOUT_LABELS: dict[str, str] = {
     "feature_tokens": "Per feature token (avg. CKA)",
 }
 
+#: Canonical **stress parameter** of each knob, in mathtext (settled with the user 2026-10-12; the catalogue
+#: lives in ``research_design.md`` §2 Hyp B). One letter per knob, so a symbol never means two things across
+#: the manuscript: the two K2 settings were both called ``alpha`` and the two fractions both ``epsilon``,
+#: while ``alpha``/``sigma``/``kappa``/``lambda``/``rho``/``delta`` are already spoken for by the GP, the
+#: acquisition functions and the Hyp C update-rule statistics. Mirrors ``StressKnob.symbol``, which is the
+#: definition; this map exists so a figure never has to import the knob registry.
+KNOB_SYMBOLS: dict[str, str] = {
+    "k1_decoy": r"$a_2/a_1$",
+    "k2_channel": r"$\gamma$",
+    "k2_global": r"$\eta$",
+    "k5_outliers": r"$\varepsilon$",
+    "k6_budget": r"$B$",
+    "k6_failure": r"$\varphi$",
+    "k7_shuffle": r"$f$",
+}
+
+#: One-line meaning of each stress parameter, for a caption or a legend title.
+KNOB_PARAM_LABELS: dict[str, str] = {
+    "k1_decoy": r"decoy amplitude ratio $a_2/a_1$",
+    "k2_channel": r"residual gain $\gamma$",
+    "k2_global": r"added noise SD $\eta$ (z-units)",
+    "k5_outliers": r"contaminated trial slots $\varepsilon$",
+    "k6_budget": r"budget $B$ (queries incl. $n_\mathrm{init}$)",
+    "k6_failure": r"failed electrodes $\varphi$",
+    "k7_shuffle": r"shuffled sites $f$",
+}
+
 #: Canonical stress-knob names (roadmap jargon) and their axis strings.
 KNOB_LABELS: dict[str, str] = {
     "k1_decoy": r"K1 decoy peak (amplitude ratio $a_2/a_1$)",
-    "k2_channel": "K2 SNR (channel-relative noise)",
-    "k2_global": "K2 SNR (global noise)",
-    "k5_outliers": "K5 outlier contamination",
-    "k6_budget": "K6 sparsity (BO iterations)",
-    "k6_failure": "K6 sparsity (electrode failure fraction)",
+    "k2_channel": r"K2 SNR (channel-relative noise, $\gamma$)",
+    "k2_global": r"K2 SNR (global noise, $\eta$)",
+    "k5_outliers": r"K5 outlier contamination ($\varepsilon$)",
+    "k6_budget": r"K6 sparsity (BO iterations, $B$)",
+    "k6_failure": r"K6 sparsity (electrode failure, $\varphi$)",
     "k7_shuffle": r"K7 spatial shuffle fraction $f$",
     "nominal": "Nominal anchor",
 }
@@ -721,7 +801,8 @@ KNOB_X_AXIS: dict[str, str] = {
 KNOB_X_LABELS: dict[str, str] = {
     "k1_decoy": "Decoy amplitude ratio\n($a_2/a_1$)",
     "k5_outliers": "Contamination $\\varepsilon$\n(fraction of trial slots)",
-    "k6_failure": "Failed electrodes $\\varepsilon$\n(fraction of array)",
+    # varphi, not varepsilon: K5's contamination fraction owns epsilon (2026-10-12 notation settlement).
+    "k6_failure": "Failed electrodes $\\varphi$\n(fraction of array)",
     "k7_shuffle": "Shuffled sites $f$\n(fraction of array)",
 }
 
@@ -737,6 +818,92 @@ def knob_x_label(knob: str, x_col: str) -> str:
         The knob's own label when :data:`KNOB_X_LABELS` has one, else :func:`axis_label` of the column.
     """
     return KNOB_X_LABELS.get(knob) or axis_label(x_col)
+
+
+#: Legend/annotation wording of the default regime. Every figure that marks it uses this exact string, so a
+#: reader meets one name for it across Hyp B and Hyp C.
+NOMINAL_MARKER_LABEL: str = "Default (no stress)"
+
+
+def mark_nominal(
+    ax: plt.Axes,
+    x: float,
+    *,
+    label: str | None = NOMINAL_MARKER_LABEL,
+    annotate: bool = True,
+    y_frac: float = 0.0,
+    axis: str = "x",
+) -> None:
+    """Mark the dataset's default (unstressed) regime as a violet slice with an arrow.
+
+    The default regime is the one level of a ladder at which nothing has been applied; it is the same
+    channel, and therefore the same achieved SNR, for every knob of a dataset (NHP 3.98 dB, spinal 6.30 dB,
+    ``5d_rat`` 2.06 dB measured 2026-10-12), so marking it is what lets a reader read two stress figures
+    against each other.
+
+    Args:
+        ax: Axes to mark.
+        x: Position of the default regime, in the marked axis's own units.
+        label: Legend entry; ``None`` draws the line without one (for the 2nd..nth panel of a row, so the
+            legend holds a single entry).
+        annotate: Draw the arrow pointing at the slice from outside the axes.
+        y_frac: Offset of the arrow's tail along the *other* axis, in axes fraction.
+        axis: ``'x'`` for a vertical slice (the degradation curves), ``'y'`` for a horizontal one (the
+            regime heatmap, whose stress ladder runs up the y-axis).
+
+    Raises:
+        ValueError: If ``x`` is not finite — a silently skipped marker would read as "no default exists" —
+            or if ``axis`` is neither ``'x'`` nor ``'y'``.
+    """
+    if not np.isfinite(x):
+        raise ValueError(f"mark_nominal: x must be finite, got {x!r}.")
+    if axis not in ("x", "y"):
+        raise ValueError(f"mark_nominal: axis must be 'x' or 'y', got {axis!r}.")
+    line = ax.axvline if axis == "x" else ax.axhline
+    line(
+        x,
+        color=NOMINAL_MARKER_COLOR,
+        linestyle=NOMINAL_MARKER_LINESTYLE,
+        linewidth=NOMINAL_MARKER_LINEWIDTH,
+        zorder=2,
+        label=label,
+    )
+    if annotate:
+        transform = ax.get_xaxis_transform() if axis == "x" else ax.get_yaxis_transform()
+        tail = (x, y_frac) if axis == "x" else (y_frac, x)
+        head = (x, y_frac + 0.08) if axis == "x" else (y_frac + 0.08, x)
+        ax.annotate(
+            "",
+            xy=head,
+            xytext=tail,
+            xycoords=transform,
+            textcoords=transform,
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": NOMINAL_MARKER_COLOR,
+                "linewidth": NOMINAL_MARKER_LINEWIDTH,
+                "shrinkA": 0,
+                "shrinkB": 0,
+            },
+            annotation_clip=False,
+        )
+
+
+def snr_series_label(snr_db: float, *, is_default: bool = False) -> str:
+    """Legend entry of one stress level, stated as achieved SNR rather than a raw knob level.
+
+    The Hyp C mechanism figures used to label their stress series by the raw K2 level (``level 1 / 2 / 4``),
+    which no reader could place against the Hyp B x-axis. Both are now absolute achieved SNR in dB (user,
+    2026-10-12), and the default regime is named as such.
+
+    Args:
+        snr_db: Mean achieved SNR of the level, in dB.
+        is_default: Whether this level is the dataset's unstressed regime.
+
+    Returns:
+        E.g. ``'4.0 dB (default)'`` or ``'-8.1 dB'``.
+    """
+    return f"{snr_db:.1f} dB" + (" (default)" if is_default else "")
 
 
 DEMO_LABELS: dict[str, str] = {

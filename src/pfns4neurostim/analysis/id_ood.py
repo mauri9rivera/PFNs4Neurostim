@@ -24,9 +24,11 @@ from tabpfn import TabPFNRegressor
 
 
 # The loader dispatch, not legacy_io directly: 5d_rat moved to data/loaders/rat_5d.py
-# with the noOutliers cohort (2026-09-25).
+# with the noOutliers cohort (2026-09-25). ALL_SUBJECTS likewise comes from data.splits, not
+# legacy_io, so this module picks up current policy (e.g. NHP subject 2, DS1) rather than the
+# frozen legacy mirror.
 from pfns4neurostim.data.loaders import load_subject as load_data
-from pfns4neurostim.data.legacy_io import ALL_SUBJECTS
+from pfns4neurostim.data.splits import ALL_SUBJECTS
 
 from pfns4neurostim.data.references.noise import generate_noise_bank
 from pfns4neurostim.data.references.prior import generate_tabpfn_prior_bank

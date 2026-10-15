@@ -32,6 +32,7 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
+from ..evaluation.results import DEMO_NAMES, canonical_demo, canonical_demo_column
 from ..evaluation.robustness import (
     noninferiority,
     bootstrap_ci,
@@ -247,6 +248,75 @@ def _level_to_x(df: pd.DataFrame, x_col: str) -> dict[float, float]:
     return {float(level): float(value) for level, value in grouped.items()}
 
 
+def _nominal_x(df: pd.DataFrame, knob: str, x_col: str) -> float | None:
+    """Return the x position of the dataset's default (unstressed) regime, or ``None``.
+
+    Resolved from the tidy frame alone, so ``--replot`` draws the marker without rebuilding the knob. The
+    level is the knob's own nominal level (K6-budget: the largest budget of the ladder, see
+    :meth:`~pfns4neurostim.data.stress.K6BudgetKnob.nominal_in`); its x is that level's mean x, which for the
+    K2 arms is the channel-averaged floor SNR of the dataset and is therefore the *same number* in every
+    figure of that dataset.
+
+    A **calibrated** ladder (``knob.targets_db``) is the one case where the nominal level is not a constant
+    across channels: each channel solves its own level for the same dB target, so the unstressed cell is the
+    0 dB target rather than any particular level value.
+
+    Args:
+        df: Tidy sweep frame (already on the shared ladder).
+        knob: Knob name.
+        x_col: Plotted x column.
+
+    Returns:
+        The x position, or ``None`` when the run never visits the unstressed regime or the knob is unknown.
+    """
+    from ..data.stress import KNOB_REGISTRY  # noqa: PLC0415 - avoids a data -> visualization import cycle
+
+    if x_col == CALIBRATED_TARGET_COLUMN:
+        targets = df[x_col].astype(float)
+        return 0.0 if bool(np.isclose(targets, 0.0).any()) else None
+    cls = KNOB_REGISTRY.get(knob)
+    if cls is None:
+        return None
+    level = cls.nominal_in(sorted(df["level"].astype(float).unique()))
+    if level is None:
+        return None
+    x = _level_to_x(df, x_col).get(float(level))
+    return x if x is not None and np.isfinite(x) else None
+
+
+def _nominal_snr_db(df: pd.DataFrame, knob: str) -> float | None:
+    """Return the channel-averaged achieved SNR of the default regime, in dB.
+
+    This is the number that has to agree across every figure of a dataset: the unstressed channel is the same
+    object whichever knob is being swept, so its achieved SNR is a property of the dataset (NHP 3.98 dB,
+    spinal 6.30 dB, ``5d_rat`` 2.06 dB; the fitted synthetic twins match to 0.15 dB by construction).
+
+    Args:
+        df: Tidy sweep frame.
+        knob: Knob name.
+
+    Returns:
+        Mean achieved SNR over the channels of the nominal level, or ``None`` when the frame carries no SNR
+        column or never visits the unstressed regime.
+    """
+    if "achieved_snr_db" not in df.columns:
+        return None
+    from ..data.stress import KNOB_REGISTRY  # noqa: PLC0415 - avoids a data -> visualization import cycle
+
+    cls = KNOB_REGISTRY.get(knob)
+    if cls is None:
+        return None
+    level = cls.nominal_in(sorted(df["level"].astype(float).unique()))
+    if level is None:
+        return None
+    cells = (
+        df[np.isclose(df["level"].astype(float), level)]
+        .groupby(["subject", "emg"], dropna=False)["achieved_snr_db"]
+        .mean()
+    )
+    return float(cells.mean()) if not cells.empty and np.isfinite(cells.mean()) else None
+
+
 def _per_level_values(sub: pd.DataFrame, y_col: str) -> dict[float, np.ndarray]:
     """Group a metric by knob level, one array of per-(channel, rep) values.
 
@@ -409,7 +479,18 @@ def plot_degradation_curves(
         Paths written.
     """
     x_col = _knob_axis(df, knob)
-    demo = str(df["demo"].iloc[0]) if "demo" in df.columns else "draws"
+    nominal_x = _nominal_x(df, knob, x_col)
+    # On an SNR x-axis the marker's position already states the default SNR; on a level axis (K5, K6, K7) it
+    # does not, so the legend entry carries it, which is what makes the default regime comparable between a
+    # K2 figure and a K5 one.
+    nominal_label = S.NOMINAL_MARKER_LABEL
+    nominal_snr = _nominal_snr_db(df, knob)
+    if nominal_x is not None and nominal_snr is not None and x_col not in X_DESCENDS_WITH_STRESS:
+        nominal_label = f"{S.NOMINAL_MARKER_LABEL}, {nominal_snr:.1f} dB"
+    # ``demo`` is resolved to its current spelling here, not in the cell: a run assembled from cells cached
+    # before the 2026-09-27 rename carries ``demo2``/``demo1``, and titling such a figure by the raw value made
+    # every pre-rename in-vivo run call itself "Synthetic" (fixed 2026-10-13).
+    demo = canonical_demo(str(df["demo"].iloc[0])) if "demo" in df.columns else "draws"
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
     # A knob that does not record one of the default metrics simply loses that panel.
     metrics = [m for m in metrics if m in df.columns]
@@ -464,6 +545,10 @@ def plot_degradation_curves(
                         alpha=0.9,
                     )
 
+        # The default regime of the dataset, on every panel; only the first panel carries the legend entry.
+        if nominal_x is not None:
+            S.mark_nominal(ax, nominal_x, label=nominal_label if idx == 0 else None)
+
         ax.set_ylabel(S.axis_label(f"{metric}_median" if _is_heavy_tailed(metric) else metric))
         if metric == "r2":
             ax.set_ylim(bottom=S.R2_AXIS_FLOOR, top=1.0)
@@ -488,7 +573,13 @@ def plot_degradation_curves(
         x=0.01, ha="left", fontsize=S.FONT_SIZES["title"],
     )
     S.panel_letters(axes, x=0.0, y=1.06 if counts is not None else 1.02)
-    return S.save_figure(fig, out_dir, f"degradation_{'draws' if demo == 'draws' else 'synthetic'}")
+    if demo not in DEMO_NAMES:
+        raise ValueError(
+            f"plot_degradation_curves: unknown demo {demo!r}; expected one of {DEMO_NAMES}. A new arm needs a "
+            f"filename of its own -- the pre-2026-10-13 code folded anything unrecognised into 'synthetic', "
+            f"which is how legacy 'demo2' in-vivo runs came to be labelled synthetic."
+        )
+    return S.save_figure(fig, out_dir, f"degradation_{demo}")
 
 
 def build_robustness_table(
@@ -680,6 +771,25 @@ def regime_surface(
     return out
 
 
+def _nominal_row(surf: dict[str, np.ndarray], nominal_x: float | None) -> float | None:
+    """Return the ``imshow`` row index of the default regime on a regime surface.
+
+    The heatmap's rows are categorical (cell ``i`` is centred at ``y = i``), so the marker needs the row
+    index rather than the x value the row stands for.
+
+    Args:
+        surf: Output of :func:`regime_surface`; ``surf['x']`` is the x value of each row, in row order.
+        nominal_x: X value of the default regime, or ``None``.
+
+    Returns:
+        The row index as a float, or ``None`` when the surface has no row at that x.
+    """
+    if nominal_x is None:
+        return None
+    hits = np.flatnonzero(np.isclose(np.asarray(surf["x"], dtype=float), float(nominal_x)))
+    return float(hits[0]) if hits.size else None
+
+
 def _outline_cells(ax, mask: np.ndarray) -> None:
     """Draw a box around each ``True`` cell of an ``imshow`` grid.
 
@@ -773,10 +883,15 @@ def plot_regime_heatmap(
     nrows = 2 if diffs else 1
     fig, axes = S.figure("wide", nrows=nrows, ncols=len(models),
                          layout=S.LAYOUT_ENGINE, squeeze=False)
-    y_label = S.knob_x_label(knob, _knob_axis(df, knob))
+    x_col = _knob_axis(df, knob)
+    y_label = S.knob_x_label(knob, x_col)
+    # The stress ladder runs up the y-axis here, so the default regime is a horizontal slice at its row.
+    nominal_row = _nominal_row(next(iter(surfaces.values())), _nominal_x(df, knob, x_col))
     top = max(float(np.nanmax(s["value"])) for s in surfaces.values())
-    for ax, m in zip(axes[0], models):
+    for idx, (ax, m) in enumerate(zip(axes[0], models)):
         im = _draw_surface(ax, surfaces[m], cmap=S.SEQUENTIAL_CMAP, vmin=0.0, vmax=top)
+        if nominal_row is not None:
+            S.mark_nominal(ax, nominal_row, axis="y", label=S.NOMINAL_MARKER_LABEL if idx == 0 else None)
         ax.set_title(S.model_label(m), fontsize=S.FONT_SIZES["title"])
         ax.set_xlabel(S.axis_label("budget"))
         ax.set_ylabel(y_label)
@@ -790,6 +905,8 @@ def plot_regime_heatmap(
         for ax, m in zip([axes[1][centre]], contrast):
             ax.set_visible(True)
             im = _draw_surface(ax, diffs[m], cmap=S.DIVERGING_CMAP, vmin=-span, vmax=span)
+            if nominal_row is not None:
+                S.mark_nominal(ax, nominal_row, axis="y", label=None)
             ax.set_title(f"{S.model_label(m)} - {S.model_label(reference)}", fontsize=S.FONT_SIZES["title"])
             ax.set_xlabel(S.axis_label("budget"))
             ax.set_ylabel(y_label)
@@ -836,7 +953,14 @@ def plot_bridge(
     surf = regime_surface(synthetic_frame, synthetic_df, knob=knob, model=model, reference=reference, margin=margin)
     from ..data.stress import KNOB_REGISTRY  # noqa: PLC0415
 
-    nominal = real_df[np.isclose(real_df["level"].astype(float), KNOB_REGISTRY[knob].nominal_level)]
+    # ``nominal_in`` rather than the class attribute: K6-budget's unstressed level is the configured budget.
+    nominal_level = KNOB_REGISTRY[knob].nominal_in(sorted(real_df["level"].astype(float).unique()))
+    if nominal_level is None:
+        raise ValueError(
+            f"plot_bridge: the draws sweep has no unstressed level for knob {knob!r}, so its channels have "
+            "no nominal achieved SNR to be placed at."
+        )
+    nominal = real_df[np.isclose(real_df["level"].astype(float), nominal_level)]
     points = nominal.groupby(["dataset", "subject", "emg"], as_index=False).agg(
         snr=("achieved_snr_db", "mean"), budget=("budget", "first")
     )
@@ -924,6 +1048,10 @@ def render_all(
         Every path written, figures and tables.
     """
     df = _shared_ladder(df)
+    if "demo" in df.columns:
+        # Once, for every deliverable below: legacy cells keep their recorded spelling on disk, readers see the
+        # current one (:func:`pfns4neurostim.evaluation.results.canonical_demo`).
+        df = df.assign(demo=canonical_demo_column(df["demo"]))
     df, counts = clip_low_snr(df, min_snr_db)
     os.makedirs(out_dir, exist_ok=True)
     counts_path = os.path.join(out_dir, CHANNEL_COUNTS_FILE)

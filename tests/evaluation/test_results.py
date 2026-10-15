@@ -15,7 +15,10 @@ import math
 import os
 
 import numpy as np
+import pandas as pd
 import pytest
+
+from pfns4neurostim.evaluation import results as _results
 
 from pfns4neurostim.evaluation.results import (
     PROVENANCE_COLUMNS,
@@ -358,3 +361,33 @@ class TestDiscoverRunDirs:
         found = discover_run_dirs(runs_root, family="vanilla-benchmark")
         names = [os.path.basename(p) for p in found]
         assert names == ["nhp-vanilla-benchmark-11111"]
+
+
+class TestCanonicalDemo:
+    """The 2026-09-27 rename reached the code, not the cells on disk (read-time fix, 2026-10-13)."""
+
+    def test_legacy_in_vivo_name_resolves_to_draws(self) -> None:
+        assert _results.canonical_demo("demo2") == "draws"
+
+    def test_legacy_synthetic_name_resolves_to_synthetic(self) -> None:
+        assert _results.canonical_demo("demo1") == "synthetic"
+
+    def test_current_names_are_unchanged(self) -> None:
+        for name in _results.DEMO_NAMES:
+            assert _results.canonical_demo(name) == name
+
+    def test_an_unrecognised_arm_passes_through_rather_than_being_folded_in(self) -> None:
+        """Guessing would be worse than showing it: the pre-fix figure code folded the unknown into
+        'synthetic', which is exactly how legacy in-vivo runs came to be labelled synthetic."""
+        assert _results.canonical_demo("decoy_map") == "decoy_map"
+
+    def test_the_column_helper_does_not_mutate_its_input(self) -> None:
+        column = pd.Series(["demo2", "draws", "demo1"])
+        before = column.copy()
+        out = _results.canonical_demo_column(column)
+        assert list(out) == ["draws", "draws", "synthetic"]
+        pd.testing.assert_series_equal(column, before)
+
+    def test_every_legacy_name_maps_onto_a_current_one(self) -> None:
+        assert set(_results.LEGACY_DEMO_NAMES.values()) <= set(_results.DEMO_NAMES)
+        assert not set(_results.LEGACY_DEMO_NAMES) & set(_results.DEMO_NAMES)

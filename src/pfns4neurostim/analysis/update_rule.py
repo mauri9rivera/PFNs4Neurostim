@@ -61,9 +61,12 @@ __all__ = [
     "ProbeResult",
     "draw_context",
     "select_anchors",
+    "select_anchors_uniform",
+    "stratum_masks",
     "run_probes",
     "update_metrics",
     "fit_half_decay_lengthscale",
+    "conditioned_profile",
     "fit_conditioned_lengthscale",
     "icc_oneway",
     "gp_channel",
@@ -207,6 +210,75 @@ def select_anchors(
     return np.asarray(chosen, dtype=int), strata
 
 
+def stratum_masks(channel: ChannelData) -> dict[str, np.ndarray]:
+    """Boolean membership of every site in each anchor stratum, as *overlapping* labels.
+
+    The same geometric and response definitions :func:`select_anchors` draws from, exposed as masks
+    so a *uniformly sampled* anchor can be labelled after the fact instead of being drawn from one
+    stratum. The strata genuinely overlap (a high-response site is often also an edge site), which
+    is why these are independent booleans rather than one categorical column.
+
+    Args:
+        channel: Source channel.
+
+    Returns:
+        ``{'high', 'low', 'edge', 'centre'} -> bool mask [n_sites]``.
+    """
+    n = channel.n_sites
+    q = max(1, n // 4)
+    order = np.argsort(channel.y_gt)
+    X = channel.X_pool
+    lo, hi = X.min(axis=0), X.max(axis=0)
+    centre_dist = np.linalg.norm(X - (lo + hi) / 2.0, axis=1)
+    masks = {name: np.zeros(n, dtype=bool) for name in ANCHOR_STRATA}
+    masks["high"][order[-q:]] = True
+    masks["low"][order[:q]] = True
+    masks["edge"] = ((X <= lo) | (X >= hi)).any(axis=1)
+    masks["centre"][np.argsort(centre_dist)[:q]] = True
+    return masks
+
+
+def select_anchors_uniform(
+    channel: ChannelData,
+    n_anchors: int,
+    rng: np.random.Generator,
+    exclude: Sequence[int] = (),
+) -> tuple[np.ndarray, list[str]]:
+    """Uniformly sampled anchor sites, with their (overlapping) stratum labels attached.
+
+    Replaces :func:`select_anchors` for the layer-dynamics analysis (user decision 2026-10-12).
+    Equal allocation over the four strata is *not* proportional to their population shares -- the
+    perimeter of an 8x12 grid is 36 of 96 sites (37.5 %) while equal allocation gives it 25 % --
+    so an unweighted statistic pooled over stratified anchors does not estimate the population
+    quantity it is read as. Sampling uniformly without replacement makes the unweighted pool
+    unbiased for the grid, and :func:`stratum_masks` still supports every conditional contrast
+    because membership is recorded per anchor rather than chosen in advance.
+
+    Args:
+        channel: Source channel.
+        n_anchors: Number of anchors (clamped to the number of selectable sites).
+        rng: Generator.
+        exclude: Sites to avoid (the context sites), skipped unless too few remain.
+
+    Returns:
+        ``(anchor_indices [A], labels)`` where each label is the ``'+'``-joined list of strata the
+        anchor belongs to, or ``'none'`` for a site in no stratum.
+    """
+    n = channel.n_sites
+    excluded = np.zeros(n, dtype=bool)
+    excluded[np.asarray(exclude, dtype=int)] = True
+    pool = np.flatnonzero(~excluded)
+    if pool.size < n_anchors:  # not enough unobserved sites: fall back to the whole grid
+        pool = np.arange(n)
+    take = min(int(n_anchors), int(pool.size))
+    anchors = np.sort(rng.choice(pool, size=take, replace=False))
+    masks = stratum_masks(channel)
+    labels = [
+        "+".join(name for name in ANCHOR_STRATA if masks[name][a]) or "none" for a in anchors
+    ]
+    return anchors.astype(int), labels
+
+
 # ---------------------------------------------------------------------------
 # Engines: one fitted context, many one-observation probes
 # ---------------------------------------------------------------------------
@@ -294,11 +366,26 @@ class PFNEngine:
         random_state: int = 0,
         max_batch_tokens: int = 400_000,
         name: str = "tabpfn_v2_5",
+        injection_mode: str = "test",
+        precision: str = "auto",
     ) -> None:
         from ..models.pfn.tabpfn import FrozenTabPFN  # noqa: PLC0415 - heavy import
 
-        self.engine = FrozenTabPFN(device=device, random_state=random_state, max_batch_tokens=max_batch_tokens)
+        if injection_mode not in ("test", "train"):
+            raise ValueError(f"PFNEngine injection_mode must be 'test' or 'train', got {injection_mode!r}.")
+        self.engine = FrozenTabPFN(device=device, random_state=random_state,
+                                   max_batch_tokens=max_batch_tokens, precision=precision)
         self.name = name
+        #: How the *injected* probe row is preprocessed. ``'test'`` is the historical path and the
+        #: only one the public API offers: it hashes the fingerprint feature as ``row + 2*salt``
+        #: with no uniqueness check, so an injected row placed at an existing grid site receives
+        #: the *identical* tag as that site's own readout row -- an identity match between a
+        #: labelled example and the thing being predicted, which no real fit or real prediction can
+        #: produce (train rows and test rows use different salt multiples). ``'train'`` replays the
+        #: uniqueness-checked training-mode hash for the injected row only, which is what a refit on
+        #: ``context + {(x*, y*)}`` would assign it. Readout rows always stay on the test path,
+        #: because that is what they are.
+        self.injection_mode = injection_mode
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         """Fit (and freeze) preprocessing on the context."""
@@ -311,11 +398,17 @@ class PFNEngine:
         return m[0], s[0]
 
     def probe(self, xs: np.ndarray, ys: np.ndarray, Q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """One batched pass over every probe, each output [P, M]."""
+        """One batched pass over every probe, each output [P, M].
+
+        Only the injected rows honour :attr:`injection_mode`; the readout rows ``Q`` are genuine
+        test rows and always take the test path.
+        """
         import torch  # noqa: PLC0415
 
         Qt = self.engine.transform_x(Q)                                    # [M, F]
-        Xs = self.engine.transform_x(np.atleast_2d(xs)).unsqueeze(1)       # [P, 1, F]
+        Xs = self.engine.transform_x(
+            np.atleast_2d(xs), as_train=self.injection_mode == "train"
+        ).unsqueeze(1)                                                     # [P, 1, F]
         yt = self.engine.transform_y(
             torch.as_tensor(np.asarray(ys, dtype=np.float32), device=self.engine.device)
         ).unsqueeze(1)                                                     # [P, 1]
@@ -460,6 +553,46 @@ def fit_half_decay_lengthscale(g: np.ndarray, dist: np.ndarray) -> float | None:
     return float(math.exp(res.x))
 
 
+def conditioned_profile(
+    ell: float,
+    Q: np.ndarray,
+    anchor: int,
+    context_X: np.ndarray,
+    noise_ratio: float,
+) -> np.ndarray:
+    """Normalized posterior-covariance slice of an isotropic RBF GP conditioned on a context.
+
+    ``k_C(x, x*) / k_C(x*, x*)`` for a GP with lengthscale ``ell`` and noise-to-signal ratio
+    ``noise_ratio``, after conditioning on ``context_X`` -- narrower than the prior kernel
+    wherever the context is dense. Factored out of :func:`fit_conditioned_lengthscale` (F6-E,
+    sprint #3) so :mod:`analysis.layer_dynamics`'s template bank (B1) can evaluate it at a
+    ladder of ``ell`` values rather than only at the fitted optimum.
+
+    Args:
+        ell: RBF lengthscale.
+        Q: Readout coordinates, shape [M, D].
+        anchor: Anchor index into ``Q``.
+        context_X: Context coordinates, shape [t, D].
+        noise_ratio: ``noise / outputscale`` of the reference GP.
+
+    Returns:
+        The profile, shape [M].
+    """
+    x_star = Q[anchor][None, :]                                       # [1, D]
+    t = len(context_X)
+
+    def k(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+        d2 = ((A[:, None, :] - B[None, :, :]) ** 2).sum(-1)
+        return np.exp(-0.5 * d2 / ell ** 2)
+
+    L = np.linalg.cholesky(k(context_X, context_X) + noise_ratio * np.eye(t))  # [t, t]
+    vq = np.linalg.solve(L, k(context_X, Q))                     # [t, M]
+    vs = np.linalg.solve(L, k(context_X, x_star))                # [t, 1]
+    kc = k(Q, x_star)[:, 0] - (vq * vs).sum(0)                   # [M]
+    kss = 1.0 - float((vs ** 2).sum())
+    return kc / kss
+
+
 def fit_conditioned_lengthscale(
     g: np.ndarray,
     Q: np.ndarray,
@@ -469,12 +602,9 @@ def fit_conditioned_lengthscale(
 ) -> float | None:
     """Implicit-kernel lengthscale: the RBF GP whose frozen update best explains ``g``.
 
-    For an isotropic RBF GP with lengthscale ``l`` and noise-to-signal ratio ``r``, the
-    normalized update of an observation at ``x*`` given context ``X_C`` is the normalized
-    posterior-covariance slice ``k_C(x, x*) / k_C(x*, x*)``. It is narrower than the prior
-    kernel wherever the context is dense, which is why a half-decay fit on it does not
-    recover ``l``. This estimator conditions on the same context and fits ``l`` directly,
-    so on data from a known GP it recovers the true lengthscale (the positive control).
+    This estimator conditions on the same context and fits ``l`` directly (via
+    :func:`conditioned_profile`), so on data from a known GP it recovers the true lengthscale
+    (the positive control) where a half-decay fit on the profile alone does not.
 
     Args:
         g: Profile normalized to 1 at the anchor, shape [M].
@@ -491,23 +621,9 @@ def fit_conditioned_lengthscale(
     if pos.size == 0:
         return None
     lo, hi = float(pos.min()) / 10.0, float(pos.max()) * 10.0
-    x_star = Q[anchor][None, :]                                       # [1, D]
-    t = len(context_X)
-
-    def profile(ell: float) -> np.ndarray:
-        def k(A: np.ndarray, B: np.ndarray) -> np.ndarray:
-            d2 = ((A[:, None, :] - B[None, :, :]) ** 2).sum(-1)
-            return np.exp(-0.5 * d2 / ell ** 2)
-
-        L = np.linalg.cholesky(k(context_X, context_X) + noise_ratio * np.eye(t))  # [t, t]
-        vq = np.linalg.solve(L, k(context_X, Q))                     # [t, M]
-        vs = np.linalg.solve(L, k(context_X, x_star))                # [t, 1]
-        kc = k(Q, x_star)[:, 0] - (vq * vs).sum(0)                   # [M]
-        kss = 1.0 - float((vs ** 2).sum())
-        return kc / kss
 
     def loss(log_l: float) -> float:
-        return float(np.sum((g - profile(math.exp(log_l))) ** 2))
+        return float(np.sum((g - conditioned_profile(math.exp(log_l), Q, anchor, context_X, noise_ratio)) ** 2))
 
     res = minimize_scalar(loss, bounds=(math.log(lo), math.log(hi)), method="bounded")
     return float(math.exp(res.x))

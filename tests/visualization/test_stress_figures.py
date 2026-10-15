@@ -141,3 +141,80 @@ class TestTraceHelpers:
     def test_r2_floor_lives_in_style(self) -> None:
         assert style.R2_AXIS_FLOOR == -1.0
         assert not hasattr(traces, "R2_AXIS_FLOOR")
+
+
+class TestDefaultRegimeMarker:
+    """The violet default-regime slice (user, 2026-10-12).
+
+    Its one job is to let two stress figures of the same dataset be read against each other, so the
+    position must be resolved from the tidy frame alone (``--replot`` never rebuilds the knob) and must land
+    on the unstressed level of whichever knob is being swept.
+    """
+
+    def test_nominal_x_is_the_floor_snr_on_an_snr_axis(self) -> None:
+        df = _sweep(lambda ch, lv: 4.0 - 6.0 * np.log2(lv)).assign(knob="k2_channel")
+        assert stress_figs._nominal_x(df, "k2_channel", "achieved_snr_db") == pytest.approx(4.0)
+
+    def test_nominal_x_is_the_unstressed_level_on_a_level_axis(self) -> None:
+        df = _sweep(lambda ch, lv: 4.0).assign(knob="k5_outliers", level=lambda d: d["level"] - 1.0)
+        assert stress_figs._nominal_x(df, "k5_outliers", "level") == pytest.approx(0.0)
+
+    def test_k6_budget_marks_the_largest_budget(self) -> None:
+        """The pre-2026-10-12 constant of 50 named a stressed cell; the default is the full budget."""
+        df = _sweep(lambda ch, lv: 4.0).assign(knob="k6_budget", level=lambda d: d["level"] * 24.0)
+        assert stress_figs._nominal_x(df, "k6_budget", "level") == pytest.approx(96.0)
+
+    def test_no_marker_when_the_ladder_never_visits_the_default(self) -> None:
+        df = _sweep(lambda ch, lv: 4.0).assign(knob="k2_global")   # levels 1, 2, 4; nominal is 0
+        assert stress_figs._nominal_x(df, "k2_global", "level") is None
+
+    def test_nominal_snr_averages_channels_at_the_unstressed_level(self) -> None:
+        df = _sweep(lambda ch, lv: (10.0 if lv == 1.0 else -5.0) + ch).assign(knob="k2_channel")
+        assert stress_figs._nominal_snr_db(df, "k2_channel") == pytest.approx(10.0 + (N_CHANNELS - 1) / 2)
+
+    def test_the_figure_draws_it_and_names_it_in_the_legend(self, tmp_path) -> None:
+        df = _sweep(lambda ch, lv: 4.0 - 6.0 * np.log2(lv)).assign(knob="k2_channel")
+        out = tmp_path / "k2"
+        stress_figs.render_all(df, str(out), knob="k2_channel", dataset="nhp", min_snr_db=None)
+        svg = (out / "degradation_draws.svg").read_text(encoding="utf-8")
+        assert style.NOMINAL_MARKER_LABEL in svg
+        assert style.NOMINAL_MARKER_COLOR.lower() in svg.lower()   # matplotlib writes SVG colours lowercase
+
+    def test_a_level_axis_figure_states_the_default_snr_in_the_legend(self, tmp_path) -> None:
+        """On a level x-axis the marker's position cannot show the SNR, so the legend entry carries it."""
+        df = _sweep(lambda ch, lv: 4.0).assign(knob="k5_outliers", level=lambda d: d["level"] - 1.0)
+        out = tmp_path / "k5"
+        stress_figs.render_all(df, str(out), knob="k5_outliers", dataset="nhp", min_snr_db=None)
+        assert "4.0 dB" in (out / "degradation_draws.svg").read_text(encoding="utf-8")
+
+
+class TestLegacyDemoSpellingsAreResolvedForFigures:
+    """A run assembled from pre-2026-09-27 cells titled itself "Synthetic" and wrote
+    ``degradation_synthetic.svg`` (fixed 2026-10-13). The cells keep ``demo2``; the figure reads ``draws``."""
+
+    def test_a_demo2_run_is_titled_and_named_as_in_vivo(self, tmp_path) -> None:
+        df = _sweep(lambda ch, lv: 10.0).assign(demo="demo2")
+        written = stress_figs.render_all(df, str(tmp_path), knob="k2_channel", dataset="nhp", min_snr_db=None)
+        names = {os.path.basename(p) for p in written}
+        assert "degradation_draws.svg" in names
+        assert "degradation_synthetic.svg" not in names
+        svg = (tmp_path / "degradation_draws.svg").read_text(encoding="utf-8")
+        assert style.DEMO_LABELS["draws"] in svg
+        assert style.DEMO_LABELS["synthetic"] not in svg
+
+    def test_a_demo1_run_is_still_the_synthetic_arm(self, tmp_path) -> None:
+        df = _sweep(lambda ch, lv: 10.0).assign(demo="demo1")
+        written = stress_figs.render_all(df, str(tmp_path), knob="k2_channel", dataset="nhp", min_snr_db=None)
+        assert "degradation_synthetic.svg" in {os.path.basename(p) for p in written}
+
+    def test_the_tidy_frame_handed_in_is_never_rewritten(self, tmp_path) -> None:
+        """The translation is a view for readers; what the cells recorded is left alone."""
+        df = _sweep(lambda ch, lv: 10.0).assign(demo="demo2")
+        before = df.copy()
+        stress_figs.render_all(df, str(tmp_path), knob="k2_channel", dataset="nhp", min_snr_db=None)
+        pd.testing.assert_frame_equal(df, before)
+
+    def test_an_unknown_arm_fails_instead_of_being_filed_as_synthetic(self, tmp_path) -> None:
+        df = _sweep(lambda ch, lv: 10.0).assign(demo="some_new_arm")
+        with pytest.raises(ValueError, match="unknown demo"):
+            stress_figs.render_all(df, str(tmp_path), knob="k2_channel", dataset="nhp", min_snr_db=None)

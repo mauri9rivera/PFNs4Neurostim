@@ -172,3 +172,85 @@ def test_real_channel_ladder_rank_pairs_passes_raw_pairs_fails() -> None:
         m = P.make_metric("mmd", bandwidth=P.median_bandwidth(Zb))
         out[mode] = P.known_shift_ladder(ch.X_pool, standardize_map(ch.y_gt), y_noise, Zb, m, 10, featurize=feat)["spearman"]
     assert out["rank_pairs"] > 0.9 and out["pairs"] < 0.9, out
+
+
+class TestRankPlacement:
+    """``rank_placement`` replaces the heavy-tailed ratio placement with a bounded rank statistic."""
+
+    FLOOR = np.array([0.1, 0.2, 0.3, 0.4])
+    CEILING = np.array([0.8, 0.9, 1.0, 1.1, 1.2])
+
+    def test_returns_the_documented_keys(self) -> None:
+        out = P.rank_placement(0.5, self.FLOOR, self.CEILING)
+        assert set(out) == {"rank_vs_floor", "rank_vs_ceiling", "p_rank"}
+
+    def test_below_every_reference_gives_zero(self) -> None:
+        out = P.rank_placement(-5.0, self.FLOOR, self.CEILING)
+        assert out == {"rank_vs_floor": 0.0, "rank_vs_ceiling": 0.0, "p_rank": 0.0}
+
+    def test_between_the_two_clouds_gives_one_zero_and_a_half(self) -> None:
+        out = P.rank_placement(0.6, self.FLOOR, self.CEILING)
+        assert out["rank_vs_floor"] == 1.0
+        assert out["rank_vs_ceiling"] == 0.0
+        assert out["p_rank"] == 0.5
+
+    def test_above_every_reference_gives_one(self) -> None:
+        out = P.rank_placement(50.0, self.FLOOR, self.CEILING)
+        assert out == {"rank_vs_floor": 1.0, "rank_vs_ceiling": 1.0, "p_rank": 1.0}
+
+    @pytest.mark.parametrize("d", [-1e12, -322.0, 0.0, 0.5, 1.0, 336.0, 1e12, float("inf"), float("-inf")])
+    def test_always_bounded_in_unit_interval_even_far_outside_both_clouds(self, d: float) -> None:
+        """The whole point: the ratio placement ran from -322 to +336; the rank cannot."""
+        out = P.rank_placement(d, self.FLOOR, self.CEILING)
+        for key in ("rank_vs_floor", "rank_vs_ceiling", "p_rank"):
+            assert 0.0 <= out[key] <= 1.0
+
+    def test_bounded_even_when_the_two_clouds_are_nearly_identical(self, rng: np.random.Generator) -> None:
+        """The ratio's denominator ~ 0 case (floor ~ ceiling) that made it unbounded."""
+        floor = rng.normal(size=20)
+        ceiling = floor + 1e-12
+        for d in rng.normal(scale=100.0, size=30):
+            assert 0.0 <= P.rank_placement(float(d), floor, ceiling)["p_rank"] <= 1.0
+
+    def test_ties_use_mid_ranks(self) -> None:
+        out = P.rank_placement(2.0, np.array([1.0, 2.0, 3.0]), np.array([2.0, 2.0]))
+        assert out["rank_vs_floor"] == pytest.approx((1 + 0.5 * 1) / 3)    # one below, one tie
+        assert out["rank_vs_ceiling"] == pytest.approx(0.5)               # all tied
+        assert out["p_rank"] == pytest.approx(0.5 * ((1.5 / 3) + 0.5))
+
+    def test_p_rank_is_the_equally_weighted_mean_regardless_of_bank_sizes(self) -> None:
+        floor = np.arange(100.0)                    # 100 refs
+        ceiling = np.array([10.0, 60.0])            # 2 refs
+        out = P.rank_placement(49.5, floor, ceiling)
+        assert out["rank_vs_floor"] == pytest.approx(0.5)
+        assert out["rank_vs_ceiling"] == pytest.approx(0.5)
+        out = P.rank_placement(30.0, floor, ceiling)
+        assert out["rank_vs_floor"] == pytest.approx(0.305)      # 30 below + half a tie, of 100
+        assert out["rank_vs_ceiling"] == pytest.approx(0.5)
+        assert out["p_rank"] == pytest.approx(0.5 * (0.305 + 0.5))
+
+    def test_empty_reference_set_gives_none(self) -> None:
+        out = P.rank_placement(0.5, np.array([]), self.CEILING)
+        assert out["rank_vs_floor"] is None and out["p_rank"] is None
+        assert out["rank_vs_ceiling"] == 0.0
+        out = P.rank_placement(0.5, self.FLOOR, np.array([]))
+        assert out["rank_vs_ceiling"] is None and out["p_rank"] is None
+        assert out["rank_vs_floor"] == 1.0
+
+    @pytest.mark.parametrize("transform", [
+        lambda v: np.exp(v),
+        lambda v: v ** 3 + v,
+        lambda v: np.arctan(v),
+        lambda v: 7.0 * v - 3.0,
+    ])
+    def test_invariant_to_any_strictly_monotone_transform(self, rng: np.random.Generator, transform) -> None:
+        floor = rng.normal(size=25)
+        ceiling = rng.normal(loc=1.0, size=30)
+        d = float(rng.normal(loc=0.5))
+        base = P.rank_placement(d, floor, ceiling)
+        moved = P.rank_placement(float(transform(d)), transform(floor), transform(ceiling))
+        assert moved == base  # a rank statistic: exact, not approximate
+
+    def test_input_arrays_may_be_multidimensional(self) -> None:
+        out = P.rank_placement(0.25, self.FLOOR.reshape(2, 2), self.CEILING.reshape(1, -1))
+        assert out == P.rank_placement(0.25, self.FLOOR, self.CEILING)

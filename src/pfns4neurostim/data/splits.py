@@ -7,7 +7,6 @@ headline number on a subject that was used to pick the settings would overstate 
 
 Exclusions, carried over from the legacy constants:
 
-* NHP subject 2 (Macaque1) is excluded from ``ALL``: its signal is pure noise.
 * ``5d_rat`` indices are positions in
   :data:`pfns4neurostim.data.loaders.rat_5d.SUBJECTS` (cohort
   ``noOutliers-2026-09-25``): 0 rCer1.5, 1 BCI00, 2 rCer1.12, 3 rCer1.14, 4 rCer1.15.
@@ -16,7 +15,19 @@ Exclusions, carried over from the legacy constants:
   down by one. Results computed under the previous indexing are not comparable; the
   cohort stamp on every channel keeps them out of the cell cache.
 
-Values mirror ``legacy_io`` exactly; a test asserts they have not drifted.
+Intentional divergence from the legacy constants (roadmap DS1, closed 2026-10-09): NHP subject 2
+(Macaque1, ``data/monkeys/Macaque1_M1_181212.mat``) was excluded from every legacy constant as a
+"pure-noise signal", a qualitative call that was never backed by a pre-declared, uniformly-applied
+threshold. It is restored to ``ALL_SUBJECTS`` here, so every NHP dataset config now evaluates all
+four subjects (2 Cebus, 2 Macaque). ``HELD_OUT_SUBJECTS`` and ``TRAIN_SUBJECTS`` still mirror the
+legacy train/held-out partition exactly, since that split predates subject 2's inclusion and no
+train/held-out split has been used since 2026-09-20 (`CLAUDE.md` Section 5) — nothing downstream
+reads them except ``legacy_code`` and the regression test below. Per-channel split-half reliability
+and achieved SNR for subject 2, and the exclusion rule they should be checked against, are still
+open (roadmap DS1's second action item) and must be pre-declared before any BO result is read.
+
+Values other than NHP's ``ALL_SUBJECTS`` mirror ``legacy_io`` exactly; a test asserts they have not
+drifted.
 """
 from __future__ import annotations
 
@@ -44,10 +55,10 @@ TRAIN_SUBJECTS: dict[str, tuple[int, ...]] = {
     "5d_rat": (1, 2),
 }
 
-#: Every usable subject (NHP subject 2 excluded: pure-noise signal).
+#: Every usable subject (NHP subject 2 restored, DS1, 2026-10-09).
 ALL_SUBJECTS: dict[str, tuple[int, ...]] = {
     "rat": (0, 1, 2, 3, 4, 5),
-    "nhp": (0, 1, 3),
+    "nhp": (0, 1, 2, 3),
     "spinal": (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
     "5d_rat": (0, 1, 2, 3, 4),
 }
