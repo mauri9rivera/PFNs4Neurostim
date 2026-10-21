@@ -14,6 +14,7 @@
 #   bash scripts/narval.sh do setup <layout|stage|submodules|check-data|env|install|weights|verify> [main|bench|latest] [models]
 #   bash scripts/narval.sh do sbatch <gpu|cpu> [--lanes N] [--conda-env E] [--gpu-type T] [--mem M] [--cpus C] [--time T]
 #                                    [--dependency afterany:ID[:ID]] [--job-name N] -- <scripts/run_*.sh> <args...>
+#   bash scripts/narval.sh do cancel <jobid> [<jobid> ...]          # scancel, own jobs only; only on the user's explicit request
 #
 # Add NARVAL_DRY_RUN=1 to any `do` call to print the exact remote command and log it as a dry run without touching the cluster.
 # Env: NARVAL_HOST (default narval), NARVAL_SOCKET (default ~/.ssh/cm-narval.sock),
@@ -91,6 +92,15 @@ do_sbatch() {   # do_sbatch <gpu|cpu> [options] -- <script> <args...>
   remote_do "sbatch ${kind}" "cd ${REMOTE_CODE_DIR} && ${envs} sbatch --parsable ${flags} ${extra[*]:-} ${script} ${args[*]:-}"
 }
 
+do_cancel() {   # do_cancel <jobid> [<jobid> ...]
+  [ "$#" -ge 1 ] || die "usage: do cancel <jobid> [<jobid> ...]"
+  local ids=""
+  for j in "$@"; do need jobid "${j}" '^[0-9]{1,12}$'; ids+=" ${j}"; done
+  # -u restricts scancel to the caller's own jobs, so a mistyped id can never touch someone else's; the sacct line
+  # records the state each job ended in.
+  remote_do "cancel" "scancel -u \$(whoami)${ids} && sleep 2 && sacct -X -n -o JobID,JobName%20,State -j $(printf '%s' "${ids# }" | tr ' ' ',')"
+}
+
 case "${1:-}" in
   pull)
     shift
@@ -102,7 +112,8 @@ case "${1:-}" in
       pull) do_pull ;;
       setup) shift; do_setup "$@" ;;
       sbatch) shift; do_sbatch "$@" ;;
-      *) die "usage: do pull | do setup <subcommand> ... | do sbatch <gpu|cpu> ... -- <script> <args>" ;;
+      cancel) shift; do_cancel "$@" ;;
+      *) die "usage: do pull | do setup <subcommand> ... | do sbatch <gpu|cpu> ... -- <script> <args> | do cancel <jobid>..." ;;
     esac
     exit $? ;;
 esac
