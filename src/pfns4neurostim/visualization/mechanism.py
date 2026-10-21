@@ -20,6 +20,7 @@ from . import style
 __all__ = [
     "arm_style",
     "render_bayes_update",
+    "render_predictive_link",
     "render_placement",
     "render_cka",
     "render_procrustes",
@@ -456,6 +457,106 @@ def _c1_distance(profile: pd.DataFrame, engines: Sequence[str], panel_ts: Sequen
     return style.save_figure(fig, run_dir, "c1_update_vs_distance")
 
 
+# ---------------------------------------------------------------------------
+# M8 predictive link (exploratory, 2026-10-21): per-channel scatter + random-intercept slope
+# ---------------------------------------------------------------------------
+#: Panels per row of a predictive-link figure (one panel per predictor x reference pair).
+_LINK_COLUMNS: int = 5
+#: Panel height / width of the predictive-link scatters.
+_LINK_PANEL_ASPECT: float = 0.8
+#: Scatter marker area, in multiples of ``style.MARKER_SIZE``.
+_LINK_MARKER_SCALE: float = 4.0
+#: Panel letters run (a) ... (z); a larger grid is an analysis figure and goes unlettered.
+_MAX_PANEL_LETTERS: int = 26
+
+
+def _link_title(row: pd.Series) -> str:
+    """Panel title naming what the predictor is read against (engine alone, contrast, or matched difference)."""
+    model, ref = arm_style(str(row["model"])).label, str(row["reference"])
+    if ref == "none":
+        key = "none"
+    else:
+        key = "contrast" if row["kind"] == "contrast" else "difference"
+    ref_label = arm_style(ref).label if ref != "none" else ""
+    return style.LINK_REFERENCE_TITLES[key].format(model=model, reference=ref_label)
+
+
+def _predictive_link_figure(links: pd.DataFrame, points: pd.DataFrame, outcome: str, run_dir: str) -> list[str]:
+    """One outcome: a scatter per (predictor, reference) pair, one colour per subject, with the fitted slope.
+
+    Args:
+        links: ``predictive_link.csv`` rows.
+        points: ``predictive_link_channels.csv`` rows (one per channel x predictor x reference, outcome columns).
+        outcome: Outcome drawn.
+        run_dir: Output directory.
+
+    Returns:
+        Written paths.
+    """
+    rows = links[links["outcome"] == outcome].reset_index(drop=True)
+    if rows.empty or outcome not in points:
+        return []
+    subjects = sorted(points["subject"].unique())
+    n = len(rows)
+    ncols = min(_LINK_COLUMNS, n)
+    nrows = -(-n // ncols)
+    fig, axes = style.figure("full" if ncols > 2 else "double", nrows=nrows, ncols=ncols, squeeze=False,
+                             panel_aspect=_LINK_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
+    flat = list(axes.ravel())
+    for ax, (_, row) in zip(flat, rows.iterrows()):
+        pts = points[(points["predictor"] == row["predictor"]) & (points["reference"] == row["reference"])]
+        pts = pts.dropna(subset=["value", outcome])
+        for subject in subjects:
+            st = style.subject_style(subject, subjects)
+            sp = pts[pts["subject"] == subject]
+            ax.scatter(sp["value"], sp[outcome], s=style.MARKER_SIZE * _LINK_MARKER_SCALE, color=st.color,
+                       marker=st.marker, label=st.label, lw=0, zorder=st.zorder)
+        xs = np.array([pts["value"].min(), pts["value"].max()])                    # [2]
+        ax.plot(xs, row["intercept"] + row["slope"] * xs, color=style.OUTLINE_COLOR, lw=style.LINE_WIDTH)
+        ax.text(0.02, 0.98, style.LINK_SLOPE_NOTE.format(slope=row["slope"], lo=row["ci_low"], hi=row["ci_high"]),
+                transform=ax.transAxes, va="top", ha="left", fontsize=style.FONT_SIZES["annotation"])
+        ax.set_xlabel(style.axis_label(str(row["predictor"])))
+        ax.set_ylabel(style.axis_label(outcome))
+        ax.set_title(_link_title(row), fontsize=style.FONT_SIZES["legend"])
+    for ax in flat[n:]:
+        ax.set_axis_off()
+    handles = [plt.Line2D([], [], ls="", marker=style.subject_style(s, subjects).marker,
+                          color=style.subject_style(s, subjects).color, label=style.subject_style(s, subjects).label)
+               for s in subjects]
+    fig.legend(handles=handles, loc="outside lower center", ncol=len(handles), frameon=False,
+               fontsize=style.FONT_SIZES["legend"])
+    first = rows.iloc[0]
+    fig.suptitle(style.LINK_TITLE.format(outcome=style.axis_label(outcome).split("\n")[0],
+                                         model=arm_style(str(first["model"])).label, pool=first["pool"],
+                                         level=float(first["level"])),
+                 x=0.01, ha="left", fontsize=style.FONT_SIZES["title"])
+    if n <= _MAX_PANEL_LETTERS:
+        style.panel_letters(flat[:n])
+    return style.save_figure(fig, run_dir, f"predictive_link_{outcome}")
+
+
+def render_predictive_link(run_dir: str) -> list[str]:
+    """M8: one figure per outcome of ``predictive_link.csv``, from the run's files alone.
+
+    Args:
+        run_dir: ``bayes_update`` run directory.
+
+    Returns:
+        Written paths (none when the link was not run).
+    """
+    links_path = os.path.join(run_dir, "predictive_link.csv")
+    points_path = os.path.join(run_dir, "predictive_link_channels.csv")
+    if not (_has_rows(links_path) and _has_rows(points_path)):
+        return []
+    links, points = pd.read_csv(links_path), pd.read_csv(points_path)
+    if links.empty:
+        return []
+    written: list[str] = []
+    for outcome in links["outcome"].unique():
+        written += _predictive_link_figure(links, points, str(outcome), run_dir)
+    return written
+
+
 def render_bayes_update(run_dir: str) -> list[str]:
     """Every OMEGA figure (Omega-1 ... Omega-5) and the Hypothesis C1 figures, from the run's files alone.
 
@@ -498,6 +599,7 @@ def render_bayes_update(run_dir: str) -> list[str]:
             written += _omega_surprise(pd.read_csv(paths["surprise"]), panel_ts, run_dir, engines=c1_engines,
                                        name="c1_surprise_response")
         written += _omega_exemplar(run_dir, "c1_exemplar.npz", "dmu", "dmu_exemplar", "c1_update_exemplar")
+    written += render_predictive_link(run_dir)            # M8, only when the link was run
     return written
 
 

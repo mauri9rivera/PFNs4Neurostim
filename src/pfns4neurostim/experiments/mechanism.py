@@ -451,10 +451,20 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
         "g4": {"min_ess": 10.0, "context_ts": [10, 50], "rel_tol": 0.10, "abs_tol": 0.01,
                "dense": [{"lengthscale": 45}, {"outputscale": 15, "noise": 19}]},
     },
-    # M8: per-channel TabPFN medians at level 1 joined with a Hyp A/B tidy.csv; skipped when null.
+    # M8 (exploratory): per-channel readouts of ``model`` (anchors of ``pool`` -> cell median -> channel median at
+    # ``level``, over ``context_ts``; null = the whole ladder) joined with per-channel outcomes; skipped while both
+    # tidy paths are null. predictors / references: a list or "all" (every readout of analysis.predictive_link.READOUTS
+    # / every reference the run contrasted ``model`` with). engine_contrasts: engine readouts (Part A, saturation,
+    # gain, far_field_share) also as the matched difference engine - reference. outcomes: tidy.csv metric columns
+    # (``r2`` included) and ``breakdown`` (per-channel S9 breakdown from ``stress_tidy_csv``; ``breakdown.margin``
+    # null = the stress run's own equivalence_margin). acq_label: the acquisition kept in both tidies (null = the
+    # only one present).
     "link": {"tidy_csv": None, "model": "tabpfn_v2_5", "level": 1.0,
              "outcomes": ["recommended_regret", "cumulative_regret"],
-             "predictors": ["drift_abs", "total_var_ratio", "transfer_slope", "delta_crps"], "n_boot": 2000},
+             "predictors": ["drift_abs", "total_var_ratio", "transfer_slope", "delta_crps"], "n_boot": 2000,
+             "references": ["gp_bayes"], "engine_contrasts": False, "pool": "unobserved", "context_ts": None,
+             "acq_label": None, "stress_tidy_csv": None,
+             "breakdown": {"reference": "gp_mll", "metric": "recommended_regret", "margin": None}},
 }
 
 #: TabPFN engines, all the deployed update -- a public-API refit on D + {(x', y')} per probe (user, 2026-10-15):
@@ -552,7 +562,63 @@ def _validate_bayes_update(p: dict[str, Any], ladder: Sequence[int]) -> dict[str
     _subset_of_ladder(p["discrepancy"]["context_ts"], ladder, "bayes_update.discrepancy.context_ts")
     if p["run"]["gates"]:
         _subset_of_ladder(p["gates"]["g4"]["context_ts"], ladder, "bayes_update.gates.g4.context_ts")
+    p["link"] = _validate_link(p["link"], p, ladder)
     return p
+
+
+#: Anchor pools a link predictor may be read from (never pooled).
+LINK_POOLS: tuple[str, ...] = ("unobserved", "observed")
+
+
+def _validate_link(link: dict[str, Any], p: dict[str, Any], ladder: Sequence[int]) -> dict[str, Any]:
+    """Resolve and check ``bayes_update.link`` (roadmap M8), refusing what the link could not honour.
+
+    Args:
+        link: The link block, already merged over its defaults (one level).
+        p: The resolved ``bayes_update`` block (references, stress levels).
+        ladder: ``context.sizes``.
+
+    Returns:
+        The link block with ``breakdown`` merged over its defaults and ``predictors: all`` expanded.
+
+    Raises:
+        ValueError: On an unknown predictor, reference, outcome or pool, a context size off the ladder, or an
+            outcome whose tidy path is missing while the link is active.
+    """
+    from ..analysis.predictive_link import BREAKDOWN_OUTCOME, READOUTS  # noqa: PLC0415
+    from ..evaluation.results import METRIC_COLUMNS  # noqa: PLC0415
+
+    d = BAYES_UPDATE_DEFAULTS["link"]
+    link["breakdown"] = _check_keys(link["breakdown"] or {}, d["breakdown"], "bayes_update.link.breakdown")
+    if link["predictors"] == "all":
+        link["predictors"] = list(READOUTS)
+    bad = [x for x in link["predictors"] if x not in READOUTS]
+    if bad:
+        raise ValueError(f"bayes_update.link.predictors: unknown {bad}; known {list(READOUTS)} (or 'all').")
+    if link["references"] != "all":
+        bad = [r for r in link["references"] if r not in p["references"]]
+        if bad:
+            raise ValueError(f"bayes_update.link.references {bad} are not Part B references of this run "
+                             f"(bayes_update.references = {p['references']}); use a subset or 'all'.")
+    bad = [o for o in link["outcomes"] if o not in METRIC_COLUMNS and o != BREAKDOWN_OUTCOME]
+    if bad:
+        raise ValueError(f"bayes_update.link.outcomes: unknown {bad}; a tidy.csv metric column or "
+                         f"{BREAKDOWN_OUTCOME!r}.")
+    if link["pool"] not in LINK_POOLS:
+        raise ValueError(f"bayes_update.link.pool must be one of {LINK_POOLS}, got {link['pool']!r}.")
+    if link["context_ts"] is not None:
+        _subset_of_ladder(link["context_ts"], ladder, "bayes_update.link.context_ts")
+    if int(link["n_boot"]) < 1:
+        raise ValueError(f"bayes_update.link.n_boot must be >= 1, got {link['n_boot']}.")
+    if link["tidy_csv"] or link["stress_tidy_csv"]:
+        if any(o != BREAKDOWN_OUTCOME for o in link["outcomes"]) and not link["tidy_csv"]:
+            raise ValueError("bayes_update.link: BO outcomes need link.tidy_csv.")
+        if BREAKDOWN_OUTCOME in link["outcomes"] and not link["stress_tidy_csv"]:
+            raise ValueError(f"bayes_update.link: outcome {BREAKDOWN_OUTCOME!r} needs link.stress_tidy_csv.")
+        if not any(np.isclose(float(link["level"]), float(lv)) for lv in p["stress"]["levels"]):
+            raise ValueError(f"bayes_update.link.level={link['level']} is not a stress level of this run "
+                             f"({p['stress']['levels']}).")
+    return link
 
 
 def _make_engine(name: str, p: dict[str, Any], device: str, draw: int = 0) -> Any:
@@ -1252,9 +1318,9 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                              dmu=np.array([[dmaps[t][n] for n in c1["engines"]] for t in sorted(dmaps)]))
         cells.report()
     link = p["link"]
-    if link.get("tidy_csv"):
-        path = _predictive_link(out, link, cfg.seed)
-        print(f"[mechanism] wrote {path}")
+    if link["tidy_csv"] or link["stress_tidy_csv"]:
+        for path in _predictive_link(out, link, cfg.seed):
+            print(f"[mechanism] wrote {path}")
     for path in figs.render_bayes_update(out):
         print(f"[mechanism] wrote {path}")
     return out
@@ -1269,12 +1335,40 @@ def _write_csv(rows: list[dict[str, Any]], out: str, name: str) -> None:
 
 
 
-def _predictive_link(out: str, link: dict[str, Any], seed: int) -> str:
-    """M8: regress per-channel regret on per-channel OMEGA metrics of the linked engine.
+#: Column order of ``predictive_link.csv``.
+LINK_COLUMNS: tuple[str, ...] = (
+    "predictor", "part", "kind", "reference", "outcome", "slope", "ci_low", "ci_high", "intercept", "within_slope",
+    "re_ratio", "spearman", "n_channels", "n_subjects", "n_boot_valid", "model", "pool", "level", "context_ts",
+)
 
-    Predictors come from the run's tables, per cell first and per channel after (medians, at ``link.level``):
-    Part A cell medians of the unobserved pool from ``coherence_cell.csv``; Part B per-anchor contrasts against
-    GP-Bayes from ``headtohead.csv`` (trial source, unobserved anchors).
+
+def _breakdown_margin(link: dict[str, Any]) -> float:
+    """The breakdown margin: ``link.breakdown.margin``, else the stress run's own ``equivalence_margin``.
+
+    Raises:
+        ValueError: If neither is set.
+    """
+    margin = link["breakdown"]["margin"]
+    if margin is not None:
+        return float(margin)
+    path = os.path.join(os.path.dirname(os.path.abspath(link["stress_tidy_csv"])), "config.yaml")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            margin = (yaml.safe_load(fh) or {}).get("equivalence_margin")
+    if margin is None:
+        raise ValueError(f"bayes_update.link.breakdown.margin is null and {path} gives no equivalence_margin.")
+    return float(margin)
+
+
+def _predictive_link(out: str, link: dict[str, Any], seed: int) -> list[str]:
+    """M8 (exploratory): per-channel slopes of every outcome on every (predictor, reference) pair of the linked engine.
+
+    Predictors come from the run's tables (:func:`analysis.predictive_link.cell_readouts`): per anchor of
+    ``link.pool``, median per cell, median per channel at ``link.level`` over ``link.context_ts``. Part A from
+    ``coherence_cell.csv``; Part B and C1 from ``headtohead.csv``; GP-MLL frozen (:data:`B_ONLY_ENGINES`) is paired
+    with the C1 readouts only. Outcomes: ``link.tidy_csv`` (BO metrics, ``r2`` included) and
+    ``link.stress_tidy_csv`` (per-channel breakdown). A pair with too few channels or a constant column is reported
+    on stdout and left out of the table.
 
     Args:
         out: Run directory.
@@ -1282,32 +1376,59 @@ def _predictive_link(out: str, link: dict[str, Any], seed: int) -> str:
         seed: Bootstrap seed.
 
     Returns:
-        Path of ``predictive_link.csv``.
-    """
-    from ..analysis.predictive_link import channel_mechanism_table, predictive_link  # noqa: PLC0415
+        Paths of ``predictive_link.csv`` (one row per predictor x reference x outcome) and
+        ``predictive_link_channels.csv`` (the per-channel points behind every slope, which the figures read).
 
-    keys = ["dataset", "subject", "emg", "level", "context_t", "draw"]
+    Raises:
+        ValueError: If a listed reference has no contrast with the linked engine in this run.
+    """
+    from ..analysis import predictive_link as L  # noqa: PLC0415
+
     coh = pd.read_csv(os.path.join(out, "coherence_cell.csv"))
-    coh = coh[(coh["engine"] == link["model"]) & (coh["pool"] == "unobserved")]
     h2h = pd.read_csv(os.path.join(out, "headtohead.csv"))
-    h2h = h2h[(h2h["engine"] == link["model"]) & (h2h["reference"] == "gp_bayes") & (h2h["source"] == "trial")
-              & (h2h["pool"] == "unobserved")]
-    a_cols = [c for c in link["predictors"] if c in coh]
-    b_cols = [c for c in link["predictors"] if c in h2h and c not in a_cols]
-    cells = coh[keys + a_cols].merge(h2h.groupby(keys)[b_cols].median().reset_index(), on=keys, how="outer")
-    mech = channel_mechanism_table(cells, list(link["predictors"]), level=float(link["level"]))
-    tidy = pd.read_csv(link["tidy_csv"])
-    tidy = tidy[tidy["model"] == link["model"]]
-    regret = tidy.groupby(["dataset", "subject", "emg"])[list(link["outcomes"])].mean().reset_index()
-    joined = mech.merge(regret, on=["dataset", "subject", "emg"], how="inner")
-    rows = []
+    present = L.references_in_run(h2h, link["model"])
+    refs = present if link["references"] == "all" else list(link["references"])
+    absent = [r for r in refs if r not in present]
+    if absent:
+        raise ValueError(f"bayes_update.link.references {absent}: the run has no {link['model']} contrast with "
+                         f"them (present: {present}).")
+    pairs = L.reference_pairs(link["predictors"], refs, c1_references=B_ONLY_ENGINES,
+                              engine_contrasts=bool(link["engine_contrasts"]))
+    cells = L.cell_readouts(coh, h2h, pairs, model=link["model"], pool=link["pool"], c1_references=B_ONLY_ENGINES)
+    mech = L.channel_readouts(cells, level=float(link["level"]), context_ts=link["context_ts"])
+    bo_outcomes = [o for o in link["outcomes"] if o != L.BREAKDOWN_OUTCOME]
+    frames: list[pd.DataFrame] = []
+    if bo_outcomes:
+        frames.append(L.channel_outcomes(pd.read_csv(link["tidy_csv"]), bo_outcomes, model=link["model"],
+                                         acq_label=link["acq_label"]))
+    if L.BREAKDOWN_OUTCOME in link["outcomes"]:
+        bd = link["breakdown"]
+        frames.append(L.channel_breakdown(pd.read_csv(link["stress_tidy_csv"]), model=link["model"],
+                                          reference=bd["reference"], metric=bd["metric"],
+                                          margin=_breakdown_margin(link), acq_label=link["acq_label"]))
+    outcomes = frames[0]
+    for frame in frames[1:]:
+        outcomes = outcomes.merge(frame, on=L.CHANNEL, how="outer")
+    joined = mech.merge(outcomes, on=L.CHANNEL, how="inner")
+    context = "all" if link["context_ts"] is None else "/".join(str(int(t)) for t in link["context_ts"])
+    rows: list[dict[str, Any]] = []
     for outcome in link["outcomes"]:
-        for predictor in link["predictors"]:
-            if predictor in joined and joined[predictor].notna().sum() >= 3:
-                rows.append(predictive_link(joined, predictor, outcome, n_boot=int(link["n_boot"]), seed=seed))
+        for pred, ref in pairs:
+            sub = joined[(joined["predictor"] == pred) & (joined["reference"] == ref)]
+            try:
+                res = L.predictive_link(sub.rename(columns={"value": pred}), pred, outcome,
+                                        n_boot=int(link["n_boot"]), seed=seed)
+            except ValueError as exc:
+                print(f"[mechanism] link {pred} vs {ref} -> {outcome}: skipped ({exc})", flush=True)
+                continue
+            readout = L.READOUTS[pred]
+            rows.append({**res, "part": readout.part, "kind": readout.kind, "reference": ref, "model": link["model"],
+                         "pool": link["pool"], "level": float(link["level"]), "context_ts": context})
     path = os.path.join(out, "predictive_link.csv")
-    pd.DataFrame(rows).to_csv(path, index=False)
-    return path
+    pd.DataFrame(rows, columns=list(LINK_COLUMNS)).to_csv(path, index=False)
+    chan_path = os.path.join(out, "predictive_link_channels.csv")
+    joined.to_csv(chan_path, index=False)
+    return [path, chan_path]
 
 
 # ---------------------------------------------------------------------------

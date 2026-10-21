@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from pfns4neurostim.analysis.predictive_link import READOUTS
 from pfns4neurostim.data.synthetic_neurostim import gp_channel
 from pfns4neurostim.experiments import mechanism
 
@@ -254,6 +255,154 @@ def test_empty_csv_is_treated_as_absent(tmp_path) -> None:
     assert figs.render_cka(str(tmp_path)) == []
     pd.DataFrame([{"a": 1}]).to_csv(path, index=False)
     assert figs._has_rows(str(path))
+
+
+# ---------------------------------------------------------------------------
+# M8 predictive link (2026-10-21): synthetic OMEGA tables, no engine runs
+# ---------------------------------------------------------------------------
+_LADDER = [10, 25, 50, 80]
+
+
+def _omega_tables(run_dir, n_subjects: int = 3, n_emg: int = 5, seed: int = 0) -> pd.DataFrame:
+    """Write coherence_cell.csv / headtohead.csv for n_subjects x n_emg channels; return the per-channel drift."""
+    rng = np.random.default_rng(seed)
+    coh, h2h, truth = [], [], []
+    for s in range(n_subjects):
+        for e in range(n_emg):
+            drift = rng.uniform(0.01, 0.1)
+            truth.append({"dataset": "nhp", "subject": s, "emg": e, "drift": drift})
+            for level in (1.0, 2.0):
+                for t in (10, 25):
+                    cell = {"dataset": "nhp", "subject": s, "emg": e, "level": level, "context_t": t, "draw": 0}
+                    for pool in ("unobserved", "observed"):
+                        for eng, d in (("tabpfn_v2_5", drift), ("gp_bayes", 0.0), ("gp_mll_refit", drift / 2)):
+                            coh.append({**cell, "engine": eng, "pool": pool, "drift_abs": d,
+                                        "total_var_ratio": 1 + rng.normal(scale=0.05),
+                                        "cov_asymmetry": rng.uniform(), "latent_frac": rng.uniform(),
+                                        "sigma_recovery_rho": rng.uniform()})
+                        for a in range(3):
+                            base = {**cell, "pool": pool, "anchor": a}
+                            for ref in ("gp_bayes", "gp_mll_refit", "gp_mll_frozen"):
+                                h2h.append({**base, "source": "trial", "engine": "tabpfn_v2_5", "reference": ref,
+                                            "transfer_slope": rng.normal(1), "footprint_r": rng.uniform(),
+                                            "gap_change": rng.normal(), "delta_crps": rng.normal(scale=0.01)})
+                            for eng in ("tabpfn_v2_5", "gp_bayes", "gp_mll_refit", "gp_mll_frozen"):
+                                h2h.append({**base, "source": "trial", "engine": eng, "reference": "none",
+                                            "gain": rng.uniform(), "far_field_share": rng.uniform()})
+                                h2h.append({**base, "source": "ladder", "engine": eng, "reference": "none",
+                                            "saturation": rng.normal(1, 0.1)})
+    pd.DataFrame(coh).to_csv(os.path.join(run_dir, "coherence_cell.csv"), index=False)
+    pd.DataFrame(h2h).to_csv(os.path.join(run_dir, "headtohead.csv"), index=False)
+    return pd.DataFrame(truth)
+
+
+def _link_tidies(run_dir, truth: pd.DataFrame, slope: float = 4.0, seed: int = 1) -> tuple[str, str]:
+    """A BO tidy whose recommended regret is planted on drift_abs, and a stress tidy (+ config.yaml margin)."""
+    rng = np.random.default_rng(seed)
+    bo, st = [], []
+    for row in truth.itertuples():
+        key = {"dataset": "nhp", "subject": row.subject, "emg": row.emg, "acq_label": "ts_marginal"}
+        for rep in range(6):
+            for model in ("tabpfn_v2_5", "gp_mll"):
+                bo.append({**key, "model": model, "rep": rep, "r2": rng.uniform(0.5, 0.9),
+                           "recommended_regret": 0.1 * row.subject + slope * row.drift + 0.01 * rng.normal(),
+                           "cumulative_regret": rng.uniform(40, 60)})
+            for level in (1.0, 2.0, 4.0):
+                ref = 0.2 + 0.01 * rng.normal()
+                broke = level >= (2.0 if row.drift > 0.05 else 99.0)
+                for model, val in (("tabpfn_v2_5", ref + (0.5 if broke else 0.0) + 0.01 * rng.normal()),
+                                   ("gp_mll", ref)):
+                    st.append({**key, "model": model, "rep": rep, "level": level, "knob": "k2_channel",
+                               "demo": "draws", "recommended_regret": val})
+    bo_dir, st_dir = os.path.join(run_dir, "bo"), os.path.join(run_dir, "stress")
+    os.makedirs(bo_dir)
+    os.makedirs(st_dir)
+    pd.DataFrame(bo).to_csv(os.path.join(bo_dir, "tidy.csv"), index=False)
+    pd.DataFrame(st).to_csv(os.path.join(st_dir, "tidy.csv"), index=False)
+    with open(os.path.join(st_dir, "config.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("equivalence_margin: 0.05\n")
+    return os.path.join(bo_dir, "tidy.csv"), os.path.join(st_dir, "tidy.csv")
+
+
+def _resolved_link(**link: object) -> dict:
+    return mechanism._validate_bayes_update({"link": link, "stress": {"knob": "k2_channel", "levels": [1.0, 2.0]}},
+                                            _LADDER)["link"]
+
+
+def test_link_defaults_are_the_pre_extension_block() -> None:
+    link = _resolved_link()
+    assert link["tidy_csv"] is None and link["stress_tidy_csv"] is None
+    assert link["references"] == ["gp_bayes"] and link["engine_contrasts"] is False
+    assert link["predictors"] == ["drift_abs", "total_var_ratio", "transfer_slope", "delta_crps"]
+    assert link["outcomes"] == ["recommended_regret", "cumulative_regret"] and link["pool"] == "unobserved"
+    assert link["breakdown"] == {"reference": "gp_mll", "metric": "recommended_regret", "margin": None}
+
+
+def test_link_validation_refuses_what_it_cannot_honour() -> None:
+    with pytest.raises(ValueError, match="link.predictors: unknown"):
+        _resolved_link(predictors=["drift_abs", "nope"])
+    with pytest.raises(ValueError, match="not Part B references"):
+        _resolved_link(references=["gp_mll_frozen"])                 # not in this run's bayes_update.references
+    with pytest.raises(ValueError, match="outcomes: unknown"):
+        _resolved_link(outcomes=["regret"])
+    with pytest.raises(ValueError, match="needs link.stress_tidy_csv"):
+        _resolved_link(tidy_csv="x.csv", outcomes=["r2", "breakdown"])
+    with pytest.raises(ValueError, match="need link.tidy_csv"):
+        _resolved_link(stress_tidy_csv="x.csv", outcomes=["breakdown", "r2"])
+    with pytest.raises(ValueError, match="not a stress level"):
+        _resolved_link(tidy_csv="x.csv", level=4.0)
+    with pytest.raises(ValueError, match="not in the shared ladder"):
+        _resolved_link(context_ts=[11])
+    with pytest.raises(ValueError, match="Unknown bayes_update.link.breakdown"):
+        _resolved_link(breakdown={"margin": 0.05, "test": "tost"})
+    assert _resolved_link(predictors="all")["predictors"] == list(READOUTS)
+
+
+def test_predictive_link_default_block_recovers_a_planted_slope(tmp_path) -> None:
+    truth = _omega_tables(str(tmp_path))
+    bo, _ = _link_tidies(str(tmp_path), truth)
+    paths = mechanism._predictive_link(str(tmp_path), _resolved_link(tidy_csv=bo, n_boot=200), seed=0)
+    res = pd.read_csv(paths[0])
+    assert set(zip(res["predictor"], res["reference"])) == {
+        ("drift_abs", "none"), ("total_var_ratio", "none"), ("transfer_slope", "gp_bayes"), ("delta_crps", "gp_bayes")}
+    row = res[(res["predictor"] == "drift_abs") & (res["outcome"] == "recommended_regret")].iloc[0]
+    assert row["slope"] == pytest.approx(4.0, abs=0.2) and row["ci_low"] < 4.0 < row["ci_high"]
+    assert (row["n_channels"], row["n_subjects"], row["pool"], row["level"]) == (15, 3, "unobserved", 1.0)
+    assert os.path.exists(paths[1])
+
+
+def test_predictive_link_every_reference_and_outcome_then_figures(tmp_path) -> None:
+    from pfns4neurostim.visualization import mechanism as figs
+
+    truth = _omega_tables(str(tmp_path))
+    bo, stress = _link_tidies(str(tmp_path), truth)
+    link = _resolved_link(tidy_csv=bo, stress_tidy_csv=stress, predictors="all", references="all",
+                          engine_contrasts=True, outcomes=["recommended_regret", "r2", "breakdown"], n_boot=50)
+    res = pd.read_csv(mechanism._predictive_link(str(tmp_path), link, seed=0)[0])
+    assert set(res["outcome"]) == {"recommended_regret", "r2", "breakdown"}
+    frozen = res[res["reference"] == "gp_mll_frozen"]
+    assert set(frozen["predictor"]) == {"transfer_slope", "footprint_r", "gain", "far_field_share", "saturation"}
+    assert not ((res["reference"] == "gp_mll_frozen") & (res["part"] == "A")).any()
+    assert set(res.loc[res["predictor"] == "drift_abs", "reference"]) == {"none", "gp_bayes", "gp_mll_refit"}
+    # the planted breakdown: channels with drift > 0.05 break at level 2 (1 level passed), the others never (3)
+    pts = pd.read_csv(os.path.join(tmp_path, "predictive_link_channels.csv"))
+    one = pts[(pts["predictor"] == "drift_abs") & (pts["reference"] == "none")].merge(truth, on=["dataset", "subject",
+                                                                                             "emg"])
+    assert (one["breakdown"] == np.where(one["drift"] > 0.05, 1.0, 3.0)).all()
+    bd = res[(res["predictor"] == "drift_abs") & (res["reference"] == "none") & (res["outcome"] == "breakdown")]
+    assert bd["slope"].iloc[0] < 0 and bd["ci_high"].iloc[0] < 0
+    written = figs.render_predictive_link(str(tmp_path))
+    assert sorted(os.path.basename(p) for p in written) == [
+        "predictive_link_breakdown.svg", "predictive_link_r2.svg", "predictive_link_recommended_regret.svg"]
+
+
+def test_predictive_link_single_subject_and_unknown_reference(tmp_path) -> None:
+    truth = _omega_tables(str(tmp_path), n_subjects=1, n_emg=8)
+    bo, _ = _link_tidies(str(tmp_path), truth)
+    res = pd.read_csv(mechanism._predictive_link(str(tmp_path), _resolved_link(tidy_csv=bo, n_boot=100), seed=0)[0])
+    assert (res["n_subjects"] == 1).all() and (res["re_ratio"] == 0.0).all()
+    with pytest.raises(ValueError, match="has no tabpfn_v2_5 contrast"):
+        mechanism._predictive_link(str(tmp_path), _resolved_link(tidy_csv=bo, references=["gp_fixed"]), seed=0)
 
 
 class TestStressSeriesAreLabelledInSnr:
