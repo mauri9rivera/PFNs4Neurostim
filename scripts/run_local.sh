@@ -98,7 +98,7 @@ step_hypc_gpu() {
   # On 2026-10-01 C1 died 21 minutes in and `set -e` took C2 with it, which cost a night for nothing.
   echo "== hypc-gpu: C1 then C2, sequentially (hours; nothing else should use the GPU) =="
   local failed=()
-  for cfg in mechanism_update_rule_nhp mechanism_cka_nhp; do
+  for cfg in mechanism_bayes_update_nhp mechanism_cka_nhp; do
     echo "-- ${cfg}"
     if ! "${PY}" -m pfns4neurostim mechanism --config "configs/experiment/${cfg}.yaml"; then
       echo "   FAILED: ${cfg} (continuing with the next analysis)" >&2
@@ -123,7 +123,7 @@ step_hypc_link() {   # step_hypc_link <tidy.csv of a finished BO run>
     exit 2
   fi
   echo "== hypc-link: M8 predictive link, C1 metrics x ${tidy} =="
-  "${PY}" -m pfns4neurostim mechanism --config configs/experiment/mechanism_update_rule_nhp.yaml --replot --set "update_rule.link.tidy_csv=${tidy}"
+  "${PY}" -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp.yaml --replot --set "bayes_update.link.tidy_csv=${tidy}"
 }
 
 step_verify() {

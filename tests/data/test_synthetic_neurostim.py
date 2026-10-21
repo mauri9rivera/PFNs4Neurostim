@@ -1,4 +1,4 @@
-"""Tests for the synthetic generator (roadmap S0) and the K1 decoy knob (S1)."""
+"""Tests for the synthetic generator (roadmap S0)."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -6,11 +6,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from pfns4neurostim.data import stress
 from pfns4neurostim.data import synthetic_neurostim as sn
 from pfns4neurostim.data.channels import ChannelData
 from pfns4neurostim.data.snr import achieved_snr_db
-from pfns4neurostim.data.stress import KnobNotApplicable
 
 
 def _grid(nx: int = 10, ny: int = 10) -> np.ndarray:
@@ -185,63 +183,3 @@ class TestMetaFeatures:
         feats = sn.meta_features(ch)
         assert set(feats) == {"morans_i", "skewness", "cv", "mean_sd_corr"}
         assert feats["mean_sd_corr"] > 0.8
-
-
-class TestK1Decoy:
-    """A second hotspot at fixed separation; direction and noise shared across levels."""
-
-    def _channel(self) -> ChannelData:
-        return sn.generate_neurostim_map(_params(), np.random.default_rng(0), dataset="synthetic_nhp")
-
-    def test_zero_ratio_adds_no_decoy_and_no_basin(self) -> None:
-        out = stress.build_knob("k1_decoy").apply(self._channel(), 0.0, np.random.default_rng(0))
-        assert len(out.meta["generator"].hotspots) == 2 and not out.meta["decoy_basin"].any()
-
-    def test_decoy_has_the_requested_ratio_and_separation(self) -> None:
-        ch = self._channel()
-        knob = stress.build_knob("k1_decoy", separation=3.0)
-        out = knob.apply(ch, 0.8, np.random.default_rng(0))
-        primary, *_, decoy = out.meta["generator"].hotspots
-        assert decoy.amplitude == pytest.approx(0.8 * primary.amplitude)
-        anchor = ch.ch2xy[int(np.argmax(sn.hotspot_drive(ch.ch2xy, primary)))]
-        assert np.linalg.norm(decoy.center - anchor) == pytest.approx(3.0)
-        assert out.meta["decoy_basin"].any()
-        assert knob.achieved(out)["amplitude_ratio"] == 0.8
-
-    def test_levels_share_direction_and_noise(self) -> None:
-        """Common random numbers: only the decoy amplitude differs between two levels."""
-        ch = self._channel()
-        knob = stress.build_knob("k1_decoy")
-        a = knob.apply(ch, 0.5, np.random.default_rng(1))
-        b = knob.apply(ch, 0.9, np.random.default_rng(2))
-        np.testing.assert_allclose(a.meta["generator"].hotspots[-1].center, b.meta["generator"].hotspots[-1].center)
-        np.testing.assert_array_equal(a.meta["decoy_basin"], b.meta["decoy_basin"])
-
-    def test_true_optimum_stays_on_the_primary(self) -> None:
-        ch = self._channel()
-        out = stress.build_knob("k1_decoy").apply(ch, 0.95, np.random.default_rng(0))
-        assert not out.meta["decoy_basin"][out.best_site]
-
-    def test_in_vivo_channel_is_not_applicable(self) -> None:
-        ch = self._channel()
-        real = ChannelData("nhp", 1, 0, ch.X_pool, ch.Y_trials, ch.y_gt, ch.ch2xy, ch.grid_shape)
-        with pytest.raises(KnobNotApplicable, match="synthetic"):
-            stress.build_knob("k1_decoy").apply(real, 0.5, np.random.default_rng(0))
-
-    def test_infeasible_separation_is_not_applicable(self) -> None:
-        with pytest.raises(KnobNotApplicable, match="inside the array"):
-            stress.build_knob("k1_decoy", separation=50.0).apply(self._channel(), 0.5, np.random.default_rng(0))
-
-    @pytest.mark.parametrize("bad", [{"levels": [1.0]}, {"separation": 0.0}])
-    def test_invalid_configuration_raises(self, bad: dict) -> None:
-        levels = bad.pop("levels", None)
-        with pytest.raises(ValueError):
-            stress.build_knob("k1_decoy", levels, **bad)
-
-    def test_decoy_capture_is_reported_per_run(self) -> None:
-        from pfns4neurostim.evaluation.bo_runner import run_channel_bo
-
-        out = stress.build_knob("k1_decoy").apply(self._channel(), 0.9, np.random.default_rng(0))
-        res = run_channel_bo("gp_naive", out, acq_fn="ei", budget=12, n_init=3, seed=0, device="cpu")
-        rec = res.trajectory["best_rec_indices"][-1]
-        assert res.row["decoy_capture"] == float(out.meta["decoy_basin"][rec])

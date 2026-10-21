@@ -1,4 +1,4 @@
-"""Predictive link (task #9 Step 7)."""
+"""Predictive link (M8)."""
 from __future__ import annotations
 
 import numpy as np
@@ -37,13 +37,12 @@ def test_too_few_channels_raises() -> None:
         predictive_link(_frame(1.0).head(2), "x", "regret")
 
 
-def test_channel_table_adds_adaptivity() -> None:
-    cell = pd.DataFrame([
-        {"dataset": "nhp", "subject": 1, "emg": 0, "engine": "tabpfn_v2_5", "level": lv,
-         "achieved_snr_db": snr, "rho_shape_median": 0.5, "saturation_index_median": 0.1,
-         "ell_hat_median": 0.2 + 0.01 * snr, "ell_cv_anchor": 0.3}
-        for lv, snr in ((1.0, 0.0), (2.0, -6.0), (4.0, -12.0))
+def test_channel_table_takes_per_channel_medians_of_the_requested_metrics() -> None:
+    cells = pd.DataFrame([
+        {"dataset": "nhp", "subject": 1, "emg": 0, "level": lv, "drift_abs": d, "delta_crps": -0.01, "other": 9.0}
+        for lv, d in ((1.0, 0.1), (1.0, 0.3), (1.0, 0.2), (2.0, 5.0))
     ])
-    out = channel_mechanism_table(cell)
-    assert len(out) == 1
-    assert out.loc[0, "ell_adaptivity"] == pytest.approx(0.01)
+    out = channel_mechanism_table(cells, ["drift_abs", "delta_crps", "missing"], level=1.0)
+    assert len(out) == 1 and list(out.columns) == ["dataset", "subject", "emg", "drift_abs", "delta_crps"]
+    assert out.loc[0, "drift_abs"] == pytest.approx(0.2)
+    assert channel_mechanism_table(cells, ["drift_abs"]).loc[0, "drift_abs"] == pytest.approx(0.25)

@@ -45,6 +45,7 @@ __all__ = [
     "synthetic_channels",
     "meta_features",
     "morans_i",
+    "gp_channel",
 ]
 
 #: Dataset-name prefix of synthetic channels; the source dataset follows (``synthetic_nhp``),
@@ -427,3 +428,39 @@ def meta_features(channel: ChannelData) -> dict[str, float]:
         "cv": float(np.std(gt) / np.mean(gt)) if np.mean(gt) != 0 else float("nan"),
         "mean_sd_corr": float(np.corrcoef(means[ok], sds[ok])[0, 1]) if ok.sum() > 2 else float("nan"),
     }
+
+
+def gp_channel(
+    grid_side: int,
+    lengthscale: float,
+    noise_sd: float,
+    n_trials: int,
+    rng: np.random.Generator,
+    outputscale: float = 1.0,
+) -> ChannelData:
+    """A channel drawn from a known isotropic RBF GP on a ``grid_side x grid_side`` grid.
+
+    Args:
+        grid_side: Sites per axis.
+        lengthscale: True RBF lengthscale in [0, 1]-scaled coordinates.
+        noise_sd: Trial noise SD.
+        n_trials: Trials per site.
+        rng: Generator.
+        outputscale: True signal variance.
+
+    Returns:
+        A ``synthetic`` channel whose ``meta['true_hyperparameters']`` records the truth.
+    """
+    ax = np.arange(grid_side)
+    coords = np.stack(np.meshgrid(ax, ax, indexing="ij"), axis=-1).reshape(-1, 2)  # [N, 2]
+    X = coords / (grid_side - 1)                                                   # [N, 2]
+    d2 = ((X[:, None, :] - X[None, :, :]) ** 2).sum(-1)                            # [N, N]
+    K = outputscale * np.exp(-0.5 * d2 / lengthscale ** 2) + 1e-8 * np.eye(len(X))
+    f = np.linalg.cholesky(K) @ rng.normal(size=len(X))                            # [N]
+    Y = f[:, None] + noise_sd * rng.normal(size=(len(X), n_trials))                # [N, R]
+    return ChannelData(
+        "synthetic_neurostim", 0, 0, X, Y, f, coords, (grid_side, grid_side), demo="synthetic",
+        meta={"true_hyperparameters": {
+            "lengthscale": lengthscale, "outputscale": outputscale, "noise": noise_sd ** 2,
+        }},
+    )

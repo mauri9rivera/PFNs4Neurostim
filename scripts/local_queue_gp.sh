@@ -39,7 +39,6 @@ if [ "${GROUP}" = "bo" ]; then
 else
   LANES="${GPU_LANES}"
   GPU_GP=("model_params.gp_mll.device=cuda" "model_params.gp_naive.device=cuda")
-  phase k7-nhp          stress_sweep configs/experiment/stress_k7_nhp.yaml            gp_mll,gp_naive,random "${GPU_GP[@]}"
   phase k6-failure-5d   stress_sweep configs/experiment/stress_k6_failure_5d_rat.yaml gp_mll,gp_naive "${GPU_GP[@]}"
   phase k5-5d           stress_sweep configs/experiment/stress_k5_5d_rat.yaml         gp_mll,gp_naive "${GPU_GP[@]}"
   phase k2-global-5d    stress_sweep configs/experiment/stress_k2_global_5d_rat.yaml  gp_mll,gp_naive "${GPU_GP[@]}"

@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from tabpfn import TabPFNRegressor
 
-__all__ = ["TabPFNSurrogate", "FrozenTabPFN", "PINNED_TABPFN_VERSION"]
+__all__ = ["TabPFNSurrogate", "FrozenTabPFN", "PINNED_TABPFN_VERSION", "bar_cdf", "bar_quantiles"]
 
 
 
@@ -72,6 +72,68 @@ def _bar_distribution_moments(
             f"{(~np.isfinite(std_np)).sum()} std entries."
         )
     return mean_np, std_np                                              # [M], [M]
+
+
+def bar_cdf(criterion: Any, log_probs: torch.Tensor, ys: Any) -> np.ndarray:
+    """CDF of TabPFN bar distributions on a y grid (the pinned ``BarDistribution.cdf``, linear inside buckets).
+
+    Args:
+        criterion: The ``FullSupportBarDistribution`` the logits belong to.
+        log_probs: Log-probabilities (or logits), shape [..., bars].
+        ys: Raw-unit evaluation points, shape [G] (shared) or [..., G].
+
+    Returns:
+        ``P(Y <= y)``, float64, shape [..., G].
+    """
+    lead = log_probs.shape[:-1]
+    dev = criterion.borders.device
+    flat = log_probs.reshape(-1, log_probs.shape[-1]).to(dev)                        # [N, bars]
+    ys = torch.as_tensor(ys, dtype=flat.dtype, device=dev)
+    ys = ys.reshape(-1, ys.shape[-1]) if ys.dim() > 1 else ys                         # [N, G] | [G]
+    with torch.no_grad():
+        out = criterion.cdf(flat, ys)                                                # [N, G]
+    return out.reshape(*lead, out.shape[-1]).cpu().numpy().astype(np.float64)
+
+
+def bar_quantiles(criterion: Any, log_probs: torch.Tensor, u: np.ndarray) -> np.ndarray:
+    """Quantile function of TabPFN bar distributions, vectorised over the levels, in float64.
+
+    The same inverse as the pinned ``BarDistribution.icdf`` (linear inside the selected bucket), evaluated here
+    because that method builds its level tensor with ``torch.ones`` -- float32 -- so a level such as ``1 - 1e-12``
+    becomes exactly 1, overshoots the cumulative mass and selects a zero-mass bucket (the target transform leaves
+    hundreds of them at the upper end): a division by zero (measured on NHP, 2026-10-15). In float64 the selected
+    bucket always carries positive mass.
+
+    Args:
+        criterion: The ``FullSupportBarDistribution`` the logits belong to.
+        log_probs: Log-probabilities (or logits), shape [..., bars].
+        u: Probability levels in (0, 1), shape [U].
+
+    Returns:
+        Raw-unit quantiles, float64, shape [..., U].
+
+    Raises:
+        ValueError: If a level is outside (0, 1).
+        RuntimeError: If a quantile is not finite.
+    """
+    u = np.asarray(u, dtype=np.float64).reshape(-1)                                  # [U]
+    if not ((u > 0) & (u < 1)).all():
+        raise ValueError(f"bar_quantiles: levels must lie in (0, 1), got [{u.min()}, {u.max()}].")
+    lead = log_probs.shape[:-1]
+    dev = criterion.borders.device
+    with torch.no_grad():
+        probs = torch.softmax(log_probs.reshape(-1, log_probs.shape[-1]).to(dev, torch.float64), -1)  # [N, bars]
+        cum = torch.cumsum(probs, -1)                                                # [N, bars]
+        levels = torch.as_tensor(u, dtype=torch.float64, device=dev).expand(len(cum), -1).contiguous()  # [N, U]
+        idx = torch.searchsorted(cum, levels).clamp(0, cum.shape[-1] - 1)            # [N, U]
+        p_idx = probs.gather(-1, idx)                                                # [N, U]
+        rest = levels - (cum.gather(-1, idx) - p_idx)
+        borders = criterion.borders.to(dev, torch.float64)                           # [bars + 1]
+        q = borders[idx] + (borders[idx + 1] - borders[idx]) * rest / p_idx          # [N, U]
+    out = q.reshape(*lead, len(u)).cpu().numpy()
+    if not np.isfinite(out).all():
+        raise RuntimeError("bar_quantiles produced non-finite quantiles.")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +348,12 @@ class FrozenTabPFN:
             ``inference_precision=torch.float32``, disabling autocast even on CUDA). ``forward``
             already runs in fp32 on CPU regardless of this flag (pinned ``tabpfn==6.3.2``
             ``FrozenTabPFN.forward``/``base.py:determine_precision``), so the flag only changes
-            CUDA runs -- added so a CUDA arm can hold the device fixed while precision changes
-            (F6-E, sprint #3 A1).
+            CUDA runs, so a CUDA arm can hold the device fixed while precision changes.
+        softmax_temperature: Divides the head logits before anything else in :meth:`decode_logits`, exactly
+            where ``TabPFNRegressor.predict`` applies it (``regressor.py:1070-1071``, logits / T before the
+            border translation). Default 0.9 is TabPFN's own default and the deployed BO surrogate's
+            (``models/registry.py``); 1.0 reads the network's raw PPD. Also passed to the wrapped regressor,
+            so :attr:`wrapper` ``.predict`` stays the public-API reference for the same setting.
     """
 
     def __init__(
@@ -296,10 +362,14 @@ class FrozenTabPFN:
         random_state: int = 0,
         max_batch_tokens: int = 400_000,
         precision: Literal["auto", "fp32"] = "auto",
+        softmax_temperature: float = 0.9,
     ) -> None:
         check_tabpfn_version()
         if precision not in ("auto", "fp32"):
             raise ValueError(f"FrozenTabPFN precision must be 'auto' or 'fp32', got {precision!r}.")
+        if not (math.isfinite(softmax_temperature) and softmax_temperature > 0):
+            raise ValueError(f"FrozenTabPFN softmax_temperature must be finite and > 0, got {softmax_temperature!r}.")
+        self.softmax_temperature = float(softmax_temperature)
         self.device = torch.device(device)
         self.random_state = random_state
         self.max_batch_tokens = max_batch_tokens
@@ -307,7 +377,7 @@ class FrozenTabPFN:
         self._reg = TabPFNRegressor(
             device=device,
             n_estimators=1,
-            softmax_temperature=1.0,
+            softmax_temperature=self.softmax_temperature,
             ignore_pretraining_limits=True,
             fit_mode="fit_preprocessors",
             random_state=random_state,
@@ -539,11 +609,11 @@ class FrozenTabPFN:
         """Turn raw head logits into the log-probabilities :meth:`moments` consumes.
 
         The post-head chain of :meth:`forward`, factored out so a *partially decoded* state can be
-        pushed through exactly the same steps the real forward pass uses: the logit-cancel mask of
-        the target transform, the fixed re-binning onto the z-normalised borders, and the log. The
-        logit lens of :mod:`pfns4neurostim.analysis.layer_dynamics` applies the checkpoint's own
-        ``decoder_dict`` to an intermediate block's label token and then calls this, so the lens
-        prediction and the real prediction differ only in which block's token was decoded.
+        pushed through exactly the same steps the real forward pass uses: the softmax temperature,
+        the logit-cancel mask of the target transform, the fixed re-binning onto the z-normalised
+        borders, and the log. The logit lens of :mod:`pfns4neurostim.analysis.embeddings` applies the
+        checkpoint's own ``decoder_dict`` to an intermediate block's label token and then calls this,
+        so the lens prediction and the real prediction differ only in which block's token was decoded.
 
         Args:
             logits: Raw head logits, shape [..., bars] (as the transformer's decoder emits them,
@@ -558,8 +628,8 @@ class FrozenTabPFN:
         self._check_fitted()
         from tabpfn.utils import translate_probs_across_borders  # noqa: PLC0415 - pinned internal
 
+        logits = logits / self.softmax_temperature                         # [..., bars]; first, as in predict()
         if self._logit_cancel_mask is not None:
-            logits = logits.clone()
             logits[..., self._logit_cancel_mask] = float("-inf")
         probs = translate_probs_across_borders(
             logits, frm=self._borders_t, to=self._znorm_borders
@@ -587,6 +657,35 @@ class FrozenTabPFN:
         flat = flat.to(self.criterion.borders.device)
         mean, sd = _bar_distribution_moments(self.criterion, flat)          # [B*q], [B*q]
         return mean.reshape(lead).astype(np.float64), sd.reshape(lead).astype(np.float64)
+
+    def cdf(self, log_probs: torch.Tensor, ys: torch.Tensor) -> np.ndarray:
+        """Predictive CDF of the bar distributions returned by :meth:`forward`, on a y grid (:func:`bar_cdf`).
+
+        Linear inside every bucket -- including the two outer ones, whose half-normal tails :meth:`moments`
+        integrates; a W1 or CRPS read from this CDF differs from the exact one only there.
+
+        Args:
+            log_probs: Output of :meth:`forward`, shape [..., bars].
+            ys: Raw-unit evaluation points, shape [G] (shared) or [..., G].
+
+        Returns:
+            ``P(Y <= y)``, float64, shape [..., G].
+        """
+        self._check_fitted()
+        return bar_cdf(self.criterion, log_probs, ys)
+
+    def ppf(self, log_probs: torch.Tensor, u: np.ndarray) -> np.ndarray:
+        """Predictive quantile function in float64 (:func:`bar_quantiles`).
+
+        Args:
+            log_probs: Output of :meth:`forward`, shape [..., bars].
+            u: Probability levels in (0, 1), shape [U].
+
+        Returns:
+            Raw-unit quantiles, float64, shape [..., U].
+        """
+        self._check_fitted()
+        return bar_quantiles(self.criterion, log_probs, u)
 
     def _check_fitted(self) -> None:
         """Raise if :meth:`fit` has not been called."""

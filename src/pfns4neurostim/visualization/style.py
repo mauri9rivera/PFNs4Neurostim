@@ -26,7 +26,7 @@ from __future__ import annotations
 import colorsys
 import os
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, Union
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -64,7 +64,6 @@ __all__ = [
     "acquisition_style",
     "ModelStyle",
     "MODEL_STYLES",
-    "TRUE_GP_STYLE",
     "MODEL_ORDER",
     "AXIS_LABELS",
     "KNOB_LABELS",
@@ -145,6 +144,11 @@ FONT_FAMILY: tuple[str, ...] = ("Arial", "Helvetica", "DejaVu Sans")
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
+#: A Matplotlib linestyle: a named style (``'-'``, ``'--'``, ...) or an ``(offset, (on, off, ...))`` dash
+#: pattern, which the GP family needs once it has more members than named dashed styles.
+Linestyle = Union[str, tuple[float, tuple[float, ...]]]
+
+
 @dataclass(frozen=True)
 class ModelStyle:
     """Canonical plotting identity of one surrogate model.
@@ -152,7 +156,7 @@ class ModelStyle:
     Attributes:
         label: Display string used in legends, tables and captions.
         color: Hex colour (Okabe-Ito family).
-        linestyle: Matplotlib linestyle.
+        linestyle: Matplotlib linestyle: a named style or an ``(offset, dashes)`` pattern.
         marker: Matplotlib marker.
         family: ``'pfn'``, ``'gp'`` or ``'baseline'``.
         zorder: Draw order; headline models sit on top.
@@ -160,7 +164,7 @@ class ModelStyle:
 
     label: str
     color: str
-    linestyle: str = "-"
+    linestyle: Linestyle = "-"
     marker: str = "o"
     family: str = "pfn"
     zorder: int = 2
@@ -376,6 +380,8 @@ MODEL_ORDER: tuple[str, ...] = (
     "gp_oracle",
     "gp_deep_kernel",
     "gp_mll_lbfgs",
+    "gp_bayes",  # added 2026-10-15 without moving any existing GP colour
+    "gp_mll_frozen",  # last GP member: added 2026-10-19 (Hypothesis C1 reference) without moving any GP colour
     "tabicl",
     "tabpfn_v3_5",
     "causilo",
@@ -387,7 +393,7 @@ MODEL_ORDER: tuple[str, ...] = (
 )
 
 #: ``key -> (label, linestyle, marker, family, zorder)``; colours come from the anchors.
-_MODEL_SPECS: dict[str, tuple[str, str, str, str, int]] = {
+_MODEL_SPECS: dict[str, tuple[str, Linestyle, str, str, int]] = {
     "tabpfn_v2_5": ("TabPFN-2.5", "-", "o", "pfn", 5),
     "pfns4bo": ("PFNs4BO", "-", "^", "pfn", 3),
     "tabflex": ("TabFlex", "-", "<", "pfn", 3),
@@ -399,6 +405,10 @@ _MODEL_SPECS: dict[str, tuple[str, str, str, str, int]] = {
     "gp_mll": ("GP-MLL", "--", "s", "gp", 4),
     "gp_mll_lbfgs": ("GP-MLL (L-BFGS)", "--", "p", "gp", 4),
     "gp_naive": ("GP-fixed", "-.", "D", "gp", 3),
+    # Hyperparameters marginalised on a grid (OMEGA, 2026-10-15): the exact-Bayes reference with learning.
+    "gp_bayes": ("GP-Bayes", (0, (5, 1.5, 1, 1.5, 1, 1.5)), "v", "gp", 4),
+    # Type-II ML hyperparameters fitted on D, frozen through the update: the GP-like reference of Hypothesis C1 only.
+    "gp_mll_frozen": ("GP-MLL frozen", (0, (1, 1)), "<", "gp", 4),
     "gp_oracle": ("GP-oracle", ":", "*", "gp", 3),
     "gp_deep_kernel": ("GP-deep", "--", "X", "gp", 2),
     "random": ("Random", ":", "x", "baseline", 1),
@@ -436,9 +446,6 @@ def _build_model_styles() -> dict[str, ModelStyle]:
 
 
 MODEL_STYLES: dict[str, ModelStyle] = _build_model_styles()
-
-#: The true GP of a known-GP synthetic channel (the analytic reference of the Hyp C positive controls).
-TRUE_GP_STYLE: ModelStyle = ModelStyle("True GP", OUTLINE_COLOR, ":", "o", "gp", 3)
 
 #: Aliases from legacy result-dict ``model_type`` strings to canonical keys.
 MODEL_ALIASES: dict[str, str] = {
@@ -653,9 +660,6 @@ AXIS_LABELS: dict[str, str] = {
     "budget": r"BO iterations (incl. $n_\mathrm{init}$)",
     # A8 / A9 (2026-09-30).
     "reached_fraction": "Runs reaching the target",
-    # K7's achieved statistics: how much spatial autocorrelation survived, and the realized shuffle fraction.
-    "achieved_moran_i": "Spatial autocorrelation (Moran's $I$)",
-    "achieved_shuffle": "Shuffled sites (realized fraction)",
     "elapsed_s": "Cumulative wall clock (s)",
     "queries_to_target": "Queries to target",
     "iteration": "BO iteration",
@@ -663,7 +667,6 @@ AXIS_LABELS: dict[str, str] = {
     "target_delta_snr_db": "SNR degradation vs channel floor (dB)",
     "achieved_contamination": r"Achieved contamination (fraction of trials)",
     "achieved_failure": "Failed electrodes (fraction of array)",
-    "achieved_budget": r"BO iterations (incl. $n_\mathrm{init}$)",
     "n_survivors": "Surviving electrodes",
     "alpha": r"Residual amplification $\alpha$",
     "coverage_50": "50% interval coverage",
@@ -676,8 +679,6 @@ AXIS_LABELS: dict[str, str] = {
     "top1_hit": "Top-1 hit rate",
     "top3_hit": "Top-3 hit rate",
     "opt_distance": "Recommendation-to-optimum distance (electrode pitch)",
-    "decoy_capture": "Decoy-capture rate",
-    "amplitude_ratio": r"Decoy amplitude ratio $a_2/a_1$",
     "regret_difference": "Regret difference vs GP-MLL (norm. GT range)",
     "morans_i": "Moran's I",
     "skewness": "Skewness",
@@ -687,14 +688,7 @@ AXIS_LABELS: dict[str, str] = {
     "reliability": "Split-half reliability (Spearman-Brown)",
     # Hyp C mechanism figures (tasks #5, #6, #9).
     "context_t": "Context size $t$ (observations)",
-    "rho_shape": r"Update-shape alignment with GP (Pearson $r$)",
-    "surprise_c": r"Surprise $c$ (predictive SD at anchor)",
-    "update_at_anchor": "Update at anchor (predictive SD units)",
-    "update_normalized": "Update (normalized to max)",
-    "ell_hat": "Implicit-kernel lengthscale (norm. coords)",
-    "sym_err": "Implied-kernel asymmetry",
-    "psd_neg_mass": "Implied-kernel negative-eigenvalue mass",
-    "ell_cv_anchor": "Lengthscale CV across anchors",
+    "psd_neg_mass": "Implied-covariance negative-eigenvalue mass",
     "placement": "Placement $p$ (0 = floor, 1 = ceiling)",
     # Rank placement (2026-10-14). A DIFFERENT reading from ``placement`` above, and the two must never share a
     # label: the ratio is 0 at the prior floor and 1 at the noise ceiling, whereas the rank is the fraction of the
@@ -714,20 +708,32 @@ AXIS_LABELS: dict[str, str] = {
     "disparity_ratio": "Procrustes disparity / null mean",
     "cka_pairwise": "Debiased CKA of the same two clouds",
     "layer": "Transformer layer",
-    "layer_corr": r"Corr. of $\|\Delta Z_\ell\|$ with GP update",
-    "layer_probe_r2": r"Ridge-probe $R^2$ ($\Delta Z_\ell \to \Delta_\mathrm{PFN}$)",
-    # F7 update_vs_distance (B2 Step 11, 2026-10-06). Distance is in electrode pitches (grid steps of ch2xy);
-    # transfer is the update divided by the injected surprise c0 * s(anchor), so 1 = the full surprise.
-    "distance_pitch": "Distance from anchor (electrode pitch)",
-    "transfer_abs": r"$|T|$, update / injected surprise",
-    "cum_energy_share": r"Cumulative share of update energy $\sum g^2$",
+    # OMEGA bayes_update (2026-10-15). Part A: every coherent Bayesian model scores 0 drift, a shrink / move
+    # ratio of 1 and 0 asymmetry, whatever its prior. Part B: TabPFN's update against a GP reference, matched per
+    # site before any aggregate. ``cov_asymmetry`` is the tower-property covariance -- never the retired
+    # ``sym_err``, which divided by (1 - gain) and so assumed homoscedastic noise.
+    "drift_abs": r"Mean drift $|\delta|$ (predictive SD)",
+    "drift_w1": "Distributional drift W1 (predictive SD)",
+    "shrink_move_ratio": "Expected shrink / mean movement (1 = Bayes)",
+    "total_var_ratio": "Total-variance ratio (1 = Bayes)",
+    "cov_asymmetry": "Implied-covariance asymmetry",
+    "latent_frac": r"Latent share of predictive variance at $x'$",
+    "implied_noise": r"Implied noise variance at $x'$ (z-units$^2$)",
+    "trial_var": r"Trial variance at $x'$ (z-units$^2$)",
+    "sigma_recovery_rho": r"Spearman $\rho$, implied noise vs trial variance",
+    "gain": r"Gain $T(x')$",
+    "transfer_slope": "Transfer slope vs reference",
+    "footprint_r": r"Footprint correlation (Pearson $r$)",
+    "gap_change": "Change of W1 gap to reference (ref. SD)",
+    "delta_crps": r"$\Delta$CRPS, TabPFN $-$ reference (z-units)",
+    "saturation": "Saturation (1 = linear response)",
+    "ladder_c": r"Injected surprise $c$ (GP-Bayes SD at $x'$)",
+    "update_anchor_sd": r"Update at $x'$ (GP-Bayes SD at $x'$)",
+    "implied_cov": r"Implied covariance $C(x', x)$",
     "far_field_share": "Far-field share of update energy",
-    "locality_index": "Locality index (0 = global shift, 1 = local)",
-    "offset_share": "Offset share of update energy",
-    "offset_fit_ell": "Offset-fit lengthscale (electrode pitch)",
-    "far_peak_ratio": "Far-field / anchor transfer",
-    "surprise_abs": r"Surprise magnitude $|c|$ (predictive SD)",
-    "offmap_transfer": r"Median $|T|$ on the grid",
+    "abs_transfer": r"Mean $|T(x)|$ (update per unit surprise)",
+    "distance_pitch": r"Distance from $x'$ (electrode pitches)",
+    "dmu_exemplar": r"Change of mean $\Delta\mu(x)$ (z-units)",
 }
 
 #: Linestyle of each embedding readout (B1 Step 3). Readouts are told apart by linestyle so that colour stays
@@ -750,60 +756,43 @@ READOUT_LABELS: dict[str, str] = {
 #: acquisition functions and the Hyp C update-rule statistics. Mirrors ``StressKnob.symbol``, which is the
 #: definition; this map exists so a figure never has to import the knob registry.
 KNOB_SYMBOLS: dict[str, str] = {
-    "k1_decoy": r"$a_2/a_1$",
     "k2_channel": r"$\gamma$",
     "k2_global": r"$\eta$",
     "k5_outliers": r"$\varepsilon$",
-    "k6_budget": r"$B$",
     "k6_failure": r"$\varphi$",
-    "k7_shuffle": r"$f$",
 }
 
 #: One-line meaning of each stress parameter, for a caption or a legend title.
 KNOB_PARAM_LABELS: dict[str, str] = {
-    "k1_decoy": r"decoy amplitude ratio $a_2/a_1$",
     "k2_channel": r"residual gain $\gamma$",
     "k2_global": r"added noise SD $\eta$ (z-units)",
     "k5_outliers": r"contaminated trial slots $\varepsilon$",
-    "k6_budget": r"budget $B$ (queries incl. $n_\mathrm{init}$)",
     "k6_failure": r"failed electrodes $\varphi$",
-    "k7_shuffle": r"shuffled sites $f$",
 }
 
 #: Canonical stress-knob names (roadmap jargon) and their axis strings.
 KNOB_LABELS: dict[str, str] = {
-    "k1_decoy": r"K1 decoy peak (amplitude ratio $a_2/a_1$)",
     "k2_channel": r"K2 SNR (channel-relative noise, $\gamma$)",
     "k2_global": r"K2 SNR (global noise, $\eta$)",
     "k5_outliers": r"K5 outlier contamination ($\varepsilon$)",
-    "k6_budget": r"K6 sparsity (BO iterations, $B$)",
-    "k6_failure": r"K6 sparsity (electrode failure, $\varphi$)",
-    "k7_shuffle": r"K7 spatial shuffle fraction $f$",
+    "k6_failure": r"K6 electrode failure ($\varphi$)",
     "nominal": "Nominal anchor",
 }
 
-#: The knob level itself is never the primary x-axis for K2 - achieved SNR is. K7 is the opposite case and
-#: deliberately plots its level: the shuffle knob realizes the requested fraction EXACTLY (its re-pairing is a
-#: cycle, so it has no fixed points), and its achieved structure statistic (Moran's I) is non-monotone once the
-#: structure is gone - it fluctuates around zero - so it makes a poor axis and a good annotation.
+#: The knob level itself is never the primary x-axis for K2 - achieved SNR is.
 KNOB_X_AXIS: dict[str, str] = {
-    "k1_decoy": "level",
     "k2_channel": "achieved_snr_db",
     "k2_global": "achieved_snr_db",
     "k5_outliers": "level",
-    "k6_budget": "budget",
     "k6_failure": "level",
-    "k7_shuffle": "level",
 }
 
 #: X-axis wording per knob, where the knob's vocabulary beats the column's (two lines, unit in parentheses,
 #: so it fits a panel of a three-panel row). K5 and K6 read as levels of the perturbation, not as SNR.
 KNOB_X_LABELS: dict[str, str] = {
-    "k1_decoy": "Decoy amplitude ratio\n($a_2/a_1$)",
     "k5_outliers": "Contamination $\\varepsilon$\n(fraction of trial slots)",
     # varphi, not varepsilon: K5's contamination fraction owns epsilon (2026-10-12 notation settlement).
     "k6_failure": "Failed electrodes $\\varphi$\n(fraction of array)",
-    "k7_shuffle": "Shuffled sites $f$\n(fraction of array)",
 }
 
 

@@ -1,12 +1,12 @@
-"""Hyp C mechanism analyses: update rule (M10, primary), placement (MMD/W2), CKA.
+"""Hyp C mechanism analyses: Bayesian update (OMEGA, arm i), placement (MMD/W2), CKA, Procrustes.
 
 One CLI, one config family: the ``analysis`` key picks the runner and a same-named block
 holds its parameters (unknown keys raise, as everywhere else)::
 
-    python -m pfns4neurostim mechanism --config configs/experiment/mechanism_update_rule_nhp.yaml
+    python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp.yaml
     python -m pfns4neurostim mechanism --config configs/experiment/mechanism_placement_nhp.yaml
     python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml
-    python -m pfns4neurostim mechanism --config configs/experiment/mechanism_update_rule_nhp.yaml --replot
+    python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml --replot
     python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml --only-cached
 
 Outputs go to ``{output_root}/mechanism/{analysis}/{dataset}/{tag}/`` with the resolved
@@ -28,9 +28,9 @@ recomputes everything. A cell's identity holds every setting that can change its
 Cells by analysis:
 
 ====================  ===================================================================================
-update_rule           ``probe`` (channel, level, t, draw, engine) -- the full probe result is cached, so F7
-                      and the exemplar are derived at assembly; ``layers``; ``offmap``;
-                      ``gate`` (each validation gate); ``profile_control`` (F7 known-GP / shuffled)
+bayes_update          ``cell`` (channel, level, t, draw: every engine of the cell, metric rows only -- the
+                      distributions are never cached); ``gate`` (G1, G2, G4); ``discrepancy`` (channel, t: the
+                      frozen-preprocessing probe vs the refit, the former G0); ``exemplar`` (Omega-5, per t)
 cka                   ``a`` (channel, level, t, draw, readout); ``b`` (grid, t, draw; feature mean);
                       ``gate`` (controls, per readout)
 placement             ``B`` (channel); ``C`` (channel: every level and context size); ``gate`` (M0 ladder)
@@ -57,7 +57,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -98,7 +98,7 @@ class MechanismConfig:
     """Resolved mechanism-analysis configuration.
 
     Attributes:
-        analysis: ``'update_rule'``, ``'placement'``, ``'cka'``, ``'procrustes'`` or ``'layer_dynamics'``.
+        analysis: A key of :data:`ANALYSES`.
         tag: Run tag.
         dataset: Dataset selection.
         device: Torch device for TabPFN.
@@ -390,194 +390,706 @@ def _grid_banks(cells: _Cells, ref: ChannelData, n_prior_total: int, n_noise: in
 
 
 # ---------------------------------------------------------------------------
-# update_rule (task #9)
+# bayes_update (OBJECTIVE OMEGA, 2026-10-15): how Bayesian is TabPFN's in-context update?
 # ---------------------------------------------------------------------------
-UPDATE_RULE_DEFAULTS: dict[str, Any] = {
-    "engines": ["tabpfn_v2_5", "gp_mll_frozen", "gp_mll_refit"],
+BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
+    # Engines (OMEGA §3.2). TabPFN's update is the deployed one -- a public-API refit on D + {(x', y')} per probe
+    # (user, 2026-10-15); the variants differ only in temperature. The frozen-preprocessing probe is not an engine.
+    "engines": ["tabpfn_v2_5", "tabpfn_v2_5_t1", "gp_bayes", "gp_mll_refit", "gp_fixed"],
+    # Part B references: every other engine of a cell is contrasted with each of them, site-matched.
+    "references": ["gp_bayes", "gp_mll_refit", "gp_fixed"],
+    # Which cells run which part, per engine; an engine or part not listed runs everywhere. Filter keys:
+    # levels, context_ts, draws, channels_per_subject (the first n channels of each subject, in load order).
+    "coverage": {},
     "stress": {"knob": "k2_channel", "levels": [1.0, 2.0, 4.0]},
-    "n_context_draws": 3,
-    "n_anchors": 12,
-    "surprises": [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0],
-    "refit_surprises": [-1.0, -0.5, 0.5, 1.0],
-    "gp_params": {"n_opt_steps": 100, "lr": 0.1},
-    # Which GP every metric is measured against (rho_shape, the surprise-response reference, the exemplar's GP row):
-    # ``mll`` is the converged type-II ML GP of ``gp_params``; ``fixed`` is the GP-fixed arm of the paper (no fitting,
-    # the hyperparameters of ``fixed_gp_params``). Added 2026-10-02 because the converged fit can drive one ARD
-    # lengthscale to ~0 and another to ~1e4 on a 10-point context, which makes the GP update a one-column stripe.
-    "reference_gp": "mll",
-    # Keep in step with configs/model/gp_naive.yaml by hand: the engines build the surrogate directly.
+    "n_context_draws": 2,
+    "anchors": {"n_unobserved": 8, "n_observed": 4},
+    # method: gauss_hermite | truncated | rqmc (analysis/bayes_update.QUADRATURE_METHODS); central_mass for truncated;
+    # n_scrambles for rqmc (K is then the points per scramble).
+    "quadrature": {"method": "gauss_hermite", "K": 20, "u_min": 1e-12, "central_mass": 1.0, "n_scrambles": 1},
+    "eps": 0.01,
+    "y_grid": {"points": 512, "u_tail": 1e-4},
+    "shared": {"n_trials": 8, "ladder": [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0], "saturation_c": [1.0, 3.0]},
+    "far_pitch": 4.0,
+    # precision / max_batch_tokens apply to the frozen probe of ``discrepancy`` only (the refit uses the public API).
+    # The inference seed of a grid cell is inference_seed + its context draw (user, 2026-10-16, replacing gate G5):
+    # each draw is then also an independent TabPFN instance, so every between-draw interval carries seed variance.
+    "tabpfn": {"inference_seed": 0, "precision": "fp32", "max_batch_tokens": 400000, "softmax_temperature": 0.9},
+    "gp_bayes": {"lengthscale": [0.05, 2.0, 12], "outputscale": [0.05, 5.0, 8], "noise": [1.0e-3, 1.0, 10],
+                 "b2": 1.0, "prune_mass": 1.0e-10, "chunk": 2048, "exact_max_components": 64, "sd_bins": 32},
+    "gp_params": {"n_opt_steps": 50, "lr": 1.0, "optimizer": "lbfgs", "dtype": "float64", "noise_floor": 1.0e-3,
+                  "n_restarts": 5, "lengthscale_floor": 0.05},
     "fixed_gp_params": {"lengthscale": 0.6931471805599453, "outputscale": 1.0, "noise": 0.05},
-    "inference_seed": 0,
-    "max_batch_tokens": 400000,
-    # Secondary layer-wise arm. ``context_ts`` (a subset of the shared ladder; ``None`` = all of it): the layer
-    # profile is a property of the surrogate *given its evidence*. It reads the feature-token mean only: the label
-    # token was dropped from every mechanism analysis on 2026-10-07 (see analysis/embeddings.py).
-    "layer_arm": {"enabled": True, "context_ts": None, "level": 1.0, "ridge": 1.0},
-    # Which cell figure F1 (the exemplar delta-maps) is drawn from (2026-09-27 / 09-30, unchanged):
-    #   context_ts      one column per context size (a subset of the shared ladder; ``None`` = all of it) for
-    #                   ONE channel.
-    #   level           the nominal anchor (alpha = 1.0).
-    #   anchor_stratum  'centre' gives the full kernel bump (used by anchor: per_cell).
-    #   select          'median_alignment' (representative by construction), 'explicit' or 'first'.
-    #   anchor          'common' (default since 2026-10-07): ONE anchor site for every column -- the most central site of
-    #                   the chosen channel that is unobserved in all of its exemplar contexts -- probed in a dedicated
-    #                   ``exemplar`` cell per context size, so the columns differ only in the evidence. The grid cells
-    #                   draw 12 anchors each, independently per context, and almost never share one, which made the
-    #                   columns show different sites. 'per_cell' keeps that older behaviour (first anchor of the stratum).
-    #   reference_gp    the GP of F1's second row: 'mll' or 'fixed'; ``None`` = ``update_rule.reference_gp``. Independent of
-    #                   the reference every metric uses, because the converged ML fit's ARD lengthscales collapse on small
-    #                   contexts and turn its update into a one-row / one-column stripe, which is a poor picture of "the GP
-    #                   update" (user, 2026-10-07: F1 compares TabPFN with GP-fixed). Needs ``anchor: common``.
-    # The plotted profile is the antisymmetrized response at the SMALLEST surprise magnitude, which is the
-    # same estimator ``ell_hat`` uses, so the figure and the metric cannot disagree.
-    "exemplar": {
-        "context_ts": None,
-        "level": 1.0,
-        "draw": 0,
-        "anchor_stratum": "centre",
-        "select": "median_alignment",
-        "subject": None,
-        "emg": None,
-        "anchor": "common",
-        "reference_gp": None,
-    },
+    # Omega-5: C(x', .) maps at ONE common anchor (the most central site unobserved in every exemplar context).
+    "exemplar": {"enabled": True, "subject": None, "emg": None, "level": 1.0, "draw": 0,
+                 "engines": ["tabpfn_v2_5", "gp_bayes", "gp_mll_refit"]},
+    "panel_ts": None,
+    # Hypothesis C1, "is the update GP-like?" (user, 2026-10-19): descriptive readouts against GP-MLL frozen, inside the
+    # same cells (a Part B reference only). distance_bins: edges (pitches) of the transfer-vs-distance profile;
+    # exemplar_c: the shared ladder multiplier of the change maps at the common anchor (y' = mu_B + c s_B).
+    "c1": {"reference": "gp_mll_frozen", "engines": ["tabpfn_v2_5", "gp_mll_frozen", "gp_mll_refit", "gp_fixed"],
+           "distance_bins": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 14.0], "exemplar_c": 1.0},
+    "run": {"gates": True, "grid": True, "discrepancy": True},
+    # The former gate G0, archived as a reported discrepancy (user, 2026-10-15): the frozen-preprocessing probe vs
+    # the refit, per site and probe, by t -- the input of the analysis of why the two differ. Never a gate.
+    # context_ts null = the whole ladder; channels: the first channels_per_subject of every subject.
+    "discrepancy": {"channels_per_subject": 2, "context_ts": None, "n_trials": 3, "ladder": [-3.0, 3.0]},
     "gates": {
-        "positive_r": 0.7, "lengthscale_tol": 0.25, "icc_min": 0.75, "linear_regime_tol": 0.25,
-        "null_quantile": 0.95, "context_t": 25,
+        # Run a subset (e.g. [G1, G2] for a quadrature shadow); null = all of G1, G2, G4. G3 (quadrature K) and G5
+        # (seed floor) were dropped on 2026-10-16 (user): RQMC gives every anchor its own SE, and the seed is varied
+        # with the context draw inside the grid.
+        "only": None,
+        "n_channels": 2,
+        # bayes_alpha: GP-Bayes under rqmc (user, 2026-10-15, option 2 -- the residual must be consistent with zero
+        # in SE units): every anchor's drift / total-variance z and every pool's asymmetry z <= the family-wise
+        # critical |t| (analysis/bayes_update.rqmc_floor, rqmc_critical_z). The *_tol rules apply to the
+        # deterministic schemes, whose residual cannot be told from a violation.
+        "g1": {"fixed_tol": 1.0e-8, "bayes_drift_tol": 1.0e-3, "bayes_tol": 1.0e-2, "bayes_alpha": 0.05},
+        "g2": {"gain_mult": 1.5, "bias_sd": 0.25, "max_shrink_move": 0.5, "min_drift": 0.05},
+        # dense: grid sizes to compare against, one refinement per entry (G4 (b), user 2026-10-15: refine the axis
+        # that matters -- the lengthscales -- and check the other axes separately, rather than every axis at once).
+        "g4": {"min_ess": 10.0, "context_ts": [10, 50], "rel_tol": 0.10, "abs_tol": 0.01,
+               "dense": [{"lengthscale": 45}, {"outputscale": 15, "noise": 19}]},
     },
-    "positive_control": {"grid_side": 10, "lengthscale": 0.2, "noise_sd": 0.3, "n_trials": 10},
-    "seed_floor": {"n_seeds": 10, "n_channels": 2},
-    # F7 update_vs_distance (B2 Step 11, 2026-10-06). Derived at assembly from the cached probe results, so
-    # changing a bin or a threshold re-assembles without recomputing; only the off-map and control cells compute.
-    #   bin_edges     distance bins in electrode pitches (a final open bin is appended); [0, 0.5) holds the anchor.
-    #   far_pitch     far field = d >= 4 pitches (half the NHP grid's short side).
-    #   level         stress level of the F7 figures and of the off-map control (the nominal one).
-    #   panel_ts      context sizes that get a radial-profile panel (the preview layout, restored 2026-10-07);
-    #                 on the ladder, ``None`` = its first and middle sizes (10 and 50 on NHP). Keep them <= half the
-    #                 grid: only 16 unobserved sites remain at t = 80 on NHP. The energy panel spans the whole ladder.
-    #   headline_gp   the stated comparator whose difference to TabPFN the F7 supplement prints (user, 2026-10-06:
-    #                 GP-fixed, the blind default). The main figure draws TabPFN, GP-fixed and GP-MLL (2026-10-07).
-    #   offmap        control (1): a virtual anchor ``distance`` grid widths past the edge.
-    #   controls      (3) known-GP synthetic channel, (4) shuffled coordinates on the first ``n_channels``, at
-    #                 context size ``context_t``.
-    "profile": {
-        "enabled": True,
-        "bin_edges": [0.0, 0.5, 1.5, 2.5, 3.5, 4.5, 6.0, 8.0, 11.0],
-        "far_pitch": 4.0,
-        "level": 1.0,
-        "panel_ts": None,
-        "headline_gp": "gp_fixed_frozen",
-        "offmap": {"enabled": True, "distance": 2.0},
-        "controls": {"known_gp": True, "shuffled": True, "context_t": 25, "n_channels": 2},
-    },
-    # Step 7 (M8): join per-channel metrics with a Hyp A/B tidy.csv; skipped when null.
-    "link": {
-        "tidy_csv": None,
-        "model": "tabpfn_v2_5",
-        "outcomes": ["recommended_regret", "cumulative_regret"],
-        "predictors": ["saturation_index_median", "ell_adaptivity", "rho_shape_median"],
-        "n_boot": 2000,
-    },
+    # M8: per-channel TabPFN medians at level 1 joined with a Hyp A/B tidy.csv; skipped when null.
+    "link": {"tidy_csv": None, "model": "tabpfn_v2_5", "level": 1.0,
+             "outcomes": ["recommended_regret", "cumulative_regret"],
+             "predictors": ["drift_abs", "total_var_ratio", "transfer_slope", "delta_crps"], "n_boot": 2000},
 }
 
-#: Engines whose update F7 profiles (the GP-refit arm re-optimizes per probe and has no single update).
-PROFILE_ENGINES: tuple[str, ...] = ("tabpfn_v2_5", "gp_mll_frozen", "gp_fixed_frozen")
+#: TabPFN engines, all the deployed update -- a public-API refit on D + {(x', y')} per probe (user, 2026-10-15):
+#: the deployed temperature, and the network's raw PPD (temperature 1 by definition).
+TABPFN_ENGINES: dict[str, dict[str, Any]] = {
+    "tabpfn_v2_5": {},
+    "tabpfn_v2_5_t1": {"softmax_temperature": 1.0},
+}
+
+#: Engines that are Part B references only (never a coherence engine): GP-MLL frozen exists for Hypothesis C1 alone.
+B_ONLY_ENGINES: tuple[str, ...] = ("gp_mll_frozen",)
+
+#: Precision of TabPFN's quantile function (``FrozenTabPFN.ppf``), recorded in every TabPFN cell identity: float32
+#: quantiles broke at the clipped extreme quadrature levels on 2026-10-15, so cells computed before the fix never
+#: serve a run after it.
+TABPFN_QUANTILE_DTYPE: str = "float64"
+
+#: Quadrature schemes (mirrors ``analysis.bayes_update.QUADRATURE_METHODS``; kept here so validating a config does
+#: not import the analysis module).
+B_QUADRATURE_METHODS: tuple[str, ...] = ("gauss_hermite", "truncated", "rqmc")
+
+#: Pre-declared headline metrics (OMEGA §3.6): Part A per-anchor, Part A per-cell, Part B (TabPFN vs GP-Bayes).
+#: Part A's law-of-total-variance headline is total_var_ratio (user, 2026-10-16): the ratio of sums SumU / SumM is
+#: ill-conditioned where M is a few % of s^2 (G3 3/8, G5 ICC <= 0.44 on the refit) and is reported as secondary.
+HEADLINE_A: tuple[str, ...] = ("drift_abs", "total_var_ratio", "latent_frac")
+HEADLINE_A_CELL: tuple[str, ...] = ("cov_asymmetry", "sigma_recovery_rho")
+HEADLINE_B: tuple[str, ...] = ("transfer_slope", "footprint_r", "gap_change", "delta_crps")
 
 
-def _make_engine(name: str, p: dict[str, Any], device: str, inference_seed: int) -> Any:
-    """Build one update engine by name.
+def _validate_bayes_update(p: dict[str, Any], ladder: Sequence[int]) -> dict[str, Any]:
+    """Resolve the ``bayes_update`` block over its defaults, refusing unknown keys at every level.
 
     Args:
-        name: ``'tabpfn_v2_5'``, ``'gp_mll_frozen'``, ``'gp_mll_refit'`` or ``'gp_fixed_frozen'``.
-        p: Resolved ``update_rule`` block.
+        p: User block.
+        ladder: ``context.sizes``.
+
+    Returns:
+        The resolved parameters.
+
+    Raises:
+        ValueError: On unknown keys, unknown engines, or settings the analysis cannot honour.
+    """
+    d = BAYES_UPDATE_DEFAULTS
+    p = _check_keys(p, d, "bayes_update")
+    for sub in ("stress", "anchors", "quadrature", "y_grid", "shared", "tabpfn", "gp_bayes", "fixed_gp_params",
+                "exemplar", "c1", "run", "discrepancy", "gates", "link"):
+        p[sub] = _check_keys(p[sub], d[sub], f"bayes_update.{sub}")
+    for g in d["gates"]:
+        if isinstance(d["gates"][g], dict):
+            p["gates"][g] = _check_keys(p["gates"][g], d["gates"][g], f"bayes_update.gates.{g}")
+    known = set(TABPFN_ENGINES) | {"gp_bayes", "gp_mll_refit", "gp_fixed", *B_ONLY_ENGINES}
+    bad = [e for e in p["engines"] if e not in known]
+    if bad:
+        raise ValueError(f"bayes_update.engines: unknown {bad}; known {sorted(known)}.")
+    if "gp_bayes" not in p["engines"]:
+        raise ValueError("bayes_update.engines must include gp_bayes: it anchors the shared y' ladder.")
+    bad = [r for r in p["references"] if r not in p["engines"]]
+    if bad:
+        raise ValueError(f"bayes_update.references {bad} are not in bayes_update.engines.")
+    for eng, parts in p["coverage"].items():
+        if eng not in p["engines"]:
+            raise ValueError(f"bayes_update.coverage names {eng!r}, which is not an engine.")
+        for part, spec in (parts or {}).items():
+            if part not in ("A", "B"):
+                raise ValueError(f"bayes_update.coverage.{eng}: parts are 'A' and 'B', got {part!r}.")
+            unknown = set(spec or {}) - {"levels", "context_ts", "draws", "channels_per_subject"}
+            if unknown:
+                raise ValueError(f"bayes_update.coverage.{eng}.{part}: unknown filter key(s) {sorted(unknown)}.")
+    lad = [float(c) for c in p["shared"]["ladder"]]
+    for c in p["shared"]["saturation_c"]:
+        if float(c) not in lad or -float(c) not in lad:
+            raise ValueError(f"bayes_update.shared.saturation_c={p['shared']['saturation_c']} needs +-{c} on the ladder.")
+    if p["quadrature"]["method"] not in B_QUADRATURE_METHODS:
+        raise ValueError(f"bayes_update.quadrature.method must be one of {B_QUADRATURE_METHODS}, "
+                         f"got {p['quadrature']['method']!r}.")
+    for eng, parts in p["coverage"].items():
+        if eng in B_ONLY_ENGINES and (parts or {}).get("A"):
+            raise ValueError(f"bayes_update.coverage.{eng}.A: {eng} is a Part B reference only (Hypothesis C1).")
+    bad = [e for e in p["exemplar"]["engines"] if e in B_ONLY_ENGINES]
+    if bad:
+        raise ValueError(f"bayes_update.exemplar.engines: {bad} have no implied covariance (Part B references only).")
+    # C1 is active when its reference is an engine; its figures then show the listed engines that are present.
+    c1 = p["c1"]
+    if c1["reference"] in p["engines"]:
+        if c1["reference"] not in p["references"]:
+            raise ValueError(f"bayes_update.c1.reference {c1['reference']!r} must be in bayes_update.references.")
+        if float(c1["exemplar_c"]) not in [float(c) for c in p["shared"]["ladder"]]:
+            raise ValueError(f"bayes_update.c1.exemplar_c={c1['exemplar_c']} is not on the shared ladder.")
+    c1["engines"] = [e for e in c1["engines"] if e in p["engines"]]
+    if p["panel_ts"] is None:
+        p["panel_ts"] = sorted({int(ladder[0]), int(ladder[len(ladder) // 2])})
+    _subset_of_ladder(p["panel_ts"], ladder, "bayes_update.panel_ts")
+    if p["discrepancy"]["context_ts"] is None:
+        p["discrepancy"]["context_ts"] = [int(t) for t in ladder]
+    _subset_of_ladder(p["discrepancy"]["context_ts"], ladder, "bayes_update.discrepancy.context_ts")
+    if p["run"]["gates"]:
+        _subset_of_ladder(p["gates"]["g4"]["context_ts"], ladder, "bayes_update.gates.g4.context_ts")
+    return p
+
+
+def _make_engine(name: str, p: dict[str, Any], device: str, draw: int = 0) -> Any:
+    """Build one update engine by name (OMEGA §3.2).
+
+    Args:
+        name: A key of :data:`TABPFN_ENGINES`, ``'gp_bayes'``, ``'gp_mll_refit'`` or ``'gp_fixed'``.
+        p: Resolved ``bayes_update`` block.
         device: Torch device for TabPFN.
-        inference_seed: TabPFN preprocessing seed.
+        draw: Context draw; TabPFN's inference seed is ``tabpfn.inference_seed + draw``.
 
     Returns:
         The engine.
     """
-    from ..analysis import update_rule as U  # noqa: PLC0415
-    from ..models.gp.surrogates import GPSurrogate, NaiveGPSurrogate  # noqa: PLC0415
+    from ..analysis import bayes_update as B  # noqa: PLC0415
 
-    if name == "tabpfn_v2_5":
-        # injection_mode defaults to 'test', the historical path, so adding the key here cannot move
-        # any cached update_rule cell: it is deliberately NOT part of ``_engine_params`` (which
-        # feeds the cell identity of the M10 grid) and the layer-dynamics runner records it in its
-        # own identity instead.
-        return U.PFNEngine(device=device, random_state=inference_seed,
-                           max_batch_tokens=int(p["max_batch_tokens"]), name=name,
-                           injection_mode=str(p.get("injection_mode", "test")),
-                           precision=str(p.get("precision", "auto")))
-    if name == "gp_mll_frozen":
-        return U.GPFrozenEngine(GPSurrogate(**p["gp_params"]), name=name)
+    if name in TABPFN_ENGINES:
+        tp = {**p["tabpfn"], **TABPFN_ENGINES[name]}
+        return B.PFNRefitEngine(device=device, random_state=int(tp["inference_seed"]) + int(draw),
+                                softmax_temperature=float(tp["softmax_temperature"]), name=name)
+    if name == "gp_bayes":
+        g = p["gp_bayes"]
+        return B.GPBayesEngine(g["lengthscale"], g["outputscale"], g["noise"], b2=float(g["b2"]),
+                               prune_mass=float(g["prune_mass"]), chunk=int(g["chunk"]), name=name,
+                               exact_max_components=int(g["exact_max_components"]), sd_bins=int(g["sd_bins"]))
     if name == "gp_mll_refit":
-        return U.GPRefitEngine(GPSurrogate(**p["gp_params"]), name=name)
-    if name == "gp_fixed_frozen":
-        return U.GPFrozenEngine(NaiveGPSurrogate(**p["fixed_gp_params"]), name=name)
-    raise ValueError(f"Unknown update_rule engine {name!r}.")
+        return B.GPRefitEngine(p["gp_params"], name=name)
+    if name == "gp_mll_frozen":
+        return B.GPFrozenEngine(p["gp_params"], name=name)
+    if name == "gp_fixed":
+        return B.GPFixedEngine(**p["fixed_gp_params"], name=name)
+    raise ValueError(f"Unknown bayes_update engine {name!r}.")
 
 
-def _engine_params(name: str, p: dict[str, Any]) -> dict[str, Any]:
-    """The settings of one engine that enter a cell identity."""
-    if name == "tabpfn_v2_5":
-        return {"inference_seed": int(p["inference_seed"])}
-    if name in ("gp_mll_frozen", "gp_mll_refit"):
+def _engine_params(name: str, p: dict[str, Any], draw: int = 0) -> dict[str, Any]:
+    """The settings of one engine that enter a cell identity (seed, temperature and quantile precision included)."""
+    if name in TABPFN_ENGINES:
+        tp = {**p["tabpfn"], **TABPFN_ENGINES[name]}
+        return {"inference_seed": int(tp["inference_seed"]) + int(draw), "softmax_temperature": float(tp["softmax_temperature"]),
+                "refit": True, "quantile_dtype": TABPFN_QUANTILE_DTYPE}
+    if name == "gp_bayes":
+        return {k: v for k, v in p["gp_bayes"].items() if k != "chunk"}
+    if name == "gp_mll_refit":
         return {"gp_params": p["gp_params"]}
+    if name == "gp_mll_frozen":
+        return {"gp_params": p["gp_params"], "refit": False}
     return {"fixed_gp_params": p["fixed_gp_params"]}
 
 
-def _reference_params(p: dict[str, Any]) -> dict[str, Any]:
-    """Identity of the reference GP (its kind and hyperparameter settings)."""
-    kind = p["reference_gp"]
-    return {"reference_gp": kind, "params": p["gp_params"] if kind == "mll" else p["fixed_gp_params"]}
+def _covered(spec: dict[str, Any] | None, label: str, allowed: dict[int, set[str]], level: float, t: int,
+             draw: int) -> bool:
+    """Whether a cell passes one coverage filter (``None`` = every cell)."""
+    if not spec:
+        return True
+    if "levels" in spec and not any(np.isclose(level, lv) for lv in spec["levels"]):
+        return False
+    if "context_ts" in spec and int(t) not in {int(v) for v in spec["context_ts"]}:
+        return False
+    if "draws" in spec and int(draw) not in {int(v) for v in spec["draws"]}:
+        return False
+    if "channels_per_subject" in spec and label not in allowed.get(int(spec["channels_per_subject"]), set()):
+        return False
+    return True
 
 
-def _make_reference(p: dict[str, Any], name: str = "reference") -> Any:
-    """The frozen GP every update is measured against, chosen by ``update_rule.reference_gp``.
+def _first_per_subject(channels: Sequence[ChannelData], n: int) -> set[str]:
+    """Labels of the first ``n`` channels of every subject, in load order."""
+    seen: dict[int, int] = {}
+    keep = set()
+    for ch in channels:
+        if seen.get(ch.subject, 0) < n:
+            keep.add(ch.label)
+        seen[ch.subject] = seen.get(ch.subject, 0) + 1
+    return keep
+
+
+def _bayes_cell(
+    stressed: ChannelData,
+    label: str,
+    level: float,
+    t: int,
+    draw: int,
+    p: dict[str, Any],
+    cfg: MechanismConfig,
+    engines_a: Sequence[str],
+    engines_b: Sequence[str],
+    make: Callable[[str], Any],
+) -> dict[str, Any]:
+    """One (channel, level, t, draw) cell: Part A for ``engines_a``, Part B for ``engines_b``, metric rows only.
 
     Args:
-        p: Resolved ``update_rule`` block.
-        name: Engine name (``'reference'`` inside the grid).
+        stressed: The channel at this stress level.
+        label: Channel label (seed streams).
+        level: Stress level.
+        t: Context size.
+        draw: Context draw.
+        p: Resolved ``bayes_update`` block.
+        cfg: Resolved config.
+        engines_a: Engines that run Part A here.
+        engines_b: Engines that run Part B here (``gp_bayes`` included whenever this is non-empty).
+        make: ``name -> unfitted engine``.
 
     Returns:
-        A :class:`GPFrozenEngine`: the converged ML GP for ``'mll'``, the fixed-kernel GP-fixed for ``'fixed'``.
+        ``coherence`` (per anchor), ``coherence_cell`` (per pool), ``headtohead``, ``surprise`` and ``profile`` rows
+        (the transfer-vs-distance profile of Hypothesis C1), the
+        ``gp_bayes`` diagnostics, the host and the wall time (guardrail G5).
+    """
+    import socket  # noqa: PLC0415
+
+    from ..analysis import bayes_update as B  # noqa: PLC0415
+
+    t0 = time.time()
+    ctx = context_for(stressed, int(t), int(draw), base_seed=cfg.seed, level=float(level))
+    rng = rng_for(label, "bayes_update", level, t, draw, base_seed=cfg.seed)
+    anchors, pools, strata = B.select_anchors_uniform(stressed, int(p["anchors"]["n_unobserved"]),
+                                                      int(p["anchors"]["n_observed"]), rng, ctx.sites)
+    Q = stressed.X_pool
+    held = B.heldout_trials(stressed, ctx.sites, ctx.trial_idx)                   # [M, R]
+    observed = np.isin(np.arange(stressed.n_sites), ctx.sites)                     # [M]
+    dist = B.site_distances(stressed.ch2xy, anchors)                               # [A, M]
+    trial_var = np.nanvar(stressed.Y_trials[anchors], axis=1, ddof=1)             # [A]
+    names = list(dict.fromkeys([*engines_a, *engines_b]))                          # every engine requested, once
+    engines = {n: make(n) for n in names}
+    bases = {}
+    for n, eng in engines.items():
+        eng.fit(ctx.X, ctx.y)
+        bases[n] = eng.base(Q)
+    sh = p["shared"]
+    shared = None
+    if engines_b:
+        shared = B.shared_values(held, anchors, bases["gp_bayes"], int(sh["n_trials"]), sh["ladder"],
+                                 rng_for(label, "bayes_update_shared", level, t, draw, base_seed=cfg.seed))
+    qd = p["quadrature"]
+    yg = p["y_grid"]
+    coh: dict[str, list[dict[str, Any]]] = {n: [] for n in engines_a}
+    Cs: dict[str, list[np.ndarray]] = {n: [] for n in engines_a}
+    Ccs: dict[str, list[np.ndarray]] = {n: [] for n in engines_a}
+    h2h: list[dict[str, Any]] = []
+    surprise: list[dict[str, Any]] = []
+    profile: list[dict[str, Any]] = []
+    refs = [r for r in p["references"] if r in engines_b]
+    for i, a in enumerate(anchors):
+        a = int(a)
+        preds_b: dict[str, dict[str, Any]] = {}
+        # One quadrature draw per anchor, shared by every engine (identical levels u; each maps them through its
+        # own quantile function).
+        u, w = B.quadrature_levels(str(qd["method"]), int(qd["K"]), u_min=float(qd["u_min"]),
+                                   central_mass=float(qd["central_mass"]), n_scrambles=int(qd["n_scrambles"]),
+                                   rng=rng_for(label, "bayes_update_quadrature", level, t, draw, a,
+                                               base_seed=cfg.seed))
+        for n in names:
+            vals, parts = [], {}
+            yqs = []
+            if n in engines_a:
+                for sidx in range(len(u)):
+                    yq = B.quadrature_values(bases[n], a, u[sidx])
+                    parts[f"quad{sidx}"] = np.arange(len(vals), len(vals) + len(yq))
+                    vals += list(yq)
+                    yqs.append(yq)
+            if n in engines_b:
+                for key in ("trial", "ladder"):
+                    parts[key] = np.arange(len(vals), len(vals) + len(shared[key][i]))
+                    vals += list(shared[key][i])
+            pr = engines[n].probe(np.repeat(Q[a][None], len(vals), axis=0), np.asarray(vals), Q)
+            if n in engines_a:
+                extra = [(yqs[sidx], pr.take(parts[f"quad{sidx}"])) for sidx in range(len(u))]
+                row, C, Cc = B.coherence_scheme(engines[n], bases[n], Q, a, u, w, float(p["eps"]),
+                                                u_tail=float(yg["u_tail"]), grid_points=int(yg["points"]), extra=extra)
+                coh[n].append({**row, "pool": pools[i], "strata": strata[i], "trial_var": float(trial_var[i])})
+                Cs[n].append(C)
+                Ccs[n].append(Cc)
+            if n in engines_b:
+                preds_b[n] = {"base": bases[n], "trial": pr.take(parts["trial"]), "ladder": pr.take(parts["ladder"])}
+        if preds_b:
+            grid = B.site_grid([q for v in preds_b.values() for q in v.values()], float(yg["u_tail"]),
+                               int(yg["points"]), extra=held)
+            rows, sur, prof = B.headtohead_anchor(
+                preds_b, refs, anchor=a, trial_y=shared["trial"][i], trial_idx=shared["trial_idx"][i],
+                ladder_c=shared["c"], s_bayes_anchor=float(bases["gp_bayes"].sd[0, a]), heldout=held,
+                observed=observed, dist=dist[i], y_grid=grid, far_pitch=float(p["far_pitch"]),
+                saturation_c=sh["saturation_c"], distance_bins=p["c1"]["distance_bins"])
+            h2h += [{**r, "pool": pools[i], "strata": strata[i]} for r in rows]
+            surprise += [{**r, "pool": pools[i]} for r in sur]
+            profile += [{**r, "pool": pools[i]} for r in prof]
+    coh_cell = []
+    for n in engines_a:
+        extra = engines[n].diagnostics() if n == "gp_bayes" else {}
+        coh_cell += [{"engine": n, **c, **extra}
+                     for c in B.coherence_cell(coh[n], np.asarray(Cs[n]), anchors, pools, trial_var,
+                                               C_c=np.asarray(Ccs[n]))]
+    return {
+        "coherence": [{"engine": n, **r} for n in engines_a for r in coh[n]],
+        "coherence_cell": coh_cell,
+        "headtohead": h2h,
+        "surprise": surprise,
+        "profile": profile,
+        "anchors": anchors.tolist(),
+        "C": {n: np.asarray(Cs[n]).tolist() for n in engines_a},
+        "host": socket.gethostname(),
+        "device": cfg.device,
+        "seconds": time.time() - t0,
+    }
+
+
+def _rel_ok(a: float | None, b: float | None, rel: float, abs_tol: float) -> bool:
+    """``|a - b| <= rel |a|`` or ``<= abs_tol`` (gate G4); two undefined values agree."""
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) <= max(rel * abs(a), abs_tol)
+
+
+def _bayes_gates(
+    cfg: MechanismConfig,
+    p: dict[str, Any],
+    cells: _Cells,
+    channels: Sequence[ChannelData],
+    knob: Any,
+) -> list[dict[str, Any]]:
+    """Gates G1, G2 and G4 (OMEGA §3.6) on the first ``gates.n_channels`` channels at the nominal level, draw 0.
+
+    G3 and G5 were dropped on 2026-10-16 (user): under RQMC every anchor carries its own standard error (with the
+    largest quadrature ``|y'|`` as a tail flag), which measures what G3's K-doubling estimated; and the inference seed
+    varies with the context draw inside the grid, so seed variance enters every interval instead of a separate ICC.
+
+    G0 (frozen probe vs refit) is no longer a gate: TabPFN's update is the refit itself, and the frozen probe's
+    distance from it is reported by :func:`_frozen_refit_discrepancy` (user, 2026-10-15).
+
+    Every gate is a cached cell whose identity holds its thresholds, so re-running reassembles ``gates.json``
+    without recomputing.
+
+    Returns:
+        One record per gate with ``passed`` and the measured quantities.
+    """
+    from ..analysis import bayes_update as B  # noqa: PLC0415
+
+    g = p["gates"]
+    only = set(g["only"] or ("G1", "G2", "G4"))
+    gate_channels = list(channels[: int(g["n_channels"])])
+    level, draw = float(knob.levels[0]), 0
+    common = {"knob": knob.name, "level": level, "draw": draw, "anchors": p["anchors"], "eps": p["eps"],
+              "quadrature": p["quadrature"], "y_grid": p["y_grid"], "shared": p["shared"]}
+    out: list[dict[str, Any]] = []
+
+    def stressed_of(ch: ChannelData) -> ChannelData:
+        return knob.apply(ch, level, rng_for(ch.label, "bayes_update", level, base_seed=cfg.seed))
+
+    def run(ident: dict[str, Any], label: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any] | None:
+        hit = cells.run("gate", {**common, **ident}, label, lambda: (fn(), {}))
+        return None if hit is None else hit[0]
+
+    # ---- G1 (exact floor), G2 (power), G4 ESS: GP engines at every t ----
+    g1, g2 = g["g1"], g["g2"]
+    fixed_rows, bayes_rows, gain_rows, bias_rows, ess = [], [], [], [], {}
+    for ch in gate_channels if only & {"G1", "G2", "G4"} else []:
+        for t in cfg.context_sizes:
+            def g12_cell(ch: ChannelData = ch, t: int = int(t)) -> dict[str, Any]:
+                st = stressed_of(ch)
+                ctx = context_for(st, t, draw, base_seed=cfg.seed, level=level)
+                rng = rng_for(ch.label, "bayes_update", level, t, draw, base_seed=cfg.seed)
+                anchors, pools, _ = B.select_anchors_uniform(st, int(p["anchors"]["n_unobserved"]),
+                                                             int(p["anchors"]["n_observed"]), rng, ctx.sites)
+                tv = np.nanvar(st.Y_trials[anchors], axis=1, ddof=1)
+                qd = p["quadrature"]
+                kw = {"method": str(qd["method"]), "u_min": float(qd["u_min"]),
+                      "central_mass": float(qd["central_mass"]), "n_scrambles": int(qd["n_scrambles"]),
+                      "rng": rng_for(ch.label, "bayes_update_g1_quadrature", level, t, draw, base_seed=cfg.seed),
+                      "u_tail": float(p["y_grid"]["u_tail"]), "grid_points": int(p["y_grid"]["points"])}
+                res: dict[str, Any] = {}
+                for name, eng in (
+                        ("gp_fixed", _make_engine("gp_fixed", p, cfg.device)),
+                        ("gp_bayes", _make_engine("gp_bayes", p, cfg.device)),
+                        ("toy_gain", B.ToyUpdater(_make_engine("gp_fixed", p, cfg.device), gain_mult=g2["gain_mult"])),
+                        ("toy_bias", B.ToyUpdater(_make_engine("gp_fixed", p, cfg.device), bias_sd=g2["bias_sd"]))):
+                    eng.fit(ctx.X, ctx.y)
+                    rows, C, Cc = B.coherence(eng, st.X_pool, anchors, int(qd["K"]), float(p["eps"]), **kw)
+                    cell = B.coherence_cell(rows, C, anchors, pools, tv, C_c=Cc)
+                    res[name] = {"rows": rows, "cell": cell}
+                    if name == "gp_fixed":
+                        kC = eng.posterior_covariance(st.X_pool)[anchors]
+                        res[name]["max_cov_error"] = float(np.abs(C - kC).max())
+                        res[name]["max_cov_error_c"] = float(np.abs(Cc - kC).max())
+                    if name == "gp_bayes":
+                        res[name]["ess"] = eng.diagnostics()["ess"]
+                        if qd["method"] == "rqmc":
+                            fr, fc = B.rqmc_floor(
+                                eng, st.X_pool, anchors, pools, int(qd["K"]), float(p["eps"]),
+                                n_scrambles=int(qd["n_scrambles"]), u_min=float(qd["u_min"]),
+                                rng=rng_for(ch.label, "bayes_update_g1_rqmc", level, t, draw, base_seed=cfg.seed))
+                            res[name]["floor"] = {"rows": fr, "cell": fc}
+                return res
+
+            hit = run({"gate": "G1G2", **cells.channel(ch), "t": int(t), "g1": g1, "g2": g2, "quadrature": p["quadrature"],
+                       "fixed": _engine_params("gp_fixed", p), "bayes": _engine_params("gp_bayes", p)},
+                      f"G1/G2 {ch.label} t={t}", g12_cell)
+            if hit is None:
+                continue
+            fixed_rows.append(hit["gp_fixed"])
+            bayes_rows.append(hit["gp_bayes"])
+            gain_rows += hit["toy_gain"]["rows"]
+            bias_rows += hit["toy_bias"]["rows"]
+            ess.setdefault(int(t), []).append(hit["gp_bayes"]["ess"])
+
+    def worst(blocks: list[dict[str, Any]], key: str, src: str = "rows", fn: Callable[[float], float] = abs) -> float:
+        vals = [fn(r[key]) for b in blocks for r in b[src] if r.get(key) is not None]
+        return float(max(vals)) if vals else float("nan")
+
+    if fixed_rows:
+        # G1 re-stated (user, 2026-10-15): the full Gauss-Hermite measure is checked on the raw readouts; a truncated
+        # or randomised measure on the moment-matched ones, which are exact for GP-fixed under any measure.
+        sfx = "" if p["quadrature"]["method"] == "gauss_hermite" else "_c"
+        f = {"max_abs_drift": worst(fixed_rows, f"max_abs_drift{sfx}"),
+             "max_abs_total_var_dev": worst(fixed_rows, f"max_abs_total_var_dev{sfx}"),
+             "max_cov_asymmetry": worst(fixed_rows, f"cov_asymmetry{sfx}", "cell"),
+             "max_cov_error": float(max(b[f"max_cov_error{sfx}"] for b in fixed_rows))}
+        b = {"max_drift_abs": worst(bayes_rows, f"drift_abs{sfx}"),
+             "max_total_var_dev": worst(bayes_rows, f"total_var_ratio{sfx}", fn=lambda v: abs(v - 1.0)),
+             "max_cov_asymmetry": worst(bayes_rows, f"cov_asymmetry{sfx}", "cell")}
+        if p["quadrature"]["method"] == "rqmc":
+            # G1 re-stated in SE units (user, 2026-10-15): GP-Bayes's residual must be consistent with zero.
+            fl = [blk["floor"] for blk in bayes_rows]
+            zs = [r[k] for blk in fl for r in blk["rows"] for k in ("drift_z", "total_var_z") if r[k] is not None]
+            za = [c["cov_asymmetry_z"] for blk in fl for c in blk["cell"] if c["cov_asymmetry_z"] is not None]
+            crit = B.rqmc_critical_z(int(p["quadrature"]["n_scrambles"]), len(zs) + len(za), float(g1["bayes_alpha"]))
+            b.update({"max_drift_z": worst(fl, "drift_z"), "max_total_var_z": worst(fl, "total_var_z"),
+                      "max_cov_asymmetry_z": worst(fl, "cov_asymmetry_z", "cell"),
+                      "median_drift_z": float(np.median([r["drift_z"] for blk in fl for r in blk["rows"]
+                                                         if r["drift_z"] is not None])),
+                      "median_total_var_z": float(np.median([r["total_var_z"] for blk in fl for r in blk["rows"]
+                                                             if r["total_var_z"] is not None])),
+                      "median_drift_se": float(np.median([r["drift_se"] for blk in fl for r in blk["rows"]
+                                                          if r["drift_se"] is not None])),
+                      "critical_z": crit, "n_tests": len(zs) + len(za)})
+            bayes_ok = max(zs + za) <= crit
+        else:
+            bayes_ok = (b["max_drift_abs"] <= g1["bayes_drift_tol"] and b["max_total_var_dev"] <= g1["bayes_tol"]
+                        and b["max_cov_asymmetry"] <= g1["bayes_tol"])
+        out.append({"gate": "G1", "quadrature": p["quadrature"], "gp_fixed": f, "gp_bayes": b, "thresholds": g1,
+                    "passed": bool(all(v <= g1["fixed_tol"] for v in f.values()) and bayes_ok)})
+        sm = float(np.median([r["shrink_move_ratio"] for r in gain_rows if r["shrink_move_ratio"] is not None]))
+        dr = float(np.median([r["drift_abs"] for r in bias_rows if r["drift_abs"] is not None]))
+        out.append({"gate": "G2", "toy_gain_shrink_move_median": sm, "toy_bias_drift_median": dr, "thresholds": g2,
+                    "passed": bool(sm <= g2["max_shrink_move"] and dr >= g2["min_drift"])})
+
+    # ---- G4 (grid density): TabPFN-vs-GP-Bayes cells at two GP-Bayes grids ----
+    def paired_cells(gate: str, spec: dict[str, Any], alt: dict[str, Any]) -> list[tuple[dict, dict]]:
+        pairs = []
+        for ch in gate_channels:
+            for t in spec["context_ts"]:
+                def compute(ch: ChannelData = ch, t: int = int(t)) -> dict[str, Any]:
+                    st = stressed_of(ch)
+                    res = {}
+                    for key, kw in (("base", {}), ("alt", alt)):
+                        pp = json.loads(json.dumps(p))
+                        if "gp_bayes" in kw:
+                            pp["gp_bayes"].update(kw["gp_bayes"])
+                        res[key] = _bayes_cell(st, ch.label, level, t, draw, pp, cfg, [], ["tabpfn_v2_5", "gp_bayes"],
+                                               lambda n, pp=pp: _make_engine(n, pp, cfg.device))
+                    return _jsonable(res)
+
+                hit = run({"gate": gate, **cells.channel(ch), "t": int(t), "spec": spec, "alt": alt,
+                           "engine_params": _engine_params("tabpfn_v2_5", p), "bayes": _engine_params("gp_bayes", p)},
+                          f"{gate} {ch.label} t={t}", compute)
+                if hit is not None:
+                    pairs.append((hit["base"], hit["alt"]))
+        return pairs
+
+    g4 = g["g4"]
+    gb = p["gp_bayes"]
+    moves = []
+    for refinement in (g4["dense"] if "G4" in only else []):
+        dense = {"gp_bayes": {k: [gb[k][0], gb[k][1], int(refinement.get(k, gb[k][2]))]
+                              for k in ("lengthscale", "outputscale", "noise")}}
+        for base, alt in paired_cells("G4", g4, dense):
+            for metric in HEADLINE_B:
+                def med(rows: list[dict[str, Any]], metric: str = metric) -> float | None:
+                    vals = [r[metric] for r in rows if r["engine"] == "tabpfn_v2_5" and r["reference"] == "gp_bayes"
+                            and r.get(metric) is not None]
+                    return float(np.median(vals)) if vals else None
+
+                a, b2 = med(base["headtohead"]), med(alt["headtohead"])
+                moves.append({"refinement": refinement, "metric": metric, "grid": a, "grid_dense": b2,
+                              "ok": _rel_ok(a, b2, g4["rel_tol"], g4["abs_tol"])})
+    ess_med = {t: float(np.median(v)) for t, v in sorted(ess.items())}
+    if moves or ess_med:
+        out.append({"gate": "G4", "median_ess": ess_med, "density": moves, "thresholds": g4,
+                    "passed": bool(all(v >= g4["min_ess"] for v in ess_med.values()) and all(mv["ok"] for mv in moves))})
+
+    return out
+
+
+def _frozen_refit_discrepancy(
+    cfg: MechanismConfig,
+    p: dict[str, Any],
+    cells: _Cells,
+    channels: Sequence[ChannelData],
+    knob: Any,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The frozen-preprocessing probe vs the deployed refit, per site and probe, by t (the former gate G0).
+
+    Archived as a report on 2026-10-15 (user): TabPFN's update is the refit, so nothing downstream depends on the
+    frozen probe; how far it is from the refit -- and why, the follow-up analysis -- is a result in itself. Every
+    cell keeps the raw moments so that analysis needs no recompute: per anchor and probe y', both engines' mean and
+    SD at every site after the update, and both engines' base (D only) moments, which must agree (same
+    preprocessing fitted on D). Cells: the first ``discrepancy.channels_per_subject`` channels of every subject, the
+    nominal stress level, draw 0, each t of ``discrepancy.context_ts``; anchors as in the grid cell.
+
+    Args:
+        cfg: Resolved config.
+        p: Resolved ``bayes_update`` block.
+        cells: Cell store.
+        channels: Every channel of the run.
+        knob: Stress knob (its first level is the nominal one).
+
+    Returns:
+        ``(sites, summary)``: one row per (channel, t, anchor, probe, site) with the signed discrepancies
+        ``d_mean = (mu_frozen - mu_refit) / s_refit`` and ``d_sd = (s_frozen - s_refit) / s_refit``; and their
+        summary by t x probe kind x pool (plus ``all`` rows): n, median and p95 of ``|d_mean|``, median of
+        ``|d_sd|``, the signed medians, and the base-moment check.
+    """
+    from ..analysis import bayes_update as B  # noqa: PLC0415
+
+    dc = p["discrepancy"]
+    tp = p["tabpfn"]
+    level, draw = float(knob.levels[0]), 0
+    keep = _first_per_subject(channels, int(dc["channels_per_subject"]))
+    rows: list[dict[str, Any]] = []
+    for ch in [c for c in channels if c.label in keep]:
+        st = knob.apply(ch, level, rng_for(ch.label, "bayes_update", level, base_seed=cfg.seed))
+        for t in dc["context_ts"]:
+            if int(t) >= st.n_sites:
+                continue
+
+            def cell(st: ChannelData = st, ch: ChannelData = ch, t: int = int(t)) -> dict[str, Any]:
+                ctx = context_for(st, t, draw, base_seed=cfg.seed, level=level)
+                rng = rng_for(ch.label, "bayes_update", level, t, draw, base_seed=cfg.seed)
+                anchors, pools, _ = B.select_anchors_uniform(st, int(p["anchors"]["n_unobserved"]),
+                                                             int(p["anchors"]["n_observed"]), rng, ctx.sites)
+                Q = st.X_pool
+                bayes = _make_engine("gp_bayes", p, cfg.device)
+                bayes.fit(ctx.X, ctx.y)
+                held = B.heldout_trials(st, ctx.sites, ctx.trial_idx)
+                sv = B.shared_values(held, anchors, bayes.base(Q), int(dc["n_trials"]), dc["ladder"],
+                                     rng_for(ch.label, "bayes_update_g0", level, t, draw, base_seed=cfg.seed))
+                frozen = B.PFNEngine(device=cfg.device, random_state=int(tp["inference_seed"]),
+                                     softmax_temperature=float(tp["softmax_temperature"]),
+                                     precision=str(tp["precision"]), max_batch_tokens=int(tp["max_batch_tokens"]),
+                                     name="tabpfn_v2_5_frozen")
+                refit = _make_engine("tabpfn_v2_5", p, cfg.device)
+                frozen.fit(ctx.X, ctx.y)
+                refit.fit(ctx.X, ctx.y)
+                bf, br = frozen.base(Q), refit.base(Q)
+                per_anchor = []
+                for i, a in enumerate(anchors):
+                    ys = np.concatenate([sv["trial"][i], sv["ladder"][i]])                 # [P]
+                    xs = np.repeat(Q[[int(a)]], len(ys), axis=0)                         # [P, D]
+                    pf, pr = frozen.probe(xs, ys, Q), refit.probe(xs, ys, Q)
+                    per_anchor.append({"anchor": int(a), "pool": pools[i], "y": ys.tolist(),
+                                       "kind": ["trial"] * len(sv["trial"][i]) + ["ladder"] * len(sv["ladder"][i]),
+                                       "c": [None] * len(sv["trial"][i]) + [float(c) for c in sv["c"]],
+                                       "mu_frozen": pf.mean.tolist(), "sd_frozen": pf.sd.tolist(),
+                                       "mu_refit": pr.mean.tolist(), "sd_refit": pr.sd.tolist()})
+                return {"anchors": per_anchor, "observed": np.isin(np.arange(st.n_sites), ctx.sites).tolist(),
+                        "dist": B.site_distances(st.ch2xy, anchors).tolist(),
+                        "y_mean": float(np.mean(ctx.y)), "y_sd": float(np.std(ctx.y)),
+                        "base": {"mu_frozen": bf.mean[0].tolist(), "sd_frozen": bf.sd[0].tolist(),
+                                 "mu_refit": br.mean[0].tolist(), "sd_refit": br.sd[0].tolist()}}
+
+            ident = {**cells.channel(ch), "knob": knob.name, "level": level, "draw": draw, "t": int(t),
+                     "anchors": p["anchors"], "discrepancy": {k: dc[k] for k in ("n_trials", "ladder")},
+                     "frozen": {k: tp[k] for k in ("precision", "max_batch_tokens")},
+                     "engine_params": _engine_params("tabpfn_v2_5", p), "bayes": _engine_params("gp_bayes", p)}
+            hit = cells.run("discrepancy", ident, f"discrepancy {ch.label} t={t}", lambda cell=cell: (cell(), {}))
+            if hit is None:
+                continue
+            pay = hit[0]
+            b = {k: np.asarray(v) for k, v in pay["base"].items()}
+            base_mu = np.abs(b["mu_frozen"] - b["mu_refit"]) / b["sd_refit"]                # [M]
+            observed = np.asarray(pay["observed"])
+            for i, an in enumerate(pay["anchors"]):
+                mf, sf = np.asarray(an["mu_frozen"]), np.asarray(an["sd_frozen"])         # [P, M]
+                mr, sr = np.asarray(an["mu_refit"]), np.asarray(an["sd_refit"])           # [P, M]
+                dist = np.asarray(pay["dist"][i])                                         # [M]
+                for k, yv in enumerate(an["y"]):
+                    for s in range(mf.shape[1]):
+                        rows.append({"label": ch.label, "subject": ch.subject, "emg": ch.emg, "level": level,
+                                     "context_t": int(t), "anchor": an["anchor"], "pool": an["pool"],
+                                     "kind": an["kind"][k], "c": an["c"][k], "y_prime": float(yv),
+                                     "z_prime": (float(yv) - pay["y_mean"]) / pay["y_sd"], "site": s,
+                                     "observed": bool(observed[s]), "dist": float(dist[s]),
+                                     "mu_frozen": mf[k, s], "sd_frozen": sf[k, s], "mu_refit": mr[k, s],
+                                     "sd_refit": sr[k, s], "d_mean": (mf[k, s] - mr[k, s]) / sr[k, s],
+                                     "d_sd": (sf[k, s] - sr[k, s]) / sr[k, s], "base_d_mean": base_mu[s]})
+    sites = pd.DataFrame(rows)
+    if sites.empty:
+        return sites, sites
+    sites["probe"] = np.where(sites["kind"] == "trial", "trial",
+                              np.where(sites["c"].fillna(0) > 0, "ladder+", "ladder-"))
+
+    def summ(g: pd.DataFrame) -> pd.Series:
+        a = g["d_mean"].abs()
+        return pd.Series({"n": len(g), "median_abs_d_mean": a.median(), "p95_abs_d_mean": a.quantile(0.95),
+                          "median_abs_d_sd": g["d_sd"].abs().median(), "median_d_mean": g["d_mean"].median(),
+                          "median_d_sd": g["d_sd"].median(), "max_base_d_mean": g["base_d_mean"].max()})
+
+    parts = []
+    for by in (["context_t"], ["context_t", "probe"], ["context_t", "pool"], ["context_t", "probe", "pool"]):
+        s = sites.groupby(by)[["d_mean", "d_sd", "base_d_mean"]].apply(summ).reset_index()
+        for col in ("probe", "pool"):
+            if col not in s:
+                s[col] = "all"
+        parts.append(s)
+    summary = pd.concat(parts, ignore_index=True)[
+        ["context_t", "probe", "pool", "n", "median_abs_d_mean", "p95_abs_d_mean", "median_abs_d_sd",
+         "median_d_mean", "median_d_sd", "max_base_d_mean"]]
+    return sites, summary
+
+
+def _common_anchor(channel: ChannelData, contexts: Sequence[Any]) -> int:
+    """The most central site of the grid that is unobserved in every context (Omega-5's common anchor).
 
     Raises:
-        ValueError: For any other ``reference_gp``.
+        ValueError: If every site is observed in some context.
     """
-    from ..analysis import update_rule as U  # noqa: PLC0415
-    from ..models.gp.surrogates import GPSurrogate, NaiveGPSurrogate  # noqa: PLC0415
-
-    kind = p["reference_gp"]
-    if kind == "mll":
-        return U.GPFrozenEngine(GPSurrogate(**p["gp_params"]), name=name)
-    if kind == "fixed":
-        return U.GPFrozenEngine(NaiveGPSurrogate(**p["fixed_gp_params"]), name=name)
-    raise ValueError(f"update_rule.reference_gp must be 'mll' or 'fixed', got {kind!r}.")
-
-
-def _res_payload(res: Any) -> dict[str, Any]:
-    """A probe result as a picklable dict (the trajectory of a ``probe`` cell)."""
-    return {"res": asdict(res)}
+    free = np.ones(channel.n_sites, dtype=bool)
+    for ctx in contexts:
+        free[ctx.sites] = False
+    if not free.any():
+        raise ValueError("no site is unobserved in every exemplar context.")
+    X = channel.X_pool
+    centre = (X.min(0) + X.max(0)) / 2.0
+    cand = np.flatnonzero(free)
+    return int(cand[np.argmin(np.linalg.norm(X[cand] - centre, axis=1))])
 
 
-def _res_from(traj: dict[str, Any]) -> Any:
-    """Rebuild a :class:`~pfns4neurostim.analysis.update_rule.ProbeResult` from a cell trajectory."""
-    from ..analysis.update_rule import ProbeResult  # noqa: PLC0415
-
-    return ProbeResult(**traj["res"])
-
-
-def _has_map(ch: ChannelData) -> bool:
-    """Whether a channel has a 2-D electrode map (F7 needs pitch distances; 5D condition sets have none)."""
-    return ch.ch2xy is not None and np.asarray(ch.ch2xy).ndim == 2 and np.asarray(ch.ch2xy).shape[1] == 2
-
-
-def run_update_rule(cfg: MechanismConfig, opts: RunOptions) -> str:
-    """Task #9 Step 4: the M10 grid, its gates, the F6 layer arm and the F7 distance profile.
-
-    Grid: channel x stress level x context size t x context draw x engine; every engine of a
-    cell shares one context, one anchor set and one frozen reference GP.
+def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
+    """OMEGA: Parts A and B on the grid channel x level x t x draw, gates G1, G2, G4, the frozen-vs-refit discrepancy
+    report, the exemplar, the figures.
 
     Args:
         cfg: Resolved config.
@@ -585,390 +1097,188 @@ def run_update_rule(cfg: MechanismConfig, opts: RunOptions) -> str:
 
     Returns:
         The run directory.
+
+    Raises:
+        RuntimeError: If gate G1 or G2 fails while the grid is requested (stop and report, OMEGA §3.6).
     """
-    from ..analysis import update_rule as U  # noqa: PLC0415
+    from ..analysis import bayes_update as B  # noqa: PLC0415
     from ..data.snr import achieved_snr_db  # noqa: PLC0415
     from ..data.stress import build_knob  # noqa: PLC0415
-    from ..models.gp.surrogates import NaiveGPSurrogate  # noqa: PLC0415
     from ..visualization import mechanism as figs  # noqa: PLC0415
 
-    p = _check_keys(cfg.params, UPDATE_RULE_DEFAULTS, "update_rule")
-    for sub in ("gates", "layer_arm", "exemplar", "profile"):
-        p[sub] = _check_keys(p[sub], UPDATE_RULE_DEFAULTS[sub], f"update_rule.{sub}")
-    pf = p["profile"]
-    pf["offmap"] = _check_keys(pf["offmap"], UPDATE_RULE_DEFAULTS["profile"]["offmap"], "update_rule.profile.offmap")
-    pf["controls"] = _check_keys(pf["controls"], UPDATE_RULE_DEFAULTS["profile"]["controls"],
-                                 "update_rule.profile.controls")
-    ladder = cfg.context_sizes
-    for sub, key in (("layer_arm", "context_ts"), ("exemplar", "context_ts")):
-        if p[sub][key] is None:
-            p[sub][key] = list(ladder)
-        _subset_of_ladder(p[sub][key], ladder, f"update_rule.{sub}.{key}")
-    ex = p["exemplar"]
-    if ex["reference_gp"] is None:
-        ex["reference_gp"] = p["reference_gp"]
-    if ex["reference_gp"] not in ("mll", "fixed"):
-        raise ValueError(f"update_rule.exemplar.reference_gp must be 'mll', 'fixed' or null, got {ex['reference_gp']!r}.")
-    if ex["anchor"] == "per_cell" and ex["reference_gp"] != p["reference_gp"]:
-        raise ValueError("update_rule.exemplar.reference_gp differs from update_rule.reference_gp, which needs "
-                         "exemplar.anchor: common (per-cell columns reuse the grid's reference GP).")
-    if pf["panel_ts"] is None:
-        pf["panel_ts"] = sorted({int(ladder[0]), int(ladder[len(ladder) // 2])})
-    if pf["enabled"]:
-        _subset_of_ladder(pf["panel_ts"], ladder, "update_rule.profile.panel_ts")
+    p = _validate_bayes_update(cfg.params, cfg.context_sizes)
     out = cfg.run_dir
     if not opts.replot:
         set_seed(cfg.seed)
         _write_config(cfg, p, out)
         cells = _Cells(cfg, opts)
         knob = build_knob(p["stress"]["knob"], p["stress"]["levels"])
-        anchor_rows: list[dict[str, Any]] = []
-        cell_rows: list[dict[str, Any]] = []
-        surprise_rows: list[dict[str, Any]] = []
-        layer_rows: list[dict[str, Any]] = []
-        profile_rows: list[dict[str, Any]] = []
-        profile_c_rows: list[dict[str, Any]] = []
-        offmap_rows: list[dict[str, Any]] = []
-        exemplar_candidates: list[dict[str, Any]] = []
         channels = _channels(cfg)
-        t0 = time.time()
-        engines: dict[str, Any] = {}
-
-        def engine(name: str) -> Any:
-            if name not in engines:
-                engines[name] = _make_engine(name, p, cfg.device, int(p["inference_seed"]))
-            return engines[name]
-
-        la = p["layer_arm"]
-        common = {"n_anchors": int(p["n_anchors"]), "reference": _reference_params(p),
-                  "knob": knob.name}
-        for ch in channels:
-            for level in knob.levels:
-                stressed = knob.apply(ch, level, rng_for(ch.label, "update_rule", level, base_seed=cfg.seed))
-                snr = achieved_snr_db(stressed)
-                for t in ladder:
-                    if t >= stressed.n_sites:
-                        continue
-                    for draw in range(int(p["n_context_draws"])):
-                        # One shared context per (grid, t, draw) with this channel's own trials (#19 Step 1).
-                        ctx = context_for(stressed, int(t), draw, base_seed=cfg.seed, level=float(level))
-                        rng = rng_for(ch.label, "update_rule", level, t, draw, base_seed=cfg.seed)
-                        anchors, strata = U.select_anchors(stressed, int(p["n_anchors"]), rng, exclude=ctx.sites)
-                        ref_box: dict[str, Any] = {}
-
-                        def reference() -> Any:
-                            # Fitted lazily: a cell served from the cache never pays for the reference fit.
-                            if "ref" not in ref_box:
-                                ref_box["ref"] = _make_reference(p)
-                                ref_box["ref"].fit(ctx.X, ctx.y)
-                            return ref_box["ref"]
-
-                        keys = {
-                            "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
-                            "knob": knob.name, "level": float(level), "achieved_snr_db": snr,
-                            "context_t": int(t), "draw": draw, "reference_gp": p["reference_gp"],
-                        }
-                        cell_id = {**cells.channel(ch), **common, "level": float(level), "t": int(t), "draw": draw}
-                        for name in p["engines"]:
-                            surprises = p["refit_surprises"] if name == "gp_mll_refit" else p["surprises"]
-                            ident = {**cell_id, "engine": name, "engine_params": _engine_params(name, p),
-                                     "surprises": list(surprises)}
-
-                            def compute(name: str = name, surprises: Sequence[float] = surprises,
-                                        ) -> tuple[dict[str, Any], dict[str, Any]]:
-                                res = U.run_probes(engine(name), reference(), ctx, stressed.X_pool, anchors, strata,
-                                                   surprises)
-                                rows, cell = U.update_metrics(res, stressed.X_pool)
-                                return {"anchor_rows": rows, "cell": cell}, _res_payload(res)
-
-                            hit = cells.run("probe", ident, f"{ch.label} a={level:g} t={t} d={draw} {name}", compute)
+        if p["run"]["gates"]:
+            gates = _bayes_gates(cfg, p, cells, channels, knob)
+            with open(os.path.join(out, "gates.json"), "w", encoding="utf-8") as fh:
+                json.dump(gates, fh, indent=2, default=_json_default)
+            for gt in gates:
+                print(f"[mechanism] gate {gt['gate']} {gt.get('channel', '')}: "
+                      f"{'PASS' if gt['passed'] else 'FAIL'}", flush=True)
+            failed = sorted({gt["gate"] for gt in gates if gt["gate"] in ("G1", "G2") and not gt["passed"]})
+            if failed and p["run"]["grid"]:
+                cells.report()
+                raise RuntimeError(f"bayes_update: gate(s) {failed} failed -- stop and report (OMEGA §3.6); "
+                                   f"see {os.path.join(out, 'gates.json')}.")
+        if p["run"]["discrepancy"]:
+            sites, summary = _frozen_refit_discrepancy(cfg, p, cells, channels, knob)
+            if not sites.empty:
+                sites.to_csv(os.path.join(out, "frozen_refit_discrepancy_sites.csv"), index=False)
+                summary.to_csv(os.path.join(out, "frozen_refit_discrepancy.csv"), index=False)
+                print(f"[mechanism] wrote {os.path.join(out, 'frozen_refit_discrepancy.csv')}", flush=True)
+        if p["run"]["grid"]:
+            allowed = {n: _first_per_subject(channels, n) for n in {
+                int(spec["channels_per_subject"]) for parts in p["coverage"].values() for spec in (parts or {}).values()
+                if spec and "channels_per_subject" in spec}}
+            coh_rows, cell_rows, h2h_rows, sur_rows, prof_rows = [], [], [], [], []
+            t0 = time.time()
+            for ch in channels:
+                for level in knob.levels:
+                    st = knob.apply(ch, level, rng_for(ch.label, "bayes_update", level, base_seed=cfg.seed))
+                    snr = achieved_snr_db(st)
+                    for t in cfg.context_sizes:
+                        if t >= st.n_sites:
+                            continue
+                        for draw in range(int(p["n_context_draws"])):
+                            cov = {part: [e for e in p["engines"] if _covered(
+                                (p["coverage"].get(e) or {}).get(part), ch.label, allowed, level, t, draw)
+                                and not (part == "A" and e in B_ONLY_ENGINES)]
+                                for part in ("A", "B")}
+                            if cov["B"] and "gp_bayes" not in cov["B"]:
+                                cov["B"].append("gp_bayes")
+                            keys = {"dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg, "knob": knob.name,
+                                    "level": float(level), "achieved_snr_db": snr, "context_t": int(t), "draw": draw}
+                            ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
+                                     "draw": draw, "engines_a": cov["A"], "engines_b": cov["B"],
+                                     "engine_params": {e: _engine_params(e, p, draw)
+                                                       for e in set(cov["A"]) | set(cov["B"])},
+                                     **{k: p[k] for k in ("references", "anchors", "quadrature", "eps", "y_grid",
+                                                          "shared", "far_pitch")}}
+                            hit = cells.run(
+                                "cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
+                                lambda st=st, ch=ch, level=level, t=t, draw=draw, cov=cov: (_bayes_cell(
+                                    st, ch.label, float(level), int(t), draw, p, cfg, cov["A"], cov["B"],
+                                    lambda n, draw=draw: _make_engine(n, p, cfg.device, draw)), {}))
                             if hit is None:
                                 continue
-                            payload, traj = hit
-                            res = _res_from(traj)
-                            cell = dict(payload["cell"])
-                            anchor_rows += [{**keys, **r} for r in payload["anchor_rows"]]
-                            for i, a in enumerate(res.anchors):
-                                for j, c in enumerate(res.surprises):
-                                    surprise_rows.append({
-                                        **keys, "engine": name, "anchor": int(a), "c": float(c),
-                                        "u": float(c * res.base_sd[a]),
-                                        "d_anchor": float(res.d_mean[i, j, a]),
-                                        "d_gp_anchor": float(res.d_gp[i, j, a]),
-                                        "dsd_anchor": float(res.d_sd[i, j, a]),
-                                        "base_sd_anchor": float(res.base_sd[a]),
-                                    })
-                            if pf["enabled"] and name in PROFILE_ENGINES and _has_map(stressed):
-                                prow, pcell = U.distance_profile(res, stressed.ch2xy, bin_edges=pf["bin_edges"],
-                                                                 far_pitch=float(pf["far_pitch"]))
-                                cell.update(pcell)
-                                profile_rows += [{**keys, **r} for r in prow]
-                                profile_c_rows += [{**keys, **r} for r in U.surprise_profile(
-                                    res, stressed.ch2xy, far_pitch=float(pf["far_pitch"]))]
-                            cell_rows.append({**keys, **cell})
-                            if _exemplar_cell_matches(p["exemplar"], ch, level, t, draw) and (
-                                    name == "tabpfn_v2_5" or "tabpfn_v2_5" not in p["engines"]):
-                                exemplar_candidates.append(
-                                    _exemplar(stressed, res, res.strata, p["exemplar"], keys, cell)
-                                )
-                            if (name == "tabpfn_v2_5" and la["enabled"]
-                                    and int(t) in {int(v) for v in la["context_ts"]}
-                                    and float(level) == float(la["level"])):
-                                def compute_layers(res: Any = res) -> tuple[dict[str, Any], dict[str, Any]]:
-                                    eng = engine("tabpfn_v2_5")
-                                    eng.fit(ctx.X, ctx.y)
-                                    return {"rows": U.layer_alignment(eng, res, stressed.X_pool,
-                                                                      ridge=float(la["ridge"]))}, {}
-
-                                lh = cells.run("layers", {**ident, "ridge": float(la["ridge"])},
-                                               f"{ch.label} t={t} d={draw} layers", compute_layers)
-                                if lh is not None:
-                                    layer_rows += [{**keys, **r} for r in lh[0]["rows"]]
-                            if (pf["enabled"] and pf["offmap"]["enabled"] and name in PROFILE_ENGINES
-                                    and float(level) == float(pf["level"]) and _has_map(stressed)):
-                                oh = cells.run(
-                                    "offmap", {**ident, "offmap_distance": float(pf["offmap"]["distance"])},
-                                    f"{ch.label} t={t} d={draw} {name} off-map",
-                                    lambda name=name, surprises=surprises: _offmap_cell(
-                                        engine(name), reference(), ctx, stressed, surprises, float(pf["offmap"]["distance"])),
-                                )
-                                if oh is not None:
-                                    offmap_rows.append({**keys, "engine": name, **oh[0]})
-                print(f"[mechanism] {ch.label} level={level} done ({time.time() - t0:.0f}s)", flush=True)
-        _write_csv(anchor_rows, out, "update_rule.csv")
-        _write_csv(cell_rows, out, "update_rule_cell.csv")
-        _write_csv(surprise_rows, out, "update_rule_surprise.csv")
-        for rows, name in ((layer_rows, "update_rule_layers.csv"), (profile_rows, "update_rule_profile.csv"),
-                           (profile_c_rows, "update_rule_profile_c.csv"), (offmap_rows, "update_rule_offmap.csv")):
-            if rows:
+                            pay = hit[0]
+                            prov = {"host": pay["host"], "seconds": pay["seconds"]}
+                            coh_rows += [{**keys, **r, **prov} for r in pay["coherence"]]
+                            cell_rows += [{**keys, **r, **prov} for r in pay["coherence_cell"]]
+                            h2h_rows += [{**keys, **r} for r in pay["headtohead"]]
+                            sur_rows += [{**keys, **r} for r in pay["surprise"]]
+                            prof_rows += [{**keys, **r} for r in pay.get("profile", [])]
+                    print(f"[mechanism] {ch.label} level={level} done ({time.time() - t0:.0f}s)", flush=True)
+            for rows, name in ((coh_rows, "coherence.csv"), (cell_rows, "coherence_cell.csv"),
+                               (h2h_rows, "headtohead.csv"), (sur_rows, "surprise.csv"),
+                               (prof_rows, "transfer_profile.csv")):
                 _write_csv(rows, out, name)
-        exemplar = _select_exemplar(exemplar_candidates, p["exemplar"])
-        if exemplar is not None and p["exemplar"]["anchor"] == "common":
-            exemplar = _common_anchor_exemplar(exemplar, p, cfg, cells, channels, knob, engine)
-        elif p["exemplar"]["anchor"] not in ("common", "per_cell"):
-            raise ValueError(f"update_rule.exemplar.anchor must be 'common' or 'per_cell', got {p['exemplar']['anchor']!r}.")
-        if exemplar is not None:
-            np.savez(os.path.join(out, "update_rule_exemplar.npz"), **exemplar)
-        else:
-            print(f"[mechanism] no exemplar cell matched {p['exemplar']}; F1 will be skipped", flush=True)
+            ex = p["exemplar"]
+            if ex["enabled"] and channels:
+                pick = [c for c in channels if (ex["subject"] is None or c.subject == ex["subject"])
+                        and (ex["emg"] is None or c.emg == ex["emg"])]
+                if not pick:
+                    raise ValueError(f"bayes_update.exemplar: no channel matches subject={ex['subject']} emg={ex['emg']}.")
+                ch = pick[0]
+                st = knob.apply(ch, ex["level"], rng_for(ch.label, "bayes_update", ex["level"], base_seed=cfg.seed))
+                ts = [t for t in cfg.context_sizes if t < st.n_sites]
+                ctxs = {t: context_for(st, t, int(ex["draw"]), base_seed=cfg.seed, level=float(ex["level"])) for t in ts}
+                a = _common_anchor(st, list(ctxs.values()))
+                maps = {}
+                for t in ts:
+                    def ex_cell(t: int = t) -> tuple[dict[str, Any], dict[str, Any]]:
+                        res = {}
+                        for n in ex["engines"]:
+                            eng = _make_engine(n, p, cfg.device, int(ex["draw"]))
+                            eng.fit(ctxs[t].X, ctxs[t].y)
+                            qd = p["quadrature"]
+                            _, C, _ = B.coherence(
+                                eng, st.X_pool, np.array([a]), int(qd["K"]), float(p["eps"]), method=str(qd["method"]),
+                                u_min=float(qd["u_min"]), central_mass=float(qd["central_mass"]),
+                                n_scrambles=int(qd["n_scrambles"]),
+                                rng=rng_for(ch.label, "bayes_update_exemplar", t, base_seed=cfg.seed),
+                                u_tail=float(p["y_grid"]["u_tail"]), grid_points=int(p["y_grid"]["points"]))
+                            res[n] = C[0].tolist()
+                        return {"C": res}, {}
 
-        # --- validation gates (Step 2), one cell each ---
-        g = p["gates"]
-        pc = p["positive_control"]
-        truth = lambda: U.GPFrozenEngine(  # noqa: E731
-            NaiveGPSurrogate(lengthscale=pc["lengthscale"], outputscale=1.0, noise=pc["noise_sd"] ** 2),
-            name="truth",
-        )
-        gates: list[dict[str, Any]] = []
-        gate_common = {"gates": g, "positive_control": pc, "n_anchors": int(p["n_anchors"]),
-                       "surprises": list(p["surprises"]), "reference": _reference_params(p)}
+                    hit = cells.run("exemplar", {**cells.channel(ch), "level": float(ex["level"]), "draw": int(ex["draw"]),
+                                                 "t": int(t), "anchor": a, "quadrature": p["quadrature"], "eps": p["eps"],
+                                                 "engine_params": {n: _engine_params(n, p, int(ex["draw"]))
+                                                                   for n in ex["engines"]}},
+                                    f"exemplar {ch.label} t={t}", ex_cell)
+                    if hit is not None:
+                        maps[t] = hit[0]["C"]
+                if maps:
+                    np.savez(os.path.join(out, "exemplar.npz"), context_ts=np.array(sorted(maps)), anchor=a,
+                             engines=np.array(ex["engines"]), ch2xy=np.asarray(st.ch2xy), channel=ch.label,
+                             observed=np.array([np.isin(np.arange(st.n_sites), ctxs[t].sites) for t in sorted(maps)]),
+                             C=np.array([[maps[t][n] for n in ex["engines"]] for t in sorted(maps)]))
+                c1 = p["c1"]
+                dmaps = {}
+                for t in (ts if c1["reference"] in p["engines"] else []):
+                    def c1_cell(t: int = t) -> tuple[dict[str, Any], dict[str, Any]]:
+                        bayes = _make_engine("gp_bayes", p, cfg.device, int(ex["draw"]))
+                        bayes.fit(ctxs[t].X, ctxs[t].y)
+                        bb = bayes.base(st.X_pool)
+                        y = float(bb.mean[0, a] + float(c1["exemplar_c"]) * bb.sd[0, a])
+                        res = {}
+                        for n in c1["engines"]:
+                            eng = _make_engine(n, p, cfg.device, int(ex["draw"]))
+                            eng.fit(ctxs[t].X, ctxs[t].y)
+                            base = eng.base(st.X_pool)
+                            pr = eng.probe(st.X_pool[[a]], np.array([y]), st.X_pool)
+                            res[n] = (pr.mean[0] - base.mean[0]).tolist()                 # [M]
+                        return {"dmu": res, "y_prime": y}, {}
 
-        def gate(ident: dict[str, Any], label: str, fn: Callable[[], dict[str, Any]]) -> None:
-            hit = cells.run("gate", {**gate_common, **ident}, label, lambda: ({"gate": fn()}, {}))
-            if hit is not None:
-                gates.append(hit[0]["gate"])
-
-        def _positive(eng: Any) -> dict[str, Any]:
-            return U.positive_control(
-                eng, truth(), grid_side=pc["grid_side"], lengthscale=pc["lengthscale"],
-                noise_sd=pc["noise_sd"], n_trials=pc["n_trials"], t=g["context_t"],
-                n_anchors=int(p["n_anchors"]), surprises=p["surprises"], min_r=g["positive_r"],
-                lengthscale_tol=g["lengthscale_tol"], seed=cfg.seed,
-            )
-
-        # Probe validity first: the true GP through the probe must pass, otherwise "the probe,
-        # not the model, is at fault" and no model result below is interpretable.
-        gate({"gate": "probe_validity"}, "probe validity", lambda: {**_positive(truth()), "role": "probe_validity"})
-        for name in p["engines"]:
-            eparams = {"engine": name, "engine_params": _engine_params(name, p)}
-            gate({"gate": "positive_control", **eparams}, f"positive {name}",
-                 lambda name=name: {**_positive(engine(name)), "role": "model"})
-            if channels:
-                ch0 = channels[0]
-                gate({"gate": "negative_control", **eparams, **cells.channel(ch0)}, f"negative {name}",
-                     lambda name=name, ch0=ch0: {**U.negative_control(
-                         engine(name), _make_reference(p), ch0,
-                         t=min(g["context_t"], ch0.n_sites - 1), n_anchors=int(p["n_anchors"]),
-                         surprises=p["surprises"], null_quantile=g["null_quantile"], seed=cfg.seed,
-                     ), "channel": ch0.label})
-            eng_rows = [r for r in anchor_rows if r["engine"] == name]
-            gates.append({**U.linear_regime_check(eng_rows, g["linear_regime_tol"]), "engine": name})
-        if "tabpfn_v2_5" in p["engines"]:
-            sf = p["seed_floor"]
-            for ch in channels[: int(sf["n_channels"])]:
-                extra = None
-                if pf["enabled"] and _has_map(ch):
-                    def extra(res: Any, ch: ChannelData = ch) -> dict[str, float | None]:
-                        cell = U.distance_profile(res, ch.ch2xy, bin_edges=pf["bin_edges"],
-                                                  far_pitch=float(pf["far_pitch"]))[1]
-                        return {"far_field_share": cell["far_field_share"], "locality_index": cell["locality_index"]}
-                gate({"gate": "seed_floor", "n_seeds": int(sf["n_seeds"]), **cells.channel(ch),
-                      "engine_params": _engine_params("tabpfn_v2_5", p), "profile_far_pitch": float(pf["far_pitch"]),
-                      "profile_bins": list(pf["bin_edges"]) if extra else None},
-                     f"seed floor {ch.label}",
-                     lambda ch=ch, extra=extra: {**U.seed_floor(
-                         lambda s: _make_engine("tabpfn_v2_5", p, cfg.device, s),
-                         _make_reference(p), ch,
-                         n_seeds=int(sf["n_seeds"]), t=min(g["context_t"], ch.n_sites - 1),
-                         n_anchors=int(p["n_anchors"]), surprises=p["surprises"], icc_min=g["icc_min"],
-                         seed=cfg.seed, extra_metrics=extra,
-                     ), "engine": "tabpfn_v2_5", "channel": ch.label})
-        with open(os.path.join(out, "gates.json"), "w", encoding="utf-8") as fh:
-            json.dump(gates, fh, indent=2, default=_json_default)
-        for gt in gates:
-            print(f"[mechanism] gate {gt['gate']} {gt.get('engine', '')}: "
-                  f"{'PASS' if gt['passed'] else 'FAIL'}", flush=True)
-
-        # --- F7 supplement controls (3) known GP and (4) shuffled coordinates ---
-        if pf["enabled"]:
-            ctrl_rows = _profile_controls(cfg, p, cells, channels, engine, truth)
-            if ctrl_rows:
-                _write_csv(ctrl_rows, out, "update_rule_profile_controls.csv")
+                    hit = cells.run("c1_exemplar", {**cells.channel(ch), "level": float(ex["level"]),
+                                                    "draw": int(ex["draw"]), "t": int(t), "anchor": a,
+                                                    "exemplar_c": float(c1["exemplar_c"]),
+                                                    "engine_params": {n: _engine_params(n, p, int(ex["draw"]))
+                                                                      for n in [*c1["engines"], "gp_bayes"]}},
+                                    f"C1 exemplar {ch.label} t={t}", c1_cell)
+                    if hit is not None:
+                        dmaps[t] = hit[0]["dmu"]
+                if dmaps:
+                    np.savez(os.path.join(out, "c1_exemplar.npz"), context_ts=np.array(sorted(dmaps)), anchor=a,
+                             engines=np.array(c1["engines"]), ch2xy=np.asarray(st.ch2xy), channel=ch.label,
+                             exemplar_c=float(c1["exemplar_c"]),
+                             observed=np.array([np.isin(np.arange(st.n_sites), ctxs[t].sites) for t in sorted(dmaps)]),
+                             dmu=np.array([[dmaps[t][n] for n in c1["engines"]] for t in sorted(dmaps)]))
+        cells.report()
     link = p["link"]
     if link.get("tidy_csv"):
         path = _predictive_link(out, link, cfg.seed)
         print(f"[mechanism] wrote {path}")
-    for path in figs.render_update_rule(out):
+    for path in figs.render_bayes_update(out):
         print(f"[mechanism] wrote {path}")
-    if not opts.replot:
-        cells.report()
     return out
 
 
+# ---------------------------------------------------------------------------
+# shared writers
+# ---------------------------------------------------------------------------
 def _write_csv(rows: list[dict[str, Any]], out: str, name: str) -> None:
     """Write assembled rows to ``out/name``."""
     pd.DataFrame(rows).to_csv(os.path.join(out, name), index=False)
 
 
-def _offmap_cell(
-    engine: Any,
-    reference: Any,
-    ctx: Any,
-    channel: ChannelData,
-    surprises: Sequence[float],
-    distance: float,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """F7 control (1): the update on the grid caused by an observation placed off the map.
-
-    Args:
-        engine: Update engine (fitted inside :func:`run_probes`).
-        reference: Fitted frozen reference GP of the cell.
-        ctx: The cell's context.
-        channel: The (stressed) channel.
-        surprises: Surprise multipliers.
-        distance: Off-map distance in grid widths (:func:`analysis.update_rule.offmap_point`).
-
-    Returns:
-        ``(payload, {})`` with the median ``|T|`` over unobserved and observed grid sites, the reference GP's,
-        and the off-map point's separation from the grid in the engine's own input space relative to the grid's
-        diameter there. TabPFN quantile-transforms its inputs, which can map an off-map point onto the edge of
-        the grid -- a separation near 0 says the control is uninformative for that engine.
-    """
-    from ..analysis import update_rule as U  # noqa: PLC0415
-
-    X = channel.X_pool
-    x_off = U.offmap_point(X, distance)                                     # [D]
-    Q = np.vstack([X, x_off[None]])                                         # [N+1, D]
-    res = U.run_probes(engine, reference, ctx, Q, np.array([len(X)]), ["offmap"], surprises)
-    T, c0 = U.transfer(res)                                                 # [1, N+1]
-    observed = np.zeros(len(X), dtype=bool)
-    observed[ctx.sites] = True
-    grid_T = np.abs(T[0, :-1])                                              # [N]
-    g_ref = U._antisym(res.d_gp, res.surprises, c0)[0, :-1] / (c0 * res.base_sd[len(X)])
-    if hasattr(engine, "engine"):
-        space = engine.engine.transform_x(Q).double().cpu().numpy()        # [N+1, F] model space
-    else:
-        space = Q
-    sep = float(np.min(np.linalg.norm(space[:-1] - space[-1], axis=1)))
-    diam = float(np.max(np.linalg.norm(space[:-1, None] - space[None, :-1], axis=-1)))
-    return {
-        "offmap_transfer_median": float(np.median(grid_T[~observed])),
-        "offmap_transfer_observed_median": float(np.median(grid_T[observed])) if observed.any() else None,
-        "offmap_reference_transfer_median": float(np.median(np.abs(g_ref[~observed]))),
-        "offmap_separation": sep / diam if diam > 0 else None,
-        "offmap_distance": float(distance),
-        "c0": float(c0),
-    }, {}
-
-
-def _profile_controls(
-    cfg: MechanismConfig,
-    p: dict[str, Any],
-    cells: _Cells,
-    channels: list[ChannelData],
-    engine: Callable[[str], Any],
-    truth: Callable[[], Any],
-) -> list[dict[str, Any]]:
-    """F7 controls (3) the known-GP channel and (4) shuffled coordinates, one cell per (control, engine).
-
-    Args:
-        cfg: Resolved config.
-        p: Resolved ``update_rule`` block.
-        cells: Cell namespace.
-        channels: Loaded channels.
-        engine: ``name -> engine`` (shared, lazily built).
-        truth: Factory of the true-GP engine of the positive control.
-
-    Returns:
-        Profile rows with a ``control`` column (``known_gp``, ``original``, ``shuffled``).
-    """
-    from ..analysis import update_rule as U  # noqa: PLC0415
-
-    pf = p["profile"]
-    cc = pf["controls"]
-    pc = p["positive_control"]
-    rows: list[dict[str, Any]] = []
-    profile_kw = {"bin_edges": pf["bin_edges"], "far_pitch": float(pf["far_pitch"])}
-    names = [n for n in p["engines"] if n in PROFILE_ENGINES]
-    base = {"n_anchors": int(p["n_anchors"]), "surprises": list(p["surprises"]), "t": int(cc["context_t"])}
-    if cc["known_gp"]:
-        ctrl = U.gp_channel(pc["grid_side"], pc["lengthscale"], pc["noise_sd"], pc["n_trials"],
-                            np.random.default_rng(cfg.seed))
-        t = min(int(cc["context_t"]), ctrl.n_sites - 1)
-        for name in names + ["truth"]:
-            def compute(name: str = name) -> tuple[dict[str, Any], dict[str, Any]]:
-                eng = truth() if name == "truth" else engine(name)
-                _, _, res = U._probe_cell(ctrl, eng, truth(), t, int(p["n_anchors"]), p["surprises"],
-                                          np.random.default_rng(cfg.seed))
-                prow, pcell = U.distance_profile(res, ctrl.ch2xy, **profile_kw)
-                return {"rows": prow, "cell": pcell}, {}
-
-            ident = {**base, "control": "known_gp", "positive_control": pc, "engine": name,
-                     "engine_params": None if name == "truth" else _engine_params(name, p), "profile": profile_kw}
-            hit = cells.run("profile_control", ident, f"known-GP {name}", compute)
-            if hit is not None:
-                rows += [{"control": "known_gp", "context_t": t, **r} for r in hit[0]["rows"]]
-    if cc["shuffled"]:
-        for ch in [c for c in channels if _has_map(c)][: int(cc["n_channels"])]:
-            t = min(int(cc["context_t"]), ch.n_sites - 1)
-            for control in ("original", "shuffled"):
-                for name in names:
-                    def compute(name: str = name, ch: ChannelData = ch, control: str = control,
-                                ) -> tuple[dict[str, Any], dict[str, Any]]:
-                        rng = rng_for(ch.label, "f7_shuffle", base_seed=cfg.seed)
-                        shown = U.shuffle_coordinates(ch, rng) if control == "shuffled" else ch
-                        _, _, res = U._probe_cell(shown, engine(name), _make_reference(p), t, int(p["n_anchors"]),
-                                                  p["surprises"], rng_for(ch.label, "f7_context", base_seed=cfg.seed),
-                                                  readout_X=ch.X_pool)
-                        prow, pcell = U.distance_profile(res, ch.ch2xy, **profile_kw)
-                        return {"rows": prow, "cell": pcell}, {}
-
-                    ident = {**base, "control": control, **cells.channel(ch), "engine": name,
-                             "engine_params": _engine_params(name, p), "reference": _reference_params(p),
-                             "profile": profile_kw}
-                    hit = cells.run("profile_control", ident, f"{control} {ch.label} {name}", compute)
-                    if hit is not None:
-                        rows += [{"control": control, "subject": ch.subject, "emg": ch.emg, "context_t": t,
-                                  **hit[0]["cell"], **r} for r in hit[0]["rows"]]
-    return rows
-
 
 def _predictive_link(out: str, link: dict[str, Any], seed: int) -> str:
-    """Task #9 Step 7: regress per-channel regret on per-channel M10 metrics.
+    """M8: regress per-channel regret on per-channel OMEGA metrics of the linked engine.
+
+    Predictors come from the run's tables, per cell first and per channel after (medians, at ``link.level``):
+    Part A cell medians of the unobserved pool from ``coherence_cell.csv``; Part B per-anchor contrasts against
+    GP-Bayes from ``headtohead.csv`` (trial source, unobserved anchors).
 
     Args:
-        out: Update-rule run directory (holds ``update_rule_cell.csv``).
-        link: Resolved ``update_rule.link`` block.
+        out: Run directory.
+        link: Resolved ``bayes_update.link`` block.
         seed: Bootstrap seed.
 
     Returns:
@@ -976,8 +1286,16 @@ def _predictive_link(out: str, link: dict[str, Any], seed: int) -> str:
     """
     from ..analysis.predictive_link import channel_mechanism_table, predictive_link  # noqa: PLC0415
 
-    cell = pd.read_csv(os.path.join(out, "update_rule_cell.csv"))
-    mech = channel_mechanism_table(cell)
+    keys = ["dataset", "subject", "emg", "level", "context_t", "draw"]
+    coh = pd.read_csv(os.path.join(out, "coherence_cell.csv"))
+    coh = coh[(coh["engine"] == link["model"]) & (coh["pool"] == "unobserved")]
+    h2h = pd.read_csv(os.path.join(out, "headtohead.csv"))
+    h2h = h2h[(h2h["engine"] == link["model"]) & (h2h["reference"] == "gp_bayes") & (h2h["source"] == "trial")
+              & (h2h["pool"] == "unobserved")]
+    a_cols = [c for c in link["predictors"] if c in coh]
+    b_cols = [c for c in link["predictors"] if c in h2h and c not in a_cols]
+    cells = coh[keys + a_cols].merge(h2h.groupby(keys)[b_cols].median().reset_index(), on=keys, how="outer")
+    mech = channel_mechanism_table(cells, list(link["predictors"]), level=float(link["level"]))
     tidy = pd.read_csv(link["tidy_csv"])
     tidy = tidy[tidy["model"] == link["model"]]
     regret = tidy.groupby(["dataset", "subject", "emg"])[list(link["outcomes"])].mean().reset_index()
@@ -990,236 +1308,6 @@ def _predictive_link(out: str, link: dict[str, Any], seed: int) -> str:
     path = os.path.join(out, "predictive_link.csv")
     pd.DataFrame(rows).to_csv(path, index=False)
     return path
-
-
-def _exemplar_cell_matches(
-    spec: dict[str, Any],
-    channel: ChannelData,
-    level: float,
-    context_t: int,
-    draw: int,
-) -> bool:
-    """Whether this (channel, level, t, draw) cell is a candidate for figure F1.
-
-    Args:
-        spec: The resolved ``update_rule.exemplar`` block.
-        channel: Channel being probed.
-        level: Stress level of the cell.
-        context_t: Context size of the cell.
-        draw: Context-draw index of the cell.
-
-    Returns:
-        True when the cell matches the requested operating point (and, for ``select: explicit``, the
-        requested channel).
-    """
-    if (int(context_t) not in {int(v) for v in spec["context_ts"]}
-            or float(level) != float(spec["level"]) or int(draw) != int(spec["draw"])):
-        return False
-    if spec["select"] == "explicit":
-        return (int(channel.subject) == int(spec["subject"]) and int(channel.emg) == int(spec["emg"]))
-    return True
-
-
-def _exemplar(
-    channel: ChannelData,
-    res: Any,
-    strata: Sequence[str],
-    spec: dict[str, Any],
-    keys: dict[str, Any],
-    cell: dict[str, Any],
-) -> dict[str, Any]:
-    """Arrays and full provenance of one candidate exemplar for figure F1 (grid heatmaps).
-
-    The plotted profile is the antisymmetrized change at the smallest surprise magnitude -- the same
-    estimator :func:`analysis.update_rule.implicit_kernel` uses for ``ell_hat`` -- so the figure and the
-    quantitative metric describe the same object. The anchor is the first one of the requested stratum,
-    falling back to the first anchor when that stratum was not sampled in this cell.
-
-    Args:
-        channel: Channel being probed.
-        res: Probe result for one engine.
-        strata: Stratum name of each sampled anchor, parallel to ``res.anchors``.
-        spec: The resolved ``update_rule.exemplar`` block.
-        keys: Cell key columns (dataset, subject, emg, knob, level, achieved SNR, context size, draw).
-        cell: Per-cell metrics, used to rank candidates under ``select: median_alignment``.
-
-    Returns:
-        A mapping ready for :func:`numpy.savez`, carrying the arrays and every field needed to caption
-        and reproduce the figure.
-    """
-    from ..analysis.update_rule import _antisym, _symmetric_magnitudes  # noqa: PLC0415
-
-    c0 = _symmetric_magnitudes(res.surprises)[0]
-    wanted = str(spec["anchor_stratum"])
-    idx = next((i for i, s in enumerate(strata) if s == wanted), 0)
-    return {
-        "engine": np.array(res.engine),
-        "label": np.array(channel.label),
-        "anchor": np.array(int(res.anchors[idx])),
-        "anchor_stratum": np.array(strata[idx] if idx < len(strata) else "unknown"),
-        "anchor_stratum_requested": np.array(wanted),
-        "surprise_c": np.array(float(c0)),
-        "select_rule": np.array(str(spec["select"])),
-        "subject": np.array(int(keys["subject"])),
-        "emg": np.array(int(keys["emg"])),
-        "knob": np.array(str(keys["knob"])),
-        "level": np.array(float(keys["level"])),
-        "achieved_snr_db": np.array(float(keys["achieved_snr_db"])),
-        "context_t": np.array(int(keys["context_t"])),
-        "draw": np.array(int(keys["draw"])),
-        "reference_gp": np.array(str(keys.get("reference_gp", "mll"))),
-        "rho_shape_offanchor": np.array(np.nan if cell.get("rho_shape_offanchor_median") is None
-                                        else float(cell["rho_shape_offanchor_median"])),
-        "ch2xy": channel.ch2xy,
-        "grid_shape": np.array(channel.grid_shape),
-        "g_model": _antisym(res.d_mean, res.surprises, c0)[idx],
-        "g_gp": _antisym(res.d_gp, res.surprises, c0)[idx],
-    }
-
-
-def _select_exemplar(
-    candidates: Sequence[dict[str, Any]],
-    spec: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Pick ONE channel and stack its exemplars over the requested context sizes (figure F1).
-
-    The channel is chosen once and then shown at every context size, so the columns of F1 differ only in
-    how much evidence the surrogate was given. ``median_alignment`` ranks channels by the median of their
-    ``rho_shape_offanchor`` over those context sizes and takes the channel at the median of that ranking: a
-    median exemplar is representative by construction, whereas selecting the best-aligned channel would
-    turn F1 into an upper bound rather than a typical case, so that option is deliberately absent.
-
-    The anchor is drawn per (context, draw) cell upstream, so it may differ between columns; the per-column
-    anchors are stored and each panel marks its own.
-
-    Args:
-        candidates: Candidate exemplars from :func:`_exemplar`, over channels and context sizes.
-        spec: The resolved ``update_rule.exemplar`` block.
-
-    Returns:
-        A mapping ready for :func:`numpy.savez` whose ``g_model`` / ``g_gp`` are ``[T, N]`` and whose
-        ``context_ts`` / ``anchors`` are ``[T]``, ordered by context size; or ``None`` when no cell matched.
-
-    Raises:
-        ValueError: If ``spec['select']`` is not a known rule.
-    """
-    if not candidates:
-        return None
-    rule = str(spec["select"])
-    if rule not in ("first", "explicit", "median_alignment"):
-        raise ValueError(
-            f"update_rule.exemplar.select={rule!r} is not one of 'median_alignment', 'explicit', 'first'."
-        )
-    by_channel: dict[tuple[int, int], list[dict[str, Any]]] = {}
-    for cand in candidates:
-        by_channel.setdefault((int(cand["subject"]), int(cand["emg"])), []).append(cand)
-    if rule in ("first", "explicit"):
-        chosen = by_channel[(int(candidates[0]["subject"]), int(candidates[0]["emg"]))]
-    else:
-        keys = list(by_channel)
-        scores = np.array([
-            np.nanmedian([float(c["rho_shape_offanchor"]) for c in by_channel[k]]) for k in keys
-        ])
-        finite = np.flatnonzero(np.isfinite(scores))
-        if finite.size == 0:
-            chosen = by_channel[keys[0]]
-        else:
-            # Lower median of the finite scores, so the pick is an actual channel rather than an interpolant.
-            ordered = finite[np.argsort(scores[finite], kind="stable")]
-            chosen = by_channel[keys[int(ordered[(len(ordered) - 1) // 2])]]
-    chosen = sorted(chosen, key=lambda c: int(c["context_t"]))
-    ref = chosen[len(chosen) // 2]     # provenance scalars come from the middle context
-    stacked = {k: v for k, v in ref.items() if k not in ("g_model", "g_gp", "anchor", "context_t")}
-    stacked["g_model"] = np.stack([c["g_model"] for c in chosen])          # [T, N]
-    stacked["g_gp"] = np.stack([c["g_gp"] for c in chosen])                # [T, N]
-    stacked["anchors"] = np.array([int(c["anchor"]) for c in chosen])      # [T]
-    stacked["context_ts"] = np.array([int(c["context_t"]) for c in chosen])  # [T]
-    return stacked
-
-
-def _common_anchor_exemplar(
-    stacked: dict[str, Any],
-    p: dict[str, Any],
-    cfg: MechanismConfig,
-    cells: _Cells,
-    channels: list[ChannelData],
-    knob: Any,
-    engine: Callable[[str], Any],
-) -> dict[str, Any] | None:
-    """Re-probe the selected F1 channel at ONE anchor site shared by every context column.
-
-    The channel picked by :func:`_select_exemplar` is kept. Among its sites that are unobserved in all of the
-    exemplar's contexts (same draw, same level), the one closest to the electrode-map centroid is the anchor (the
-    'centre' stratum's full kernel bump); for each context size one ``exemplar`` cell probes it with the exemplar's
-    engine and the GP of ``exemplar.reference_gp`` fitted on that context, exactly as
-    :func:`analysis.update_rule.run_probes` does in the grid: the GP's update is its exact posterior update to the same
-    injected observation (x*, y*) the probed model received. Falls back to the per-cell anchors when no site is
-    unobserved in every context (only possible when ``exemplar.reference_gp`` equals the grid's reference).
-
-    Args:
-        stacked: The per-cell exemplar from :func:`_select_exemplar`.
-        p: Resolved ``update_rule`` block.
-        cfg: Resolved config.
-        cells: Cell namespace.
-        channels: Loaded channels.
-        knob: The stress knob of the grid.
-        engine: ``name -> engine`` (shared, lazily built).
-
-    Returns:
-        The exemplar mapping with ``g_model`` / ``g_gp`` re-probed at the common anchor, ``anchors`` repeating it,
-        ``reference_gp`` naming the GP row and ``anchor_rule`` recording which rule produced the columns; ``None`` when
-        an ``--only-cached`` run lacks a common-anchor cell.
-
-    Raises:
-        RuntimeError: If no site is unobserved in every context while F1's GP differs from the grid's reference.
-    """
-    from ..analysis import update_rule as U  # noqa: PLC0415
-
-    spec = p["exemplar"]
-    p_ex = {**p, "reference_gp": spec["reference_gp"]}       # the GP of F1's second row
-    ch = next(c for c in channels if (int(c.subject), int(c.emg)) == (int(stacked["subject"]), int(stacked["emg"])))
-    level, draw = float(spec["level"]), int(spec["draw"])
-    stressed = knob.apply(ch, level, rng_for(ch.label, "update_rule", level, base_seed=cfg.seed))
-    ts = [int(t) for t in stacked["context_ts"]]
-    ctxs = {t: context_for(stressed, t, draw, base_seed=cfg.seed, level=level) for t in ts}
-    observed = set().union(*(set(int(i) for i in c.sites) for c in ctxs.values()))
-    free = np.array(sorted(set(range(stressed.n_sites)) - observed), dtype=int)                # [F]
-    if free.size == 0:
-        if spec["reference_gp"] != p["reference_gp"]:
-            raise RuntimeError(f"F1: no site of {ch.label} is unobserved in every exemplar context, and the per-cell "
-                               "fallback cannot show exemplar.reference_gp; pick another exemplar draw or channel.")
-        print(f"[mechanism] F1: no site of {ch.label} is unobserved in every context; keeping per-cell anchors",
-              flush=True)
-        return {**stacked, "anchor_rule": np.array("per_cell (no common unobserved site)")}
-    xy = np.asarray(stressed.ch2xy, dtype=np.float64)                                          # [N, 2]
-    site = int(free[np.argmin(np.linalg.norm(xy[free] - xy.mean(axis=0), axis=1))])
-    name = str(stacked["engine"])
-    g_model, g_gp = [], []
-    for t in ts:
-        ctx = ctxs[t]
-
-        def compute(ctx: Any = ctx) -> tuple[dict[str, Any], dict[str, Any]]:
-            reference = _make_reference(p_ex)
-            reference.fit(ctx.X, ctx.y)
-            res = U.run_probes(engine(name), reference, ctx, stressed.X_pool, np.array([site]), ["centre"],
-                               p["surprises"])
-            c0 = U._symmetric_magnitudes(res.surprises)[0]
-            return {}, {"g_model": U._antisym(res.d_mean, res.surprises, c0)[0],
-                        "g_gp": U._antisym(res.d_gp, res.surprises, c0)[0]}
-
-        ident = {**cells.channel(ch), "knob": knob.name, "level": level, "t": t, "draw": draw, "anchor": site,
-                 "engine": name, "engine_params": _engine_params(name, p), "reference": _reference_params(p_ex),
-                 "surprises": list(p["surprises"])}
-        hit = cells.run("exemplar", ident, f"F1 {ch.label} t={t} anchor {site}", compute)
-        if hit is None:
-            print(f"[mechanism] F1: common-anchor cell missing for t={t}; F1 is skipped", flush=True)
-            return None
-        g_model.append(hit[1]["g_model"])
-        g_gp.append(hit[1]["g_gp"])
-    return {**stacked, "g_model": np.stack(g_model), "g_gp": np.stack(g_gp),                  # [T, N] each
-            "anchors": np.full(len(ts), site), "anchor_stratum": np.array("centre (common)"),
-            "reference_gp": np.array(str(spec["reference_gp"])),
-            "anchor_rule": np.array("common: most central site unobserved in every column")}
 
 
 # ---------------------------------------------------------------------------
@@ -1664,13 +1752,15 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
     Returns:
         The run directory.
     """
-    from ..analysis import update_rule as U  # noqa: PLC0415
     from ..analysis.cka import linear_gram, target_kernels  # noqa: PLC0415
     from ..analysis.embeddings import READOUTS, readout_embeddings  # noqa: PLC0415
     from ..analysis import placement as P  # noqa: PLC0415
     from ..analysis.placement import placement as place  # noqa: PLC0415
+    from ..analysis.context import draw_context  # noqa: PLC0415
     from ..data.snr import achieved_snr_db  # noqa: PLC0415
     from ..data.stress import build_knob  # noqa: PLC0415
+    from ..data.synthetic_neurostim import gp_channel  # noqa: PLC0415
+    from ..evaluation.stats import icc_oneway  # noqa: PLC0415
     from ..models.gp.surrogates import GPSurrogate  # noqa: PLC0415
     from ..models.pfn.tabpfn import FrozenTabPFN  # noqa: PLC0415
     from ..visualization import mechanism as figs  # noqa: PLC0415
@@ -1783,12 +1873,12 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
                     from dataclasses import replace  # noqa: PLC0415
 
                     rng = np.random.default_rng(cfg.seed)
-                    ctrl = U.gp_channel(c["grid_side"], c["lengthscale"], c["noise_sd"], c["n_trials"], rng)
+                    ctrl = gp_channel(c["grid_side"], c["lengthscale"], c["noise_sd"], c["n_trials"], rng)
                     if noise_only:
                         y = rng.normal(size=ctrl.n_sites)
                         ctrl = replace(ctrl, y_gt=y,
                                        Y_trials=y[:, None] + c["noise_sd"] * rng.normal(size=ctrl.Y_trials.shape))
-                    ctx = U.draw_context(ctrl, int(c["t"]), rng)
+                    ctx = draw_context(ctrl, int(c["t"]), rng)
                     emb = embed(ctx.X, ctx.y, ctrl.X_pool, readout)
                     tab = _cka_layer_table(emb, {"K_GT": target_kernels(ctrl.X_pool, ctrl.y_gt)["K_GT"]},
                                            int(p["n_perm"]), rng)
@@ -1807,7 +1897,7 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
             for ch in channels[: int(c["n_seed_channels"])]:
                 def seed_stability(readout: str = readout, ch: ChannelData = ch,
                                    ) -> tuple[dict[str, Any], dict[str, Any]]:
-                    ctx = U.draw_context(ch, min(int(c["t"]), ch.n_sites - 1), np.random.default_rng(cfg.seed))
+                    ctx = draw_context(ch, min(int(c["t"]), ch.n_sites - 1), np.random.default_rng(cfg.seed))
                     gp = GPSurrogate(**p["gp_params"])
                     gp.fit(ctx.X, ctx.y)
                     ks = {k: v for k, v in target_kernels(ch.X_pool, ch.y_gt, gp.posterior_covariance(ch.X_pool)).items()
@@ -1815,7 +1905,7 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
                     per_seed = [_layer_cka(embed(ctx.X, ctx.y, ch.X_pool, readout,
                                                  eng=FrozenTabPFN(device=cfg.device, random_state=s)), ks)
                                 for s in range(int(c["n_seeds"]))]
-                    icc = U.icc_oneway(np.asarray(per_seed).T)
+                    icc = icc_oneway(np.asarray(per_seed).T)
                     return {"gate": {"gate": "seed_stability", "readout": readout, "channel": ch.label,
                                      "n_seeds": int(c["n_seeds"]), "icc": icc,
                                      "passed": bool(icc >= c["icc_min"])}}, {}
@@ -1983,13 +2073,6 @@ def shadow_criterion(df: pd.DataFrame, spec: dict[str, Any]) -> dict[str, Any]:
     passed = bool(ratios) and all(v is not None and v < float(spec["max_iqr_ratio"]) for v in ratios.values())
     return {"readout": spec["readout"], "baseline": spec["baseline"], "level": float(spec["level"]),
             "ratios": ratios, "max_iqr_ratio": float(spec["max_iqr_ratio"]), "passed": passed}
-
-
-def _layer_dynamics(cfg: MechanismConfig, opts: RunOptions) -> str:
-    """Dispatch to the F6 layer-dynamics analysis (its own module: experiments/mechanism_layers.py)."""
-    from .mechanism_layers import run_layer_dynamics  # noqa: PLC0415 - lazy (heavy import)
-
-    return run_layer_dynamics(cfg, opts)
 
 
 def _cka_ceiling(
@@ -2296,11 +2379,10 @@ def run_procrustes(cfg: MechanismConfig, opts: RunOptions) -> str:
 
 #: Analysis runners by name.
 ANALYSES: dict[str, Callable[[MechanismConfig, RunOptions], str]] = {
-    "update_rule": run_update_rule,
+    "bayes_update": run_bayes_update,
     "placement": run_placement,
     "cka": run_cka,
     "procrustes": run_procrustes,
-    "layer_dynamics": _layer_dynamics,
 }
 
 

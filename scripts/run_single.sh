@@ -3,7 +3,7 @@
 # (no lanes, no --compute-only, no separate assemble job): `mechanism` (Hyp C).
 #
 # Usage (from a Mila login node, repo root; the USER runs sbatch):
-#   sbatch scripts/run_single.sh mechanism configs/experiment/mechanism_update_rule_nhp.yaml
+#   sbatch scripts/run_single.sh mechanism configs/experiment/mechanism_bayes_update_nhp.yaml
 #
 # Everything after the config path is forwarded to `--set`. The dataset is staged to $SLURM_TMPDIR.
 #SBATCH --job-name=single

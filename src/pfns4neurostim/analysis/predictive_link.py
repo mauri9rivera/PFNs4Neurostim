@@ -1,4 +1,4 @@
-"""Predictive link (roadmap M8; task #9 Step 7): mechanism metrics -> regret.
+"""Predictive link (roadmap M8): per-channel mechanism metrics -> regret.
 
 Model: ``outcome ~ predictor + (1 | dataset/subject)``. The slope is estimated by the
 *within* estimator (predictor and outcome centred inside each dataset x subject group), which
@@ -21,42 +21,24 @@ _CHANNEL: list[str] = ["dataset", "subject", "emg"]
 
 
 def channel_mechanism_table(
-    cell: pd.DataFrame,
+    cells: pd.DataFrame,
+    metrics: Sequence[str],
     *,
-    engine: str = "tabpfn_v2_5",
     level: float | None = None,
-    metrics: Sequence[str] = ("rho_shape_median", "saturation_index_median", "ell_hat_median", "ell_cv_anchor"),
 ) -> pd.DataFrame:
-    """Per-channel mechanism metrics from ``update_rule_cell.csv``.
-
-    Adds ``ell_adaptivity``: the slope of ``ell_hat_median`` on achieved SNR within the
-    channel (how fast the implicit lengthscale moves with noise, H10.3), when the table
-    carries more than one stress level.
+    """Per-channel medians of per-cell mechanism metrics (the metrics come from the config).
 
     Args:
-        cell: Cell table.
-        engine: Engine to summarize.
-        level: Keep one stress level (``None`` averages over levels).
-        metrics: Columns averaged per channel.
+        cells: One row per analysis cell with the channel keys, ``level`` and the metric columns.
+        metrics: Columns to summarise; absent ones are skipped.
+        level: Keep one stress level (``None`` pools every level).
 
     Returns:
         One row per channel.
     """
-    sub = cell[cell["engine"] == engine]
-    if level is not None:
-        sub_level = sub[np.isclose(sub["level"], level)]
-    else:
-        sub_level = sub
-    out = sub_level.groupby(_CHANNEL)[list(metrics)].mean()
-    if "achieved_snr_db" in sub and sub["level"].nunique() > 1:
-        def _slope(g: pd.DataFrame) -> float:
-            g = g.dropna(subset=["ell_hat_median"])
-            if g["achieved_snr_db"].nunique() < 2:
-                return float("nan")
-            return float(np.polyfit(g["achieved_snr_db"], g["ell_hat_median"], 1)[0])
-
-        out["ell_adaptivity"] = sub.groupby(_CHANNEL)[["achieved_snr_db", "ell_hat_median"]].apply(_slope)
-    return out.reset_index()
+    sub = cells if level is None else cells[np.isclose(cells["level"], level)]
+    cols = [m for m in metrics if m in sub]
+    return sub.groupby(_CHANNEL)[cols].median().reset_index()
 
 
 def predictive_link(

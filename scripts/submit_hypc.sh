@@ -43,7 +43,7 @@ submit_single() {
   echo "submitted: $name  (job ${id%%;*})"
 }
 
-submit_single "C1. M10 update rule (t = 10/25/50), NHP" mechanism configs/experiment/mechanism_update_rule_nhp.yaml pfns4neurostim scripts/run_single.sh
+submit_single "C1. OMEGA bayes_update, NHP" mechanism configs/experiment/mechanism_bayes_update_nhp.yaml pfns4neurostim scripts/run_single.sh
 submit_single "C2. CKA (a) + placement ladder (t = 10/25/50/80), NHP" mechanism configs/experiment/mechanism_cka_nhp.yaml pfns4neurostim scripts/run_single.sh
 submit_single "C3. Placement MMD / W2 (t = 10...96), NHP" mechanism configs/experiment/mechanism_placement_nhp.yaml pfns4neurostim scripts/run_single_cpu.sh
 submit_single "C4. Placement MMD / W2 (t = 10...200), 5d_rat" mechanism configs/experiment/mechanism_placement_5d_rat.yaml pfns4neurostim scripts/run_single_cpu.sh

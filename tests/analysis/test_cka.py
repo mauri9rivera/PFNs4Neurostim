@@ -64,7 +64,7 @@ class TestPositiveNegativeControlMachinery:
     """Step 4 controls on a representation with known content (the PFN versions are slow tests)."""
 
     def test_map_from_known_kernel_exceeds_null_noise_map_does_not(self, rng: np.random.Generator) -> None:
-        from pfns4neurostim.analysis.update_rule import gp_channel
+        from pfns4neurostim.data.synthetic_neurostim import gp_channel
 
         ch = gp_channel(8, 0.25, 0.2, 5, rng)
         # A kernel-smoother "representation": site features are RBF similarities to the
@@ -97,7 +97,8 @@ def test_gp_posterior_covariance_is_psd_and_matches_predictive_sd() -> None:
 @pytest.mark.gpu
 def test_layer_embeddings_shape_and_determinism() -> None:
     from pfns4neurostim.analysis.embeddings import site_embeddings
-    from pfns4neurostim.analysis.update_rule import draw_context, gp_channel
+    from pfns4neurostim.analysis.context import draw_context
+    from pfns4neurostim.data.synthetic_neurostim import gp_channel
 
     ch = gp_channel(8, 0.25, 0.2, 5, np.random.default_rng(0))
     ctx = draw_context(ch, 20, np.random.default_rng(0))
@@ -191,7 +192,8 @@ def test_shadow_criterion_passes_only_when_the_band_narrows() -> None:
 def test_readout_embeddings_are_feature_tokens_only() -> None:
     """Both readouts come from one pass over the FEATURE tokens; the label token is never read (2026-10-07)."""
     from pfns4neurostim.analysis.embeddings import READOUTS, layer_embeddings, readout_embeddings
-    from pfns4neurostim.analysis.update_rule import draw_context, gp_channel
+    from pfns4neurostim.analysis.context import draw_context
+    from pfns4neurostim.data.synthetic_neurostim import gp_channel
     from pfns4neurostim.models.pfn.tabpfn import FrozenTabPFN
 
     assert READOUTS == ("feature_mean", "feature_tokens")

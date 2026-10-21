@@ -576,3 +576,27 @@ def _final_regret_array(res: dict) -> np.ndarray:
         np.array(res['values']), axis=1
     )  # [n_reps, budget]
     return (optimal - running_best[:, -1]) / y_range  # [n_reps]
+
+
+def icc_oneway(ratings: np.ndarray) -> float:
+    """One-way random-effects ICC(1,1) (Shrout & Fleiss 1979).
+
+    Args:
+        ratings: Targets x raters (e.g. anchors x inference seeds), shape [n, k].
+
+    Returns:
+        ``(MSB - MSW) / (MSB + (k - 1) MSW)``; 1.0 when every rater agrees exactly.
+
+    Raises:
+        ValueError: With fewer than 2 targets or raters.
+    """
+    ratings = np.asarray(ratings, dtype=np.float64)
+    n, k = ratings.shape
+    if n < 2 or k < 2:
+        raise ValueError(f"icc_oneway needs >= 2 targets and raters, got {ratings.shape}.")
+    grand = ratings.mean()
+    msb = k * ((ratings.mean(axis=1) - grand) ** 2).sum() / (n - 1)
+    msw = ((ratings - ratings.mean(axis=1, keepdims=True)) ** 2).sum() / (n * (k - 1))
+    if msb + (k - 1) * msw == 0:
+        return 1.0
+    return float((msb - msw) / (msb + (k - 1) * msw))

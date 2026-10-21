@@ -19,7 +19,6 @@ case "$wave" in
     CONDA_ENV=pfns4neurostim LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=12G --time=03:15:00 --job-name=N2-gpu scripts/run_stress_sweep.sh configs/experiment/stress_k2_global_nhp.yaml "models=[tabpfn_v2_5]"
     CONDA_ENV=pfns4neurostim LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=12G --time=02:30:00 --job-name=N3-gpu scripts/run_stress_sweep.sh configs/experiment/stress_k5_nhp.yaml "models=[tabpfn_v2_5]"
     CONDA_ENV=pfns4neurostim LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=12G --time=02:00:00 --job-name=N4-gpu scripts/run_stress_sweep.sh configs/experiment/stress_k6_failure_nhp.yaml "models=[tabpfn_v2_5]"
-    CONDA_ENV=pfns4neurostim LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=12G --time=01:00:00 --job-name=N5-gpu scripts/run_stress_sweep.sh configs/experiment/stress_k6_budget_nhp.yaml "models=[tabpfn_v2_5]"
     CONDA_ENV=pfns4neurostim-bench LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=12G --time=02:00:00 --job-name=N11-gpu scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_nhp.yaml "models=[tabicl]"
     CONDA_ENV=pfns4neurostim-bench LANES=6 sbatch --parsable ${GPU_FLAGS[@]} --cpus-per-task=6 --mem=12G --time=02:00:00 --job-name=E1-gpu scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabicl]"
     ;;

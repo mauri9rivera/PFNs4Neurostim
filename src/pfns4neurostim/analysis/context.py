@@ -1,10 +1,9 @@
 """One context draw, shared by every Hyp C analysis (task plan #19 Step 1).
 
-A "context" is the evidence a surrogate is conditioned on: ``t`` sites of a channel and one observed trial at
-each. All three mechanism analyses -- the update-rule probe (M10), CKA (a) and (b), and the MMD / sliced-W2
-placement -- need one, and until 2026-09-30 each drew its own from its own seed stream
-(``'update_rule'``, ``'cka'``, ``'cka_placement'``, ``'placement_c'``). Two things followed from that, both
-bad:
+A "context" (:class:`Context`) is the evidence a surrogate is conditioned on: ``t`` sites of a channel and one
+observed trial at each. Every mechanism analysis -- the OMEGA update probe, CKA, and the MMD / sliced-W2
+placement -- needs one, and until 2026-09-30 each drew its own from its own seed stream (the retired M10 probe's
+``'update_rule'``, ``'cka'``, ``'cka_placement'``, ``'placement_c'``). Two things followed from that, both bad:
 
 * **Nothing could be shared.** Everything that depends on the *sites alone* -- the electrode-geometry kernel,
   the embeddings of the prior/noise reference maps, and hence the placement floor and ceiling -- had to be
@@ -27,14 +26,17 @@ happen to share a layout share their site sets, and one dataset whose subjects h
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 
 import numpy as np
 
 from ..data.channels import ChannelData
 from ..seeding import rng_for
-from .update_rule import Context, draw_context
 
-__all__ = ["CONTEXT_SITE_STREAM", "CONTEXT_TRIAL_STREAM", "context_for", "context_sites", "grid_id"]
+__all__ = [
+    "CONTEXT_SITE_STREAM", "CONTEXT_TRIAL_STREAM", "Context", "context_for", "context_sites", "draw_context",
+    "grid_id",
+]
 
 #: Seed-stream names. Distinct constants, so a future change to one cannot silently move the other.
 CONTEXT_SITE_STREAM: str = "mechanism_context_sites"
@@ -43,6 +45,74 @@ CONTEXT_TRIAL_STREAM: str = "mechanism_context_trials"
 #: Characters of the coordinate hash kept as a grid identifier. 12 hex characters is 48 bits: collision-free
 #: for the handful of layouts a study holds, and short enough to read in a log line or a CSV column.
 GRID_ID_CHARS: int = 12
+
+
+@dataclass(frozen=True)
+class Context:
+    """A fixed context of noisy observations shared by every probed model.
+
+    Attributes:
+        sites: Site indices of the observations, shape [t].
+        X: Their coordinates, shape [t, D].
+        y: One valid noisy trial per observation, shape [t].
+        trial_idx: Index of that trial in ``channel.Y_trials[site]``, shape [t]. Recorded so held-out trials can
+            exclude it (OMEGA, 2026-10-15); the draw itself is unchanged.
+    """
+
+    sites: np.ndarray
+    X: np.ndarray
+    y: np.ndarray
+    trial_idx: np.ndarray
+
+
+def draw_context(
+    channel: ChannelData,
+    t: int,
+    rng: np.random.Generator,
+    sites: np.ndarray | None = None,
+) -> Context:
+    """Draw ``t`` distinct sites and one random valid trial at each.
+
+    Args:
+        channel: Source channel.
+        t: Context size (``<= n_sites``).
+        rng: Generator.
+        sites: Site indices to use instead of drawing them, shape [t]. Passing them makes the site set a
+            *shared* quantity across channels while the trial draw stays per channel (added 2026-09-30): a
+            paired design, which both removes site selection as a source of between-channel variance and lets
+            an analysis reuse everything that depends on the sites alone -- reference-map embeddings, geometry
+            kernels, floors and ceilings -- across every channel on the same grid.
+
+    Returns:
+        The context.
+
+    Raises:
+        ValueError: If ``t`` exceeds the number of sites or is < 2, or if ``sites`` has the wrong length or
+            repeats an index.
+    """
+    if not 2 <= t <= channel.n_sites:
+        raise ValueError(f"draw_context: t={t} must be in [2, {channel.n_sites}].")
+    if sites is None:
+        sites = np.sort(rng.choice(channel.n_sites, size=t, replace=False))     # [t]
+    else:
+        sites = np.sort(np.asarray(sites, dtype=int))                           # [t]
+        if sites.size != t or np.unique(sites).size != t:
+            raise ValueError(
+                f"draw_context: sites must hold {t} distinct indices, got {sites.size} "
+                f"({np.unique(sites).size} distinct)."
+            )
+        if sites.min() < 0 or sites.max() >= channel.n_sites:
+            raise ValueError(
+                f"draw_context: sites out of range for {channel.n_sites} sites: "
+                f"[{sites.min()}, {sites.max()}]."
+            )
+    y = np.empty(t)
+    trial_idx = np.empty(t, dtype=int)
+    for i, s in enumerate(sites):
+        valid = np.flatnonzero(np.isfinite(channel.Y_trials[s]))
+        trial_idx[i] = rng.choice(valid)
+        y[i] = channel.Y_trials[s, trial_idx[i]]
+    return Context(sites=sites, X=channel.X_pool[sites].copy(), y=y, trial_idx=trial_idx)
 
 
 def grid_id(X_pool: np.ndarray) -> str:

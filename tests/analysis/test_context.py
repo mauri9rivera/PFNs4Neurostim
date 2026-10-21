@@ -107,6 +107,18 @@ class TestTrialsArePerChannel:
         for site, value in zip(ctx.sites, ctx.y):
             assert value in set(ch.Y_trials[site].tolist())
 
+    def test_trial_idx_names_the_drawn_trial_without_moving_the_draw(self) -> None:
+        """``trial_idx`` (OMEGA, 2026-10-15) is recorded only: the values are the pre-OMEGA draw."""
+        from pfns4neurostim.analysis.context import draw_context
+
+        ch = _channel("0-0")
+        sites = np.array([1, 4, 7, 9])
+        ctx = draw_context(ch, 4, np.random.default_rng(3), sites=sites)
+        np.testing.assert_array_equal(ctx.y, ch.Y_trials[ctx.sites, ctx.trial_idx])
+        rng = np.random.default_rng(3)  # the pre-OMEGA loop, replayed call for call
+        legacy = [ch.Y_trials[s, rng.choice(np.flatnonzero(np.isfinite(ch.Y_trials[s])))] for s in sites]
+        np.testing.assert_array_equal(ctx.y, legacy)
+
 
 class TestTrialDraw:
     """``trial_draw`` re-keys the trial stream only: same sites, independent readings."""

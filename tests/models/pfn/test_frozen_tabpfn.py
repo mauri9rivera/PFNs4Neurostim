@@ -1,4 +1,4 @@
-"""``FrozenTabPFN`` precision flag and train-mode fingerprint replay (F6-E Step 2).
+"""``FrozenTabPFN``: precision flag, train-mode fingerprint replay, softmax temperature and cdf / ppf.
 
 Both features were added for sprint #3's measurement gate (F6-0 A1 / A4): a ``precision``
 flag so a CUDA arm can hold the device fixed while precision changes, and ``transform_x``'s
@@ -58,7 +58,7 @@ def _without_fingerprint_step(random_state: int = 0) -> FrozenTabPFN:
     model._reg = TabPFNRegressor(
         device="cpu",
         n_estimators=1,
-        softmax_temperature=1.0,
+        softmax_temperature=model.softmax_temperature,
         ignore_pretraining_limits=True,
         fit_mode="fit_preprocessors",
         random_state=random_state,
@@ -273,3 +273,108 @@ class TestDecodeLogits:
     def test_before_fit_raises(self) -> None:
         with pytest.raises(RuntimeError, match="used before fit"):
             FrozenTabPFN(device="cpu").decode_logits(torch.zeros(1, 4))
+
+
+# ---------------------------------------------------------------------------
+# softmax temperature, public-API equivalence, cdf / ppf (OMEGA Step 3)
+# ---------------------------------------------------------------------------
+def _public_moments(model: FrozenTabPFN, X_query: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and SD of the wrapped regressor's own ``predict(output_type='full')`` distribution."""
+    from pfns4neurostim.models.pfn.tabpfn import _bar_distribution_moments
+
+    full = model.wrapper.predict(X_query, output_type="full")
+    return _bar_distribution_moments(full["criterion"], full["logits"])
+
+
+class TestTemperatureAndPublicApi:
+    @pytest.mark.parametrize("temperature", [0.9, 1.0])
+    def test_base_mean_and_sd_match_the_public_api(self, toy_context, temperature: float) -> None:
+        """The frozen forward without an injected row is ``TabPFNRegressor.predict`` at the same T
+        (atol 1e-4, as the pre-OMEGA mean-only check)."""
+        X, y = toy_context
+        model = FrozenTabPFN(device="cpu", random_state=0, softmax_temperature=temperature)
+        model.fit(X, y)
+        X_query = np.random.default_rng(21).random((9, 2))
+        mean, sd = model.moments(model.forward(None, None, model.transform_x(X_query)))
+        pub_mean, pub_sd = _public_moments(model, X_query)
+        np.testing.assert_allclose(mean[0], pub_mean, atol=1e-4)
+        np.testing.assert_allclose(sd[0], pub_sd, atol=1e-4)
+
+    def test_frozen_forward_matches_public_api(self, fitted: FrozenTabPFN) -> None:
+        """Moved from the M10 tests: the public ``predict`` mean at the deployed default T = 0.9."""
+        X_query = np.random.default_rng(22).random((12, 2))
+        mean, _ = fitted.moments(fitted.forward(None, None, fitted.transform_x(X_query)))
+        np.testing.assert_allclose(mean[0], fitted.wrapper.predict(X_query, output_type="mean"), atol=1e-4)
+
+    def test_default_is_the_deployed_temperature_and_it_sharpens(self, toy_context) -> None:
+        X, y = toy_context
+        X_query = np.random.default_rng(23).random((6, 2))
+        sds = {}
+        for t in (0.9, 1.0):
+            model = FrozenTabPFN(device="cpu", random_state=0, softmax_temperature=t)
+            model.fit(X, y)
+            sds[t] = model.moments(model.forward(None, None, model.transform_x(X_query)))[1][0]
+        assert FrozenTabPFN(device="cpu").softmax_temperature == 0.9
+        assert (sds[0.9] < sds[1.0]).all()
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+    def test_invalid_temperature_raises(self, bad: float) -> None:
+        with pytest.raises(ValueError, match="softmax_temperature"):
+            FrozenTabPFN(device="cpu", softmax_temperature=bad)
+
+
+class TestCdfPpf:
+    LEVELS = np.array([0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99])
+
+    @staticmethod
+    def _logp(model: FrozenTabPFN, n: int = 5, seed: int = 31) -> torch.Tensor:
+        X_query = np.random.default_rng(seed).random((n, 2))
+        return model.forward(None, None, model.transform_x(X_query))[0]          # [n, bars]
+
+    def test_cdf_of_ppf_is_the_identity(self, fitted: FrozenTabPFN) -> None:
+        logp = self._logp(fitted)
+        q = fitted.ppf(logp, self.LEVELS)                                       # [n, U]
+        assert q.shape == (5, len(self.LEVELS)) and (np.diff(q, axis=1) > 0).all()
+        u = fitted.cdf(logp, torch.as_tensor(q, dtype=torch.float32))           # [n, U]
+        np.testing.assert_allclose(u, np.broadcast_to(self.LEVELS, u.shape), atol=1e-4)
+
+    def test_moments_from_the_cdf_match_the_criterion(self, fitted: FrozenTabPFN) -> None:
+        """Mean and SD integrated from the CDF on a fine grid agree, within 1 % of the SD, with the bar
+        distribution's own moments *with uniform outer buckets* -- which is what ``criterion.cdf`` / ``icdf``
+        implement. ``moments`` (``FullSupportBarDistribution.variance``) instead models the two outer buckets as
+        half-normal tails: ~2e-5 of mass each but ~33 units wide here, so they add a large share of the variance
+        and none of the mean (measured 2026-10-15). That gap is a property of the checkpoint, pinned here."""
+        from tabpfn.architectures.base.bar_distribution import BarDistribution
+
+        logp = self._logp(fitted)
+        mean, sd = fitted.moments(logp)
+        sd_bars = (BarDistribution.mean_of_square(fitted.criterion, logp)
+                   - BarDistribution.mean(fitted.criterion, logp) ** 2).sqrt().numpy()
+        lo, hi = fitted.ppf(logp, np.array([1e-7, 1 - 1e-7])).T                   # [n] each
+        for i in range(len(mean)):
+            grid = np.linspace(lo[i], hi[i], 400001)                            # [G]
+            F = fitted.cdf(logp[i:i + 1], torch.as_tensor(grid, dtype=torch.float64))[0]
+            mid, dF = 0.5 * (grid[1:] + grid[:-1]), np.diff(F)
+            m = float((mid * dF).sum() / dF.sum())
+            v = float(((mid - m) ** 2 * dF).sum() / dF.sum())
+            assert abs(m - mean[i]) <= 0.01 * sd[i]
+            assert abs(np.sqrt(v) - sd_bars[i]) <= 0.01 * sd_bars[i]
+            assert sd[i] >= sd_bars[i]                                          # the half-normal tails only add
+
+    def test_shared_and_per_row_grids_agree(self, fitted: FrozenTabPFN) -> None:
+        logp = self._logp(fitted, n=3)
+        grid = torch.linspace(-1.0, 2.0, 11)
+        shared = fitted.cdf(logp, grid)
+        per_row = fitted.cdf(logp, grid.expand(3, -1).contiguous())
+        np.testing.assert_allclose(shared, per_row, atol=1e-7)
+
+    def test_ppf_is_finite_at_the_extreme_quadrature_levels(self, fitted: FrozenTabPFN) -> None:
+        """1 - 1e-12 rounds to 1.0 in float32; the float64 quantile must stay finite and inside the borders."""
+        q = fitted.ppf(self._logp(fitted, n=4), np.array([1e-12, 0.5, 1.0 - 1e-12]))
+        assert np.isfinite(q).all() and (np.diff(q, axis=-1) > 0).all()
+        borders = fitted.criterion.borders.cpu().numpy()
+        assert (q >= borders[0]).all() and (q <= borders[-1]).all()
+
+    def test_ppf_rejects_levels_outside_the_unit_interval(self, fitted: FrozenTabPFN) -> None:
+        with pytest.raises(ValueError, match="levels"):
+            fitted.ppf(self._logp(fitted, n=1), np.array([0.0, 0.5]))

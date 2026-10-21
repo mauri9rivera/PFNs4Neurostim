@@ -197,12 +197,8 @@ UNITS: tuple[Unit, ...] = (
        group="spinal", channels=90),
     _u("P8. K6 electrode failure, spinal", "stress_sweep", "stress_k6_failure_spinal", "spinal", _TP, _GP, 5,
        group="spinal", channels=90),
-    _u("P9. K6 budget, spinal", "stress_sweep", "stress_k6_budget_spinal", "spinal", _TP, _GP, 2.5, group="spinal",
-       channels=90, note="levels 10,20,30,50,64 = ~2.5x one full budget"),
     _u("P10. synthetic K2-channel, spinal twins", "stress_sweep", "stress_k2_channel_synthetic_spinal", "spinal", _TP, _GP, 9,
        group="spinal", channels=90, note="all 90 twins fit without collapse (checked 2026-09-25)"),
-    _u("P11. synthetic K1 decoy, spinal twins", "stress_sweep", "stress_k1_decoy_spinal", "spinal", _TP, _GP, 5,
-       group="spinal", channels=90, note="separation 3 pitches on an 8x8 grid: channels where it does not fit are skipped"),
     _u("P13. PFN bench base (TabPFN-2.5, TabICL / GP-MLL), spinal", "bo_benchmark", "hyp0_pfn_bench_spinal", "spinal",
        ("tabpfn_v2_5", "tabicl"), ("gp_mll",), group="spinal", env=BENCH_ENV,
        note="bench env; TabPFN-2.5 / GP-MLL cells are shared with P1"),
@@ -213,16 +209,12 @@ UNITS: tuple[Unit, ...] = (
        note="done 2026-10-07 (Narval 4929919-22, 4 subject parts); needs a bf16 GPU (Ampere+); sigma is constructed (G3)"),
     # ---- hypc: the mechanism analyses on the shared context ladder (B3, 2026-10-06) ----
     # Every mechanism cell is cached (output/cells/<ds>/mechanism_<analysis>/), so a unit that times out is RESUMED by
-    # submitting it again, and a unit can be split over several jobs (dataset.subjects / update_rule.engines) whose
+    # submitting it again, and a unit can be split over several jobs (dataset.subjects / bayes_update.engines) whose
     # cells meet in one cache and are assembled once with `--only-cached` over the full config. Hours below are
     # measured on the local RTX 3060 / 12-core box on 2026-10-06 (2-channel NHP smoke, per-cell timings).
-    _u("C1. M10 update rule + F6 readouts + F7 (ladder 10/25/50/80), NHP", "mechanism", "mechanism_update_rule_nhp",
+    _u("C1. OMEGA bayes_update, NHP", "mechanism", "mechanism_bayes_update_nhp",
        "nhp", _TP, (), group="hypc", hours=7.0,
-       note="MEASURED per cell: GP-refit probe 33 s (CPU), TabPFN probe 1.6 s, layer-arm readout 2.2 s, GP frozen "
-            "0.2-0.9 s. 648 cells per engine -> the GP-refit arm is ~5.9 h of the ~7 h: split it off as a CPU half "
-            "(update_rule.engines=[gp_mll_refit,gp_mll_frozen,gp_fixed_frozen], one job per subject, 2-2.6 h each) "
-            "and run the TabPFN half (engines=[tabpfn_v2_5], ALL subjects -- the seed floor reads channels[:2]) "
-            "on a GPU in ~0.6 h; assemble with --only-cached and the full engine list"),
+       note="hours are a placeholder until OMEGA Step 6 times one full cell; cells are cached per (channel, level, t, draw), so a timed-out job resumes on resubmission"),
     _u("C2. CKA (a) + (b), readouts feature_mean / label_token + decoder stages, NHP", "mechanism", "mechanism_cka_nhp",
        "nhp", _TP, (), group="hypc", hours=1.7,
        note="MEASURED: (a) 0.7 s per cell after the batched permutation null (4320 cells ~0.85 h, was 5.8 s per "
@@ -254,14 +246,8 @@ UNITS: tuple[Unit, ...] = (
     _u("N2. K2-global, NHP", "stress_sweep", "stress_k2_global_nhp", "nhp", _TP, _GP, 8, group="nhp"),
     _u("N3. K5 slot-fraction heavy tail, NHP", "stress_sweep", "stress_k5_nhp", "nhp", _TP, _GP, 6, group="nhp"),
     _u("N4. K6 electrode failure, NHP", "stress_sweep", "stress_k6_failure_nhp", "nhp", _TP, _GP, 5, group="nhp"),
-    _u("N5. K6 budget, NHP", "stress_sweep", "stress_k6_budget_nhp", "nhp", _TP, _GP, 2.5, group="nhp",
-       note="levels 10,20,30,50,96 = ~2.5x one full budget"),
     _u("N6. synthetic K2-channel, NHP twins", "stress_sweep", "stress_k2_channel_synthetic_nhp", "nhp", _TP, _GP, 9,
        group="nhp", note="then --replot --bridge on the N1 run directory for S10"),
-    _u("N7. synthetic K1 decoy, NHP twins", "stress_sweep", "stress_k1_decoy_nhp", "nhp", _TP, _GP, 5, group="nhp"),
-    _u("N13. K7 spatial shuffle, NHP", "stress_sweep", "stress_k7_nhp", "nhp", _TP, _BASE_CPU, 6, group="nhp",
-       note="NEW knob (2026-09-30), not a re-run: the only axis that removes spatial structure itself. Random "
-            "search is an arm because it is the floor every model must meet at f = 1"),
     _u("N8. Hyp A (TabPFN vs GP), NHP", "bo_benchmark", "hyp_a_nhp", "nhp", _TP, _BASE_CPU, 1, group="nhp"),
     _u("N9. Acquisition core (ts/ei/ucb), NHP", "bo_benchmark", "hyp0_acq_core_nhp", "nhp", _TP, _BASE_CPU, 3,
        group="nhp", note="ts_marginal cells are shared with N8 (same identity)"),
@@ -300,7 +286,7 @@ UNITS: tuple[Unit, ...] = (
 #: throughput). 6, not 8: sharding is per channel and 18 / 6 = 3 channels per lane, exactly the busiest lane of 8 lanes.
 MILA_GPU_LANES = 6
 MILA_GPU_MEM = "12G"          # 6 lanes x 1.58 GB (peak per lane, N9 probe 11078548: 9.46 of 10G = 95 %) x 1.25
-#: Narval CPU halves: one lane per channel (no per-user cap). GP lanes peak at 1.18 GB (NHP K7, 4692312) to 1.27 GB
+#: Narval CPU halves: one lane per channel (no per-user cap). GP lanes peak at 1.18 GB (NHP GP probe 4692312) to 1.27 GB
 #: (spinal K6-failure, 4929910: OOM at 50G for 42 lanes); 1.5 keeps ~20 % headroom over the heaviest.
 NARVAL_CPU_MEM_PER_LANE_GB = 1.5
 WALL_MARGIN = 1.25            # --time = estimate x margin, rounded up to a quarter hour (sharded units requeue anyway)
@@ -348,14 +334,13 @@ def _cpu_mem(lanes: int) -> str:
 
 
 # Rates: NHP TabPFN-2.5 ~1180 cells/GPU-h at 6 lanes (N9 probe 11078548: 720 cells in 0.61 h, GPU util 63 %, against
-# 492-759 at 4 lanes); GP-MLL ~60 s per rep on a Narval core (N13 probe 4692312: 18 lanes x 360 cells in 2.0 h, grade A),
+# 492-759 at 4 lanes); GP-MLL ~60 s per rep on a Narval core (GP probe 4692312: 18 lanes x 360 cells in 2.0 h, grade A),
 # one channel per CPU lane. Synthetic units wait for the twin check. Wave `done` = already ran, kept as the record.
 _M, _NC, _RC = MILA_GPU_LANES, CHANNELS["nhp"], CHANNELS["5d_rat"]
 _NM, _RM = _cpu_mem(CHANNELS["nhp"]), _cpu_mem(CHANNELS["5d_rat"])
 SPLIT_PLAN: tuple[Placement, ...] = (
     # ---- probes: one per job class ----
     Placement("N9", "gpu", "mila", ("tabpfn_v2_5",), "done", 0.61, _M, MILA_GPU_MEM),
-    Placement("N13", "cpu", "narval", ("gp_mll", "gp_naive", "random"), "done", 2.0, _NC, _NM),
     # TabFM stays on Mila (2026-10-05): its bench env cannot be built on Narval (numpy==2.2.6 is not in the Alliance
     # wheelhouse). 1 lane / 24G fits beside the N9 probe within Mila's caps (7 of 8 CPUs, 34 of 48 GB, 2 of 2 GPUs).
     # The full TabFM 5d_rat run is placed once this calibration has measured it.
@@ -364,14 +349,12 @@ SPLIT_PLAN: tuple[Placement, ...] = (
     Placement("N2", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 2.5, _M, MILA_GPU_MEM),
     Placement("N3", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 1.9, _M, MILA_GPU_MEM),
     Placement("N4", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 1.6, _M, MILA_GPU_MEM),
-    Placement("N5", "gpu", "mila", ("tabpfn_v2_5",), "bulk", 0.8, _M, MILA_GPU_MEM),
     Placement("N11", "gpu", "mila", ("tabicl",), "bulk", 1.6, _M, "12G"),
     Placement("E1", "gpu", "mila", ("tabicl",), "bulk", 1.6, _M, "12G"),
     # ---- bulk: Narval CPU, GP halves (one lane per channel) ----
     Placement("N2", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 2.3, _NC, _NM),
     Placement("N3", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 1.8, _NC, _NM),
     Placement("N4", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 1.5, _NC, _NM),
-    Placement("N5", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 0.7, _NC, _NM),
     Placement("N9", "cpu", "narval", ("gp_mll",), "bulk", 0.9, _NC, _NM),   # + ts_marginal: those cells sit on Mila only
     Placement("S2b", "cpu", "narval", ("gp_naive",), "bulk", 0.1, _RC, _RM),
     Placement("S3b", "cpu", "narval", ("gp_mll", "gp_naive"), "bulk", 2.2, _RC, _RM),
@@ -386,10 +369,8 @@ SPLIT_PLAN: tuple[Placement, ...] = (
     # conda/Windows build (output/twins/synth_narval_4711545.json; different numpy/BLAS builds), so a TabPFN half on Mila
     # and a GP half on Narval would run on different twins under the same keys. TabPFN on a 2g slice, 4 lanes, split by
     # subject (NHP subjects 0, 1, 3 hold 6 / 8 / 4 channels); rate assumed ~400 cells/slice-h until the first part reports.
-    Placement("N7", "gpu", "narval", ("tabpfn_v2_5",), "synthetic", 4.5, 4, "8G", gpu_type="a100_2g.10gb"),
     Placement("N6", "gpu", "narval", ("tabpfn_v2_5",), "synthetic", 3.6, 4, "8G", gpu_type="a100_2g.10gb",
               parts=tuple(f"dataset.subjects=[{s}]" for s in (0, 1, 3))),
-    Placement("N7", "cpu", "narval", ("gp_mll", "gp_naive"), "synthetic", 1.5, _NC, _NM),
     Placement("N6", "cpu", "narval", ("gp_mll",), "synthetic", 2.6, _NC, _NM),
     Placement("S5b", "cpu", "narval", ("gp_mll", "gp_naive"), "synthetic", 3.2, _RC, _RM),
     Placement("S5b", "gpu", "narval", ("tabpfn_v2_5",), "synthetic", 6.5, 4, "8G", gpu_type="a100_2g.10gb",

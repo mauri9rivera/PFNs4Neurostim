@@ -20,6 +20,11 @@ represents the electrode geometry, which is the question the mechanism analyses 
 ``feature_tokens``  every feature token kept separately, ``[n_tok, q, d]``; CKA is then computed per token and
                     averaged (B1 Step 5 shadow run), which is not the CKA of the averaged tokens.
 
+**Capture layer** (moved here on 2026-10-15 from the cancelled Sprint #3 module): :func:`capture_block_states`
+keeps both token kinds per block, :func:`capture_head_states` the prediction head's input, hidden state and
+logits, and :func:`logit_lens` decodes a block's label token with the checkpoint's own head. The label token is
+reportable against belief targets (G6 as rewritten per BETA D1); the decoder hidden state stays diagnostic.
+
 Uses :class:`~pfns4neurostim.models.pfn.tabpfn.FrozenTabPFN`, so extra context rows (the update-rule probe of task
 #9 Step 6) can be added without refitting preprocessing.
 """
@@ -30,7 +35,10 @@ from typing import Any, Sequence
 
 import numpy as np
 
-__all__ = ["READOUTS", "LayerEmbeddings", "readout_embeddings", "layer_embeddings", "site_embeddings"]
+__all__ = [
+    "READOUTS", "LayerEmbeddings", "readout_embeddings", "layer_embeddings", "site_embeddings",
+    "BlockStates", "capture_block_states", "HeadStates", "capture_head_states", "logit_lens",
+]
 
 #: Feature-token readouts over the per-row token axis.
 READOUTS: tuple[str, ...] = ("feature_mean", "feature_tokens")
@@ -182,3 +190,219 @@ def site_embeddings(
         engine = FrozenTabPFN(device=device, random_state=inference_seed)
     engine.fit(np.asarray(X_context), np.asarray(y_context))
     return layer_embeddings(engine, np.asarray(X_sites), layers=layers, readout=readout)
+
+
+# ---------------------------------------------------------------------------
+# Capture layer: both token kinds and the prediction head (pinned to tabpfn 6.3.2)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class BlockStates:
+    """Per-block post-LN states of the query (test) rows, both token kinds.
+
+    Attributes:
+        layers: Block indices captured, in hook order.
+        feature_tokens: Per block, feature-group tokens, float64 ``[q, n_tok, d]``.
+        label_token: Per block, the label token (diagnostic only, G6), float64 ``[q, d]``.
+    """
+
+    layers: tuple[int, ...]
+    feature_tokens: tuple[np.ndarray, ...]
+    label_token: tuple[np.ndarray, ...]
+
+
+def _run_forward(
+    engine: Any,
+    X_query: np.ndarray,
+    X_extra: np.ndarray | None,
+    y_extra: np.ndarray | None,
+    as_train: bool = False,
+) -> Any:
+    """Shared single-probe forward: context (already fitted into ``engine``) + one extra row.
+
+    ``as_train`` applies only to the injected row, matching
+    the update probe's injected row: the readout rows
+    are genuine test rows and always take the test preprocessing path. Keeping the two in step
+    matters because the probe result and the captured states must describe the *same* forward pass.
+    """
+    import torch  # noqa: PLC0415
+
+    Qt = engine.transform_x(X_query)
+    if X_extra is None:
+        return engine.forward(None, None, Qt)
+    Xe = engine.transform_x(np.atleast_2d(X_extra), as_train=as_train).unsqueeze(0)  # [1, r, F]
+    ye = engine.transform_y(
+        torch.as_tensor(np.asarray(y_extra, dtype=np.float32), device=engine.device)
+    ).reshape(1, -1)  # [1, r]
+    return engine.forward(Xe, ye, Qt)
+
+
+def capture_block_states(
+    engine: Any,
+    X_query: np.ndarray,
+    *,
+    X_extra: np.ndarray | None = None,
+    y_extra: np.ndarray | None = None,
+    layers: Sequence[int] | None = None,
+    as_train: bool = False,
+) -> BlockStates:
+    """Hook every requested block in one forward pass, keeping both token kinds.
+
+    Generalises :func:`pfns4neurostim.analysis.embeddings.readout_embeddings` (which keeps the
+    feature-token mean only) to also keep the label token per block: the only token the decoder
+    reads, which the logit lens and BETA's label-token readout need.
+
+    Args:
+        engine: Fitted :class:`~pfns4neurostim.models.pfn.tabpfn.FrozenTabPFN`.
+        X_query: Query coordinates (raw units, as passed to ``fit``), shape [q, D].
+        X_extra: Extra context row(s) injected for this probe, shape [r, D], or None.
+        y_extra: Their targets (raw units), shape [r], or None.
+        layers: Block indices; ``None`` = all.
+
+    Returns:
+        Post-LN states of every hooked block, query rows only.
+
+    Raises:
+        RuntimeError: If a hook does not fire.
+    """
+    import torch  # noqa: PLC0415
+
+    blocks = engine._model.transformer_encoder.layers  # noqa: SLF001 - pinned internal (tabpfn 6.3.2)
+    idx = list(range(len(blocks))) if layers is None else [int(i) for i in layers]
+    q = len(X_query)
+    captured: dict[int, torch.Tensor] = {}
+
+    def make_hook(k: int) -> Any:
+        def hook(_mod: Any, _inp: Any, out: Any) -> None:
+            act = out if isinstance(out, torch.Tensor) else out[0]   # [B, rows, tokens, d]
+            captured[k] = act[0, -q:].detach().float().cpu()         # [q, tokens, d]
+        return hook
+
+    handles = [blocks[k].register_forward_hook(make_hook(k)) for k in idx]
+    try:
+        _run_forward(engine, X_query, X_extra, y_extra, as_train)
+    finally:
+        for h in handles:
+            h.remove()
+    missing = [k for k in idx if k not in captured]
+    if missing:
+        raise RuntimeError(f"capture_block_states: hooks on blocks {missing} did not fire.")
+    feature_tokens = tuple(captured[k][:, :-1].numpy().astype(np.float64) for k in idx)
+    label_token = tuple(captured[k][:, -1].numpy().astype(np.float64) for k in idx)
+    return BlockStates(layers=tuple(idx), feature_tokens=feature_tokens, label_token=label_token)
+
+
+@dataclass(frozen=True)
+class HeadStates:
+    """Prediction-head readouts of the query rows (the decoder hidden state stays diagnostic, G6).
+
+    Attributes:
+        h1: Block-17 test label token (post-LN), the decoder's input, shape ``[q, 192]``.
+        h2: Post-GELU decoder hidden state, shape ``[q, 384]``.
+        h3: Logits before the temperature division, shape ``[q, n_out]``.
+    """
+
+    h1: np.ndarray
+    h2: np.ndarray
+    h3: np.ndarray
+
+
+def capture_head_states(
+    engine: Any,
+    X_query: np.ndarray,
+    *,
+    X_extra: np.ndarray | None = None,
+    y_extra: np.ndarray | None = None,
+    as_train: bool = False,
+) -> HeadStates:
+    """Hook the prediction head (``decoder_dict['standard']``) in one forward pass.
+
+    Pinned to ``tabpfn==6.3.2``: the decoder is called as ``Sequential(Linear(192, 384), GELU(),
+    Linear(384, n_out))`` on a seq-first ``[q, b, *]`` tensor (``transformer.py:567-572``), so every
+    capture here indexes batch position 0 along dim 1, not dim 0.
+
+    Args:
+        engine: Fitted :class:`~pfns4neurostim.models.pfn.tabpfn.FrozenTabPFN`.
+        X_query: Query coordinates, shape [q, D].
+        X_extra: Extra context row(s), shape [r, D], or None.
+        y_extra: Their targets, shape [r], or None.
+
+    Returns:
+        The three head readouts.
+
+    Raises:
+        RuntimeError: If a hook does not fire.
+    """
+    import torch  # noqa: PLC0415
+
+    seq = engine._model.decoder_dict["standard"]  # noqa: SLF001 - pinned internal (tabpfn 6.3.2)
+    captured: dict[str, torch.Tensor] = {}
+
+    def pre_hook_0(_mod: Any, inp: Any) -> None:
+        captured["h1"] = inp[0][:, 0].detach().float().cpu()   # [q, 192]
+
+    def pre_hook_2(_mod: Any, inp: Any) -> None:
+        captured["h2"] = inp[0][:, 0].detach().float().cpu()   # [q, 384]
+
+    def hook_2(_mod: Any, _inp: Any, out: Any) -> None:
+        captured["h3"] = out[:, 0].detach().float().cpu()      # [q, n_out]
+
+    handles = [
+        seq[0].register_forward_pre_hook(pre_hook_0),
+        seq[2].register_forward_pre_hook(pre_hook_2),
+        seq[2].register_forward_hook(hook_2),
+    ]
+    try:
+        _run_forward(engine, X_query, X_extra, y_extra, as_train)
+    finally:
+        for h in handles:
+            h.remove()
+    missing = [k for k in ("h1", "h2", "h3") if k not in captured]
+    if missing:
+        raise RuntimeError(f"capture_head_states: hooks {missing} did not fire.")
+    return HeadStates(**{k: v.numpy().astype(np.float64) for k, v in captured.items()})
+
+
+def logit_lens(
+    engine: Any,
+    label_plus: Sequence[np.ndarray],
+    label_minus: Sequence[np.ndarray],
+) -> np.ndarray:
+    """Per-block output-space update, read through the checkpoint's own decoder.
+
+    Applies ``decoder_dict['standard']`` -- the real, already-trained prediction head, with zero
+    fitted parameters added -- to each block's *label* token, then the same post-head chain the
+    forward pass uses (:meth:`~pfns4neurostim.models.pfn.tabpfn.FrozenTabPFN.decode_logits` and the
+    bar distribution's mean). The result is the prediction the network would make if it stopped at
+    block l, so the antisymmetrised difference between the two surprise signs is an *output-space*
+    update defined at every depth and directly comparable with the GP's.
+
+    This is the readout that makes the depth profile interpretable without a learned probe: the
+    label token is the only block-17 output the decoder actually reads, and at block 17 the lens
+    value equals the model's real prediction by construction (a useful internal check).
+
+    Args:
+        engine: Fitted :class:`~pfns4neurostim.models.pfn.tabpfn.FrozenTabPFN`.
+        label_plus: Per block, the label token at the positive surprise, each ``[q, 192]``.
+        label_minus: Per block, the same at the negative surprise, each ``[q, 192]``.
+
+    Returns:
+        Antisymmetrised output-space update ``(mean_+ - mean_-) / 2``, shape [L, q].
+
+    Raises:
+        ValueError: If the two sign sequences do not match in length or shape.
+    """
+    import torch  # noqa: PLC0415
+
+    if len(label_plus) != len(label_minus):
+        raise ValueError(f"logit_lens: {len(label_plus)} blocks for +c but {len(label_minus)} for -c.")
+    decoder = engine._model.decoder_dict["standard"]  # noqa: SLF001 - pinned internal (tabpfn 6.3.2)
+    means = []
+    for sign_states in (label_plus, label_minus):
+        stacked = np.stack([np.asarray(z, dtype=np.float32) for z in sign_states])   # [L, q, 192]
+        L, q, d = stacked.shape
+        flat = torch.as_tensor(stacked.reshape(L * q, d), device=engine.device)      # [L*q, 192]
+        with torch.no_grad():
+            logits = decoder(flat)                                                  # [L*q, bars]
+            mean, _ = engine.moments(engine.decode_logits(logits))                   # [L*q]
+        means.append(np.asarray(mean, dtype=np.float64).reshape(L, q))               # [L, q]
+    return 0.5 * (means[0] - means[1])                                               # [L, q]

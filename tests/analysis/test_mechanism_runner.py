@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pfns4neurostim.analysis.update_rule import gp_channel
+from pfns4neurostim.data.synthetic_neurostim import gp_channel
 from pfns4neurostim.experiments import mechanism
 
 
@@ -32,85 +32,6 @@ def _config(tmp_path, body: str, sizes: str = "[10]") -> str:
         output_root: {tmp_path.as_posix()}
     """) + textwrap.dedent(body))
     return str(path)
-
-
-def test_update_rule_runner_writes_tables_gates_and_figures(tmp_path, tiny) -> None:
-    cfg = _config(tmp_path, """
-        analysis: update_rule
-        update_rule:
-          engines: [gp_mll_frozen, gp_mll_refit]
-          stress: {knob: k2_channel, levels: [1.0, 2.0]}
-          n_context_draws: 1
-          n_anchors: 4
-          refit_surprises: [-0.5, 0.5]
-          gp_params: {n_opt_steps: 20, lr: 0.1}
-          positive_control: {grid_side: 7, lengthscale: 0.25, noise_sd: 0.3, n_trials: 6}
-    """)
-    out = mechanism.run_mechanism(cfg)
-    anchor = pd.read_csv(os.path.join(out, "update_rule.csv"))
-    assert set(anchor["engine"]) == {"gp_mll_frozen", "gp_mll_refit"}
-    assert set(anchor["level"]) == {1.0, 2.0}
-    gates = json.load(open(os.path.join(out, "gates.json")))
-    probe = [g for g in gates if g.get("role") == "probe_validity"]
-    assert probe and probe[0]["passed"]
-    for name in ("shape_vs_context", "surprise_response", "kernel_properties"):
-        assert os.path.exists(os.path.join(out, f"{name}.svg"))
-    assert not os.path.exists(os.path.join(out, "lengthscale_vs_snr.svg"))      # F4 dropped 2026-10-07
-    # --replot rebuilds from CSVs alone
-    os.remove(os.path.join(out, "kernel_properties.svg"))
-    mechanism.run_mechanism(cfg, replot=True)
-    assert os.path.exists(os.path.join(out, "kernel_properties.svg"))
-
-
-def test_fixed_reference_runs_end_to_end_and_is_recorded(tmp_path, tiny) -> None:
-    """reference_gp: fixed measures every arm against the GP-fixed kernel (no fitting); the GP-fixed arm is then identical to
-    the reference by construction, and the choice is written into the rows and the exemplar so figures label it."""
-    cfg = _config(tmp_path, """
-        analysis: update_rule
-        update_rule:
-          engines: [gp_fixed_frozen, gp_mll_frozen]
-          reference_gp: fixed
-          stress: {knob: k2_channel, levels: [1.0]}
-          n_context_draws: 1
-          n_anchors: 4
-          gp_params: {n_opt_steps: 20, lr: 0.1}
-          positive_control: {grid_side: 7, lengthscale: 0.25, noise_sd: 0.3, n_trials: 6}
-          exemplar: {context_ts: [10], level: 1.0, draw: 0, anchor_stratum: centre, select: first, subject: null, emg: null}
-    """)
-    out = mechanism.run_mechanism(cfg)
-    cell = pd.read_csv(os.path.join(out, "update_rule_cell.csv"))
-    assert set(cell["reference_gp"]) == {"fixed"}
-    fixed_arm = cell[cell["engine"] == "gp_fixed_frozen"]
-    assert (fixed_arm["rho_shape_median"] > 0.99).all()           # the reference measured against itself
-    ex = np.load(os.path.join(out, "update_rule_exemplar.npz"))
-    assert ex["reference_gp"] == "fixed"
-    # anchor: common (2026-10-07) -- every column is probed at one site, unobserved in every column's context.
-    assert str(ex["anchor_rule"]).startswith("common") and len(set(ex["anchors"].tolist())) == 1
-    assert os.path.exists(os.path.join(out, "shape_vs_context.svg"))
-
-
-def test_make_reference_and_fixed_engine_use_the_fixed_hyperparameters() -> None:
-    from pfns4neurostim.models.gp.surrogates import GP_FIXED_NOISE, GPYTORCH_DEFAULT_HYPERPARAMETER, GPSurrogate, NaiveGPSurrogate
-
-    p = {**mechanism.UPDATE_RULE_DEFAULTS, "reference_gp": "fixed"}
-    ref = mechanism._make_reference(p)
-    assert isinstance(ref.gp, NaiveGPSurrogate)
-    assert (ref.gp._lengthscale, ref.gp._outputscale, ref.gp._noise) == (GPYTORCH_DEFAULT_HYPERPARAMETER, 1.0, GP_FIXED_NOISE)
-    arm = mechanism._make_engine("gp_fixed_frozen", p, "cpu", 0)
-    assert isinstance(arm.gp, NaiveGPSurrogate)
-    assert type(mechanism._make_reference({**p, "reference_gp": "mll"}).gp) is GPSurrogate
-    with pytest.raises(ValueError, match="reference_gp"):
-        mechanism._make_reference({**p, "reference_gp": "bogus"})
-
-
-def test_unknown_block_key_raises(tmp_path, tiny) -> None:
-    cfg = _config(tmp_path, """
-        analysis: update_rule
-        update_rule:
-          bogus: 1
-    """)
-    with pytest.raises(ValueError, match="bogus"):
-        mechanism.run_mechanism(cfg)
 
 
 def test_placement_runner(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -231,113 +152,95 @@ def test_cka_runner_end_to_end(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_shared_ladder_is_required_and_validated(tmp_path, tiny) -> None:
-    """B3 Step 4: one ladder, composed or inline; a missing ladder or an analysis subset outside it fails."""
-    body = """
-        analysis: update_rule
-        update_rule:
-          engines: [gp_mll_frozen]
-          layer_arm: {enabled: true, context_ts: [25], level: 1.0, ridge: 1.0}
-    """
-    with pytest.raises(ValueError, match="not in the shared ladder"):
-        mechanism.run_mechanism(_config(tmp_path, body))
+    """B3 Step 4: one ladder, composed or inline; a missing ladder or an unknown context key fails."""
     path = tmp_path / "noladder.yaml"
-    path.write_text("defaults:\n  dataset: nhp\nanalysis: update_rule\n")
+    path.write_text("defaults:\n  dataset: nhp\nanalysis: cka\n")
     with pytest.raises(ValueError, match="no context ladder"):
         mechanism.load_mechanism_config(str(path))
     bogus = tmp_path / "bogus.yaml"
-    bogus.write_text("defaults:\n  dataset: nhp\ncontext: {sizes: [10], bogus: 1}\nanalysis: update_rule\n")
+    bogus.write_text("defaults:\n  dataset: nhp\ncontext: {sizes: [10], bogus: 1}\nanalysis: cka\n")
     with pytest.raises(ValueError, match="Unknown context key"):
         mechanism.load_mechanism_config(str(bogus))
     assert mechanism.load_mechanism_config("configs/experiment/mechanism_cka_nhp.yaml").context_sizes == (10, 25, 50, 80)
-    for name in ("mechanism_update_rule_nhp", "mechanism_placement_nhp", "mechanism_placement_5d_rat"):
+    for name in ("mechanism_bayes_update_nhp", "mechanism_placement_nhp", "mechanism_placement_5d_rat"):
         assert mechanism.load_mechanism_config(f"configs/experiment/{name}.yaml").context_sizes
     assert mechanism.load_mechanism_config(
         "configs/experiment/mechanism_cka_tokens_nhp.yaml").context_sizes == (25,)
 
 
-def _small_update_rule(tmp_path) -> str:
-    return _config(tmp_path, """
-        analysis: update_rule
-        update_rule:
-          engines: [gp_fixed_frozen, gp_mll_frozen]
+def _small_bayes_update(tmp_path, **extra: str) -> str:
+    body = """
+        analysis: bayes_update
+        bayes_update:
+          engines: [gp_bayes, gp_fixed]
+          references: [gp_bayes]
           stress: {knob: k2_channel, levels: [1.0]}
-          n_context_draws: 2
-          n_anchors: 4
-          gp_params: {n_opt_steps: 20, lr: 0.1}
-          positive_control: {grid_side: 7, lengthscale: 0.25, noise_sd: 0.3, n_trials: 6}
-          profile: {enabled: true, bin_edges: [0.0, 0.5, 1.5, 2.5, 3.5], far_pitch: 3.0, level: 1.0, panel_ts: [10],
-                    headline_gp: gp_fixed_frozen, offmap: {enabled: true, distance: 2.0},
-                    controls: {known_gp: true, shuffled: true, context_t: 10, n_channels: 1}}
-    """)
+          n_context_draws: 1
+          anchors: {n_unobserved: 2, n_observed: 1}
+          quadrature: {K: 4, u_min: 1.0e-12}
+          y_grid: {points: 128, u_tail: 1.0e-4}
+          shared: {n_trials: 3, ladder: [-3.0, -1.0, 1.0, 3.0], saturation_c: [1.0, 3.0]}
+          far_pitch: 3.0
+          gp_bayes: {lengthscale: [0.1, 0.6, 3], outputscale: [0.5, 2.0, 2], noise: [0.05, 0.3, 2], b2: 1.0,
+                     prune_mass: 1.0e-10, chunk: 64, exact_max_components: 64, sd_bins: 8}
+          exemplar: {enabled: true, subject: null, emg: null, level: 1.0, draw: 0, engines: [gp_bayes, gp_fixed]}
+          panel_ts: [10]
+          run: {gates: false, grid: true, discrepancy: false}
+    """
+    return _config(tmp_path, body)
 
 
-def test_cells_resume_and_only_cached_reassemble_identically(tmp_path, tiny, monkeypatch) -> None:
-    """B3 Steps 2-3: every cell is persisted; --only-cached recomputes nothing and reproduces the CSVs."""
-    from pfns4neurostim.analysis import update_rule as U
-
-    cfg = _small_update_rule(tmp_path)
-    out = mechanism.run_mechanism(cfg)
-    tables = {n: pd.read_csv(os.path.join(out, n)) for n in (
-        "update_rule.csv", "update_rule_cell.csv", "update_rule_profile.csv", "update_rule_offmap.csv",
-        "update_rule_profile_controls.csv")}
-    cell_dir = tmp_path / "cells" / "nhp" / "mechanism_update_rule"
-    assert len(list(cell_dir.glob("*.json"))) > 0
+def test_bayes_update_runner_writes_every_table_and_figure_and_reassembles_from_cache(
+        tmp_path, tiny, monkeypatch) -> None:
+    """OMEGA Step 5: GP engines on a tiny known-GP channel; --only-cached recomputes 0 cells."""
+    out = mechanism.run_mechanism(_small_bayes_update(tmp_path))
+    tables = {n: pd.read_csv(os.path.join(out, f"{n}.csv")) for n in (
+        "coherence", "coherence_cell", "headtohead", "surprise")}
+    assert set(tables["coherence"]["engine"]) == {"gp_bayes", "gp_fixed"}
+    assert set(tables["coherence"]["pool"]) == {"unobserved", "observed"}
+    assert {"host", "seconds"} <= set(tables["coherence_cell"].columns)
+    fixed = tables["coherence_cell"][tables["coherence_cell"]["engine"] == "gp_fixed"]
+    assert (fixed["drift_abs"].abs() < 1e-8).all() and (fixed["cov_asymmetry"] < 1e-8).all()
+    assert tables["coherence_cell"].loc[tables["coherence_cell"]["engine"] == "gp_bayes", "ess"].notna().all()
+    h = tables["headtohead"]
+    assert set(h.loc[h["reference"] == "gp_bayes", "engine"]) == {"gp_fixed"}
+    for name in ("coherence", "implied_noise", "headtohead", "surprise_response", "implied_cov_exemplar"):
+        assert os.path.exists(os.path.join(out, f"{name}.svg")), name
+    assert os.path.exists(os.path.join(out, "exemplar.npz"))
     for n in tables:
-        os.remove(os.path.join(out, n))
+        os.remove(os.path.join(out, f"{n}.csv"))
 
     def boom(*_a, **_k):
         raise AssertionError("an --only-cached run must not compute")
 
-    monkeypatch.setattr(U, "run_probes", boom)
-    monkeypatch.setattr(U, "_probe_cell", boom)
-    mechanism.run_mechanism(cfg, only_cached=True)
+    monkeypatch.setattr(mechanism, "_bayes_cell", boom)
+    mechanism.run_mechanism(_small_bayes_update(tmp_path), only_cached=True)
     for n, before in tables.items():
-        pd.testing.assert_frame_equal(before, pd.read_csv(os.path.join(out, n)), check_like=True)
+        pd.testing.assert_frame_equal(before, pd.read_csv(os.path.join(out, f"{n}.csv")), check_like=True)
 
 
-def test_failed_cell_is_reported_and_only_it_is_recomputed(tmp_path, tiny, monkeypatch) -> None:
-    """One failing cell no longer kills the grid: the run finishes, raises a listing, and a re-run retries it."""
-    from pfns4neurostim.analysis import update_rule as U
-
-    real = U.run_probes
-    calls = {"n": 0, "failed": False}
-
-    def flaky(engine, reference, ctx, Q, anchors, strata, surprises=U.DEFAULT_SURPRISES):
-        calls["n"] += 1
-        if not calls["failed"] and len(anchors) > 1:
-            calls["failed"] = True
-            raise RuntimeError("injected")
-        return real(engine, reference, ctx, Q, anchors, strata, surprises)
-
-    monkeypatch.setattr(U, "run_probes", flaky)
-    cfg = _small_update_rule(tmp_path)
-    with pytest.raises(RuntimeError, match=r"1 cell\(s\) failed"):
-        mechanism.run_mechanism(cfg)
-    first = calls["n"]
-    mechanism.run_mechanism(cfg)
-    # Only the failed probe cell and the off-map cell that hangs off it (skipped while its probe was missing)
-    # are computed again; every other cell is served from the cache.
-    assert calls["n"] - first == 2
-
-
-def test_f7_profile_columns_and_figures(tmp_path, tiny) -> None:
-    """F7: cell metrics, binned profile, off-map and control tables, main and supplement figures."""
-    out = mechanism.run_mechanism(_small_update_rule(tmp_path))
-    cell = pd.read_csv(os.path.join(out, "update_rule_cell.csv"))
-    for col in ("far_field_share", "locality_index", "offset_share", "offset_fit_ell"):
-        assert col in cell
-    assert cell["far_field_share"].between(0, 1).all() and cell["offset_share"].between(0, 1).all()
-    assert cell["locality_index"].le(1.0 + 1e-9).all()
-    prof = pd.read_csv(os.path.join(out, "update_rule_profile.csv"))
-    un = prof[~prof["observed"].astype(bool)]
-    assert un["cum_energy_share"].between(0, 1 + 1e-9).all()
-    ctrl = pd.read_csv(os.path.join(out, "update_rule_profile_controls.csv"))
-    assert {"known_gp", "original", "shuffled"} <= set(ctrl["control"]) and "truth" in set(ctrl["engine"])
-    off = pd.read_csv(os.path.join(out, "update_rule_offmap.csv"))
-    # A GP's update on the grid from an observation two grid widths away is ~0 (relative to the full surprise).
-    assert (off["offmap_transfer_median"] < 0.05).all()
-    for name in ("update_vs_distance", "update_vs_distance_controls"):
-        assert os.path.exists(os.path.join(out, f"{name}.svg"))
+def test_bayes_update_refuses_unknown_engines_and_ladders_without_saturation_points(tmp_path, tiny) -> None:
+    with pytest.raises(ValueError, match="unknown"):
+        mechanism.run_mechanism(_config(tmp_path, """
+            analysis: bayes_update
+            bayes_update: {engines: [gp_bayes, gp_unknown]}
+        """))
+    with pytest.raises(ValueError, match="Part B reference only"):
+        mechanism.run_mechanism(_config(tmp_path, """
+            analysis: bayes_update
+            bayes_update: {engines: [gp_bayes, gp_mll_frozen], references: [gp_bayes, gp_mll_frozen],
+                           coverage: {gp_mll_frozen: {A: {levels: [1.0]}}}}
+        """))
+    with pytest.raises(ValueError, match="saturation_c"):
+        mechanism.run_mechanism(_config(tmp_path, """
+            analysis: bayes_update
+            bayes_update: {shared: {n_trials: 3, ladder: [-1.0, 1.0], saturation_c: [1.0, 3.0]}}
+        """))
+    with pytest.raises(ValueError, match="not in the shared ladder"):
+        mechanism.run_mechanism(_config(tmp_path, """
+            analysis: bayes_update
+            bayes_update: {panel_ts: [25]}
+        """))
 
 
 def test_empty_csv_is_treated_as_absent(tmp_path) -> None:
@@ -351,29 +254,6 @@ def test_empty_csv_is_treated_as_absent(tmp_path) -> None:
     assert figs.render_cka(str(tmp_path)) == []
     pd.DataFrame([{"a": 1}]).to_csv(path, index=False)
     assert figs._has_rows(str(path))
-
-
-def test_exemplar_gp_row_can_differ_from_the_metric_reference(tmp_path, tiny) -> None:
-    """F1's GP row follows exemplar.reference_gp (2026-10-07), while every metric keeps update_rule.reference_gp."""
-    body = """
-        analysis: update_rule
-        update_rule:
-          engines: [gp_mll_frozen, gp_fixed_frozen]
-          reference_gp: mll
-          stress: {knob: k2_channel, levels: [1.0]}
-          n_context_draws: 1
-          n_anchors: 4
-          gp_params: {n_opt_steps: 20, lr: 0.1}
-          positive_control: {grid_side: 7, lengthscale: 0.25, noise_sd: 0.3, n_trials: 6}
-          exemplar: {context_ts: [10], level: 1.0, draw: 0, anchor_stratum: centre, select: first, subject: null,
-                     emg: null, anchor: common, reference_gp: fixed}
-    """
-    out = mechanism.run_mechanism(_config(tmp_path, body))
-    ex = np.load(os.path.join(out, "update_rule_exemplar.npz"))
-    assert str(ex["reference_gp"]) == "fixed"
-    assert set(pd.read_csv(os.path.join(out, "update_rule_cell.csv"))["reference_gp"]) == {"mll"}
-    with pytest.raises(ValueError, match="anchor: common"):
-        mechanism.run_mechanism(_config(tmp_path, body.replace("anchor: common", "anchor: per_cell")))
 
 
 class TestStressSeriesAreLabelledInSnr:
