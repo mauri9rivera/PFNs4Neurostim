@@ -6,7 +6,8 @@ recomputed without re-running any experiment:
 * **breakdown point** — the first knob level (ordered by increasing severity) at
   which the model stops being statistically equivalent to the reference
   (TOST fails) *or* its mean regret exceeds the random-search baseline. Reported
-  with a bootstrap CI over channels.
+  with a bootstrap CI over channels: since 2026-10-21 a CI of the *pooled* point itself
+  (:func:`bootstrap_breakdown`), no longer of the mean of per-channel breakdowns, which need not contain it.
 * **degradation AUC** — normalized area under the degradation curve; higher means
   worse degradation across the whole sweep, and it summarizes the curve without
   presupposing a breakdown.
@@ -31,6 +32,7 @@ __all__ = [
     "noninferiority",
     "relative_robustness",
     "bootstrap_ci",
+    "bootstrap_breakdown",
 ]
 
 
@@ -269,6 +271,139 @@ def breakdown_point(
         "tost_p": tost_p,
         "equivalent": equivalent,
         "margin": float(margin),
+    }
+
+
+#: Pooled variance at or below this fraction of the pooled mean square is treated as exactly zero by
+#: :func:`bootstrap_breakdown`, which works from sufficient statistics: a constant difference vector gives a
+#: variance of ~1e-17 instead of the 0.0 that :func:`noninferiority` tests for.
+ZERO_VARIANCE_RTOL: float = 1e-12
+
+
+def _channel_sufficient_stats(
+    model_by_channel: Sequence[dict[float, np.ndarray]],
+    reference_by_channel: Sequence[dict[float, np.ndarray]],
+    levels: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-(channel, level) count, sum and sum of squares of the paired differences ``model - reference``.
+
+    Repetitions are paired by position within a channel and truncated to the shorter of the two, as
+    :func:`breakdown_point` pairs its pooled arrays. A level a channel does not visit contributes nothing.
+
+    Args:
+        model_by_channel: One ``level -> values`` dict per channel for the model.
+        reference_by_channel: The same for the reference, channel for channel.
+        levels: Levels in severity order (columns of the outputs).
+
+    Returns:
+        ``(n, s, q)``, each of shape [C, L].
+    """
+    n_ch, n_lv = len(model_by_channel), len(levels)
+    n = np.zeros((n_ch, n_lv))                                                      # [C, L]
+    s = np.zeros((n_ch, n_lv))                                                      # [C, L]
+    q = np.zeros((n_ch, n_lv))                                                      # [C, L]
+    for c, (mod, ref) in enumerate(zip(model_by_channel, reference_by_channel)):
+        for j, lv in enumerate(levels):
+            if lv not in mod or lv not in ref:
+                continue
+            a = np.asarray(mod[lv], dtype=np.float64)
+            b = np.asarray(ref[lv], dtype=np.float64)
+            k = min(a.size, b.size)
+            d = a[:k] - b[:k]                                                       # [k]
+            n[c, j], s[c, j], q[c, j] = k, float(d.sum()), float((d * d).sum())
+    return n, s, q
+
+
+def bootstrap_breakdown(
+    model_by_channel: Sequence[dict[float, np.ndarray]],
+    reference_by_channel: Sequence[dict[float, np.ndarray]],
+    *,
+    margin: float,
+    severity_ascending: bool = True,
+    alpha: float = 0.05,
+    n_boot: int = 2000,
+    level: float = 0.95,
+    rng: np.random.Generator | None = None,
+) -> dict[str, Any]:
+    """Channel-bootstrap distribution of the *pooled* non-inferiority breakdown point.
+
+    Each resample draws channels with replacement and recomputes the pooled breakdown exactly as
+    :func:`breakdown_point` does with ``test='noninferiority'`` on the concatenated channels: the mildest
+    level whose one-sided paired t-test of ``model - reference < margin`` fails at ``alpha`` (a level with
+    fewer than two pairs is skipped; a zero-variance level passes iff its mean is below ``margin``). The pooled
+    statistics of a resample are weighted sums of per-channel sufficient statistics, so the 2000 resamples
+    cost one matrix product each, not a t-test loop.
+
+    The breakdown is coded as a **severity rank**: ``r < L`` is the ``r``-th level in severity order and
+    ``r = L`` means "no breakdown on the ladder", i.e. beyond the harshest level. The CI is the percentile
+    interval of the resampled ranks (lower / higher order statistics, so both ends are ladder points), extended
+    when necessary so it always brackets the point estimate; ``extended`` says whether that happened.
+
+    Args:
+        model_by_channel: One ``level -> per-repetition values`` dict per channel for the model.
+        reference_by_channel: The same for the reference, paired channel for channel.
+        margin: Non-inferiority margin, in the metric's units.
+        severity_ascending: True when a larger level means more stress.
+        alpha: Test significance level.
+        n_boot: Bootstrap resamples.
+        level: Confidence level.
+        rng: Seeded generator; the same fixed default as :func:`bootstrap_ci` keeps figures reproducible.
+
+    Returns:
+        ``levels`` (severity order), ``point_rank``, ``ci_rank`` ``(mild, harsh)``, ``none_fraction`` (share of
+        resamples with no breakdown), ``extended`` and ``ranks`` (the resampled ranks, shape [n_boot]).
+
+    Raises:
+        ValueError: With no channel, mismatched channel lists or level sets.
+    """
+    from scipy import stats  # noqa: PLC0415 - heavy import, load on demand
+
+    if not model_by_channel or len(model_by_channel) != len(reference_by_channel):
+        raise ValueError(
+            f"bootstrap_breakdown: need matching, non-empty channel lists "
+            f"({len(model_by_channel)} vs {len(reference_by_channel)})."
+        )
+    model_levels = set().union(*model_by_channel)
+    ref_levels = set().union(*reference_by_channel)
+    if model_levels != ref_levels:
+        raise ValueError(
+            f"bootstrap_breakdown: model and reference level sets differ ({sorted(model_levels)} vs "
+            f"{sorted(ref_levels)})."
+        )
+    levels = sorted(model_levels, reverse=not severity_ascending)
+    n_lv = len(levels)
+    n, s, q = _channel_sufficient_stats(model_by_channel, reference_by_channel, levels)   # [C, L] each
+
+    def ranks_of(weights: np.ndarray) -> np.ndarray:
+        """Pooled breakdown rank of each weighting of the channels, weights [K, C] -> ranks [K]."""
+        pn, ps, pq = weights @ n, weights @ s, weights @ q                                # [K, L] each
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean = ps / pn                                                                # [K, L]
+            var = (pq - ps * mean) / (pn - 1.0)                                           # [K, L]
+            zero = var <= ZERO_VARIANCE_RTOL * (pq / pn)
+            t_stat = (mean - margin) / np.sqrt(var / pn)
+            p = stats.t.cdf(t_stat, df=pn - 1.0)
+        ok = np.where(zero, mean < margin, p < alpha)
+        broken = (pn >= 2) & ~ok                                                          # [K, L]
+        return np.where(broken.any(axis=1), broken.argmax(axis=1), n_lv)                  # [K]
+
+    point = int(ranks_of(np.ones((1, n.shape[0])))[0])
+    gen = rng if rng is not None else np.random.default_rng(0)
+    draws = gen.integers(0, n.shape[0], size=(n_boot, n.shape[0]))                        # [n_boot, C]
+    weights = np.zeros((n_boot, n.shape[0]))                                              # [n_boot, C]
+    np.add.at(weights, (np.arange(n_boot)[:, None], draws), 1.0)
+    ranks = ranks_of(weights)                                                             # [n_boot]
+    half = (1.0 - level) / 2.0
+    lo = int(np.quantile(ranks, half, method="lower"))
+    hi = int(np.quantile(ranks, 1.0 - half, method="higher"))
+    ci = (min(lo, point), max(hi, point))
+    return {
+        "levels": [float(lv) for lv in levels],
+        "point_rank": point,
+        "ci_rank": ci,
+        "none_fraction": float(np.mean(ranks == n_lv)),
+        "extended": ci != (lo, hi),
+        "ranks": ranks,
     }
 
 

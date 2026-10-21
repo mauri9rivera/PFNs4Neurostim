@@ -59,6 +59,13 @@ __all__ = [
     "ACQUISITION_LINESTYLES",
     "READOUT_LINESTYLES",
     "READOUT_LABELS",
+    "SUBJECT_COLOR_RANGE",
+    "SUBJECT_MARKERS",
+    "SUBJECT_LABEL",
+    "LINK_REFERENCE_TITLES",
+    "LINK_SLOPE_NOTE",
+    "LINK_TITLE",
+    "subject_style",
     "set_integer_xaxis",
     "derive_shade",
     "acquisition_style",
@@ -72,6 +79,12 @@ __all__ = [
     "KNOB_PARAM_LABELS",
     "NOMINAL_MARKER_COLOR",
     "NOMINAL_MARKER_LABEL",
+    "CALIBRATION_TARGET_COLOR",
+    "CALIBRATION_TARGET_LABEL",
+    "NO_BREAKDOWN_LABEL",
+    "BREAKDOWN_RULE_NOTE",
+    "ONLINE_Y_SCALER_LABELS",
+    "CALIBRATION_TARGET_LABELS",
     "mark_nominal",
     "snr_series_label",
     "DEMO_LABELS",
@@ -227,6 +240,34 @@ NOMINAL_MARKER_COLOR: str = "#6A1B9A"
 #: Linestyle and width of that marker, so every figure draws the same line.
 NOMINAL_MARKER_LINESTYLE: str = (0, (4, 2))
 NOMINAL_MARKER_LINEWIDTH: float = 1.0
+
+#: Horizontal guide at the value a perfectly calibrated predictive scores (coverage 0.5 / 0.9, ECE 0) in the
+#: E12 calibration-under-stress figure (2026-10-21). A dark grey, thin and solid, drawn under the data: darker
+#: than NEUTRAL_GREY so it is never read as the Random baseline, and horizontal and labelled so it is never
+#: read as a PFN (solid) model line.
+CALIBRATION_TARGET_COLOR: str = "#4D4D4D"
+CALIBRATION_TARGET_LINESTYLE: str = "-"
+CALIBRATION_TARGET_LINEWIDTH: float = 0.6
+CALIBRATION_TARGET_LABEL: str = "Perfect calibration"
+#: Legend entry of the open marker that the E10 breakdown panel draws at the harshest level of the ladder when a
+#: model never breaks down at that budget (a gap would read as "missing", not as "robust").
+NO_BREAKDOWN_LABEL: str = "Open marker: no breakdown on the ladder"
+#: Panel title of the E10 breakdown panel. The breakdown rule is *relative to the reference model* (the reason
+#: ``breakdown_vs_budget.svg`` was dropped), so the panel states it where it is read.
+BREAKDOWN_RULE_NOTE: str = "Rule: non-inferior to {reference} (margin {margin:g})"
+#: Wording of each ``experiment.online_y_scaler`` setting, for figure titles: calibration is only comparable
+#: within one setting, so every calibration figure states the one it was computed under.
+#: What the E12 calibration metrics are scored against, for figure titles. ``bo_runner`` scores the predictive of
+#: the *noisy observations* against the *noise-free* ground-truth mean map, so every figure names that target
+#: (user, 2026-10-21) instead of letting "coverage" read as coverage of new trials.
+CALIBRATION_TARGET_LABELS: dict[str, str] = {
+    "ground_truth_mean": "coverage of the ground-truth mean map",
+}
+ONLINE_Y_SCALER_LABELS: dict[str, str] = {
+    "none": "offline y-scaling",
+    "minmax": "online y min-max",
+    "zscore": "online y z-score",
+}
 
 #: Lightness band (HLS) that derived shades walk; bounded so shades stay mutually
 #: distinguishable, lighter than either anchor, and never wash out on white.
@@ -734,6 +775,22 @@ AXIS_LABELS: dict[str, str] = {
     "abs_transfer": r"Mean $|T(x)|$ (update per unit surprise)",
     "distance_pitch": r"Distance from $x'$ (electrode pitches)",
     "dmu_exemplar": r"Change of mean $\Delta\mu(x)$ (z-units)",
+    # M8 predictive link (2026-10-21): the per-channel breakdown outcome is a count on the stress ladder (levels
+    # passed before the first non-inferiority failure; the ladder length = never breaks down).
+    "breakdown": "Breakdown point\n(stress levels passed)",
+    # E12 calibration under stress (2026-10-21): the predictive is scored against the noise-free ground-truth mean
+    # map, not against held-out noisy trials (bo_runner), and the label says so; repetitions reduced within a
+    # channel, then the median and the interquartile range over channels.
+    "coverage_50_gt_median": "50% interval coverage of GT mean\n(median, IQR over channels)",
+    "coverage_90_gt_median": "90% interval coverage of GT mean\n(median, IQR over channels)",
+    "ece_gt_median": "Expected calibration error vs GT mean\n(median, IQR over channels)",
+    "nll_gt_median": "NLL of GT mean (nats)\n(median, IQR over channels)",
+    # E10 robustness vs BO budget (2026-10-21). The breakdown point is in knob-axis units, so its label is this
+    # prefix plus the knob's own x-axis wording; the two regret summaries average the per-level values over the
+    # ladder (each level weighted equally).
+    "breakdown_point": "Pooled breakdown point (95% channel-bootstrap CI)",
+    "recommended_regret_median_level_mean": "Recommended-site regret (norm. GT range)\n(median over channels, mean over levels)",
+    "cvar10_level_mean": "CVaR$_{10\\%}$ of recommended regret\n(mean over levels)",
 }
 
 #: Linestyle of each embedding readout (B1 Step 3). Readouts are told apart by linestyle so that colour stays
@@ -748,6 +805,52 @@ READOUT_LABELS: dict[str, str] = {
     "feature_mean": "Feature-token mean",
     "feature_tokens": "Per feature token (avg. CKA)",
 }
+
+#: Subject identity in per-channel scatters (the M8 predictive link, 2026-10-21). Subjects are an ordered handful
+#: (NHP 0-3), so their colours are evenly spaced samples of :data:`SEQUENTIAL_CMAP` over this range (the top of
+#: viridis is too light on white), and the marker repeats the identity for greyscale print. No model is drawn in
+#: those figures, so no subject colour can be read as a model anchor.
+SUBJECT_COLOR_RANGE: tuple[float, float] = (0.0, 0.85)
+SUBJECT_MARKERS: tuple[str, ...] = ("o", "s", "^", "D", "v", "P", "X", "h")
+SUBJECT_LABEL: str = "Subject {subject}"
+
+#: Panel titles of the predictive link: which reference a predictor is read against. ``none`` = the engine's own
+#: readout; ``contrast`` = a site-matched contrast with the reference (Part B); ``difference`` = the matched
+#: difference engine - reference of an engine readout.
+LINK_REFERENCE_TITLES: dict[str, str] = {
+    "none": "{model}",
+    "contrast": "vs {reference}",
+    "difference": "{model} $-$ {reference}",
+}
+#: Slope annotation of a predictive-link panel (random-intercept slope, channel-bootstrap CI).
+LINK_SLOPE_NOTE: str = "slope {slope:.3g} [{lo:.3g}, {hi:.3g}]"
+#: Figure title of a predictive-link figure; the link is exploratory and the title says so where it is read.
+LINK_TITLE: str = ("Exploratory link to {outcome}: {model}, {pool} anchors, level {level:g}; "
+                   "random-intercept slope, 95% channel-bootstrap CI")
+
+
+def subject_style(subject: object, subjects: Sequence[object]) -> ModelStyle:
+    """Colour, marker and label of one subject among the subjects of a figure.
+
+    Args:
+        subject: The subject.
+        subjects: Every subject of the figure, in display order.
+
+    Returns:
+        A :class:`ModelStyle` (family ``'subject'``, solid line).
+
+    Raises:
+        ValueError: If ``subject`` is not in ``subjects``.
+    """
+    order = list(subjects)
+    if subject not in order:
+        raise ValueError(f"subject_style: {subject!r} not in {order}.")
+    i = order.index(subject)
+    lo, hi = SUBJECT_COLOR_RANGE
+    frac = 0.0 if len(order) == 1 else i / (len(order) - 1)
+    color = mpl.colors.to_hex(mpl.colormaps[SEQUENTIAL_CMAP](lo + frac * (hi - lo)))
+    return ModelStyle(SUBJECT_LABEL.format(subject=subject), color, "-", SUBJECT_MARKERS[i % len(SUBJECT_MARKERS)],
+                      "subject", 3)
 
 #: Canonical **stress parameter** of each knob, in mathtext (settled with the user 2026-10-12; the catalogue
 #: lives in ``research_design.md`` §2 Hyp B). One letter per knob, so a symbol never means two things across
