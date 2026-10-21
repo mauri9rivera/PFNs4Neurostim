@@ -159,11 +159,6 @@ class TestDefaultRegimeMarker:
         df = _sweep(lambda ch, lv: 4.0).assign(knob="k5_outliers", level=lambda d: d["level"] - 1.0)
         assert stress_figs._nominal_x(df, "k5_outliers", "level") == pytest.approx(0.0)
 
-    def test_k6_budget_marks_the_largest_budget(self) -> None:
-        """The pre-2026-10-12 constant of 50 named a stressed cell; the default is the full budget."""
-        df = _sweep(lambda ch, lv: 4.0).assign(knob="k6_budget", level=lambda d: d["level"] * 24.0)
-        assert stress_figs._nominal_x(df, "k6_budget", "level") == pytest.approx(96.0)
-
     def test_no_marker_when_the_ladder_never_visits_the_default(self) -> None:
         df = _sweep(lambda ch, lv: 4.0).assign(knob="k2_global")   # levels 1, 2, 4; nominal is 0
         assert stress_figs._nominal_x(df, "k2_global", "level") is None

@@ -32,24 +32,24 @@ class TestRegistry:
     """The knob registry and its declared placeholders."""
 
     def test_implemented_knobs(self) -> None:
-        """Every declared knob is live since K7 landed on 2026-09-30."""
+        """Every declared knob is live (K1, K6-budget and K7 were removed on 2026-10-19)."""
         assert stress.available_knobs(implemented_only=True) == [
-            "k1_decoy", "k2_channel", "k2_global", "k5_outliers", "k6_budget", "k6_failure", "k7_shuffle"
+            "k2_channel", "k2_global", "k5_outliers", "k6_failure"
         ]
         assert stress.available_knobs(implemented_only=True) == stress.available_knobs()
 
     def test_every_knob_is_registered(self) -> None:
-        for name in ("k1_decoy", "k2_channel", "k2_global", "k5_outliers", "k6_budget", "k6_failure", "k7_shuffle"):
+        for name in ("k2_channel", "k2_global", "k5_outliers", "k6_failure"):
             assert name in stress.KNOB_REGISTRY
 
     def test_seed_key_defaults_to_name_and_survives_the_k2_rename(self) -> None:
         """Seeds (hence cached cells) must not change when a knob is renamed."""
         assert stress.KNOB_REGISTRY["k2_channel"].seed_key == "k2_snr"
-        for name in ("k2_global", "k5_outliers", "k6_budget", "k6_failure", "k1_decoy"):
+        for name in ("k2_global", "k5_outliers", "k6_failure"):
             assert stress.KNOB_REGISTRY[name].seed_key == name
 
     def test_no_placeholder_knobs_remain(self) -> None:
-        """Nothing is declared-but-pending since K7 landed; the base class is kept for the next one."""
+        """Nothing is declared-but-pending; the base class is kept for the next one."""
         assert [n for n, k in stress.KNOB_REGISTRY.items() if not k.implemented] == []
 
     def test_unknown_knob_raises_with_options(self) -> None:
@@ -127,9 +127,6 @@ class TestK2ChannelKnob:
     def test_non_positive_alpha_raises(self, alpha: float) -> None:
         with pytest.raises(ValueError, match="must be > 0"):
             stress.build_knob("k2_channel").apply(_channel(), alpha, np.random.default_rng(0))
-
-    def test_budget_is_unchanged_by_a_data_knob(self) -> None:
-        assert stress.build_knob("k2_channel").budget_for(4.0, 50) == 50
 
 
 class TestK2GlobalKnob:
@@ -292,25 +289,14 @@ class TestNominalIn:
             ("k2_global", [0.0, 0.5, 1.0], 0.0),
             ("k5_outliers", [0.0, 0.1], 0.0),
             ("k6_failure", [0.0, 0.5], 0.0),
-            ("k7_shuffle", [0.0, 1.0], 0.0),
-            ("k1_decoy", [0.0, 0.5], 0.0),
         ],
     )
     def test_fixed_nominal_levels(self, name: str, levels: list[float], expected: float) -> None:
         assert stress.KNOB_REGISTRY[name].nominal_in(levels) == pytest.approx(expected)
 
-    def test_k6_budget_resolves_to_the_full_budget_not_the_old_constant(self) -> None:
-        """K6-budget's unstressed level is the configured budget (96 on NHP), never a class constant.
-
-        Until 2026-10-12 ``nominal_level`` was 50, which names a *stressed* cell of the NHP ladder, so the
-        robustness table's nominal reference and the default marker both pointed at the wrong level.
-        """
-        assert stress.KNOB_REGISTRY["k6_budget"].nominal_in([10, 20, 30, 50, 96]) == pytest.approx(96.0)
-        assert np.isnan(stress.KNOB_REGISTRY["k6_budget"].nominal_level)
-
     def test_a_ladder_without_the_unstressed_level_has_no_nominal(self) -> None:
         assert stress.KNOB_REGISTRY["k2_channel"].nominal_in([2.0, 4.0]) is None
-        assert stress.KNOB_REGISTRY["k6_budget"].nominal_in([]) is None
+        assert stress.KNOB_REGISTRY["k5_outliers"].nominal_in([]) is None
 
 
 class TestDefaultRegimeSnrIsOneNumberPerChannel:
@@ -328,16 +314,13 @@ class TestDefaultRegimeSnrIsOneNumberPerChannel:
             ("k2_channel", {}),
             ("k2_global", {}),
             ("k5_outliers", {}),
-            ("k6_budget", {}),
             ("k6_failure", {}),
-            ("k7_shuffle", {}),
         ],
     )
     def test_nominal_level_leaves_the_floor_snr_untouched(self, name: str, kwargs: dict) -> None:
         ch = _channel()
-        levels = [10.0, 20.0, 96.0] if name == "k6_budget" else None
-        knob = stress.build_knob(name, levels, **kwargs)
-        nominal = type(knob).nominal_in(levels if levels is not None else knob.levels)
+        knob = stress.build_knob(name, **kwargs)
+        nominal = type(knob).nominal_in(knob.levels)
         assert nominal is not None, f"{name}: its default ladder contains no unstressed level."
         stressed = knob.apply(ch, nominal, np.random.default_rng(0))
         assert snr.achieved_snr_db(stressed) == pytest.approx(stress.floor_snr_db(ch), abs=1e-9)

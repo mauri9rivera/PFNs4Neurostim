@@ -22,9 +22,8 @@ threshold. It is restored to ``ALL_SUBJECTS`` here, so every NHP dataset config 
 four subjects (2 Cebus, 2 Macaque). ``HELD_OUT_SUBJECTS`` and ``TRAIN_SUBJECTS`` still mirror the
 legacy train/held-out partition exactly, since that split predates subject 2's inclusion and no
 train/held-out split has been used since 2026-09-20 (`CLAUDE.md` Section 5) — nothing downstream
-reads them except ``legacy_code`` and the regression test below. Per-channel split-half reliability
-and achieved SNR for subject 2, and the exclusion rule they should be checked against, are still
-open (roadmap DS1's second action item) and must be pre-declared before any BO result is read.
+reads them except ``legacy_code`` and the regression test below. Subject 2 enters with every channel:
+the user dropped DS1's planned channel-exclusion rule on 2026-10-15, so no reliability / SNR filter applies.
 
 Values other than NHP's ``ALL_SUBJECTS`` mirror ``legacy_io`` exactly; a test asserts they have not
 drifted.

@@ -20,8 +20,8 @@ Retired 2026-09-27:
     ``breakdown_vs_budget.svg`` dropped. It re-evaluated the breakdown rule at budget fractions, but the
                                 rule is defined *relative to GP-MLL*, so the curve mixed "robust under
                                 stress" with "ahead of the reference at this budget" and could not be read
-                                as either. The budget axis is covered by the K6-budget knob and by
-                                ``regime_heatmap.svg``, both of which report regret directly.
+                                as either. The budget axis is covered by ``regime_heatmap.svg``, which
+                                reports regret directly.
 """
 from __future__ import annotations
 
@@ -95,11 +95,6 @@ def _knob_axis(df: pd.DataFrame, knob: str) -> str:
     return "level"
 
 
-#: Knobs whose *level* gets more severe as it decreases (the level is a budget). Every other knob (K2 alpha,
-#: K5 contamination, K6 dropout) gets more severe as the level increases, whatever the plotted x-axis does.
-LEVEL_SEVERITY_DESCENDING: frozenset[str] = frozenset({"k6_budget"})
-
-
 #: Axes on which a *lower* value means more stress (SNR, or SNR degradation relative to a channel's floor).
 X_DESCENDS_WITH_STRESS: frozenset[str] = frozenset({"achieved_snr_db", "target_delta_snr_db"})
 
@@ -166,16 +161,16 @@ def _restrict_to_cells(frame: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
     return keyed.merge(cells, on=["subject", "emg", "_key"], how="inner").drop(columns="_key")
 
 
-def _level_severity_ascending(knob: str, df: pd.DataFrame | None = None) -> bool:
+def _level_severity_ascending(df: pd.DataFrame | None = None) -> bool:
     """Whether a larger knob *level* means more stress (the order in which breakdown walks the ladder).
 
     This is about the level, not the plotted axis: K2 is plotted against achieved SNR, which falls with
     stress, but its level (alpha) rises with stress. Passing the axis direction here made the walk start at
-    the harshest level and report a breakdown there for every model. A calibrated ladder is in dB of SNR
-    degradation, where a more negative level is more severe.
+    the harshest level and report a breakdown there for every model. Every knob's level gets more severe as
+    it increases, except a calibrated ladder, which is in dB of SNR degradation, where a more negative level
+    is more severe.
 
     Args:
-        knob: Knob name.
         df: The sweep frame after :func:`_shared_ladder`, to detect a calibrated ladder.
 
     Returns:
@@ -183,7 +178,7 @@ def _level_severity_ascending(knob: str, df: pd.DataFrame | None = None) -> bool
     """
     if df is not None and _is_calibrated(df):
         return False
-    return knob not in LEVEL_SEVERITY_DESCENDING
+    return True
 
 
 def _severity_ascending(x_col: str) -> bool:
@@ -252,8 +247,8 @@ def _nominal_x(df: pd.DataFrame, knob: str, x_col: str) -> float | None:
     """Return the x position of the dataset's default (unstressed) regime, or ``None``.
 
     Resolved from the tidy frame alone, so ``--replot`` draws the marker without rebuilding the knob. The
-    level is the knob's own nominal level (K6-budget: the largest budget of the ladder, see
-    :meth:`~pfns4neurostim.data.stress.K6BudgetKnob.nominal_in`); its x is that level's mean x, which for the
+    level is the knob's own nominal level (see
+    :meth:`~pfns4neurostim.data.stress.StressKnob.nominal_in`); its x is that level's mean x, which for the
     K2 arms is the channel-averaged floor SNR of the dataset and is therefore the *same number* in every
     figure of that dataset.
 
@@ -480,7 +475,7 @@ def plot_degradation_curves(
     """
     x_col = _knob_axis(df, knob)
     nominal_x = _nominal_x(df, knob, x_col)
-    # On an SNR x-axis the marker's position already states the default SNR; on a level axis (K5, K6, K7) it
+    # On an SNR x-axis the marker's position already states the default SNR; on a level axis (K5, K6) it
     # does not, so the legend entry carries it, which is what makes the default regime comparable between a
     # K2 figure and a K5 one.
     nominal_label = S.NOMINAL_MARKER_LABEL
@@ -606,7 +601,7 @@ def build_robustness_table(
     """
     x_col = _knob_axis(df, knob)
     ascending = _severity_ascending(x_col)
-    level_ascending = _level_severity_ascending(knob, df)
+    level_ascending = _level_severity_ascending(df)
     models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
     ref_sub = df[df["model"] == reference]
     level_x = _level_to_x(df, x_col)
@@ -712,7 +707,7 @@ def regime_surface(
 
     A budget-``B`` run's final recommendation is the recommendation after ``B`` observations,
     which every longer run already records (``recommended_regret_per_step[B - n_init]``), so
-    the K2 x K6-budget surface (roadmap S5) costs no extra compute. Each cell is the median
+    the K2 x BO-budget surface (roadmap S5) costs no extra compute. Each cell is the median
     over channels of the repetition-mean regret. With ``reference`` the cell is instead the
     mean paired difference ``model - reference`` and ``noninferior`` marks the cells where
     the one-sided paired test at ``margin`` passes (the robustness table's rule).
@@ -835,7 +830,7 @@ def plot_regime_heatmap(
     margin: float,
     reference: str = REFERENCE_MODEL,
 ) -> list[str]:
-    """K2 x K6-budget interaction surface (roadmap S5), one panel per model plus one difference.
+    """K2 x BO-budget interaction surface (roadmap S5), one panel per model plus one difference.
 
     Top row: median recommended regret per (level, budget) for every model. Bottom row: a **single**
     centred panel, the paired difference of the primary PFN against ``reference``, diverging around zero,
@@ -912,7 +907,7 @@ def plot_regime_heatmap(
             ax.set_ylabel(y_label)
         fig.colorbar(im, ax=[axes[1][centre]], label=S.axis_label("regret_difference"))
     fig.suptitle(
-        f"{S.DATASET_LABELS.get(dataset, dataset)} - {S.KNOB_LABELS.get(knob, knob)} x K6 budget",
+        f"{S.DATASET_LABELS.get(dataset, dataset)} - {S.KNOB_LABELS.get(knob, knob)} x BO budget",
         x=0.01, ha="left", fontsize=S.FONT_SIZES["title"],
     )
     return [csv_path, *S.save_figure(fig, out_dir, "regime_heatmap")]
@@ -953,7 +948,7 @@ def plot_bridge(
     surf = regime_surface(synthetic_frame, synthetic_df, knob=knob, model=model, reference=reference, margin=margin)
     from ..data.stress import KNOB_REGISTRY  # noqa: PLC0415
 
-    # ``nominal_in`` rather than the class attribute: K6-budget's unstressed level is the configured budget.
+    # ``nominal_in`` rather than the class attribute, so a knob without a constant nominal level resolves too.
     nominal_level = KNOB_REGISTRY[knob].nominal_in(sorted(real_df["level"].astype(float).unique()))
     if nominal_level is None:
         raise ValueError(
@@ -1004,7 +999,7 @@ def plot_generator_validation(features: pd.DataFrame, out_dir: str) -> list[str]
     csv_path = os.path.join(out_dir, "generator_validation.csv")
     features.to_csv(csv_path, index=False)
     demos = [d for d in ("draws", "synthetic") if d in set(features["demo"])]
-    if not demos:   # e.g. K1 decoy runs, whose demos are the decoy maps: no real-vs-synthetic comparison to draw
+    if not demos:   # a run with neither a draws nor a synthetic demo: no real-vs-synthetic comparison to draw
         return [csv_path]
     fig, axes = S.figure("double", ncols=len(names), layout=S.LAYOUT_ENGINE)
     for ax, name in zip(axes, names):
@@ -1072,7 +1067,7 @@ def render_all(
         df, out_dir, knob=knob, dataset=dataset, breakdowns=breakdowns, counts=counts
     )
     frame = T.load_trace_frame(out_dir)
-    if frame is not None and not frame.empty and knob != "k6_budget" and knob in REGIME_KNOBS:
+    if frame is not None and not frame.empty and knob in REGIME_KNOBS:
         frame = _restrict_to_cells(_trace_frame_on_ladder(frame, df), df)
         written += plot_regime_heatmap(frame, df, out_dir, knob=knob, dataset=dataset, margin=margin)
     return written

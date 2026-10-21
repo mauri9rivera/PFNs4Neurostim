@@ -29,7 +29,6 @@ from pfns4neurostim.experiments import _rows
 #: Schema columns that no ``build_row`` call site can fill, with the reason. A column may be listed here
 #: only because it is *structurally* unavailable, never because it happens to be unset today.
 EXEMPT: dict[str, str] = {
-    "decoy_capture": "K1 only: set from channel.meta when the decoy knob built the channel",
     "achieved_snr_db": "stress sweeps only: comes from the knob's achieved() mapping",
     "split_id": "split-half ground truth only",
     "gt_r_half": "split-half ground truth only",

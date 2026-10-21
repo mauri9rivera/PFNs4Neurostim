@@ -11,20 +11,20 @@ The sweep runner never branches on which knob it is running: it iterates
 x-axis from ``visualization.style.KNOB_X_AXIS``. Adding a knob is therefore one
 subclass with two methods, and no change anywhere else.
 
-Implemented (stress design of 2026-09-23): **K2** in two settings (channel-relative
-residual amplification against each channel's floor, and one global absolute noise
-level for every channel), **K5** epsilon-contamination of the trial slots with a
-heavy tail, and **K6** sparsity (BO budget, and electrode failure during the run).
-**K1** decoy peak (synthetic) and **K7** spatial shuffle (2026-09-30). No placeholder
-knobs remain; ``_PlaceholderKnob`` is kept for the next declared-but-pending one,
-which carries its name, levels and label key so configs, schemas and figures can
-reference it before it computes anything.
+Implemented (stress design of 2026-09-23, restructured 2026-10-19): **K2** in two
+settings (channel-relative residual amplification against each channel's floor, and
+one global absolute noise level for every channel), **K5** epsilon-contamination of
+the trial slots with a heavy tail, and **K6** electrode failure during the run. The
+K1 decoy peak, the K6 budget knob and the K7 spatial shuffle were removed on
+2026-10-19; the BO budget is a plain config key, and its effect on robustness is
+read off the per-step traces of the other sweeps. No placeholder knobs remain;
+``_PlaceholderKnob`` is kept for the next declared-but-pending one, which carries
+its name, levels and label key so configs, schemas and figures can reference it
+before it computes anything.
 
 Knobs differ in *what* they alter, which the ``alters`` class attribute records:
-``trials`` (K2, K5) rewrites the observation bank, ``map`` (K1, K7) changes which
-response belongs to which coordinate, ``pool`` (K6 failure) changes what some sites
-return during the run, and ``budget`` (K6 budget) changes only how many queries the
-loop gets.
+``trials`` (K2, K5) rewrites the observation bank and ``pool`` (K6 failure) changes
+what some sites return during the run.
 
 Roadmap: ``.claude/roadmap.md`` sections S1-S7; plan: task #10.
 """
@@ -37,10 +37,8 @@ import numpy as np
 
 from dataclasses import dataclass, replace
 
-from ..seeding import rng_for
 from .channels import ChannelData
 from .snr import achieved_snr_db, noise_power
-from .synthetic_neurostim import Hotspot, generate_neurostim_map, hotspot_drive, morans_i
 
 __all__ = [
     "StressKnob",
@@ -50,11 +48,8 @@ __all__ = [
     "floor_snr_db",
     "K2ChannelNoiseKnob",
     "K2GlobalNoiseKnob",
-    "K1DecoyKnob",
     "K5OutlierKnob",
-    "K6BudgetKnob",
     "K6FailureKnob",
-    "K7ShuffleKnob",
     "KNOB_REGISTRY",
     "register_knob",
     "build_knob",
@@ -84,17 +79,15 @@ class StressKnob(ABC):
         default_levels: Pre-registered level ladder, ordered from mildest to
             most severe stress.
         nominal_level: The level that must reproduce the unstressed channel.
-            A knob whose nominal level is not a fixed number (K6-budget: the
-            unstressed budget is whatever the config asked for) leaves this NaN
+            A knob whose nominal level is not a fixed number leaves this NaN
             and overrides :meth:`nominal_in`.
         symbol: Mathtext symbol of the knob's level, the canonical notation of
             the manuscript (settled 2026-10-12). Every knob has its own letter:
             ``gamma`` and ``eta`` for the two K2 settings rather than one
             ``alpha``, and ``varepsilon`` / ``varphi`` for the two fractions, so
             no symbol means two different things across figures.
-        alters: Which part of the problem the knob touches — ``'trials'``,
-            ``'pool'``, ``'budget'`` or ``'map'``. The runner uses this to know
-            whether a level changes the BO budget rather than the data.
+        alters: Which part of the problem the knob touches — ``'trials'`` or
+            ``'pool'``.
         implemented: False for declared-but-pending knobs.
         seed_key: Namespace of the knob's RNG streams in ``seeding.seed_for``.
             Defaults to ``name``; a renamed knob keeps its old key so its seeds,
@@ -134,10 +127,7 @@ class StressKnob(ABC):
         """Return a stressed copy of ``channel`` at ``level``.
 
         Implementations must not mutate ``channel`` and must be deterministic
-        given ``rng`` and the channel. A knob that needs **common random numbers**
-        across its levels (the same draw at every level, so levels differ only in
-        the knob's own parameter) derives that stream from the channel label via
-        :func:`~pfns4neurostim.seeding.rng_for` instead of using ``rng`` (K1).
+        given ``rng`` and the channel.
 
         Args:
             channel: Nominal channel.
@@ -166,8 +156,8 @@ class StressKnob(ABC):
         The figure layer marks this level as the **default regime** of the
         dataset, so it has to be resolvable from a run's tidy frame alone (the
         ``--replot`` path never rebuilds the knob). Most knobs have a fixed
-        nominal level; K6-budget overrides this because its unstressed level is
-        the configured budget rather than a constant.
+        nominal level; a knob without one overrides this to resolve it from the
+        realized ladder.
 
         Args:
             levels: The levels actually present in the run, in any order.
@@ -197,18 +187,6 @@ class StressKnob(ABC):
             The level, or ``None`` when the knob has no exact inversion.
         """
         return None
-
-    def budget_for(self, level: float, budget: int) -> int:
-        """Return the BO budget at this level (only K6-budget changes it).
-
-        Args:
-            level: Knob level.
-            budget: Configured budget.
-
-        Returns:
-            Budget in total queries including ``n_init`` (P0.3).
-        """
-        return int(budget)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"{type(self).__name__}(levels={self.levels})"
@@ -448,143 +426,6 @@ class _PlaceholderKnob(StressKnob):
 
 
 @register_knob
-class K1DecoyKnob(StressKnob):
-    """K1 decoy peak (synthetic only): a second hotspot competing with the true optimum.
-
-    The level is the amplitude ratio ``a2 / a1`` of a decoy hotspot to the primary one
-    (0 = no decoy, the nominal map). The decoy copies the primary's shape and sits at
-    ``separation`` electrode pitches from the primary's **peak electrode** (the in-array
-    site it drives most; a fitted centre may lie just off the array), in a random
-    direction that keeps it inside the array. The direction and the trial noise are drawn **once per channel**
-    (streams keyed by the channel label, not the level: common random numbers), so across
-    the ladder only the decoy's amplitude changes and the levels stay paired. The map is
-    redrawn from the generator with the decoy added, so ground truth stays exact. A decoy cannot be injected into a measured map, which is
-    why the knob needs a channel carrying ``meta['generator']`` (synthetic).
-
-    ``meta['decoy_basin']`` marks the sites closer to the decoy than to the primary;
-    a run whose final recommendation lands there counts as a **decoy capture**.
-    """
-
-    name: ClassVar[str] = "k1_decoy"
-    default_levels: ClassVar[tuple[float, ...]] = (0.0, 0.5, 0.7, 0.85, 0.95, 0.98)
-    nominal_level: ClassVar[float] = 0.0
-    symbol: ClassVar[str] = r"$a_2/a_1$"
-    alters: ClassVar[str] = "map"
-
-    def __init__(
-        self,
-        levels: Sequence[float] | None = None,
-        *,
-        separation: float = 3.0,
-        n_directions: int = 256,
-    ) -> None:
-        """Create the knob.
-
-        Args:
-            levels: Amplitude ratios ``a2 / a1`` in [0, 1) to sweep.
-            separation: Primary-to-decoy distance, in electrode pitch.
-            n_directions: Candidate directions the in-array one is chosen from.
-
-        Raises:
-            ValueError: On a ratio outside [0, 1) or a non-positive separation.
-        """
-        super().__init__(levels)
-        for level in self.levels:
-            if not 0.0 <= level < 1.0:
-                raise ValueError(f"K1DecoyKnob: amplitude ratio must be in [0, 1), got {level}.")
-        if separation <= 0.0:
-            raise ValueError(f"K1DecoyKnob: separation must be > 0, got {separation}.")
-        self.separation = float(separation)
-        self.n_directions = int(n_directions)
-
-    def apply(self, channel: ChannelData, level: float, rng: np.random.Generator) -> ChannelData:
-        """Redraw the channel's map with a decoy hotspot of ratio ``level``.
-
-        Args:
-            channel: synthetic channel with ``meta['generator']``.
-            level: Amplitude ratio ``a2 / a1``.
-            rng: Unused: direction and noise come from channel-keyed streams (see above).
-
-        Returns:
-            Stressed channel with ``meta['decoy_basin']`` (bool [N]).
-
-        Raises:
-            KnobNotApplicable: On an in-vivo channel, or when no direction keeps the
-                decoy inside the array at this separation.
-        """
-        params = channel.meta.get("generator")
-        if params is None:
-            raise KnobNotApplicable(
-                f"{channel.label}: K1 needs a synthetic channel (meta['generator']); a decoy "
-                "cannot be injected into a measured map."
-            )
-        coords = np.asarray(params.ch2xy, dtype=np.float64)                   # [N, D]
-        primary = max(params.hotspots, key=lambda spot: spot.amplitude)
-        anchor = coords[int(np.argmax(hotspot_drive(coords, primary)))]       # [D], primary's peak electrode
-        centre = self._decoy_centre(anchor, coords, channel.label)
-        hotspots = params.hotspots
-        if level > 0.0:
-            hotspots = hotspots + (
-                Hotspot(centre, primary.lengthscale, float(level) * primary.amplitude, primary.rotation),
-            )
-        stressed = generate_neurostim_map(
-            replace(params, hotspots=hotspots), rng_for(channel.label, self.name, "noise"),
-            dataset=channel.dataset, subject=channel.subject, emg=channel.emg,
-            normalization=channel.normalization,
-        )
-        to_decoy = np.linalg.norm(coords - centre[None, :], axis=1)            # [N]
-        to_primary = np.linalg.norm(coords - anchor[None, :], axis=1)          # [N]
-        basin = (to_decoy < to_primary) if level > 0.0 else np.zeros(coords.shape[0], dtype=bool)
-        return replace(
-            stressed,
-            meta={**channel.meta, **stressed.meta, "decoy_basin": basin},
-            stress={"knob": self.name, "level": float(level), "separation": self.separation},
-        )
-
-    def _decoy_centre(self, primary: np.ndarray, coords: np.ndarray, label: str) -> np.ndarray:
-        """Pick a decoy centre ``separation`` away from ``primary`` and inside the array.
-
-        Args:
-            primary: Primary hotspot centre, shape [D].
-            coords: Electrode coordinates, shape [N, D].
-            label: Channel label; seeds the direction so it is the same at every level.
-
-        Returns:
-            Decoy centre, shape [D].
-
-        Raises:
-            KnobNotApplicable: If no candidate direction stays inside the array.
-        """
-        rng = rng_for(label, self.name, "direction", self.separation)
-        lo, hi = coords.min(axis=0), coords.max(axis=0)                         # [D], [D]
-        dirs = rng.standard_normal((self.n_directions, primary.size))           # [M, D]
-        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
-        centres = primary[None, :] + self.separation * dirs                     # [M, D]
-        inside = np.all((centres >= lo) & (centres <= hi), axis=1)              # [M]
-        if inside.any():
-            return centres[int(rng.choice(np.flatnonzero(inside)))]
-        raise KnobNotApplicable(
-            f"K1DecoyKnob: no direction keeps a decoy {self.separation} pitches from the primary "
-            "inside the array; lower knob.params.separation."
-        )
-
-    def achieved(self, channel: ChannelData) -> dict[str, float]:
-        """Report achieved SNR, the amplitude ratio and the separation.
-
-        Args:
-            channel: The stressed channel.
-
-        Returns:
-            ``achieved_snr_db``, ``amplitude_ratio`` and ``decoy_separation``.
-        """
-        return {
-            "achieved_snr_db": achieved_snr_db(channel),
-            "amplitude_ratio": float(channel.stress.get("level", 0.0)),
-            "decoy_separation": float(channel.stress.get("separation", float("nan"))),
-        }
-
-
-@register_knob
 class K5OutlierKnob(StressKnob):
     """K5: Huber epsilon-contamination of the trial bank with heavy-tailed artefacts.
 
@@ -676,113 +517,6 @@ class K5OutlierKnob(StressKnob):
 
 
 @register_knob
-class K6BudgetKnob(StressKnob):
-    """K6 sparsity via BO budget: explicit iteration counts (never a % of grid).
-
-    The level *is* the budget, in total queries including ``n_init`` (P0.3). The
-    data is untouched: this knob asks how performance degrades when the experiment
-    simply gets fewer stimulations, which is the constraint that actually binds in
-    an operating room.
-
-    Expressing the level as an iteration count rather than a fraction of the grid
-    is deliberate (P0.3): a "20% budget" means something different on a 96-site
-    array than on a 2048-condition 5D grid, and reviewers cannot compare them.
-    """
-
-    name: ClassVar[str] = "k6_budget"
-    default_levels: ClassVar[tuple[float, ...]] = (10.0, 20.0, 30.0, 50.0)
-    # The unstressed level is the configured budget (96 on NHP), not a constant, so the class attribute
-    # cannot name it and ``nominal_in`` resolves it from the realized ladder instead (2026-10-12).
-    nominal_level: ClassVar[float] = float("nan")
-    symbol: ClassVar[str] = r"$B$"
-    alters: ClassVar[str] = "budget"
-
-    @classmethod
-    def nominal_in(cls, levels: Sequence[float]) -> float | None:
-        """Return the largest budget of the ladder: the unstressed regime.
-
-        Every other knob has a constant nominal level, but "no stress" here means
-        "the budget the experiment would have had anyway" — 96 on NHP, i.e. the
-        Hyp A budget — which only the realized ladder knows. The pre-2026-10-12
-        class constant of 50 named a *stressed* cell, so the robustness table's
-        nominal reference and the figures' default marker both pointed at the
-        wrong level for this knob alone.
-
-        Args:
-            levels: The levels actually present in the run.
-
-        Returns:
-            ``max(levels)``, or ``None`` for an empty ladder.
-        """
-        values = [float(level) for level in levels]
-        return max(values) if values else None
-
-    def apply(self, channel: ChannelData, level: float, rng: np.random.Generator) -> ChannelData:
-        """Return the channel unchanged, recording the budget as provenance.
-
-        Args:
-            channel: Nominal channel.
-            level: The BO budget for this level.
-            rng: Unused.
-
-        Returns:
-            The same data with stress provenance attached.
-
-        Raises:
-            ValueError: If the level is not a positive whole number of queries.
-        """
-        if level < 1 or float(level) != int(level):
-            raise ValueError(
-                f"K6BudgetKnob: level is a query count and must be a positive integer, got {level}."
-            )
-        return channel.with_trials(
-            channel.Y_trials.copy(),
-            stress={"knob": self.name, "level": float(level)},
-        )
-
-    def solve_level(self, channel: ChannelData, target_db: float) -> float | None:
-        """Return the level that shifts ``channel``'s SNR by exactly ``target_db``, if one exists.
-
-        Knobs whose SNR shift inverts in closed form override this; the default
-        ``None`` makes :func:`calibrate_levels` refuse a dB ladder for the knob.
-
-        Args:
-            channel: Channel the level is solved for.
-            target_db: SNR change relative to the channel's floor, in dB.
-
-        Returns:
-            The level, or ``None`` when the knob has no exact inversion.
-        """
-        return None
-
-    def budget_for(self, level: float, budget: int) -> int:
-        """Return the level itself as the budget (total queries incl. ``n_init``).
-
-        Args:
-            level: Knob level.
-            budget: The config budget, ignored by this knob.
-
-        Returns:
-            The budget for this level.
-        """
-        return int(level)
-
-    def achieved(self, channel: ChannelData) -> dict[str, float]:
-        """Report achieved SNR and the realized budget.
-
-        Args:
-            channel: The stressed channel.
-
-        Returns:
-            ``achieved_snr_db`` and ``achieved_budget``.
-        """
-        out = {"achieved_snr_db": achieved_snr_db(channel)}
-        if channel.stress:
-            out["achieved_budget"] = float(channel.stress.get("level", float("nan")))
-        return out
-
-
-@register_knob
 class K6FailureKnob(StressKnob):
     """K6 sparsity via electrode failure during the run.
 
@@ -797,7 +531,7 @@ class K6FailureKnob(StressKnob):
     and calibration are computed on the **surviving** electrodes, since those are
     the only ones a clinician could still use at the end of the session. The
     failure times are stored as run fractions, so the knob is independent of the
-    budget and composes with K6-budget.
+    budget.
     """
 
     name: ClassVar[str] = "k6_failure"
@@ -867,119 +601,6 @@ class K6FailureKnob(StressKnob):
             "achieved_snr_db": achieved_snr_db(channel),
             "achieved_failure": 1.0 - n_survivors / channel.n_sites,
             "n_survivors": float(n_survivors),
-        }
-
-
-@register_knob
-class K7ShuffleKnob(StressKnob):
-    """K7 spatial-shuffle structure knob *f*: destroy the coordinate-response binding.
-
-    The level is the fraction of sites whose responses are re-paired with other coordinates. A site's whole
-    response moves together -- its ground-truth mean **and** its trial bank -- so the response marginals the
-    channel carries (skewness, heteroscedasticity, noise floor, and hence the achieved SNR and the GT range)
-    are untouched. What changes is only *which coordinate carries which response*.
-
-    **Why this knob is not a variant of the others.** Every surrogate here exploits one assumption: nearby
-    electrodes give similar responses. A GP states it as a prior (an RBF/Matern kernel with a fitted
-    lengthscale); a PFN has to infer it in context. K2 degrades how well that structure can be *observed*, K5
-    corrupts a fraction of *trials*, K6 removes *budget* or *electrodes* -- only K7 removes the structure
-    itself. At ``f = 1`` position carries no information about response, the Bayes-optimal policy is
-    exhaustive search, and every surrogate must collapse to random search; the readout is the *shape* of that
-    collapse and where each model's curve crosses random search (roadmap S7, and the control that Hyp C's
-    placement Ceiling 2 already uses at ``f = 1``).
-
-    **Common random numbers and a nested ladder.** The site ordering is drawn once per channel from a
-    channel-keyed stream (not level-keyed), and level *f* shuffles the first ``k = round(f * N)`` sites of
-    that fixed ordering, so the shuffled set *grows monotonically* with *f* and the levels stay paired: two
-    levels differ only in how many sites were re-paired, never in which ones were eligible (the lesson of
-    review finding R13 on K1). Within that prefix the re-pairing is a **single cycle** (each selected site
-    takes the response of the next one in the ordering). A cycle is deliberate rather than convenient: it has
-    no fixed points, so exactly ``k`` sites lose their own response and ``achieved_shuffle`` is exact instead
-    of an expectation, and it keeps the transformation a deterministic function of the ordering alone.
-    """
-
-    name: ClassVar[str] = "k7_shuffle"
-    default_levels: ClassVar[tuple[float, ...]] = (0.0, 0.25, 0.5, 0.75, 1.0)
-    nominal_level: ClassVar[float] = 0.0
-    symbol: ClassVar[str] = r"$f$"
-    alters: ClassVar[str] = "map"
-
-    def __init__(self, levels: Sequence[float] | None = None) -> None:
-        """Create the knob.
-
-        Args:
-            levels: Shuffle fractions in [0, 1] to sweep.
-
-        Raises:
-            ValueError: On a fraction outside [0, 1].
-        """
-        super().__init__(levels)
-        for level in self.levels:
-            if not 0.0 <= level <= 1.0:
-                raise ValueError(f"K7ShuffleKnob: shuffle fraction must be in [0, 1], got {level}.")
-
-    def apply(self, channel: ChannelData, level: float, rng: np.random.Generator) -> ChannelData:
-        """Re-pair the responses of ``round(level * N)`` sites with other coordinates.
-
-        Args:
-            channel: Nominal channel.
-            level: Shuffle fraction *f*.
-            rng: Unused: the site ordering is a channel-keyed stream, so the ladder is nested and paired
-                (see the class docstring).
-
-        Returns:
-            Stressed channel whose ``y_gt`` and ``Y_trials`` rows have been permuted together.
-
-        Raises:
-            KnobNotApplicable: If the channel has fewer than two sites, where no re-pairing exists.
-        """
-        n = int(channel.n_sites)
-        if n < 2:
-            raise KnobNotApplicable(f"{channel.label}: K7 needs at least two sites, got {n}.")
-        k = int(round(float(level) * n))
-        if k < 2:
-            # A fraction this small selects at most one site, and one site cannot be re-paired with anything.
-            # Reported truthfully by ``achieved`` (achieved_shuffle = 0) rather than silently claimed as
-            # stress: the figure's x-axis is the achieved fraction for exactly this reason.
-            return replace(
-                channel,
-                stress={"knob": self.name, "level": float(level), "n_shuffled": 0},
-            )
-        order = rng_for(channel.label, self.seed_key, "order", base_seed=0).permutation(n)   # [N]
-        prefix = order[:k]                                                                  # [k]
-        source = np.roll(prefix, -1)                                                        # [k]
-        y_gt = np.array(channel.y_gt, dtype=np.float64, copy=True)                           # [N]
-        trials = np.array(channel.Y_trials, dtype=np.float64, copy=True)                     # [N, R]
-        y_gt[prefix] = channel.y_gt[source]
-        trials[prefix] = channel.Y_trials[source]
-        return replace(
-            channel,
-            y_gt=y_gt,
-            Y_trials=trials,
-            stress={"knob": self.name, "level": float(level), "n_shuffled": int(k)},
-        )
-
-    def achieved(self, channel: ChannelData) -> dict[str, float]:
-        """Report the realized shuffle fraction and the structure that survived it.
-
-        ``achieved_moran_i`` is the point of the knob made measurable: Moran's I of the (possibly shuffled)
-        ground-truth map is *the* quantity K7 manipulates, so it is to K7 what achieved SNR is to K2 -- the
-        honest x-axis, since ``f`` is a nominal dose and the realized loss of structure is what a surrogate
-        actually faces. It is NaN on a non-grid condition set (``5d_rat``), where unit-distance neighbours are
-        undefined; ``level`` remains the x-axis there.
-
-        Args:
-            channel: The stressed channel.
-
-        Returns:
-            ``achieved_shuffle``, ``achieved_moran_i`` and ``achieved_snr_db`` (which the knob leaves
-            unchanged by construction, recorded so that the claim is checkable rather than asserted).
-        """
-        n_shuffled = float((channel.stress or {}).get("n_shuffled", 0))
-        return {
-            "achieved_shuffle": n_shuffled / float(channel.n_sites),
-            "achieved_moran_i": morans_i(channel.y_gt, channel.ch2xy),
-            "achieved_snr_db": achieved_snr_db(channel),
         }
 
 

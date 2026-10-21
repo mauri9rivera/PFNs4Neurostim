@@ -107,30 +107,6 @@ class TestK5Outliers:
         np.testing.assert_allclose(a, b)
 
 
-class TestK6Budget:
-    """K6 sparsity via the BO budget."""
-
-    def test_level_is_the_budget(self) -> None:
-        knob = stress.build_knob("k6_budget", [10, 20])
-        assert knob.budget_for(10, 96) == 10
-        assert knob.budget_for(20, 96) == 20
-
-    def test_data_is_unchanged(self) -> None:
-        ch = _channel()
-        out = stress.build_knob("k6_budget").apply(ch, 20, np.random.default_rng(0))
-        np.testing.assert_allclose(out.Y_trials, ch.Y_trials)
-        np.testing.assert_allclose(out.y_gt, ch.y_gt)
-
-    def test_achieved_reports_the_budget(self) -> None:
-        knob = stress.build_knob("k6_budget")
-        out = knob.achieved(knob.apply(_channel(), 30, np.random.default_rng(0)))
-        assert out["achieved_budget"] == 30.0
-
-    def test_fractional_level_raises(self) -> None:
-        with pytest.raises(ValueError, match="positive integer"):
-            stress.build_knob("k6_budget").apply(_channel(), 12.5, np.random.default_rng(0))
-
-
 class TestK6Failure:
     """K6 sparsity via electrode failure at random times during the run."""
 

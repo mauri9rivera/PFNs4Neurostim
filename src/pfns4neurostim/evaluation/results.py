@@ -93,7 +93,6 @@ METRIC_COLUMNS: tuple[str, ...] = (
     "top1_hit",
     "top3_hit",
     "opt_distance",
-    "decoy_capture",
     "coverage_50",
     "coverage_90",
     "ece",
@@ -267,7 +266,6 @@ class TidyRow:
     top1_hit: Optional[float] = None
     top3_hit: Optional[float] = None
     opt_distance: Optional[float] = None
-    decoy_capture: Optional[float] = None
     coverage_50: Optional[float] = None
     coverage_90: Optional[float] = None
     ece: Optional[float] = None

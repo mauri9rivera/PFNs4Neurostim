@@ -149,9 +149,6 @@ def run_channel_bo(
     row.update(
         _metrics.identification_metrics(np.where(alive, y_end, -np.inf), recommended, channel.ch2xy)
     )
-    if "decoy_basin" in channel.meta:
-        # K1: did the final recommendation land on the decoy's side of the map?
-        row["decoy_capture"] = float(channel.meta["decoy_basin"][recommended])
 
     # Kernel hyperparameters of the LAST fit of the run, for any surrogate that exposes them (the GP
     # family). Value columns, not key columns, so cached cells stay valid. Added 2026-09-27: no artefact

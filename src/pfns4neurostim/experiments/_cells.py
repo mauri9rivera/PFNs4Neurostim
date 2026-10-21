@@ -60,7 +60,7 @@ def cell_identity(
         experiment: Experiment type.
         rep: Repetition index.
         seed: Seed of this repetition.
-        budget: Effective budget (K6-budget overrides the config's).
+        budget: Total queries including ``n_init``.
         knob: Stress knob name, or ``None``.
         level: Knob level, or ``None``.
         target_db: Calibrated SNR-degradation target, or ``None``.

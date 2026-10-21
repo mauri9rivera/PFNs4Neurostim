@@ -107,7 +107,7 @@ def _compute_cell(
         level: Knob level.
         stressed: The already-stressed channel.
         achieved: Knob-reported achieved metrics for this level.
-        budget: Effective budget (K6-budget overrides the config's).
+        budget: Total queries including ``n_init`` (the config's budget).
         model: Registered model key.
         rep: Repetition index.
         seed: Seed of this repetition.
@@ -228,7 +228,7 @@ def build_tidy_rows(
                 stressed_all = [knob.apply(inst, level, np.random.default_rng(level_seed)) for inst in instances]
             except KnobNotApplicable as exc:
                 # Some channels simply lack what a knob needs (too few electrodes to
-                # survive K6 failure, a recorded map for K1). Skip the cell, keep the
+                # survive K6 failure). Skip the cell, keep the
                 # rest of the grid, and make the gap visible in the log.
                 skipped.append(f"{channel.label} @ {knob.name}={level:g}: {exc}")
                 print(f"[stress_sweep] skipping {skipped[-1]}", flush=True)
@@ -240,7 +240,7 @@ def build_tidy_rows(
                 if np.isfinite(target_db):
                     achieved["target_delta_snr_db"] = float(target_db)
                 achieved_all.append(achieved)
-            budget = knob.budget_for(level, cfg.budget)
+            budget = cfg.budget
 
             for model in cfg.models:
                 for rep in range(cfg.n_reps):

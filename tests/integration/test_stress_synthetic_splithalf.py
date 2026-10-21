@@ -79,15 +79,12 @@ def _rows(cfg: Any, tmp_path: Any) -> tuple[list[Any], list[dict]]:
 
 def test_synthetic_sweep_runs_on_fitted_twins(patched: list[ChannelData], tmp_path: Any) -> None:
     cfg = load_experiment_config(
-        "configs/experiment/stress_k1_decoy_nhp.yaml",
-        OVERRIDES + ["knob.levels=[0.0,0.8]", "knob.params.separation=2.0", f"output_root={tmp_path}"],
+        "configs/experiment/stress_k2_channel_synthetic_nhp.yaml",
+        OVERRIDES + ["knob.levels=[1.0,2.0]", f"output_root={tmp_path}"],
     )
     rows, _ = _rows(cfg, tmp_path)
     assert {r.dataset for r in rows} == {"synthetic_nhp"} and {r.demo for r in rows} == {"synthetic"}
     assert len(rows) == 2 * 2 * 2 * 4                        # channels x levels x models x reps
-    captured = [r.decoy_capture for r in rows if r.level == 0.8]
-    assert all(c in (0.0, 1.0) for c in captured)
-    assert all(r.decoy_capture == 0.0 for r in rows if r.level == 0.0)
 
 
 def test_split_half_reps_cycle_through_instances(patched: list[ChannelData], tmp_path: Any) -> None:
@@ -103,7 +100,8 @@ def test_split_half_reps_cycle_through_instances(patched: list[ChannelData], tmp
 
 def test_split_half_is_refused_on_synthetic(patched: list[ChannelData], tmp_path: Any) -> None:
     cfg = load_experiment_config(
-        "configs/experiment/stress_k1_decoy_nhp.yaml", OVERRIDES + ["gt_mode=split_half", f"output_root={tmp_path}"]
+        "configs/experiment/stress_k2_channel_synthetic_nhp.yaml",
+        OVERRIDES + ["gt_mode=split_half", f"output_root={tmp_path}"],
     )
     with pytest.raises(ValueError, match="meaningless on synthetic"):
         _rows(cfg, tmp_path)

@@ -379,7 +379,7 @@ class TestCanonicalDemo:
     def test_an_unrecognised_arm_passes_through_rather_than_being_folded_in(self) -> None:
         """Guessing would be worse than showing it: the pre-fix figure code folded the unknown into
         'synthetic', which is exactly how legacy in-vivo runs came to be labelled synthetic."""
-        assert _results.canonical_demo("decoy_map") == "decoy_map"
+        assert _results.canonical_demo("unknown_arm") == "unknown_arm"
 
     def test_the_column_helper_does_not_mutate_its_input(self) -> None:
         column = pd.Series(["demo2", "draws", "demo1"])

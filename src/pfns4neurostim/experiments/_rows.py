@@ -111,7 +111,6 @@ def build_row(
         top1_hit=_clean(row.get("top1_hit")),
         top3_hit=_clean(row.get("top3_hit")),
         opt_distance=_clean(row.get("opt_distance")),
-        decoy_capture=_clean(row.get("decoy_capture")),
         coverage_50=_clean(row.get("coverage_50")),
         coverage_90=_clean(row.get("coverage_90")),
         ece=_clean(row.get("ece")),
