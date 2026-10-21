@@ -43,6 +43,7 @@ __all__ = [
     "site_distances",
     "Predictive",
     "MixturePredictive",
+    "RankOneMixturePredictive",
     "BarPredictive",
     "UpdateEngine",
     "PFNEngine",
@@ -292,6 +293,10 @@ class MixturePredictive(Predictive):
         second = (w * (self.variances + self.means ** 2)).sum(-1)                  # [P, M]
         self.var = np.maximum(second - self.mean ** 2, np.finfo(float).tiny)       # [P, M]
 
+    def _site_components(self, m: int) -> tuple[np.ndarray, np.ndarray]:
+        """Component means and variances at one site, shape [P, C] each."""
+        return self.means[:, m], self.variances[:, m]
+
     def _mixture_cdf(self, y: np.ndarray, means: np.ndarray, sds: np.ndarray, weights: np.ndarray) -> np.ndarray:
         """``sum_c w_c Phi((y - mu_c) / s_c)`` with ``y`` [..., G] against components [..., C], chunked over C."""
         out = np.zeros(y.shape, dtype=np.float64)
@@ -325,7 +330,8 @@ class MixturePredictive(Predictive):
         Returns:
             Shape [P, M, G].
         """
-        P, M, C = self.means.shape
+        P, C = self.weights.shape
+        M = self.mean.shape[1]
         G = y_grid.shape[1]
         out = np.empty((P, M, G))
         lag = np.arange(-(G - 1), G)                                               # [2G-1]
@@ -333,11 +339,12 @@ class MixturePredictive(Predictive):
         p_idx = np.repeat(np.arange(P), C)                                         # [P*C]
         w = self.weights.reshape(-1)                                               # [P*C]
         for m in range(M):
+            means_m, variances_m = self._site_components(m)                         # [P, C] x2
             lo, dy = y_grid[m, 0], y_grid[m, 1] - y_grid[m, 0]
-            pos = np.clip((self.means[:, m].reshape(-1) - lo) / dy, 0.0, G - 1.0)  # [P*C]
+            pos = np.clip((means_m.reshape(-1) - lo) / dy, 0.0, G - 1.0)            # [P*C]
             j0 = np.minimum(pos.astype(int), G - 2)
             fj = pos - j0
-            logs = 0.5 * np.log(self.variances[:, m].reshape(-1))                   # [P*C]
+            logs = 0.5 * np.log(variances_m.reshape(-1))                            # [P*C]
             smin, smax = logs.min(), logs.max()
             S = 1 if smax - smin < 1e-12 else self.sd_bins
             ks = np.zeros_like(logs) if S == 1 else (logs - smin) / (smax - smin) * (S - 1)
@@ -364,8 +371,19 @@ class MixturePredictive(Predictive):
         if not ((u > 0) & (u < 1)).all():
             raise ValueError(f"MixturePredictive.ppf: levels must lie in (0, 1), got [{u.min()}, {u.max()}].")
         sites = np.asarray(sites, dtype=int).reshape(-1)
-        mu = self.means[:, sites]                                                  # [P, S, C]
-        sd = np.sqrt(self.variances[:, sites])                                     # [P, S, C]
+        return self._ppf_components(u, self.means[:, sites], np.sqrt(self.variances[:, sites]))
+
+    def _ppf_components(self, u: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
+        """Bisection quantiles from component means and SDs at the requested sites.
+
+        Args:
+            u: Levels in (0, 1), shape [U].
+            mu: Component means, shape [P, S, C].
+            sd: Component SDs, shape [P, S, C].
+
+        Returns:
+            Quantiles, shape [P, S, U].
+        """
         w = np.broadcast_to(self.weights[:, None, :], mu.shape)                    # [P, S, C]
         z = float(-ndtri(min(u.min(), 1.0 - u.max()) / 2.0)) + 1.0               # bracket: every component
         lo = np.broadcast_to((mu - z * sd).min(-1)[..., None], (*mu.shape[:2], u.size)).copy()   # [P, S, U]
@@ -393,6 +411,124 @@ class MixturePredictive(Predictive):
         return MixturePredictive(self.weights[idx], self.means[idx], self.variances[idx],
                                  max_elements=self.max_elements, bisection_steps=self.bisection_steps,
                                  exact_max_components=self.exact_max_components, sd_bins=self.sd_bins)
+
+
+class RankOneMixturePredictive(MixturePredictive):
+    """A GP-Bayes probe predictive kept as rank-one factors instead of ``[P, M, C]`` component arrays.
+
+    After probe ``p`` at site ``j`` every component is ``mu_c(x) + k_c(x, x_j) r_pc``, with ``r_pc`` the surprise
+    over the predictive variance ``d_c`` at ``x_j``, and variance ``max(v_c(x) - k_c(x, x_j)^2 / d_c, 0) +
+    sigma_c^2`` (exact sequential Bayes, :meth:`GPBayesEngine.probe`). Components are rebuilt per site or per probe
+    with exactly the arithmetic the materialised mixture used, so every value is bit-identical; memory is
+    ``O((U + 2) M C + P C)`` for ``U`` probed sites instead of ``O(P M C)`` (~21 GiB for one 80-value probe at
+    t = 10 on NHP, task #28, 2026-10-21).
+
+    Args:
+        weights: Posterior component weights after each probe, shape [P, C].
+        mu: Context latent means per component, shape [C, M].
+        kcs: Latent cross-covariance with each probed site, shape [U, C, M].
+        site_variances: Component predictive variances after a probe at each probed site, shape [U, M, C].
+        site_of_probe: Index into the ``U`` probed sites for every probe, shape [P].
+        ratio: ``r_pc / d_c`` for every probe, shape [P, C].
+        max_elements: See :class:`MixturePredictive`.
+        bisection_steps: See :class:`MixturePredictive`.
+        exact_max_components: See :class:`MixturePredictive`; must be below ``C`` (the binned CDF is used).
+        sd_bins: See :class:`MixturePredictive`.
+
+    Raises:
+        RuntimeError: On non-finite factors or non-positive component variances.
+        ValueError: If the mixture is small enough for the exact CDF (materialise it instead).
+    """
+
+    def __init__(
+        self,
+        weights: np.ndarray,
+        mu: np.ndarray,
+        kcs: np.ndarray,
+        site_variances: np.ndarray,
+        site_of_probe: np.ndarray,
+        ratio: np.ndarray,
+        *,
+        max_elements: int = 20_000_000,
+        bisection_steps: int = 100,
+        exact_max_components: int = 64,
+        sd_bins: int = 32,
+    ) -> None:
+        self.exact_max_components = int(exact_max_components)
+        self.sd_bins = int(sd_bins)
+        self.max_elements = int(max_elements)
+        self.bisection_steps = int(bisection_steps)
+        self.weights = np.asarray(weights, dtype=np.float64)                       # [P, C]
+        self._mu = mu                                                              # [C, M]
+        self._kcs = kcs                                                            # [U, C, M]
+        self._site_var = site_variances                                            # [U, M, C]
+        self._site = np.asarray(site_of_probe, dtype=int)                          # [P]
+        self._ratio = ratio                                                        # [P, C]
+        if self.weights.shape[1] <= self.exact_max_components:
+            raise ValueError("RankOneMixturePredictive: a mixture this small uses the exact CDF; materialise it.")
+        if not all(np.isfinite(a).all() for a in (self.weights, mu, kcs, site_variances, ratio)):
+            raise RuntimeError("RankOneMixturePredictive: non-finite weights, means or variances.")
+        if (site_variances <= 0).any():
+            raise RuntimeError("RankOneMixturePredictive: non-positive component variance.")
+        P, M = len(self._site), mu.shape[1]
+        self.mean = np.empty((P, M))
+        second = np.empty((P, M))
+        for p in range(P):                                                         # the moments, one probe at a time
+            means_p = self._probe_means(p)                                         # [M, C]
+            w = self.weights[p][None, :]                                           # [1, C]
+            self.mean[p] = (w * means_p).sum(-1)
+            second[p] = (w * (self._site_var[self._site[p]] + means_p ** 2)).sum(-1)
+        self.var = np.maximum(second - self.mean ** 2, np.finfo(float).tiny)       # [P, M]
+
+    def _probe_means(self, p: int) -> np.ndarray:
+        """Component means after probe ``p``, shape [M, C] (C-contiguous, as the materialised array was)."""
+        return np.ascontiguousarray((self._mu + self._kcs[self._site[p]] * self._ratio[p][:, None]).T)
+
+    def _site_components(self, m: int) -> tuple[np.ndarray, np.ndarray]:
+        """See :meth:`MixturePredictive._site_components`, rebuilt from the factors."""
+        means_m = self._mu[:, m][None, :] + self._kcs[:, :, m][self._site] * self._ratio   # [P, C]
+        return means_m, self._site_var[:, m, :][self._site]                        # [P, C] x2
+
+    @property
+    def means(self) -> np.ndarray:
+        """Materialised component means, shape [P, M, C] (memory-heavy; the cell path never calls it)."""
+        return np.stack([self._probe_means(p) for p in range(len(self._site))])
+
+    @property
+    def variances(self) -> np.ndarray:
+        """Materialised component variances, shape [P, M, C] (memory-heavy; the cell path never calls it)."""
+        return np.ascontiguousarray(self._site_var[self._site])
+
+    def ppf(self, u: np.ndarray, sites: np.ndarray) -> np.ndarray:
+        """See :meth:`MixturePredictive.ppf`, from components rebuilt at the requested sites only."""
+        u = np.asarray(u, dtype=np.float64).reshape(-1)                            # [U]
+        if not ((u > 0) & (u < 1)).all():
+            raise ValueError(f"MixturePredictive.ppf: levels must lie in (0, 1), got [{u.min()}, {u.max()}].")
+        comps = [self._site_components(int(s)) for s in np.asarray(sites, dtype=int).reshape(-1)]
+        mu = np.stack([c[0] for c in comps], axis=1)                               # [P, S, C]
+        var = np.stack([c[1] for c in comps], axis=1)                              # [P, S, C]
+        return self._ppf_components(u, mu, np.sqrt(var))
+
+    def support(self, u_tail: float) -> np.ndarray:
+        """See :meth:`MixturePredictive.support`, one site at a time."""
+        z = float(ndtri(1.0 - u_tail))
+        heavy = self.weights >= min(u_tail, self.weights.max(axis=1, keepdims=True).min())   # [P, C]
+        P, M = self.mean.shape
+        out = np.empty((P, M, 2))
+        for m in range(M):
+            means_m, variances_m = self._site_components(m)                         # [P, C] x2
+            sd = np.sqrt(variances_m)
+            out[:, m, 0] = np.where(heavy, means_m - z * sd, np.inf).min(-1)
+            out[:, m, 1] = np.where(heavy, means_m + z * sd, -np.inf).max(-1)
+        return out
+
+    def take(self, idx: Sequence[int] | np.ndarray) -> "RankOneMixturePredictive":
+        """See :meth:`Predictive.take`; the factors are shared, not copied."""
+        idx = np.asarray(idx, dtype=int)
+        return RankOneMixturePredictive(self.weights[idx], self._mu, self._kcs, self._site_var, self._site[idx],
+                                        self._ratio[idx], max_elements=self.max_elements,
+                                        bisection_steps=self.bisection_steps,
+                                        exact_max_components=self.exact_max_components, sd_bins=self.sd_bins)
 
 
 class BarPredictive(Predictive):
@@ -795,6 +931,8 @@ class GPBayesEngine:
         mu, v, _ = self._state(Q)
         noise = self.theta[:, -1]                                                  # [C]
         P, (C, M) = len(ys), mu.shape
+        if C > self.mixture_kw["exact_max_components"]:
+            return self._probe_factors(ys, site, Q, mu, v, noise)
         w_out = np.empty((P, C))
         m_out = np.empty((P, M, C))
         v_out = np.empty((P, M, C))
@@ -808,6 +946,37 @@ class GPBayesEngine:
                 m_out[p] = (mu + kc * (r / d)[:, None]).T                          # [M, C]
                 v_out[p] = (np.maximum(v - kc ** 2 / d[:, None], 0.0) + noise[:, None]).T
         return MixturePredictive(w_out, m_out, v_out, **self.mixture_kw)
+
+    def _probe_factors(self, ys: np.ndarray, site: np.ndarray, Q: np.ndarray, mu: np.ndarray, v: np.ndarray,
+                       noise: np.ndarray) -> RankOneMixturePredictive:
+        """:meth:`probe` for large mixtures: the same update, kept as rank-one factors (task #28).
+
+        Args:
+            ys: Probe values, shape [P].
+            site: Readout-site index of every probe, shape [P].
+            Q: Readout sites, shape [M, D].
+            mu: Context latent means per component, shape [C, M].
+            v: Context latent variances per component, shape [C, M].
+            noise: Component noise variances, shape [C].
+
+        Returns:
+            The probed predictive, bit-identical to the materialised one.
+        """
+        uniq = np.unique(site)                                                     # [U]
+        kcs = np.stack([self._cross(Q, int(j)) for j in uniq])                     # [U, C, M]
+        ds = np.stack([v[:, j] + noise for j in uniq])                             # [U, C]
+        site_var = np.stack([np.ascontiguousarray((np.maximum(v - kc ** 2 / d[:, None], 0.0) + noise[:, None]).T)
+                             for kc, d in zip(kcs, ds)])                           # [U, M, C]
+        pos = np.searchsorted(uniq, site)                                          # [P]
+        w_out = np.empty((len(ys), len(noise)))
+        ratio = np.empty_like(w_out)
+        for p, (u, j) in enumerate(zip(pos, site)):
+            d = ds[u]
+            r = ys[p] - mu[:, j]                                                   # [C]
+            logw = self.log_w - 0.5 * (r ** 2 / d + np.log(2.0 * math.pi * d))
+            w_out[p] = np.exp(logw - logsumexp(logw))
+            ratio[p] = r / d
+        return RankOneMixturePredictive(w_out, mu, kcs, site_var, pos, ratio, **self.mixture_kw)
 
     def latent_covariance(self, Q: np.ndarray) -> np.ndarray:
         """Mixture latent posterior covariance ``sum w Sigma_theta + Cov_theta(mu_theta)`` over ``Q``.

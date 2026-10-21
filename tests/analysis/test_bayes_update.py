@@ -193,6 +193,29 @@ class TestGPBayes:
         np.testing.assert_allclose(a.var, b.var, atol=1e-12)
         np.testing.assert_allclose(cached.latent_covariance(Q), lean.latent_covariance(Q), atol=1e-12)
 
+    def test_rank_one_factors_are_bit_identical_to_the_materialised_mixture(self, channel, ctx) -> None:
+        """Task #28 (2026-10-21): large probes keep factors, not [P, M, C] arrays; every readout is unchanged."""
+        Q = channel.X_pool
+        lean = B.GPBayesEngine(**SMALL_GRID, prune_mass=0.0)                       # 144 components > 64: factors
+        dense = B.GPBayesEngine(**SMALL_GRID, prune_mass=0.0, exact_max_components=10_000)   # materialised path
+        for eng in (lean, dense):
+            eng.fit(ctx.X, ctx.y)
+        xs, ys = Q[[4, 4, 4, 60, 60]], np.array([0.2, -0.7, 1.9, 0.1, -2.4])
+        r1, mat = lean.probe(xs, ys, Q), dense.probe(xs, ys, Q)
+        assert isinstance(r1, B.RankOneMixturePredictive) and type(mat) is B.MixturePredictive
+        for got, want in ((r1.weights, mat.weights), (r1.means, mat.means), (r1.variances, mat.variances),
+                          (r1.mean, mat.mean), (r1.var, mat.var)):
+            np.testing.assert_array_equal(got, want)
+        binned = B.MixturePredictive(mat.weights, mat.means, mat.variances)        # same CDF algorithm as r1
+        grid = B.site_grid([lean.base(Q), r1], 1e-4, 64)
+        np.testing.assert_array_equal(r1.cdf(grid), binned.cdf(grid))
+        np.testing.assert_array_equal(r1.support(1e-4), binned.support(1e-4))
+        np.testing.assert_array_equal(r1.ppf(np.array([0.1, 0.5, 0.9]), np.array([4, 33])),
+                                      binned.ppf(np.array([0.1, 0.5, 0.9]), np.array([4, 33])))
+        sub, sub_mat = r1.take([3, 0]), binned.take([3, 0])
+        np.testing.assert_array_equal(sub.mean, sub_mat.mean)
+        np.testing.assert_array_equal(sub.cdf(grid), sub_mat.cdf(grid))
+
     def test_part_a_stays_within_gate_g1(self, channel, ctx) -> None:
         eng = B.GPBayesEngine(**SMALL_GRID)
         eng.fit(ctx.X, ctx.y)
