@@ -264,8 +264,11 @@ def _omega_headtohead(h2h: pd.DataFrame, run_dir: str) -> list[str]:
 
 
 def _omega_surprise(surprise: pd.DataFrame, panel_ts: Sequence[int], run_dir: str,
-                    engines: Sequence[str] | None = None, name: str = "surprise_response") -> list[str]:
-    """Omega-4 (and C1): update at the anchor vs injected surprise (GP-Bayes SD units), one panel per context size.
+                    engines: Sequence[str] | None = None, name: str = "surprise_response",
+                    reference: str | None = None) -> list[str]:
+    """Omega-4 (and C1): update at the anchor vs injected surprise, one panel per context size.
+
+    Both axes are in units of the ladder reference's predictive SD at the anchor (``bayes_update.shared.reference``).
 
     Args:
         surprise: ``surprise.csv`` rows.
@@ -273,6 +276,7 @@ def _omega_surprise(surprise: pd.DataFrame, panel_ts: Sequence[int], run_dir: st
         run_dir: Output directory.
         engines: Engines drawn (``None`` = every engine of the table).
         name: Figure name.
+        reference: The run's ladder reference, named in the figure title (``None`` = no title).
 
     Returns:
         Written paths.
@@ -284,7 +288,8 @@ def _omega_surprise(surprise: pd.DataFrame, panel_ts: Sequence[int], run_dir: st
     ts = [t for t in panel_ts if t in set(sub["context_t"])]
     if not ts:
         return []
-    fig, axes = style.figure("double", ncols=len(ts), squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT)
+    fig, axes = style.figure("double", ncols=len(ts), squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT,
+                             layout=style.LAYOUT_ENGINE)
     for ax, t in zip(axes[0], ts):
         at = sub[sub["context_t"] == t]
         for engine in at["engine"].unique():
@@ -300,6 +305,9 @@ def _omega_surprise(surprise: pd.DataFrame, panel_ts: Sequence[int], run_dir: st
         ax.set_title(f"$t$ = {int(t)}", fontsize=style.FONT_SIZES["legend"])
     axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
     style.panel_letters(axes.ravel())
+    if reference is not None:
+        fig.suptitle(style.SURPRISE_REFERENCE_TITLE.format(reference=arm_style(reference).label),
+                     x=0.01, ha="left", fontsize=style.FONT_SIZES["title"])
     return style.save_figure(fig, run_dir, name)
 
 
@@ -583,8 +591,9 @@ def render_bayes_update(run_dir: str) -> list[str]:
         with open(cfg_path, encoding="utf-8") as fh:
             cfg_block = yaml.safe_load(fh).get("bayes_update") or {}
     panel_ts: Sequence[int] = cfg_block.get("panel_ts") or ()
+    ladder_ref = (cfg_block.get("shared") or {}).get("reference")        # the surprise unit (user, 2026-10-21)
     if _has_rows(paths["surprise"]):
-        written += _omega_surprise(pd.read_csv(paths["surprise"]), panel_ts, run_dir)
+        written += _omega_surprise(pd.read_csv(paths["surprise"]), panel_ts, run_dir, reference=ladder_ref)
     written += _omega_exemplar(run_dir)
     # Hypothesis C1: the GP-like figures (only when the run has the C1 reference)
     c1 = cfg_block.get("c1") or {}
@@ -597,7 +606,7 @@ def render_bayes_update(run_dir: str) -> list[str]:
             written += _c1_distance(pd.read_csv(prof), c1_engines, panel_ts, run_dir)
         if _has_rows(paths["surprise"]):
             written += _omega_surprise(pd.read_csv(paths["surprise"]), panel_ts, run_dir, engines=c1_engines,
-                                       name="c1_surprise_response")
+                                       name="c1_surprise_response", reference=ladder_ref)
         written += _omega_exemplar(run_dir, "c1_exemplar.npz", "dmu", "dmu_exemplar", "c1_update_exemplar")
     written += render_predictive_link(run_dir)            # M8, only when the link was run
     return written

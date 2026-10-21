@@ -409,7 +409,11 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
     "quadrature": {"method": "gauss_hermite", "K": 20, "u_min": 1e-12, "central_mass": 1.0, "n_scrambles": 1},
     "eps": 0.01,
     "y_grid": {"points": 512, "u_tail": 1e-4},
-    "shared": {"n_trials": 8, "ladder": [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0], "saturation_c": [1.0, 3.0]},
+    # reference: the ladder-anchor engine (user, 2026-10-21): y' = mu_ref(x') + c s_ref(x'), and the surprise response
+    # (Omega-4, C1) is read in its predictive SD. One of ``engines``, never a TabPFN engine; fitted (fit + base only)
+    # on every cell where Part B runs, whether or not coverage gives it Part A or Part B there.
+    "shared": {"n_trials": 8, "ladder": [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0], "saturation_c": [1.0, 3.0],
+               "reference": "gp_bayes"},
     "far_pitch": 4.0,
     # precision / max_batch_tokens apply to the frozen probe of ``discrepancy`` only (the refit uses the public API).
     # The inference seed of a grid cell is inference_seed + its context draw (user, 2026-10-16, replacing gate G5):
@@ -426,7 +430,8 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
     "panel_ts": None,
     # Hypothesis C1, "is the update GP-like?" (user, 2026-10-19): descriptive readouts against GP-MLL frozen, inside the
     # same cells (a Part B reference only). distance_bins: edges (pitches) of the transfer-vs-distance profile;
-    # exemplar_c: the shared ladder multiplier of the change maps at the common anchor (y' = mu_B + c s_B).
+    # exemplar_c: the shared ladder multiplier of the change maps at the common anchor (y' = mu_ref + c s_ref, the
+    # ladder reference of ``shared.reference``).
     "c1": {"reference": "gp_mll_frozen", "engines": ["tabpfn_v2_5", "gp_mll_frozen", "gp_mll_refit", "gp_fixed"],
            "distance_bins": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 14.0], "exemplar_c": 1.0},
     "run": {"gates": True, "grid": True, "discrepancy": True},
@@ -462,7 +467,7 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
     "link": {"tidy_csv": None, "model": "tabpfn_v2_5", "level": 1.0,
              "outcomes": ["recommended_regret", "cumulative_regret"],
              "predictors": ["drift_abs", "total_var_ratio", "transfer_slope", "delta_crps"], "n_boot": 2000,
-             "references": ["gp_bayes"], "engine_contrasts": False, "pool": "unobserved", "context_ts": None,
+             "references": "all", "engine_contrasts": False, "pool": "unobserved", "context_ts": None,
              "acq_label": None, "stress_tidy_csv": None,
              "breakdown": {"reference": "gp_mll", "metric": "recommended_regret", "margin": None}},
 }
@@ -486,7 +491,7 @@ TABPFN_QUANTILE_DTYPE: str = "float64"
 #: not import the analysis module).
 B_QUADRATURE_METHODS: tuple[str, ...] = ("gauss_hermite", "truncated", "rqmc")
 
-#: Pre-declared headline metrics (OMEGA §3.6): Part A per-anchor, Part A per-cell, Part B (TabPFN vs GP-Bayes).
+#: Pre-declared headline metrics (OMEGA §3.6): Part A per-anchor, Part A per-cell, Part B (TabPFN vs each reference).
 #: Part A's law-of-total-variance headline is total_var_ratio (user, 2026-10-16): the ratio of sums SumU / SumM is
 #: ill-conditioned where M is a few % of s^2 (G3 3/8, G5 ICC <= 0.44 on the refit) and is reported as secondary.
 HEADLINE_A: tuple[str, ...] = ("drift_abs", "total_var_ratio", "latent_frac")
@@ -519,8 +524,14 @@ def _validate_bayes_update(p: dict[str, Any], ladder: Sequence[int]) -> dict[str
     bad = [e for e in p["engines"] if e not in known]
     if bad:
         raise ValueError(f"bayes_update.engines: unknown {bad}; known {sorted(known)}.")
-    if "gp_bayes" not in p["engines"]:
-        raise ValueError("bayes_update.engines must include gp_bayes: it anchors the shared y' ladder.")
+    # The ladder reference (user, 2026-10-21): any non-TabPFN engine of the run -- GP-Bayes is optional.
+    ref = p["shared"]["reference"]
+    if ref not in p["engines"]:
+        raise ValueError(f"bayes_update.shared.reference {ref!r} is not in bayes_update.engines {p['engines']}: "
+                         f"the y' ladder is anchored on an engine of the run.")
+    if ref in TABPFN_ENGINES:
+        raise ValueError(f"bayes_update.shared.reference {ref!r} is a TabPFN engine; the ladder anchor must be "
+                         f"model-neutral (a GP engine).")
     bad = [r for r in p["references"] if r not in p["engines"]]
     if bad:
         raise ValueError(f"bayes_update.references {bad} are not in bayes_update.engines.")
@@ -546,6 +557,9 @@ def _validate_bayes_update(p: dict[str, Any], ladder: Sequence[int]) -> dict[str
     bad = [e for e in p["exemplar"]["engines"] if e in B_ONLY_ENGINES]
     if bad:
         raise ValueError(f"bayes_update.exemplar.engines: {bad} have no implied covariance (Part B references only).")
+    bad = [e for e in p["exemplar"]["engines"] if e not in p["engines"]]
+    if p["exemplar"]["enabled"] and bad:
+        raise ValueError(f"bayes_update.exemplar.engines: {bad} are not in bayes_update.engines {p['engines']}.")
     # C1 is active when its reference is an engine; its figures then show the listed engines that are present.
     c1 = p["c1"]
     if c1["reference"] in p["engines"]:
@@ -625,7 +639,8 @@ def _make_engine(name: str, p: dict[str, Any], device: str, draw: int = 0) -> An
     """Build one update engine by name (OMEGA §3.2).
 
     Args:
-        name: A key of :data:`TABPFN_ENGINES`, ``'gp_bayes'``, ``'gp_mll_refit'`` or ``'gp_fixed'``.
+        name: A key of :data:`TABPFN_ENGINES`, ``'gp_bayes'``, ``'gp_mll_refit'``, ``'gp_mll_frozen'`` or
+            ``'gp_fixed'``.
         p: Resolved ``bayes_update`` block.
         device: Torch device for TabPFN.
         draw: Context draw; TabPFN's inference seed is ``tabpfn.inference_seed + draw``.
@@ -709,6 +724,10 @@ def _bayes_cell(
 ) -> dict[str, Any]:
     """One (channel, level, t, draw) cell: Part A for ``engines_a``, Part B for ``engines_b``, metric rows only.
 
+    Whenever Part B runs, the ladder reference ``p['shared']['reference']`` is fitted and its base predictive anchors
+    the shared ``y'`` ladder and the surprise unit; it is probed (Part A / Part B) only if it is in ``engines_a`` /
+    ``engines_b``.
+
     Args:
         stressed: The channel at this stress level.
         label: Channel label (seed streams).
@@ -718,13 +737,13 @@ def _bayes_cell(
         p: Resolved ``bayes_update`` block.
         cfg: Resolved config.
         engines_a: Engines that run Part A here.
-        engines_b: Engines that run Part B here (``gp_bayes`` included whenever this is non-empty).
+        engines_b: Engines that run Part B here.
         make: ``name -> unfitted engine``.
 
     Returns:
         ``coherence`` (per anchor), ``coherence_cell`` (per pool), ``headtohead``, ``surprise`` and ``profile`` rows
         (the transfer-vs-distance profile of Hypothesis C1), the
-        ``gp_bayes`` diagnostics, the host and the wall time (guardrail G5).
+        ``gp_bayes`` diagnostics (when it runs Part A), the host and the wall time (guardrail G5).
     """
     import socket  # noqa: PLC0415
 
@@ -740,16 +759,18 @@ def _bayes_cell(
     observed = np.isin(np.arange(stressed.n_sites), ctx.sites)                     # [M]
     dist = B.site_distances(stressed.ch2xy, anchors)                               # [A, M]
     trial_var = np.nanvar(stressed.Y_trials[anchors], axis=1, ddof=1)             # [A]
-    names = list(dict.fromkeys([*engines_a, *engines_b]))                          # every engine requested, once
-    engines = {n: make(n) for n in names}
+    sh = p["shared"]
+    ref = str(sh["reference"])                                                     # the ladder anchor
+    names = list(dict.fromkeys([*engines_a, *engines_b]))                          # every engine probed, once
+    fitted = list(dict.fromkeys([*names, *([ref] if engines_b else [])]))          # + the ladder anchor (base only)
+    engines = {n: make(n) for n in fitted}
     bases = {}
     for n, eng in engines.items():
         eng.fit(ctx.X, ctx.y)
         bases[n] = eng.base(Q)
-    sh = p["shared"]
     shared = None
     if engines_b:
-        shared = B.shared_values(held, anchors, bases["gp_bayes"], int(sh["n_trials"]), sh["ladder"],
+        shared = B.shared_values(held, anchors, bases[ref], int(sh["n_trials"]), sh["ladder"],
                                  rng_for(label, "bayes_update_shared", level, t, draw, base_seed=cfg.seed))
     qd = p["quadrature"]
     yg = p["y_grid"]
@@ -797,7 +818,7 @@ def _bayes_cell(
                                int(yg["points"]), extra=held)
             rows, sur, prof = B.headtohead_anchor(
                 preds_b, refs, anchor=a, trial_y=shared["trial"][i], trial_idx=shared["trial_idx"][i],
-                ladder_c=shared["c"], s_bayes_anchor=float(bases["gp_bayes"].sd[0, a]), heldout=held,
+                ladder_c=shared["c"], s_ref_anchor=float(bases[ref].sd[0, a]), heldout=held,
                 observed=observed, dist=dist[i], y_grid=grid, far_pitch=float(p["far_pitch"]),
                 saturation_c=sh["saturation_c"], distance_bins=p["c1"]["distance_bins"])
             h2h += [{**r, "pool": pools[i], "strata": strata[i]} for r in rows]
@@ -858,8 +879,11 @@ def _bayes_gates(
     only = set(g["only"] or ("G1", "G2", "G4"))
     gate_channels = list(channels[: int(g["n_channels"])])
     level, draw = float(knob.levels[0]), 0
+    # The gates validate GP-Bayes itself, so G4's ladder is always anchored on it whatever ``shared.reference`` the
+    # grid uses; the reference is therefore not part of a gate identity.
+    gate_shared = {k: v for k, v in p["shared"].items() if k != "reference"}
     common = {"knob": knob.name, "level": level, "draw": draw, "anchors": p["anchors"], "eps": p["eps"],
-              "quadrature": p["quadrature"], "y_grid": p["y_grid"], "shared": p["shared"]}
+              "quadrature": p["quadrature"], "y_grid": p["y_grid"], "shared": gate_shared}
     out: list[dict[str, Any]] = []
 
     def stressed_of(ch: ChannelData) -> ChannelData:
@@ -972,6 +996,7 @@ def _bayes_gates(
                     res = {}
                     for key, kw in (("base", {}), ("alt", alt)):
                         pp = json.loads(json.dumps(p))
+                        pp["shared"]["reference"] = "gp_bayes"
                         if "gp_bayes" in kw:
                             pp["gp_bayes"].update(kw["gp_bayes"])
                         res[key] = _bayes_cell(st, ch.label, level, t, draw, pp, cfg, [], ["tabpfn_v2_5", "gp_bayes"],
@@ -1216,14 +1241,14 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                                 (p["coverage"].get(e) or {}).get(part), ch.label, allowed, level, t, draw)
                                 and not (part == "A" and e in B_ONLY_ENGINES)]
                                 for part in ("A", "B")}
-                            if cov["B"] and "gp_bayes" not in cov["B"]:
-                                cov["B"].append("gp_bayes")
+                            # the ladder reference is fitted wherever Part B runs (shared.reference), never added
+                            # to Part A or Part B; its settings enter the identity through engine_params
+                            fitted = set(cov["A"]) | set(cov["B"]) | ({p["shared"]["reference"]} if cov["B"] else set())
                             keys = {"dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg, "knob": knob.name,
                                     "level": float(level), "achieved_snr_db": snr, "context_t": int(t), "draw": draw}
                             ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
                                      "draw": draw, "engines_a": cov["A"], "engines_b": cov["B"],
-                                     "engine_params": {e: _engine_params(e, p, draw)
-                                                       for e in set(cov["A"]) | set(cov["B"])},
+                                     "engine_params": {e: _engine_params(e, p, draw) for e in fitted},
                                      **{k: p[k] for k in ("references", "anchors", "quadrature", "eps", "y_grid",
                                                           "shared", "far_pitch")}}
                             hit = cells.run(
@@ -1286,13 +1311,14 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                              observed=np.array([np.isin(np.arange(st.n_sites), ctxs[t].sites) for t in sorted(maps)]),
                              C=np.array([[maps[t][n] for n in ex["engines"]] for t in sorted(maps)]))
                 c1 = p["c1"]
+                ladder_ref = str(p["shared"]["reference"])
                 dmaps = {}
                 for t in (ts if c1["reference"] in p["engines"] else []):
                     def c1_cell(t: int = t) -> tuple[dict[str, Any], dict[str, Any]]:
-                        bayes = _make_engine("gp_bayes", p, cfg.device, int(ex["draw"]))
-                        bayes.fit(ctxs[t].X, ctxs[t].y)
-                        bb = bayes.base(st.X_pool)
-                        y = float(bb.mean[0, a] + float(c1["exemplar_c"]) * bb.sd[0, a])
+                        anchor_eng = _make_engine(ladder_ref, p, cfg.device, int(ex["draw"]))
+                        anchor_eng.fit(ctxs[t].X, ctxs[t].y)
+                        bb = anchor_eng.base(st.X_pool)
+                        y = float(bb.mean[0, a] + float(c1["exemplar_c"]) * bb.sd[0, a])  # y' = mu_ref + c s_ref
                         res = {}
                         for n in c1["engines"]:
                             eng = _make_engine(n, p, cfg.device, int(ex["draw"]))
@@ -1305,8 +1331,9 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                     hit = cells.run("c1_exemplar", {**cells.channel(ch), "level": float(ex["level"]),
                                                     "draw": int(ex["draw"]), "t": int(t), "anchor": a,
                                                     "exemplar_c": float(c1["exemplar_c"]),
+                                                    "ladder_reference": ladder_ref,
                                                     "engine_params": {n: _engine_params(n, p, int(ex["draw"]))
-                                                                      for n in [*c1["engines"], "gp_bayes"]}},
+                                                                      for n in [*c1["engines"], ladder_ref]}},
                                     f"C1 exemplar {ch.label} t={t}", c1_cell)
                     if hit is not None:
                         dmaps[t] = hit[0]["dmu"]

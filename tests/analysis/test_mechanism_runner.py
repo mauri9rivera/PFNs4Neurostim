@@ -8,6 +8,7 @@ import textwrap
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 
 from pfns4neurostim.analysis.predictive_link import READOUTS
 from pfns4neurostim.data.synthetic_neurostim import gp_channel
@@ -244,6 +245,118 @@ def test_bayes_update_refuses_unknown_engines_and_ladders_without_saturation_poi
         """))
 
 
+def _ladder_reference_run(tmp_path, engines: str, references: str, reference: str, coverage: str = "{}") -> str:
+    """A tiny bayes_update config with an explicit ladder reference (user, 2026-10-21: GP-Bayes is optional)."""
+    return _config(tmp_path, f"""
+        analysis: bayes_update
+        bayes_update:
+          engines: {engines}
+          references: {references}
+          coverage: {coverage}
+          stress: {{knob: k2_channel, levels: [1.0]}}
+          n_context_draws: 1
+          anchors: {{n_unobserved: 2, n_observed: 1}}
+          quadrature: {{K: 4, u_min: 1.0e-12}}
+          y_grid: {{points: 128, u_tail: 1.0e-4}}
+          shared: {{n_trials: 3, ladder: [-3.0, -1.0, 1.0, 3.0], saturation_c: [1.0, 3.0], reference: {reference}}}
+          far_pitch: 3.0
+          gp_bayes: {{lengthscale: [0.1, 0.6, 3], outputscale: [0.5, 2.0, 2], noise: [0.05, 0.3, 2], b2: 1.0,
+                     prune_mass: 1.0e-10, chunk: 64, exact_max_components: 64, sd_bins: 8}}
+          gp_params: {{n_opt_steps: 10, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 1,
+                      lengthscale_floor: 0.05}}
+          exemplar: {{enabled: false}}
+          panel_ts: [10]
+          run: {{gates: false, grid: true, discrepancy: false}}
+    """)
+
+
+@pytest.mark.parametrize("ref_in_part_b", [True, False])
+def test_ladder_anchored_on_gp_mll_refit_without_gp_bayes(tmp_path, tiny, monkeypatch, ref_in_part_b: bool) -> None:
+    """No GP-Bayes anywhere: the ladder is mu_ref + c s_ref of GP-MLL refit, which is fitted even off Part B."""
+    from pfns4neurostim.analysis import bayes_update as B
+
+    made: dict[str, list] = {}
+    real_make = mechanism._make_engine
+
+    def spy_make(name, p, device, draw=0):
+        eng = real_make(name, p, device, draw)
+        real_base = eng.base
+
+        def base(Q):
+            out = real_base(Q)
+            made.setdefault(name, []).append(out)
+            return out
+
+        eng.base = base
+        return eng
+
+    calls: list[tuple] = []
+    real_shared = B.shared_values
+
+    def spy_shared(heldout, anchors, ref_base, n_trials, ladder, rng):
+        out = real_shared(heldout, anchors, ref_base, n_trials, ladder, rng)
+        calls.append((ref_base, np.asarray(anchors), out))
+        return out
+
+    monkeypatch.setattr(mechanism, "_make_engine", spy_make)
+    monkeypatch.setattr(B, "shared_values", spy_shared)
+    # coverage keeps GP-MLL refit out of Part B at the only level of the run: it must still anchor the ladder
+    coverage = "{}" if ref_in_part_b else "{gp_mll_refit: {B: {levels: [2.0]}}}"
+    out = mechanism.run_mechanism(_ladder_reference_run(
+        tmp_path, "[gp_mll_refit, gp_fixed]", "[gp_mll_refit, gp_fixed]", "gp_mll_refit", coverage))
+    assert "gp_bayes" not in made
+    assert len(calls) == 1
+    ref_base, anchors, sv = calls[0]
+    assert any(ref_base is b for b in made["gp_mll_refit"])                   # anchored on GP-MLL refit's base
+    c = np.asarray(sv["c"])                                                    # [L]
+    mu, sd = ref_base.mean[0, anchors], ref_base.sd[0, anchors]                # [A]
+    np.testing.assert_allclose(sv["ladder"], mu[:, None] + c[None] * sd[:, None], rtol=0, atol=1e-14)
+    tables = {n: pd.read_csv(os.path.join(out, f"{n}.csv")) for n in ("coherence", "headtohead", "surprise")}
+    for df in tables.values():
+        assert "gp_bayes" not in set(df["engine"])
+    assert "gp_bayes" not in set(tables["headtohead"]["reference"])
+    assert set(tables["coherence"]["engine"]) == {"gp_mll_refit", "gp_fixed"}  # never added to Part A
+    part_b = {"gp_mll_refit", "gp_fixed"} if ref_in_part_b else {"gp_fixed"}
+    assert set(tables["surprise"]["engine"]) == part_b
+    assert set(tables["headtohead"]["engine"]) == part_b
+    cfg = yaml.safe_load(open(os.path.join(out, "config.yaml"), encoding="utf-8"))
+    assert cfg["bayes_update"]["shared"]["reference"] == "gp_mll_refit"
+    assert os.path.exists(os.path.join(out, "surprise_response.svg"))
+
+
+def test_gp_bayes_stays_available_as_engine_and_ladder_reference(tmp_path, tiny) -> None:
+    """Re-enabled by config, GP-Bayes runs Part A and Part B and anchors the ladder, exactly as before 2026-10-21."""
+    out = mechanism.run_mechanism(_ladder_reference_run(tmp_path, "[gp_bayes, gp_fixed]", "[gp_bayes, gp_fixed]",
+                                                        "gp_bayes"))
+    coh = pd.read_csv(os.path.join(out, "coherence_cell.csv"))
+    h2h = pd.read_csv(os.path.join(out, "headtohead.csv"))
+    sur = pd.read_csv(os.path.join(out, "surprise.csv"))
+    assert set(coh["engine"]) == {"gp_bayes", "gp_fixed"}
+    assert coh.loc[coh["engine"] == "gp_bayes", "ess"].notna().all()          # its diagnostics ride on Part A
+    assert set(h2h.loc[h2h["reference"] == "gp_bayes", "engine"]) == {"gp_fixed"}
+    assert set(h2h.loc[h2h["reference"] == "gp_fixed", "engine"]) == {"gp_bayes"}
+    assert set(sur["engine"]) == {"gp_bayes", "gp_fixed"}
+
+
+def test_ladder_reference_is_validated() -> None:
+    base = {"stress": {"knob": "k2_channel", "levels": [1.0]}, "exemplar": {"enabled": False}}
+    with pytest.raises(ValueError, match="shared.reference 'gp_bayes' is not in bayes_update.engines"):
+        mechanism._validate_bayes_update({**base, "engines": ["gp_mll_refit", "gp_fixed"],
+                                          "references": ["gp_mll_refit", "gp_fixed"]}, _LADDER)
+    with pytest.raises(ValueError, match="is a TabPFN engine"):
+        mechanism._validate_bayes_update({**base, "engines": ["tabpfn_v2_5", "gp_fixed"], "references": ["gp_fixed"],
+                                          "shared": {"reference": "tabpfn_v2_5"}}, _LADDER)
+    with pytest.raises(ValueError, match="exemplar.engines"):
+        mechanism._validate_bayes_update({"engines": ["gp_mll_refit", "gp_fixed"], "references": ["gp_fixed"],
+                                          "shared": {"reference": "gp_mll_refit"}}, _LADDER)
+    # no GP-Bayes anywhere is a valid run: the link's default references are the run's own
+    p = mechanism._validate_bayes_update({**base, "engines": ["tabpfn_v2_5", "gp_mll_refit", "gp_fixed"],
+                                          "references": ["gp_mll_refit", "gp_fixed"],
+                                          "shared": {"reference": "gp_mll_refit"}}, _LADDER)
+    assert p["shared"]["reference"] == "gp_mll_refit" and p["link"]["references"] == "all"
+    assert mechanism.BAYES_UPDATE_DEFAULTS["shared"]["reference"] == "gp_bayes"      # an old config keeps its meaning
+
+
 def test_empty_csv_is_treated_as_absent(tmp_path) -> None:
     """An empty frame still writes a newline (CRLF on Windows); the figure code must skip it, not crash (2026-10-06)."""
     from pfns4neurostim.visualization import mechanism as figs
@@ -332,7 +445,9 @@ def _resolved_link(**link: object) -> dict:
 def test_link_defaults_are_the_pre_extension_block() -> None:
     link = _resolved_link()
     assert link["tidy_csv"] is None and link["stress_tidy_csv"] is None
-    assert link["references"] == ["gp_bayes"] and link["engine_contrasts"] is False
+    # references default to every reference of the run (2026-10-21: GP-Bayes is optional, so a fixed default would
+    # refuse a run without it)
+    assert link["references"] == "all" and link["engine_contrasts"] is False
     assert link["predictors"] == ["drift_abs", "total_var_ratio", "transfer_slope", "delta_crps"]
     assert link["outcomes"] == ["recommended_regret", "cumulative_regret"] and link["pool"] == "unobserved"
     assert link["breakdown"] == {"reference": "gp_mll", "metric": "recommended_regret", "margin": None}
@@ -363,8 +478,10 @@ def test_predictive_link_default_block_recovers_a_planted_slope(tmp_path) -> Non
     bo, _ = _link_tidies(str(tmp_path), truth)
     paths = mechanism._predictive_link(str(tmp_path), _resolved_link(tidy_csv=bo, n_boot=200), seed=0)
     res = pd.read_csv(paths[0])
+    # default references = all of the run; GP-MLL frozen is a C1 reference, so it carries no delta_crps contrast
     assert set(zip(res["predictor"], res["reference"])) == {
-        ("drift_abs", "none"), ("total_var_ratio", "none"), ("transfer_slope", "gp_bayes"), ("delta_crps", "gp_bayes")}
+        ("drift_abs", "none"), ("total_var_ratio", "none"), ("transfer_slope", "gp_bayes"), ("delta_crps", "gp_bayes"),
+        ("transfer_slope", "gp_mll_refit"), ("delta_crps", "gp_mll_refit"), ("transfer_slope", "gp_mll_frozen")}
     row = res[(res["predictor"] == "drift_abs") & (res["outcome"] == "recommended_regret")].iloc[0]
     assert row["slope"] == pytest.approx(4.0, abs=0.2) and row["ci_low"] < 4.0 < row["ci_high"]
     assert (row["n_channels"], row["n_subjects"], row["pool"], row["level"]) == (15, 3, "unobserved", 1.0)

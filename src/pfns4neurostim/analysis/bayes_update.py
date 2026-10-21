@@ -15,8 +15,9 @@ predictive for ``y'`` (Gauss-Hermite nodes mapped through the model's quantile f
   equals ``Cov(f(x'), f(x) | D)``, and at ``x = x'`` the *latent* variance, so ``s^2(x') - C(x', x')`` is the noise
   the model implies.
 
-**Part B -- head-to-head**: TabPFN's update against GP-Bayes (hyperparameters marginalised on a grid), GP-MLL
-refit and GP-fixed, on shared ``y'`` values (held-out real trials, and a ladder in GP-Bayes's predictive SD).
+**Part B -- head-to-head**: TabPFN's update against the GP references (GP-MLL refit and GP-fixed; GP-Bayes, with
+hyperparameters marginalised on a grid, is available but optional since 2026-10-21), on shared ``y'`` values
+(held-out real trials, and a ladder in the predictive SD of one non-TabPFN *ladder reference* engine).
 Every contrast is matched per site (and per held-out trial for CRPS) before it is aggregated (user, 2026-10-15).
 
 Every engine predicts a new **noisy** observation; units are the dataset's offline z-scored y. Distributions are
@@ -1735,7 +1736,7 @@ def heldout_trials(channel: ChannelData, context_sites: np.ndarray, context_tria
 def shared_values(
     heldout: np.ndarray,
     anchors: np.ndarray,
-    bayes_base: Predictive,
+    ref_base: Predictive,
     n_trials: int,
     ladder: Sequence[float],
     rng: np.random.Generator,
@@ -1745,11 +1746,12 @@ def shared_values(
     Args:
         heldout: Output of :func:`heldout_trials`, shape [M, R].
         anchors: Anchor sites, shape [A].
-        bayes_base: GP-Bayes's predictive given D: the model-neutral ladder anchor.
+        ref_base: The ladder reference's predictive given D (``bayes_update.shared.reference``, a non-TabPFN
+            engine): the model-neutral ladder anchor.
         n_trials: Held-out trials per anchor, drawn without replacement; an anchor with fewer valid held-out
             trials contributes all of them (NHP has 28 trials per site on subject 0, fewer at some sites of other
             subjects -- found 2026-10-15).
-        ladder: Multipliers ``c`` of ``y' = mu_B(x') + c s_B(x')``.
+        ladder: Multipliers ``c`` of ``y' = mu_ref(x') + c s_ref(x')``.
         rng: Generator.
 
     Returns:
@@ -1767,7 +1769,7 @@ def shared_values(
         trial.append(heldout[a, pick])
         idx.append(pick)
     c = np.asarray(ladder, dtype=np.float64)
-    mu, sd = bayes_base.mean[0, anchors], bayes_base.sd[0, anchors]                # [A]
+    mu, sd = ref_base.mean[0, anchors], ref_base.sd[0, anchors]                    # [A]
     return {"trial": trial, "trial_idx": [np.asarray(i, dtype=int) for i in idx],
             "ladder": mu[:, None] + c[None, :] * sd[:, None], "c": c}
 
@@ -1780,7 +1782,7 @@ def headtohead_anchor(
     trial_y: np.ndarray,
     trial_idx: np.ndarray,
     ladder_c: np.ndarray,
-    s_bayes_anchor: float,
+    s_ref_anchor: float,
     heldout: np.ndarray,
     observed: np.ndarray,
     dist: np.ndarray,
@@ -1798,7 +1800,7 @@ def headtohead_anchor(
         trial_y: Injected held-out trials, shape [R].
         trial_idx: Their trial indices at the anchor, shape [R].
         ladder_c: Ladder multipliers, shape [L].
-        s_bayes_anchor: GP-Bayes's predictive SD at the anchor (ladder unit).
+        s_ref_anchor: The ladder reference's predictive SD at the anchor (the ladder and surprise unit).
         heldout: Held-out trials per site, shape [M, H] (NaN = excluded).
         observed: Context-site mask, shape [M].
         dist: Distance of every site from the anchor, in pitches, shape [M].
@@ -1847,7 +1849,7 @@ def headtohead_anchor(
         rows.append({"source": "ladder", "engine": name, "reference": "none", "anchor": int(anchor),
                      "saturation": saturation})
         surprise += [{"engine": name, "anchor": int(anchor), "c": float(c),
-                      "update_anchor_sd": float(d / s_bayes_anchor)} for c, d in zip(ladder_c, d_anchor)]
+                      "update_anchor_sd": float(d / s_ref_anchor)} for c, d in zip(ladder_c, d_anchor)]
         if distance_bins is not None:
             profile += [{"engine": name, "anchor": int(anchor), **p}
                         for p in transfer_profile(T, dist, observed, anchor, distance_bins)]

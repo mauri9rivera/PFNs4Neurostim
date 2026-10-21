@@ -373,7 +373,7 @@ class TestHeadToHead:
         grid = B.site_grid([p for v in preds.values() for p in v.values()], 1e-6, 512, extra=held)
         rows, surprise, profile = B.headtohead_anchor(
             preds, ["gp_fixed"], anchor=a, trial_y=held[a, :3], trial_idx=np.arange(3),
-            ladder_c=np.array([-3, -1, 1, 3.0]), s_bayes_anchor=1.0, heldout=held,
+            ladder_c=np.array([-3, -1, 1, 3.0]), s_ref_anchor=1.0, heldout=held,
             observed=np.isin(np.arange(channel.n_sites), ctx.sites), dist=B.site_distances(channel.ch2xy, [a])[0],
             y_grid=grid, far_pitch=4.0, saturation_c=(1.0, 3.0), distance_bins=[0.0, 2.0, 4.0, 20.0])
         contrast = [r for r in rows if r["reference"] == "gp_fixed"]
@@ -389,6 +389,33 @@ class TestHeadToHead:
         assert [r["abs_transfer"] for r in twin] == pytest.approx([r["abs_transfer"] for r in ref])
         assert {r["site_pool"] for r in profile} <= {"unobserved", "observed"}
         assert sum(r["n_sites"] for r in ref) == channel.n_sites - 1                # every site but the anchor
+
+    def test_ladder_and_surprise_are_in_the_ladder_reference_sd(self, channel, ctx) -> None:
+        """The ladder anchor is any non-TabPFN engine (user, 2026-10-21), here GP-fixed, not GP-Bayes.
+
+        ``y' = mu_ref(x') + c s_ref(x')``; a GP's update at ``x'`` is ``gain (y' - mu)``, so the reference's own
+        surprise response in its own SD units is exactly ``gain * c``.
+        """
+        Q = channel.X_pool
+        eng = _fixed(ctx)
+        base = eng.base(Q)
+        held = B.heldout_trials(channel, ctx.sites, ctx.trial_idx)
+        anchors = np.setdiff1d(np.arange(channel.n_sites), ctx.sites)[:2]
+        c = np.array([-2.0, -1.0, 1.0, 2.0])
+        sv = B.shared_values(held, anchors, base, 3, c, np.random.default_rng(0))
+        mu, sd = base.mean[0, anchors], base.sd[0, anchors]                         # [A]
+        np.testing.assert_allclose(sv["ladder"], mu[:, None] + c[None] * sd[:, None], rtol=0, atol=1e-14)
+        a = int(anchors[0])
+        pr = {"base": base, "trial": eng.probe(Q[[a] * len(sv["trial"][0])], sv["trial"][0], Q),
+              "ladder": eng.probe(Q[[a] * len(c)], sv["ladder"][0], Q)}
+        grid = B.site_grid(list(pr.values()), 1e-6, 512, extra=held)
+        _, surprise, _ = B.headtohead_anchor(
+            {"gp_fixed": pr}, ["gp_fixed"], anchor=a, trial_y=sv["trial"][0], trial_idx=sv["trial_idx"][0],
+            ladder_c=sv["c"], s_ref_anchor=float(base.sd[0, a]), heldout=held,
+            observed=np.isin(np.arange(channel.n_sites), ctx.sites), dist=B.site_distances(channel.ch2xy, [a])[0],
+            y_grid=grid, far_pitch=4.0, saturation_c=(1.0, 2.0))
+        gain = float(eng.posterior_covariance(Q)[a, a]) / float(base.sd[0, a]) ** 2   # k_C / (k_C + sigma^2)
+        assert [r["update_anchor_sd"] for r in surprise] == pytest.approx(gain * c, rel=1e-8)
 
 
 class TestC1FrozenReference:
@@ -431,7 +458,7 @@ class TestC1FrozenReference:
         dist = B.site_distances(channel.ch2xy, [a])[0]
         rows, _, profile = B.headtohead_anchor(
             preds, [kind], anchor=a, trial_y=held[a, :3], trial_idx=np.arange(3), ladder_c=c,
-            s_bayes_anchor=float(base.sd[0, a]), heldout=held,
+            s_ref_anchor=float(base.sd[0, a]), heldout=held,
             observed=np.isin(np.arange(channel.n_sites), ctx.sites), dist=dist, y_grid=grid, far_pitch=4.0,
             saturation_c=(1.0, 3.0), distance_bins=[0.0, 2.0, 4.0, 20.0])
         (contrast,) = [r for r in rows if r["reference"] == kind]

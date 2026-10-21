@@ -65,6 +65,7 @@ __all__ = [
     "LINK_REFERENCE_TITLES",
     "LINK_SLOPE_NOTE",
     "LINK_TITLE",
+    "SURPRISE_REFERENCE_TITLE",
     "subject_style",
     "set_integer_xaxis",
     "derive_shade",
@@ -768,8 +769,10 @@ AXIS_LABELS: dict[str, str] = {
     "gap_change": "Change of W1 gap to reference (ref. SD)",
     "delta_crps": r"$\Delta$CRPS, TabPFN $-$ reference (z-units)",
     "saturation": "Saturation (1 = linear response)",
-    "ladder_c": r"Injected surprise $c$ (GP-Bayes SD at $x'$)",
-    "update_anchor_sd": r"Update at $x'$ (GP-Bayes SD at $x'$)",
+    # The ladder unit is the predictive SD of the run's ladder reference (bayes_update.shared.reference, user
+    # 2026-10-21); the surprise figures name that engine in their title (SURPRISE_REFERENCE_TITLE).
+    "ladder_c": r"Injected surprise $c$ (ladder-reference SD at $x'$)",
+    "update_anchor_sd": r"Update at $x'$ (ladder-reference SD at $x'$)",
     "implied_cov": r"Implied covariance $C(x', x)$",
     "far_field_share": "Far-field share of update energy",
     "abs_transfer": r"Mean $|T(x)|$ (update per unit surprise)",
@@ -827,6 +830,8 @@ LINK_SLOPE_NOTE: str = "slope {slope:.3g} [{lo:.3g}, {hi:.3g}]"
 #: Figure title of a predictive-link figure; the link is exploratory and the title says so where it is read.
 LINK_TITLE: str = ("Exploratory link to {outcome}: {model}, {pool} anchors, level {level:g}; "
                    "random-intercept slope, 95% channel-bootstrap CI")
+#: Figure title of the surprise-response figures (Omega-4, C1): the engine whose predictive SD is the ladder unit.
+SURPRISE_REFERENCE_TITLE: str = "Surprise in {reference} predictive SD at $x'$"
 
 
 def subject_style(subject: object, subjects: Sequence[object]) -> ModelStyle:
