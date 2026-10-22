@@ -12,7 +12,13 @@ from ..evaluation.results import TidyRow
 from ..models.registry import model_version
 from ..seeding import rng_for
 
-__all__ = ["cell_identity", "row_from_payload", "count_channels", "gt_instances"]
+__all__ = ["cell_identity", "row_from_payload", "count_channels", "gt_instances", "RETIRED_ROW_FIELDS"]
+
+#: Tidy columns removed from :class:`TidyRow` whose key still sits in rows cached before the removal. A cell identity
+#: holds no schema version, so those cells keep hitting; the key is dropped on read only while its value is null.
+RETIRED_ROW_FIELDS: dict[str, str] = {
+    "decoy_capture": "K1 decoy knob removed in 400cd81 (2026-10-21); null for every other knob",
+}
 
 
 def count_channels(cfg: ExperimentConfig, shard: tuple[int, int] | None = None) -> int:
@@ -125,8 +131,19 @@ def row_from_payload(payload: dict[str, Any], run_tag: str) -> TidyRow:
 
     Returns:
         The tidy row.
+
+    Raises:
+        ValueError: If a :data:`RETIRED_ROW_FIELDS` column holds a value: the cell measured something the current
+            schema cannot carry, so it must not be assembled silently.
     """
-    return replace(TidyRow(**payload["row"]), run_tag=run_tag)
+    row = dict(payload["row"])
+    for name, why in RETIRED_ROW_FIELDS.items():
+        if name not in row:
+            continue
+        value = row.pop(name)
+        if value is not None and value == value:  # NaN != NaN: a NaN is a null
+            raise ValueError(f"cached row holds a value for the retired column {name!r} ({why}): {value!r}")
+    return replace(TidyRow(**row), run_tag=run_tag)
 
 
 def gt_instances(cfg: ExperimentConfig, channel: ChannelData) -> list[ChannelData]:
