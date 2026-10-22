@@ -230,6 +230,19 @@ def test_channel_breakdown_counts_levels_passed() -> None:
     assert (out["n_levels"] == 3).all()
 
 
+def test_channel_breakdown_resolves_legacy_demo_spellings() -> None:
+    """Cells cached before the 2026-09-27 rename say ``demo2``; a backfilled channel says ``draws`` (same ladder)."""
+    stress = _stress().assign(demo=lambda d: np.where(d["emg"] == 0, "demo2", "draws"))
+    out = L.channel_breakdown(stress, model="tabpfn_v2_5", reference="gp_mll", metric="recommended_regret",
+                              margin=0.05).set_index("emg")
+    pd.testing.assert_frame_equal(out, L.channel_breakdown(_stress().assign(demo="draws"), model="tabpfn_v2_5",
+                                                           reference="gp_mll", metric="recommended_regret",
+                                                           margin=0.05).set_index("emg"))
+    with pytest.raises(ValueError, match="several demos"):
+        L.channel_breakdown(_stress().assign(demo=lambda d: np.where(d["emg"] == 0, "synthetic", "draws")),
+                            model="tabpfn_v2_5", reference="gp_mll", metric="recommended_regret", margin=0.05)
+
+
 def test_channel_breakdown_refuses_missing_columns_and_mixed_ladders() -> None:
     with pytest.raises(ValueError, match="no column"):
         L.channel_breakdown(_stress().drop(columns="rep"), model="tabpfn_v2_5", reference="gp_mll",

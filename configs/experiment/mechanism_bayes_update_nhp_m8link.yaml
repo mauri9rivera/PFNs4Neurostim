@@ -1,0 +1,195 @@
+# M8 predictive link, exploratory reading (2026-10-22): mechanism_bayes_update_nhp.yaml with only the `link` block switched on
+# (Hyp A NHP + K2 draws outcomes) and its own tag. Reads the cached OMEGA cells (--only-cached); the pre-registered config keeps
+# link off until the user decides on the proposed link: diff. No confirmatory claim (research_design §2, M8).
+# OBJECTIVE OMEGA (Sprint #4) -- Hypothesis C, re-founded 2026-10-19 (research_design.md §2 and §4):
+#   C2 (roadmap M15) "is TabPFN-2.5's in-context update Bayesian-like?" -- Part A coherence + Part B head-to-head;
+#   C1 (roadmap M10) "is it GP-like?" -- descriptive readouts against GP-MLL frozen, computed in the SAME cells.
+# Plan of record: .research_assistant/omega_sprint4_bayesian_update.md. Replaces the old M10 (update rule) and Sprint #3 (F6).
+#
+# QUESTION. After ONE new observation (x', y') is added to the same context D, how does TabPFN's full posterior
+# predictive compare with GP posteriors? Every engine predicts a new noisy observation, in offline z-units.
+#
+# ENGINES (all fp32, local CPU unless the user places the grid elsewhere; each cell records its host, G5).
+#   tabpfn_v2_5            the DEPLOYED update: public-API TabPFNRegressor refit on D + {(x', y')} per probe
+#                          (n_estimators=1, ignore_pretraining_limits), softmax temperature 0.9 (user, 2026-10-15)
+#   tabpfn_v2_5_t1         same, temperature 1.0 (the network's raw PPD)
+#   The frozen-preprocessing probe (FrozenTabPFN) is NOT an engine (user, 2026-10-15): the Bayes question is asked of
+#   the refit. Its distance from the refit is a report (DISCREPANCY below); the A4 test-hash variant is dropped.
+#   gp_bayes               ARD-RBF + constant (b^2 = 1), hyperparameters marginalised on a log grid [23, 23, 11, 13] (refined by G4).
+#                          AVAILABLE, NOT IN THE GRID (user, 2026-10-21: high compute, low novelty); re-enable by adding
+#                          it to engines / references (and, to anchor the ladder on it again, shared.reference). Its
+#                          hyperparameter grid and the gates that validate it (G1 / G2 / G4) are kept below, unchanged.
+#   gp_mll_refit           converged type-II ML GP refitted on D + {(x', y')} per probe. Part A on EVERY cell (the
+#                          empirical-Bayes band of the yardstick; user, 2026-10-19 -- runs on Narval); Part B: level 1.
+#                          The LADDER REFERENCE (shared.reference, 2026-10-21): fitted on every cell where Part B runs,
+#                          also at levels 2 / 4 where coverage keeps it out of Part B (fit + base only there).
+#   gp_fixed               l = ln 2, s^2 = 1, sigma^2 = 0.05, closed form (exact Bayes, other prior)
+#   gp_mll_frozen          type-II ML GP fitted on D, closed-form update with frozen hyperparameters. SCOPED EXCEPTION
+#                          (user, 2026-10-19) to "GP-MLL frozen is gone everywhere" (2026-10-14): a Part B reference
+#                          for Hypothesis C1 ONLY -- never a coherence engine, never read in C2 (the runner refuses it
+#                          in Part A).
+#
+# GRID. NHP subjects [0, 1, 2, 3] (user, 2026-10-15: subject 2 included, DS1's exclusion rule dropped).
+# K2-channel levels [1, 2, 4]; the shared ladder t = 10 / 25 / 50 / 80 (configs/context/nhp.yaml); 2 context draws.
+# Per cell: 8 anchors uniform over the unobserved sites + 4 over the observed ones (the revisit); the two pools are
+# never pooled. One cell = (channel, level, t, draw) running every engine enabled for it; metric rows only.
+# Cells are keyed by the full engine list (engines_a / engines_b / engine_params) and the ladder reference, so
+# re-adding GP-Bayes later recomputes EVERY cell -- there is no incremental add of an engine to a cached grid.
+#
+# METRICS. Part A (per engine, per anchor, RQMC 8 scrambles x 8 points in u-space through the model's own quantile
+# function at x'; adopted 2026-10-19 after G1 passed, see quadrature below): drift_abs = median |delta| on the influenced sites I = {M(x) >= eps s^2(x)}, eps = 0.01;
+# drift_w1; shrink_move_ratio = median U/M on I (Bayes = 1); total_var_ratio; per pool cov_asymmetry,
+# psd_neg_mass; latent_frac and implied_noise at x'; sigma_recovery_rho (Spearman over a cell's anchors of
+# implied_noise vs the empirical variance of the trials at x'; closes roadmap M5).
+# Part B (TabPFN vs each reference, SITE-MATCHED before any aggregate): on 8 held-out real trials at x' -- gain,
+# footprint_r and transfer_slope (unobserved off-anchor sites), far_field_share (>= 4 pitches), gap_before /
+# gap_after / gap_change (W1 / reference SD), delta_crps (per site and held-out trial, TabPFN - reference); on the
+# ladder y' = mu_ref(x') + c s_ref(x'), c in +-{0.5, 1, 2, 3}, ref = shared.reference (GP-MLL refit since
+# 2026-10-21): saturation and the surprise response.
+#
+# HEADLINE METRICS (pre-declared before any grid cell; amended 2026-10-16 and 2026-10-19, user):
+#   Part A: the three identities -- drift_abs (Bayes 0), total_var_ratio (Bayes 1; replaced shrink_move_ratio
+#   2026-10-16), cov_asymmetry (Bayes 0). Secondary: latent_frac, sigma_recovery_rho, shrink_move_ratio, drift_w1.
+#   Part B: NO single headline reference (2026-10-19) -- transfer_slope, footprint_r, gap_change, delta_crps and
+#   saturation in two C2 columns (gp_mll_refit, gp_fixed; gp_bayes dropped from the grid 2026-10-21).
+#   C1 (descriptive, no pass/fail): transfer_slope and footprint_r vs gp_mll_frozen (perfect GP = 1), gain and
+#   far_field_share (perfect GP = gp_mll_frozen's own), saturation (= 1); transfer_profile.csv (mean |T| per distance
+#   bin) and c1_exemplar.npz (change maps at the common anchor, y' = mu_ref + c1.exemplar_c s_ref). Figures: one
+#   readouts panel figure, update exemplar, update vs distance, surprise response; engines tabpfn_v2_5, gp_mll_frozen,
+#   gp_mll_refit, gp_fixed. Surprise in GP-MLL refit's predictive SD at x' (the ladder reference, shared y'; GP-Bayes
+#   SD until 2026-10-21), not each model's own SD as in the archived M10.
+#
+# DISCREPANCY (the former gate G0, archived as a report on 2026-10-15 -- user: "G0 was only to pre-screen"). The
+#   frozen-preprocessing probe vs the refit on D + {(x', y')}, first 2 channels of every subject, level 1, draw 0,
+#   every t, 12 anchors x (3 held-out trials + ladder +-3): per site and probe the signed d_mean = (mu_f - mu_r) / s_r
+#   and d_sd = (s_f - s_r) / s_r, summarised by t x probe x pool (frozen_refit_discrepancy{,_sites}.csv). It feeds the
+#   follow-up analysis of WHY they differ; no pass/fail. For the record, G0 as pre-registered (median |d_mean| <= 0.02,
+#   p95 <= 0.05, median |d_sd| <= 0.05 over t in {10, 50}) FAILED on 2026-10-15 (0.012 / 0.108 / 0.029; t = 50 alone
+#   0.004 / 0.021 / 0.021; t = 10 0.039 / 0.121 / 0.044, driven by the +-3 SD ladder probes). Archived gates.json:
+#   output/archive/omega_gates_2026-10-15/.
+#
+# GATES (pre-registered; gates.json). On the first 2 channels, level 1, draw 0. Aggregation is the WORST anchor
+# unless stated. TabPFN = the refit engine throughout.
+#   G1 exact floor, every t: gp_fixed max over sites and anchors of |delta|, |R - 1|, cov_asymmetry and |C - k_C|
+#      <= 1e-8; gp_bayes per-anchor median-on-I |delta| <= 1e-3, |R - 1| and cov_asymmetry <= 1e-2. FAIL -> a bug.
+#      RE-STATED for rqmc (user, 2026-10-16; decided before any grid cell): GP-Bayes's moment-matched residual must be
+#      consistent with zero -- every anchor's drift and total-variance z (median_I |scramble mean| / median_I SE) and
+#      every pool's asymmetry z <= the Bonferroni-corrected |t_{S-1}| at alpha = 0.05 over all of G1's tests; the
+#      median z is reported beside it (null ~ 0.7). A flat 3 SE would fail an exact model by chance (worst of ~200
+#      near-|t_7| draws; measured worst 4.4 at 8 x 16, medians 0.81 / 0.61). gp_fixed keeps the 1e-8 floor.
+#   G2 power, every t: toy_gain (x1.5) median U/M <= 0.5; toy_bias (+0.25 s(x')) median |delta| on I >= 0.05.
+#   G3 quadrature -- DROPPED 2026-10-16 (user): under rqmc each TabPFN anchor carries its own SE (``*_se``) and the
+#      tail flag y_quad_max_z (largest quadrature |y' - mu| / s); G3 under Gauss-Hermite on the refit is archived in
+#      output/mechanism/bayes_update/nhp/nhp-refit-gates/gates.json (drift, total_var_ratio, latent_frac 8/8).
+#   G4 GP-Bayes grid: median ESS >= 10 at every t; at 2x density per axis (2n - 1, nested), t in {10, 50}, the
+#      TabPFN-vs-GP-Bayes headline medians move <= 10 % or <= 0.01 (a pure 10 % rule is unstable for
+#      metrics near 0 such as delta_crps).
+#   G5 seed floor -- REPLACED 2026-10-16 (user) by a seed design: a grid cell's TabPFN inference seed is
+#      tabpfn.inference_seed + its context draw, so every between-draw interval carries seed variance (seed and
+#      context-draw variance are not separated). The 10-seed ICCs on the refit stay as a diagnostic
+#      (nhp-refit-gates/gates.json): per-anchor drift_abs ICC ~ 0 (seed SD 0.006-0.008), so per-anchor drift is not
+#      reported; sigma_recovery_rho is attenuated by seed noise.
+# WORDING (guardrail G7, 2026-10-19): captions say "within" / "beyond the empirical-Bayes band" per readout and t,
+# never the bare words "Bayesian" / "non-Bayesian". C1 is descriptive. The predictive link is exploratory.
+#
+# INTERPRETIVE YARDSTICK (pre-declared; amended 2026-10-21). TabPFN's Part A violations are read against the
+# exact-Bayes floor -- gp_fixed in the grid, plus G1's certification of the estimator (gp_fixed <= 1e-8 and GP-Bayes's
+# residual consistent with zero, passed 2026-10-19) and the per-anchor RQMC standard errors -- and the empirical-Bayes
+# band (gp_mll_refit). "Within empirical-Bayes": TabPFN's median violation <= the refit GP's at the same t and pool.
+# "Beyond": >= 2x the refit GP's.
+#
+# DEVIATIONS FROM THE PLAN, decided before any run (2026-10-15):
+#   quadrature.u_min = 1e-12, not 1e-6. At K = 20, u_min = 1e-6 clips three node pairs (|z| = 5.5, 6.5, 7.6), not
+#   only the outermost: second-moment error 1.05e-6, which alone fails G1's 1e-8 floor. 1e-12 clips only the outermost
+#   pair (error 2e-12).
+#   y_grid.u_tail = 1e-4: TabPFN's two outer buckets hold ~2e-5 mass each over ~33 z-units; a 1e-6 tail would
+#   stretch every per-site grid to +-40 and starve the body of resolution.
+#   GP-Bayes CDFs (W1 / CRPS only) use a binned convolution above 64 components (W1 error <= 0.2 % of an SD,
+#   measured on NHP); its means and variances, hence all of Part A's moment readouts and G1, stay exact.
+#
+# DEVIATION, 2026-10-21 (user; decided before any grid cell -- the grid has NOT run, pre-run amendment of 9d918ad):
+#   GP-Bayes leaves the Hyp C grid (high compute, low novelty); GP-MLL refit and GP-fixed are the C2 references,
+#   GP-MLL frozen stays the C1-only reference. The implementation stays available and is re-enabled by config.
+#   - engines: gp_bayes removed -> [tabpfn_v2_5, tabpfn_v2_5_t1, gp_mll_refit, gp_fixed, gp_mll_frozen].
+#   - references: gp_bayes removed -> [gp_mll_refit, gp_fixed, gp_mll_frozen].
+#   - shared.reference: gp_mll_refit (new key; the code default is gp_bayes): the ladder y' = mu_ref + c s_ref, the
+#     surprise response and the C1 surprise axis / c1_exemplar y' are in GP-MLL refit's predictive SD.
+#   - exemplar.engines: [tabpfn_v2_5, gp_mll_refit] (gp_bayes removed).
+#   - run: gates false (G1 / G2 / G4 passed 2026-10-19 and are recorded), discrepancy false (the report is done).
+#   - Yardstick: the exact-Bayes floor is gp_fixed plus the G1 certification and the per-anchor RQMC SEs.
+#   - link.references now defaults to "all" (every reference of the run).
+#   - Kept unchanged so GP-Bayes and the gates can be re-enabled by config: the gp_bayes grid block and gates block.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp.yaml --set bayes_update.run.grid=false
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp.yaml
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp.yaml --only-cached
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp.yaml --replot
+defaults:
+  dataset: nhp
+  context: nhp
+
+analysis: bayes_update
+tag: nhp-m8link
+device: cpu
+seed: 42
+output_root: output
+
+dataset:
+  subjects: [0, 1, 2, 3]
+
+bayes_update:
+  # gp_bayes: available, NOT in the grid (user, 2026-10-21); re-enable by adding it to engines / references.
+  engines: [tabpfn_v2_5, tabpfn_v2_5_t1, gp_mll_refit, gp_fixed, gp_mll_frozen]
+  references: [gp_mll_refit, gp_fixed, gp_mll_frozen]
+  coverage:
+    gp_mll_refit:
+      B: {levels: [1.0]}
+  c1: {reference: gp_mll_frozen, engines: [tabpfn_v2_5, gp_mll_frozen, gp_mll_refit, gp_fixed],
+       distance_bins: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 14.0], exemplar_c: 1.0}
+  stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
+  n_context_draws: 2
+  anchors: {n_unobserved: 8, n_observed: 4}
+  # method: gauss_hermite (plan) | truncated (central_mass) | rqmc (n_scrambles; K = points per scramble).
+  # rqmc, 8 scrambles x 8 points = 64 per anchor (user, 2026-10-16; adopted 2026-10-19 after G1 passed at 8 x 8 on the
+  # refined GP-Bayes grid: worst z 5.03 vs critical 6.86, median drift / total-variance z 0.92 / 0.71, drift SE 0.0015).
+  # Gauss-Hermite K = 20 and truncated 99.99 % both failed G1 (GP-Bayes drift 0.013 / 0.020, no error bar).
+  quadrature: {method: rqmc, K: 8, u_min: 1.0e-12, central_mass: 1.0, n_scrambles: 8}
+  eps: 0.01
+  y_grid: {points: 512, u_tail: 1.0e-4}
+  # reference: the ladder-anchor engine (2026-10-21; GP-Bayes before): y' = mu_ref(x') + c s_ref(x').
+  shared: {n_trials: 8, ladder: [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0], saturation_c: [1.0, 3.0],
+           reference: gp_mll_refit}
+  far_pitch: 4.0
+  tabpfn: {inference_seed: 0, precision: fp32, max_batch_tokens: 400000, softmax_temperature: 0.9}
+  # Unused while gp_bayes is not an engine (2026-10-21); kept so it can be re-enabled; the gates read it.
+  # lengthscale axis refined 12 -> 23 points (G4 (b), user 2026-10-15); outputscale 8 -> 11 and noise 10 -> 13 (user,
+  # 2026-10-16: footprint_r moved +16 % against the 15 x 19 check at 8 x 10, a single comparison). G4 re-checks the
+  # new grid against 45 lengthscales and against 15 outputscales x 19 noises.
+  gp_bayes: {lengthscale: [0.05, 2.0, 23], outputscale: [0.05, 5.0, 11], noise: [1.0e-3, 1.0, 13], b2: 1.0,
+             prune_mass: 1.0e-10, chunk: 2048, exact_max_components: 64, sd_bins: 32}
+  # The converged L-BFGS GP of the paper (P0.10), plus the mechanism-only lengthscale floor of 2026-10-01 (half the
+  # finest NHP grid step); keep in step with configs/model/gp_mll.yaml by hand.
+  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5,
+              lengthscale_floor: 0.05}
+  # Keep in step with configs/model/gp_naive.yaml by hand.
+  fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.05}
+  exemplar: {enabled: true, subject: null, emg: null, level: 1.0, draw: 0,
+             engines: [tabpfn_v2_5, gp_mll_refit]}
+  # Figure-only key (not in any cell identity): context sizes drawn as panels of the surprise and distance figures.
+  # t = 80 added after the grid (user, 2026-10-22); the grid computed every t, so nothing is recomputed.
+  panel_ts: [10, 50, 80]
+  # gates / discrepancy off (2026-10-21): G1 / G2 / G4 passed 2026-10-19 and are recorded; the discrepancy
+  # report is done. Both stay runnable by config.
+  run: {gates: false, grid: true, discrepancy: false}
+  discrepancy: {channels_per_subject: 2, context_ts: null, n_trials: 3, ladder: [-3.0, 3.0]}
+  gates:
+    only: null
+    n_channels: 2
+    g1: {fixed_tol: 1.0e-8, bayes_drift_tol: 1.0e-3, bayes_tol: 1.0e-2, bayes_alpha: 0.05}
+    g2: {gain_mult: 1.5, bias_sd: 0.25, max_shrink_move: 0.5, min_drift: 0.05}
+    g4: {min_ess: 10.0, context_ts: [10, 50], rel_tol: 0.10, abs_tol: 0.01,
+         dense: [{lengthscale: 45}, {outputscale: 15, noise: 19}]}
+  # M8 reading (2026-10-22, exploratory): the only block that differs from mechanism_bayes_update_nhp.yaml (link off there)
+  link: {tidy_csv: output/benchmark/nhp/hyp-a-nhp/tidy.csv, model: tabpfn_v2_5, level: 1.0,
+         outcomes: [recommended_regret, cumulative_regret, r2, breakdown], predictors: all, n_boot: 2000,
+         acq_label: ts_marginal, stress_tidy_csv: output/stress/k2_channel/nhp/stress-k2-channel-draws-nhp/tidy.csv}

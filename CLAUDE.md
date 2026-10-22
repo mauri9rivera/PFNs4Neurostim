@@ -181,14 +181,14 @@ PFNs4Neurostim/
 │   ├── dataset/                 ← nhp · 5d_rat · spinal
 │   ├── model/                   ← tabpfn_v2_5 · gp_mll · gp_naive · random
 │   ├── acquisition/             ← ei · ucb · pi · ts_marginal · ts_joint · greedy · random
-│   ├── experiment/              ← hyp_a_nhp · hyp0_acq_core_nhp · stress_k2_{nhp,5d_rat}
+│   ├── experiment/              ← hyp_a_* · hyp0_* · stress_* · mechanism_{bayes_update,representation,placement,cka}_*
 │   └── legacy/                  ← the 24 pre-restructure YAMLs
 ├── data/  output/  logs/        ← gitignored; symlinks into $SCRATCH on the cluster
 ├── libs/                        ← git submodules, READ-ONLY (PFNs, PFNs4BO, tabpfn-v1-prior)
 ├── scripts/                     ← mila_setup.sh · run_stress_sweep.sh · run_*_experiments.sh
 ├── tests/                       ← mirrors the package (+ integration/, shadow/)
 └── src/pfns4neurostim/
-    ├── __main__.py              ← CLI dispatch: bo_benchmark | stress_sweep
+    ├── __main__.py              ← CLI dispatch: bo_benchmark | stress_sweep | mechanism
     ├── config.py                ← YAML group composition, validation, --set, resolved dump
     ├── seeding.py               ← set_seed, rng_for/seed_for (per-cell reproducibility)
     ├── data/
@@ -214,8 +214,10 @@ PFNs4Neurostim/
     │   ├── robustness.py        ← breakdown point, degradation AUC, CVaR, relative robustness
     │   ├── stats.py             ← TOST, equivalence margins, bootstrap
     │   └── results.py           ← tidy schema + run-dir I/O
-    ├── experiments/             ← bo_benchmark.py (Hyp 0/A) · stress_sweep.py (Hyp B) · mechanism.py (Hyp C)
-    ├── analysis/                ← update_rule.py (M10) · placement.py · cka.py · embeddings.py · predictive_link.py (Hyp C)
+    ├── experiments/             ← bo_benchmark.py (Hyp 0/A) · stress_sweep.py (Hyp B) · mechanism.py (Hyp C: bayes_update,
+    │                               representation, placement, cka)
+    ├── analysis/                ← bayes_update.py (OMEGA: C1 / C2 output) · representation.py · cka.py · procrustes.py (BETA)
+    │                               · embeddings.py · context.py · placement.py · predictive_link.py (M8) (Hyp C)
     ├── visualization/           ← style.py (single source of style) · bo · stress · mechanism
     └── legacy_code/             ← superseded CLIs, finetuning/LoRA, old loop and plotting
 ```

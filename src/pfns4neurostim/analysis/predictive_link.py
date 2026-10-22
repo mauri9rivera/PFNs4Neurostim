@@ -39,6 +39,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
+from ..evaluation.results import canonical_demo_column
 from ..evaluation.robustness import breakdown_point
 
 __all__ = [
@@ -387,6 +388,9 @@ def channel_breakdown(
     missing = [c for c in need if c not in stress]
     if missing:
         raise ValueError(f"predictive link: the stress tidy.csv has no column(s) {missing}.")
+    if "demo" in stress:
+        # pre-2026-09-27 cells keep their legacy spelling (demo2 = draws); readers resolve it (2026-10-13 decision)
+        stress = stress.assign(demo=canonical_demo_column(stress["demo"]))
     m = _one_model(stress, model, acq_label, "the stress tidy.csv")
     r = _one_model(stress, reference, acq_label, "the stress tidy.csv")
     for col in ("knob", "demo"):
