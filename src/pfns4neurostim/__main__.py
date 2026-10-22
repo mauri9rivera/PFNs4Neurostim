@@ -46,7 +46,7 @@ def _bo_benchmark(argv: list[str]) -> int:
 
 
 def _mechanism(argv: list[str]) -> int:
-    """Dispatch to the Hyp C mechanism analyses (update rule, placement, CKA).
+    """Dispatch to the Hyp C mechanism analyses (bayes_update, placement, CKA (b), representation).
 
     Args:
         argv: Remaining CLI arguments.

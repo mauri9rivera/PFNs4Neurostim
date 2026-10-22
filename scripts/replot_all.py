@@ -49,6 +49,21 @@ def _config_index() -> tuple[dict[tuple[str, str], str], dict[tuple[str, str], s
     return by_family, by_run_name
 
 
+def mechanism_run_dir(path: str, output: str) -> str:
+    """The run directory a mechanism YAML writes, under the output root ``output``.
+
+    Args:
+        path: A ``configs/experiment/mechanism_*.yaml``.
+        output: The output root.
+
+    Returns:
+        ``{output}/mechanism/{ANALYSIS_SUBDIR.get(analysis, analysis)}/{dataset}/{tag}``, from the composed config.
+    """
+    from pfns4neurostim.experiments.mechanism import load_mechanism_config  # noqa: PLC0415 - only for mechanism runs
+
+    return load_mechanism_config(path, [f"output_root={output}"]).run_dir
+
+
 def commands(output: str) -> list[list[str]]:
     """Return one replot command per run directory.
 
@@ -76,10 +91,11 @@ def commands(output: str) -> list[list[str]]:
             continue
         cmds.append([cfg["experiment"], "--config", yaml_path, "--replot", "--run-dir", run])
     for path in sorted(glob.glob(os.path.join(EXPERIMENT_DIR, "mechanism_*.yaml"))):
-        raw = _yaml(path)
-        analysis = path.split("mechanism_")[1].rsplit("_", 1)[0]
-        dataset = (raw.get("defaults") or {}).get("dataset")
-        if glob.glob(os.path.join(output, "mechanism", analysis, str(dataset), "*", "*.csv")):
+        # The run directory comes from the YAML itself -- its `analysis` key, the analysis' sub-path and its `tag` --
+        # resolved exactly as the runner resolves it (BETA §2.6): deriving the analysis from the file name missed
+        # every config whose name is not `mechanism_<analysis>_<dataset>.yaml` (e.g. the 5d_rat placement run).
+        run_dir = mechanism_run_dir(path, output)
+        if glob.glob(os.path.join(run_dir, "*.csv")):
             cmds.append(["mechanism", "--config", path, "--replot"])
     if missing:
         print("[replot_all] skipped, no current experiment YAML produces:\n  " + "\n  ".join(missing), file=sys.stderr)

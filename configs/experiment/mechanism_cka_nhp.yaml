@@ -1,27 +1,22 @@
-# Task #5 - CKA redesign (P0.5; B1, 2026-10-06), secondary to the update-rule analysis (#9).
+# CKA (b): embedding placement of the feature-token mean (task #5, P0.5; B1, 2026-10-06), NHP.
 #
-# The CKA analyses ask how TabPFN-2.5 represents the ELECTRODE GEOMETRY given its evidence, so they read the
-# FEATURE tokens of every query row (the 2 feature-group tokens NHP's inputs become), never the label token.
+# Places each channel's layer-wise feature-token-mean embedding between the on-grid prior bank (TabPFN v1 prior bag,
+# the floor) and the noise bank (the ceiling), row by row with debiased CKA, at every context size of the shared
+# ladder configs/context/nhp.yaml = [10, 25, 50, 80]. Reported statistic: the rank placement p_rank (2026-10-12);
+# the ratio p stays on disk as the frozen reference. Figures cka_placement.svg and cka_placement_surface.svg.
 #
-# (a) debiased linear CKA between the layer-wise feature-token embeddings of all N sites (query rows) and target
-# kernels on the same sites: K_X (geometry, a control), K_GT (RBF on the standardized response), K_GT_linear
-# (sensitivity), K_GP (MLL-GP posterior covariance on the same context); site-permutation null. Controls: known-kernel
-# map exceeds the null, a pure-noise map does not, x10 inference seeds ICC >= 0.75.
-# (b) placement: row-by-row CKA of the feature-token mean against on-grid prior maps at the same context sites.
+# TRIMMED 2026-10-21 (BETA §7, D5): CKA (a) -- the feature tokens against K_X / K_GT / K_GT_linear / K_GP with a
+# site-permutation null, its M0 controls, the per-token shadow readout and the K_GP ceiling -- is replaced by the
+# `representation` analysis (configs/experiment/mechanism_representation_nhp.yaml). The analysis name `cka` is kept
+# (D5), and so are `layers` and `inference_seed`: both enter every (b) cell identity, so the cells re-run on
+# 2026-10-21 for the subject-2 backfill keep serving.
 #
-# Label token DROPPED 2026-10-07 (user decision): the decoder reads only that token, so it carries the prediction.
-# Its CKA against K_GT re-measures prediction accuracy (Hyp A's R^2) and its placement re-places the predicted map
-# among prior maps (what C3's MMD / W2 placement already does); neither speaks to the representation of the geometry.
-# The decoder stages that followed it (dec_hidden / dec_logits / dec_probs) went with it. Measured on the 18-channel
-# run before the drop: label-token CKA to K_GP 0.13-0.18 (the lowest of all targets), so it was not "GP-like" either.
-# Ladder: the shared NHP ladder configs/context/nhp.yaml = [10, 25, 50, 80].
-#
-# Cells and resume (B3): one cell per (channel, level, t, draw, readout) for (a), one per (grid, t, draw) for (b),
-# cached under output/cells/nhp/mechanism_cka/; the MLL-GP posterior of each context is a cached artifact. A killed
-# job resumes; --only-cached assembles what exists.
+# Cells: one per (grid, t, draw) over the grid's FULL channel list, cached under output/cells/nhp/mechanism_cka/; the
+# prior and noise banks are cached artifacts. Never split this unit by subject.
 #
 #   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml
 #   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml --only-cached
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml --replot
 defaults:
   dataset: nhp
   context: nhp
@@ -34,37 +29,9 @@ output_root: output
 
 cka:
   layers: null                 # all 18 blocks
-  readouts: [feature_mean]
-  targets: [K_X, K_GT, K_GT_linear, K_GP]
-  stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
-  # Each cell is ONE context draw: TabPFN is conditioned on t known sites, all n_sites rows are embedded, and
-  # CKA is computed per draw and AVERAGED afterwards (paired design: draws are averaged within a channel before
-  # the spread over channels is taken; rows are NOT pooled across draws). The draw count follows the rule
-  #     n_context_draws = ceil(TARGET * 192 / n_sites),  TARGET = 5  (settled 2026-09-27)
-  # so datasets with different grid sizes get the same amount of averaging. One draw gives 96 < 192 rows, the
-  # n << d regime debiased CKA only partly rescues, which is why draws are averaged.
-  # => NHP 10 draws; spinal (64 sites) 15; rat (32 sites) 30.
-  #
-  # Cost (B1 Step 7, re-measured 2026-10-06). The site-permutation null was ~97 % of the cost: one
-  # permutation_null of 1000 draws took ~80 ms per (layer, target). Its permutations depend on the target only,
-  # so they are now drawn ONCE per target and shared by every layer of the cell (analysis/cka.cka_null_draws):
-  # 21 layers x 1000 permutations went 1.74 s -> 0.12 s (14x), identical to 1e-13. That removes the reason to
-  # cut targets, so all four stay at every context size; K_X remains a control and K_GT_linear a sensitivity
-  # check, neither is a headline panel. Cells: 18 ch x 3 levels x 4 t x 10 draws = 2160 (~0.7 s each).
-  n_context_draws: 10
-  # Kept at 1000: the null mean is already ~1000x better resolved than the effect, and min p = 1/(n_perm+1)
-  # must clear the Bonferroni threshold alpha/layers = 0.05/18 = 2.8e-3 (n_perm >= 359).
-  n_perm: 1000
   inference_seed: 0
-  # Converged GP reference (2026-09-30, option A): the settings `gp_mll` itself uses, restated by hand (the
-  # engines build GPSurrogate(**gp_params) directly). lengthscale_floor 0.05 is MECHANISM ONLY (2026-10-01): it
-  # binds on degenerate ARD fits (minimum lengthscale ~1e-4) and nothing else. The GP runs on CPU.
-  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5, lengthscale_floor: 0.05}
-  controls: {grid_side: 10, lengthscale: 0.2, noise_sd: 0.3, n_trials: 10, t: 25, alpha: 0.05, n_seeds: 10, icc_min: 0.75, n_seed_channels: 1}
-  # CKA (b), rescaled 2026-09-27 (t, bank_quantile, n_prior 100, n_noise 30, min_gap) and swept over the shared
-  # ladder since 2026-09-30 (n_draws 5 pays for the context axis). Places the feature-token mean
-  # (mechanism.CKA_PLACEMENT_READOUT); figures cka_placement.svg and cka_placement_surface.svg.
+  # Rescaled 2026-09-27 (t, bank_quantile, n_prior 100, n_noise 30, min_gap) and swept over the shared ladder since
+  # 2026-09-30 (n_draws 5 pays for the context axis). Places the feature-token mean (mechanism.CKA_PLACEMENT_READOUT).
   placement: {enabled: true, n_prior: 100, n_prior_holdout: 30, n_noise: 30,
               n_draws: 5, min_gap: 0.02, bank_quantile: 0.10, n_dense: 1024, holdout_frac: 0.1,
               rmse_threshold: 0.5, prior_type: prior_bag}
-  shadow: null

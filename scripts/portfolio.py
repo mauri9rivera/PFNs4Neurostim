@@ -215,15 +215,17 @@ UNITS: tuple[Unit, ...] = (
     _u("C1. OMEGA bayes_update, NHP", "mechanism", "mechanism_bayes_update_nhp",
        "nhp", _TP, (), group="hypc", hours=7.0,
        note="hours are a placeholder until OMEGA Step 6 times one full cell; cells are cached per (channel, level, t, draw), so a timed-out job resumes on resubmission"),
-    _u("C2. CKA (a) + (b), readouts feature_mean / label_token + decoder stages, NHP", "mechanism", "mechanism_cka_nhp",
-       "nhp", _TP, (), group="hypc", hours=1.7,
-       note="MEASURED: (a) 0.7 s per cell after the batched permutation null (4320 cells ~0.85 h, was 5.8 s per "
-            "cell); (b) ~47-50 s per (t, draw, readout) cell at 2 channels, ~1 min at 18 (40 cells ~0.7 h); "
-            "controls ~5 min. (b) cells are keyed by the grid's full channel list: never split this unit by subject"),
-    _u("C2b. CKA shadow run, per-feature-token readout (t = 25), NHP", "mechanism", "mechanism_cka_tokens_nhp", "nhp",
-       _TP, (), group="hypc", hours=0.3,
-       note="after C2 in the SAME cell store: its feature_mean cells (540) are then cache hits and only the 540 "
-            "feature_tokens cells compute (~1 s each); writes shadow_criterion.json (pre-registered IQR ratio < 0.75)"),
+    _u("C2. CKA (b) embedding placement of the feature-token mean, NHP", "mechanism", "mechanism_cka_nhp",
+       "nhp", _TP, (), group="hypc", hours=0.7,
+       note="MEASURED: (b) ~47-50 s per (t, draw) cell at 2 channels, ~1 min at 18 (40 cells ~0.7 h). CKA (a), its "
+            "controls and the C2b shadow run were removed on 2026-10-21 (BETA s7; replaced by C5). (b) cells are keyed "
+            "by the grid's full channel list: never split this unit by subject"),
+    _u("C5. BETA representation (beta2 label-token alignment, beta1a site match, beta1b posterior covariance), NHP",
+       "mechanism", "mechanism_representation_nhp", "nhp", _TP, (), group="hypc", hours=None,
+       note="NOT TIMED. beta2 + beta1a: one cell per (channel, level, t, draw), 528 cells, one TabPFN forward + two GP fits "
+            "each (x2 with the trial ceiling). beta1b (posterior_cov): 32 cells of 96 anchors x RQMC 8 x 8 refits, "
+            "~30 min GPU each (D3b estimate), Narval only; split beta1b off with "
+            "--set representation.posterior_cov.enabled=false for the CPU part. Cells shard by subject"),
     _u("C3. Placement MMD / W2 (ladder 10/25/50/80 + full map), NHP", "mechanism", "mechanism_placement_nhp", "nhp",
        (), ("placement",), group="hypc", cpu_only=True, hours=4.9,
        note="ESTIMATED from the 2026-10-01 local run (6.8 h at 6 sizes + full; formulation C dominates, ~430 s per "

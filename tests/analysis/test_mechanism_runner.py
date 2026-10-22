@@ -78,19 +78,21 @@ def test_placement_runner(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) -> No
     assert os.path.exists(os.path.join(out, "placement_context.svg"))
 
 
-def test_cka_runner_rejects_unresolvable_permutation_count(tmp_path, tiny) -> None:
-    cfg = _config(tmp_path, """
-        analysis: cka
-        cka:
-          n_perm: 100
-    """)
-    with pytest.raises(ValueError, match="Bonferroni"):
-        mechanism.run_mechanism(cfg)
+def test_cka_runner_refuses_the_retired_cka_a_keys(tmp_path, tiny) -> None:
+    """CKA (a) was removed on 2026-10-21 (BETA §7): its keys are refused, never silently ignored."""
+    for key in ("targets: [K_GT]", "n_perm: 1000", "readouts: [feature_mean]", "shadow: null"):
+        cfg = _config(tmp_path, f"""
+            analysis: cka
+            cka:
+              {key}
+        """)
+        with pytest.raises(ValueError, match="Unknown cka key"):
+            mechanism.run_mechanism(cfg)
 
 
 @pytest.mark.slow
 @pytest.mark.gpu
-def test_cka_runner_end_to_end(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cka_placement_runner_end_to_end(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) -> None:
     from pfns4neurostim.data.references import grid as G
 
     real = G.prior_grid_bank
@@ -105,38 +107,20 @@ def test_cka_runner_end_to_end(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) 
         analysis: cka
         cka:
           layers: [0, 17]
-          readouts: [feature_mean, feature_tokens]
-          stress: {knob: k2_channel, levels: [1.0]}
-          n_context_draws: 1
-          n_perm: 120
-          gp_params: {n_opt_steps: 20, lr: 0.1}
-          controls: {grid_side: 7, lengthscale: 0.25, noise_sd: 0.3, n_trials: 6, t: 15, alpha: 0.05, n_seeds: 2, icc_min: 0.75, n_seed_channels: 1}
           placement: {enabled: true, n_prior: 6, n_prior_holdout: 2, n_noise: 2, n_draws: 1, min_gap: 0.0, bank_quantile: 0.5, n_dense: 256, holdout_frac: 0.1, rmse_threshold: 0.5, prior_type: prior_bag}
     """, sizes="[10, 15]")
     out = mechanism.run_mechanism(cfg, ["device=cuda"])
-    df = pd.read_csv(os.path.join(out, "cka.csv"))
-    # Layers keep their block index (0 and 17, not 0 and 1); only feature-token readouts exist.
-    assert set(df["layer"]) == {0, 17} and "stage" not in df
-    assert set(df["readout"]) == {"feature_mean", "feature_tokens"}
-    assert {"K_X", "K_GT", "K_GP"} <= set(df["target"]) and set(df["context_t"]) == {10, 15}
-    for name in ("cka_vs_layer_feature_mean", "cka_vs_layer_feature_tokens"):
-        assert os.path.exists(os.path.join(out, f"{name}.svg"))
-    assert not os.path.exists(os.path.join(out, "cka_readouts.svg"))
-    gates = json.load(open(os.path.join(out, "gates.json")))
-    assert {g["gate"] for g in gates} == {"positive_control", "negative_control", "seed_stability"}
-    assert {g["readout"] for g in gates} == {"feature_mean", "feature_tokens"}
+    assert not os.path.exists(os.path.join(out, "cka.csv"))                 # CKA (a) is gone
     # CKA (b): the context ladder is swept, and the work that does not depend on the channel is shared
     # (2026-09-30). Channels on one grid see the SAME context sites at a given (t, draw), so their floor and
     # ceiling must come out as identical numbers -- that identity is what the restructure bought.
     pl = pd.read_csv(os.path.join(out, "cka_placement.csv"))
     assert set(pl["context_t"]) == {10, 15}
+    assert set(pl["layer"]) == {0, 17}
     assert pl["grid_id"].nunique() == 1
     for _keys, part in pl.groupby(["context_t", "draw", "layer"]):
         assert part["floor1"].nunique() == 1 and part["ceiling1"].nunique() == 1
     assert "readout" not in pl                                                 # CKA (b) = feature-token mean
-    # The rank placement is the REPORTED statistic (2026-10-12) and the ratio ``p`` stays on disk as the frozen
-    # reference it is compared against. The rank is bounded in [0, 1] by construction -- the whole reason it
-    # replaced the ratio, whose denominator ``gap`` has a median of 0.049 on the real NHP run.
     assert {"rank_vs_floor", "rank_vs_ceiling", "p_rank", "p"} <= set(pl.columns)
     for col in ("rank_vs_floor", "rank_vs_ceiling", "p_rank"):
         assert pl[col].between(0.0, 1.0).all(), f"{col} left [0, 1]"
@@ -145,11 +129,11 @@ def test_cka_runner_end_to_end(tmp_path, tiny, monkeypatch: pytest.MonkeyPatch) 
     for name in ("cka_placement", "cka_placement_surface",
                  "cka_placement_ratio", "cka_placement_ratio_surface"):
         assert os.path.exists(os.path.join(out, f"{name}.svg"))
-    # Resume (B3 Step 3): a second run is served entirely from the cell cache and reproduces the tables.
-    keys = ["readout", "subject", "emg", "level", "context_t", "rep", "layer", "target"]   # cka.csv columns
-    before = df.sort_values(keys).reset_index(drop=True)
+    # Resume (B3 Step 3): a second run is served entirely from the cell cache and reproduces the table.
+    keys = ["subject", "emg", "context_t", "draw", "layer"]
+    before = pl.sort_values(keys).reset_index(drop=True)
     mechanism.run_mechanism(cfg, ["device=cuda"], only_cached=True)
-    after = pd.read_csv(os.path.join(out, "cka.csv")).sort_values(keys).reset_index(drop=True)
+    after = pd.read_csv(os.path.join(out, "cka_placement.csv")).sort_values(keys).reset_index(drop=True)
     pd.testing.assert_frame_equal(before, after)
 
 
@@ -164,10 +148,11 @@ def test_shared_ladder_is_required_and_validated(tmp_path, tiny) -> None:
     with pytest.raises(ValueError, match="Unknown context key"):
         mechanism.load_mechanism_config(str(bogus))
     assert mechanism.load_mechanism_config("configs/experiment/mechanism_cka_nhp.yaml").context_sizes == (10, 25, 50, 80)
-    for name in ("mechanism_bayes_update_nhp", "mechanism_placement_nhp", "mechanism_placement_5d_rat"):
+    for name in ("mechanism_bayes_update_nhp", "mechanism_placement_nhp", "mechanism_placement_5d_rat",
+                 "mechanism_representation_nhp"):
         assert mechanism.load_mechanism_config(f"configs/experiment/{name}.yaml").context_sizes
-    assert mechanism.load_mechanism_config(
-        "configs/experiment/mechanism_cka_tokens_nhp.yaml").context_sizes == (25,)
+    for retired in ("mechanism_cka_tokens_nhp", "mechanism_procrustes_cka_nhp"):           # BETA §7, 2026-10-21
+        assert not os.path.exists(f"configs/experiment/{retired}.yaml")
 
 
 def _small_bayes_update(tmp_path, **extra: str) -> str:

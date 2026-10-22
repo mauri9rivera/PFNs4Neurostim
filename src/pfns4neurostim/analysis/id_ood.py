@@ -99,7 +99,7 @@ def _effective_n_ctx(n_context: float, n_total: int) -> int:
 
 
 # Phase-aligned layer indices for TabPFN v2 (18-layer model).
-# Maps the three-phase attention structure from Ye et al. (2025,
+# Maps the three-phase attention structure from Ye, Liu & Chao (NeurIPS 2025,
 # arXiv:2502.17361) Section 5, scaled from 12-layer to 18-layer:
 #   Early  (0-4):  label-token attention, attribute identity internalized
 #   Middle (5-12): uniform mixing, cross-attribute information exchange
