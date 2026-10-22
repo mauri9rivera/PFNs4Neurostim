@@ -1,4 +1,4 @@
-"""Hyp C mechanism analyses: Bayesian update (OMEGA, arm i), placement (MMD/W2), CKA, Procrustes.
+"""Hyp C mechanism analyses: Bayesian update (OMEGA), placement (MMD/W2), CKA (b) placement, representation (BETA).
 
 One CLI, one config family: the ``analysis`` key picks the runner and a same-named block
 holds its parameters (unknown keys raise, as everywhere else)::
@@ -8,6 +8,7 @@ holds its parameters (unknown keys raise, as everywhere else)::
     python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml
     python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml --replot
     python -m pfns4neurostim mechanism --config configs/experiment/mechanism_cka_nhp.yaml --only-cached
+    python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_nhp.yaml
 
 Outputs go to ``{output_root}/mechanism/{analysis}/{dataset}/{tag}/`` with the resolved
 ``config.yaml``; every figure is rebuilt from the CSVs alone with ``--replot``.
@@ -31,20 +32,20 @@ Cells by analysis:
 bayes_update          ``cell`` (channel, level, t, draw: every engine of the cell, metric rows only -- the
                       distributions are never cached); ``gate`` (G1, G2, G4); ``discrepancy`` (channel, t: the
                       frozen-preprocessing probe vs the refit, the former G0); ``exemplar`` (Omega-5, per t)
-cka                   ``a`` (channel, level, t, draw, readout); ``b`` (grid, t, draw; feature mean);
-                      ``gate`` (controls, per readout)
+cka                   ``b`` (grid, t, draw; feature mean): the embedding placement. CKA (a) (kind ``a``), its
+                      controls and the ``ceiling`` cells were removed on 2026-10-21 (BETA §7); their cached cells
+                      stay on disk, unread
 placement             ``B`` (channel); ``C`` (channel: every level and context size); ``gate`` (M0 ladder)
-procrustes            ``trajectory`` (channel, level, draw, readout): the whole context ladder of one draw,
-                      every layer, disparity + shuffled-site null + the CKA companion on the same pairs
+representation        ``cell`` (channel, level, t, draw: β2 alignment of the label token / feature mean / lens with
+                      belief targets, the smooth-field surrogate, ceilings, β1a site-matched W2 and the lens rows);
+                      ``posterior_cov`` (channel, level, t, draw on its coverage: β1b, C_PFN vs the references)
 ====================  ===================================================================================
 
-One analysis does **not** follow the ``{analysis}`` output path: ``procrustes`` writes under
-``{output_root}/mechanism/procrustes/cka/{dataset}/{tag}/`` (:data:`ANALYSIS_SUBDIR`, user requirement
-2026-10-14). It is the CKA analysis' complement -- the same clouds, the same pairs, one statistic that keeps the
-anisotropy CKA quotients out -- and the nesting says so on disk.
+The Procrustes trajectory (``procrustes``, nested under ``procrustes/cka``) was folded into ``representation`` on
+2026-10-21 (BETA D5): NBS and the shape distance are computed there on Gram matrices.
 
-**Artifacts** (same store, ``kind`` in the identity): ``bank`` / ``noise_bank`` per grid and ``gpfit``
-(the ``K_GP`` posterior covariance per context). Embeddings are deliberately *not* cached: at 18 blocks x
+**Artifacts** (same store, ``kind`` in the identity): ``bank`` / ``noise_bank`` per grid. Embeddings are
+deliberately *not* cached: at 18 blocks x
 96 sites x 192 dims a cell's embeddings are ~1.3 MB, ~4 GB+ for NHP, while recomputing one costs ~0.2 s; the
 cells above are what makes a re-run free. Caching the banks also pins them across hosts (G5): a
 requeued job on another node serves the same maps instead of re-sampling them with that node's numerics.
@@ -81,10 +82,10 @@ __all__ = [
     "MECHANISM_CACHE_VERSION",
 ]
 
-#: Output sub-path of an analysis under ``{output_root}/mechanism/``, when it is not the analysis name.
-#: ``procrustes`` is nested under ``cka`` because it is that analysis' complement on the same clouds and the
-#: same pairs (user requirement, 2026-10-14): a reader who opens the CKA tree finds the Procrustes curve in it.
-ANALYSIS_SUBDIR: dict[str, str] = {"procrustes": os.path.join("procrustes", "cka")}
+#: Output sub-path of an analysis under ``{output_root}/mechanism/``, when it is not the analysis name. Empty since
+#: the Procrustes analysis (nested under ``procrustes/cka``) was folded into ``representation`` (BETA D5,
+#: 2026-10-21); kept as the one place a nested layout would be declared (``scripts/replot_all.py`` reads it).
+ANALYSIS_SUBDIR: dict[str, str] = {}
 
 #: Invalidation stamp of every mechanism cell and artifact; bump it to discard them all.
 MECHANISM_CACHE_VERSION: int = 1
@@ -1772,36 +1773,27 @@ def run_placement(cfg: MechanismConfig, opts: RunOptions) -> str:
 
 
 # ---------------------------------------------------------------------------
-# cka (task #5, redesigned in B1 on 2026-10-06; feature tokens only since 2026-10-07)
+# cka (task #5; B1 2026-10-06): CKA (b) embedding placement only since BETA (2026-10-21)
 # ---------------------------------------------------------------------------
 #: The readout CKA (b) places. Placement asks where the network's representation of the electrode geometry sits
-#: between the prior and noise references; the per-token shadow readout is a CKA (a) question only.
+#: between the prior and noise references.
 CKA_PLACEMENT_READOUT: str = "feature_mean"
 
 #: Statistic set the placement (``b``) cell payload carries. A ``b`` cell caches its finished rows, so an older
 #: cell cannot serve a column it never computed; this stamp is part of the cell identity, so bumping it supersedes
-#: the previous generation without discarding it (the expensive ``a`` / ``gpfit`` cells are untouched). Bumped to 2
-#: on 2026-10-14, when ``rank_vs_floor`` / ``rank_vs_ceiling`` / ``p_rank`` and the reference counts joined the rows.
+#: the previous generation without discarding it. Bumped to 2 on 2026-10-14, when ``rank_vs_floor`` /
+#: ``rank_vs_ceiling`` / ``p_rank`` and the reference counts joined the rows.
 CKA_PLACEMENT_STATS_VERSION: int = 2
 
+#: The ``cka`` block. CKA (a) -- the feature tokens against K_X / K_GT / K_GP with site-permutation nulls, its M0
+#: controls, the per-token shadow criterion and the K_GP ceiling -- was removed on 2026-10-21 (BETA §7, D5): the
+#: ``representation`` analysis replaces it. ``layers`` and ``inference_seed`` stay because they enter every CKA (b)
+#: cell identity (``embed_ident``), so the cells computed for the subject-2 backfill keep serving.
 CKA_DEFAULTS: dict[str, Any] = {
     "layers": None,
-    # Feature-token readouts (analysis/embeddings.READOUTS): ``feature_mean``, and ``feature_tokens`` -- the
-    # per-token shadow readout of B1 Step 5 (CKA (a) only). The label token and the decoder stages that follow it
-    # were dropped on 2026-10-07 (user): they re-measure the prediction, not the representation of the geometry.
-    "readouts": ["feature_mean"],
-    "targets": ["K_X", "K_GT", "K_GT_linear", "K_GP"],
-    "stress": {"knob": "k2_channel", "levels": [1.0, 2.0, 4.0]},
-    "n_context_draws": 3,
-    "n_perm": 1000,
     "inference_seed": 0,
-    "gp_params": {"n_opt_steps": 100, "lr": 0.1},
-    "controls": {
-        "grid_side": 10, "lengthscale": 0.2, "noise_sd": 0.3, "n_trials": 10, "t": 25,
-        "alpha": 0.05, "n_seeds": 10, "icc_min": 0.75, "n_seed_channels": 1,
-    },
-    # CKA (b): placement of a channel's layer-wise feature-mean embedding between the on-grid prior bank and the noise bank,
-    # at every context size of the shared ladder (B3 Step 4 replaced the old ``ts`` key).
+    # CKA (b): placement of a channel's layer-wise feature-mean embedding between the on-grid prior bank and the noise
+    # bank, at every context size of the shared ladder (B3 Step 4 replaced the old ``ts`` key).
     #   n_prior    on-grid prior maps forming the comparison bank.
     #   n_noise    noise maps forming the ceiling.
     #   n_draws    independent context draws; the figure averages within a channel first.
@@ -1815,83 +1807,15 @@ CKA_DEFAULTS: dict[str, Any] = {
         "bank_quantile": 0.10, "n_dense": 1024, "holdout_frac": 0.1, "rmse_threshold": 0.5,
         "prior_type": "prior_bag",
     },
-    # B1 Step 5: the pre-registered success criterion of a shadow readout, evaluated at assembly and written to
-    # ``shadow_criterion.json``; ``null`` disables it. See configs/experiment/mechanism_cka_tokens_nhp.yaml.
-    "shadow": None,
-    # The CKA **ceiling** (user, 2026-10-12). Debiased CKA against a structured target is bounded well below 1 even
-    # under a perfect monotone relationship, because the two Gram matrices have different spectra -- so an absolute
-    # value like "TabPFN scores 0.23 against K_GP" is uninterpretable on its own, and the permutation null only
-    # supplies a FLOOR. This computes the reachable ceiling instead: ``noise_ceiling`` is the CKA between two GP
-    # posterior covariances fitted on the SAME sites with INDEPENDENT trial draws (so they differ only by measurement
-    # noise, which is the best any method could score against a noisily estimated target), and ``gp_vs_gt`` is the CKA
-    # between the GP's posterior covariance and the ground-truth response kernel (how well the comparator models the
-    # surface at all). Reported so a measured CKA can be read as a fraction of what is achievable.
-    #   trial_draw_offset  re-keys the trial stream only (analysis/context.context_for), holding the sites fixed.
-    "ceiling": {"enabled": True, "trial_draw_offset": 100},
 }
-
-#: Keys of a ``cka.shadow`` block.
-CKA_SHADOW_KEYS: dict[str, Any] = {
-    "readout": "feature_tokens", "baseline": "feature_mean", "targets": ["K_GT", "K_GP"],
-    "level": 1.0, "max_iqr_ratio": 0.75,
-}
-
-
-def _layer_grams(emb: Any, index: int) -> list[np.ndarray]:
-    """Linear Gram matrices of one layer: one per feature token for ``feature_tokens``, else one."""
-    from ..analysis.cka import linear_gram  # noqa: PLC0415
-
-    arr = emb.arrays[index]
-    if arr.ndim == 3:                                                       # [n_tok, q, d]
-        return [linear_gram(a) for a in arr]
-    return [linear_gram(arr)]                                               # [q, d]
-
-
-def _cka_layer_table(
-    emb: Any, kernels: dict[str, np.ndarray], n_perm: int, rng: np.random.Generator
-) -> list[dict[str, Any]]:
-    """Debiased CKA with a site-permutation null for every (layer, target).
-
-    One set of permutations per target is shared by every layer (and every feature token) of the cell, see
-    :func:`analysis.cka.cka_null_draws`. For ``feature_tokens`` the statistic is the CKA averaged over tokens and
-    the null is averaged over tokens draw by draw, so ``p`` tests the averaged statistic.
-
-    Args:
-        emb: :class:`~pfns4neurostim.analysis.embeddings.LayerEmbeddings` of one readout.
-        kernels: Target Gram matrices, each [N, N].
-        n_perm: Permutations.
-        rng: Generator.
-
-    Returns:
-        Rows with ``layer, target, value, null_mean, cka_minus_null, p, n_tokens``; ``layer`` is the block index.
-    """
-    from ..analysis.cka import cka_null_draws, permutation_p  # noqa: PLC0415
-
-    grams = [_layer_grams(emb, i) for i in range(len(emb.arrays))]
-    flat = [G for gs in grams for G in gs]
-    owner = np.repeat(np.arange(len(grams)), [len(gs) for gs in grams])    # [K] layer of each Gram
-    rows = []
-    for target, L in kernels.items():
-        obs, null = cka_null_draws(flat, L, n_perm, rng)                    # [K], [K, P]
-        for i in range(len(grams)):
-            sel = owner == i
-            o, nl = float(obs[sel].mean()), null[sel].mean(axis=0)          # token-averaged
-            rows.append({"layer": int(emb.layers[i]), "target": target, "value": o,
-                         "null_mean": float(nl.mean()), "cka_minus_null": o - float(nl.mean()),
-                         "p": permutation_p(o, nl), "n_tokens": int(sel.sum())})
-    return rows
-
-
-def _layer_cka(emb: Any, kernels: dict[str, np.ndarray]) -> list[float]:
-    """Debiased CKA (token-averaged) at every (layer, target), without a null (seed-stability control)."""
-    from ..analysis.cka import cka_debiased  # noqa: PLC0415
-
-    return [float(np.mean([cka_debiased(G, K) for G in _layer_grams(emb, i)]))
-            for i in range(len(emb.arrays)) for K in kernels.values()]
 
 
 def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
-    """Task #5 / B1: CKA (a) of the feature tokens against target kernels, controls, and CKA (b) placement.
+    """CKA (b): placement of the feature-token mean between the on-grid prior bank and the noise bank.
+
+    One cell per (grid, t, draw) over every channel of the grid; the channel-independent work (banks, the bank maps'
+    embeddings at the context sites, hence the floor and ceiling) is done once per cell. The context sites come from
+    a grid-keyed stream, so the comparison is paired.
 
     Args:
         cfg: Resolved config.
@@ -1900,34 +1824,15 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
     Returns:
         The run directory.
     """
-    from ..analysis.cka import linear_gram, target_kernels  # noqa: PLC0415
-    from ..analysis.embeddings import READOUTS, readout_embeddings  # noqa: PLC0415
+    from ..analysis.cka import linear_gram  # noqa: PLC0415
+    from ..analysis.embeddings import readout_embeddings  # noqa: PLC0415
     from ..analysis import placement as P  # noqa: PLC0415
     from ..analysis.placement import placement as place  # noqa: PLC0415
-    from ..analysis.context import draw_context  # noqa: PLC0415
-    from ..data.snr import achieved_snr_db  # noqa: PLC0415
-    from ..data.stress import build_knob  # noqa: PLC0415
-    from ..data.synthetic_neurostim import gp_channel  # noqa: PLC0415
-    from ..evaluation.stats import icc_oneway  # noqa: PLC0415
-    from ..models.gp.surrogates import GPSurrogate  # noqa: PLC0415
     from ..models.pfn.tabpfn import FrozenTabPFN  # noqa: PLC0415
     from ..visualization import mechanism as figs  # noqa: PLC0415
 
     p = _check_keys(cfg.params, CKA_DEFAULTS, "cka")
-    p["controls"] = _check_keys(p["controls"], CKA_DEFAULTS["controls"], "cka.controls")
     p["placement"] = _check_keys(p["placement"], CKA_DEFAULTS["placement"], "cka.placement")
-    p["ceiling"] = _check_keys(p["ceiling"], CKA_DEFAULTS["ceiling"], "cka.ceiling")
-    if p["shadow"] is not None:
-        p["shadow"] = _check_keys(p["shadow"], CKA_SHADOW_KEYS, "cka.shadow")
-    bad = [r for r in p["readouts"] if r not in READOUTS]
-    if bad:
-        raise ValueError(f"cka.readouts: unknown {bad}; expected a subset of {READOUTS}.")
-    n_layers = 18 if p["layers"] is None else len(p["layers"])
-    if 1.0 / (int(p["n_perm"]) + 1) >= p["controls"]["alpha"] / n_layers:
-        raise ValueError(
-            f"cka.n_perm={p['n_perm']} cannot resolve the Bonferroni threshold "
-            f"{p['controls']['alpha']}/{n_layers}: the smallest attainable p is 1/(n_perm+1)."
-        )
     out = cfg.run_dir
     if not opts.replot:
         set_seed(cfg.seed)
@@ -1940,135 +1845,15 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
                 engine_box["e"] = FrozenTabPFN(device=cfg.device, random_state=int(p["inference_seed"]))
             return engine_box["e"]
 
-        def embed(X_ctx: np.ndarray, y_ctx: np.ndarray, X_sites: np.ndarray, readout: str,
-                  eng: Any | None = None) -> Any:
-            eng = engine() if eng is None else eng
+        def embed(X_ctx: np.ndarray, y_ctx: np.ndarray, X_sites: np.ndarray, readout: str) -> Any:
+            eng = engine()
             eng.fit(X_ctx, y_ctx)
             return readout_embeddings(eng, X_sites, readouts=(readout,), layers=p["layers"])[readout]
 
         def embed_ident(readout: str) -> dict[str, Any]:
             return {"readout": readout, "layers": p["layers"], "inference_seed": int(p["inference_seed"])}
 
-        def gp_cov(ch: ChannelData, ctx: Any, ident: dict[str, Any]) -> np.ndarray:
-            """The MLL-GP posterior covariance of a context: a cached artifact shared by every readout."""
-            def compute() -> tuple[dict[str, Any], dict[str, Any]]:
-                gp = GPSurrogate(**p["gp_params"])
-                gp.fit(ctx.X, ctx.y)
-                return {"diagnostics": gp.fit_diagnostics()}, {"cov": gp.posterior_covariance(ch.X_pool)}
-
-            hit = cells.run("gpfit", {**ident, "gp_params": p["gp_params"]}, f"GP {ident.get('label')}", compute)
-            if hit is None:
-                raise RuntimeError("the context's GP fit failed (see the gpfit failure above).")
-            return hit[1]["cov"]
-
-        def kernels_for(ch: ChannelData, ctx: Any, ident: dict[str, Any]) -> dict[str, np.ndarray]:
-            cov = gp_cov(ch, ctx, ident) if "K_GP" in p["targets"] else None
-            ks = target_kernels(ch.X_pool, ch.y_gt, cov)
-            return {k: v for k, v in ks.items() if k in p["targets"]}
-
         channels = _channels(cfg)
-        knob = build_knob(p["stress"]["knob"], p["stress"]["levels"])
-        rows: list[dict[str, Any]] = []
-        for ch in channels:
-            for level in knob.levels:
-                st = knob.apply(ch, level, rng_for(ch.label, "cka", level, base_seed=cfg.seed))
-                snr = achieved_snr_db(st)
-                for t in cfg.context_sizes:
-                    if t >= st.n_sites:
-                        continue
-                    for rep in range(int(p["n_context_draws"])):
-                        ctx_ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
-                                     "draw": rep}
-                        for readout in p["readouts"]:
-                            def compute(level: float = level, t: int = t, rep: int = rep, readout: str = readout,
-                                        st: ChannelData = st, ctx_ident: dict[str, Any] = ctx_ident,
-                                        ) -> tuple[dict[str, Any], dict[str, Any]]:
-                                ctx = context_for(st, int(t), rep, base_seed=cfg.seed, level=float(level))
-                                kernels = kernels_for(st, ctx, ctx_ident)
-                                emb = embed(ctx.X, ctx.y, st.X_pool, readout)
-                                # Keyed per cell, so the null is reproducible and independent of run order.
-                                perm_rng = rng_for(ch.label, "cka-perm", level, t, rep, readout, base_seed=cfg.seed)
-                                return {"rows": _cka_layer_table(emb, kernels, int(p["n_perm"]), perm_rng)}, {}
-
-                            hit = cells.run("a", {**ctx_ident, **embed_ident(readout), "targets": list(p["targets"]),
-                                                  "n_perm": int(p["n_perm"]), "gp_params": p["gp_params"]},
-                                            f"{ch.label} a={level:g} t={t} d={rep} {readout}", compute)
-                            if hit is None:
-                                continue
-                            for r in hit[0]["rows"]:
-                                rows.append({
-                                    "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
-                                    "model": MECHANISM_MODEL, "readout": readout, "context_t": int(t),
-                                    "knob": knob.name, "level": float(level), "achieved_snr_db": snr,
-                                    "rep": rep, **r,
-                                })
-            print(f"[mechanism] cka {ch.label} done", flush=True)
-        _write_csv(rows, out, "cka.csv")
-
-        # --- the reachable CKA ceiling (user, 2026-10-12) ---
-        if p["ceiling"]["enabled"] and "K_GP" in p["targets"]:
-            ceil_rows = _cka_ceiling(cfg, p, cells, channels, knob)
-            if ceil_rows:
-                _write_csv(ceil_rows, out, "cka_ceiling.csv")
-
-        # --- M0 controls (Step 4), per readout ---
-        c = p["controls"]
-        gates: list[dict[str, Any]] = []
-        for readout in p["readouts"]:
-            for label, noise_only in (("positive_control", False), ("negative_control", True)):
-                def control(readout: str = readout, noise_only: bool = noise_only, label: str = label,
-                            ) -> tuple[dict[str, Any], dict[str, Any]]:
-                    from dataclasses import replace  # noqa: PLC0415
-
-                    rng = np.random.default_rng(cfg.seed)
-                    ctrl = gp_channel(c["grid_side"], c["lengthscale"], c["noise_sd"], c["n_trials"], rng)
-                    if noise_only:
-                        y = rng.normal(size=ctrl.n_sites)
-                        ctrl = replace(ctrl, y_gt=y,
-                                       Y_trials=y[:, None] + c["noise_sd"] * rng.normal(size=ctrl.Y_trials.shape))
-                    ctx = draw_context(ctrl, int(c["t"]), rng)
-                    emb = embed(ctx.X, ctx.y, ctrl.X_pool, readout)
-                    tab = _cka_layer_table(emb, {"K_GT": target_kernels(ctrl.X_pool, ctrl.y_gt)["K_GT"]},
-                                           int(p["n_perm"]), rng)
-                    min_p = min(r["p"] for r in tab)
-                    bonf = c["alpha"] / len(tab)
-                    return {"gate": {
-                        "gate": label, "readout": readout, "min_p": min_p, "alpha_bonferroni": bonf,
-                        "max_cka_minus_null": max(r["cka_minus_null"] for r in tab),
-                        "passed": bool(min_p < bonf) if not noise_only else bool(min_p >= bonf),
-                    }}, {}
-
-                hit = cells.run("gate", {"gate": label, "controls": c, **embed_ident(readout),
-                                         "n_perm": int(p["n_perm"])}, f"{label} {readout}", control)
-                if hit is not None:
-                    gates.append(hit[0]["gate"])
-            for ch in channels[: int(c["n_seed_channels"])]:
-                def seed_stability(readout: str = readout, ch: ChannelData = ch,
-                                   ) -> tuple[dict[str, Any], dict[str, Any]]:
-                    ctx = draw_context(ch, min(int(c["t"]), ch.n_sites - 1), np.random.default_rng(cfg.seed))
-                    gp = GPSurrogate(**p["gp_params"])
-                    gp.fit(ctx.X, ctx.y)
-                    ks = {k: v for k, v in target_kernels(ch.X_pool, ch.y_gt, gp.posterior_covariance(ch.X_pool)).items()
-                          if k in p["targets"]}
-                    per_seed = [_layer_cka(embed(ctx.X, ctx.y, ch.X_pool, readout,
-                                                 eng=FrozenTabPFN(device=cfg.device, random_state=s)), ks)
-                                for s in range(int(c["n_seeds"]))]
-                    icc = icc_oneway(np.asarray(per_seed).T)
-                    return {"gate": {"gate": "seed_stability", "readout": readout, "channel": ch.label,
-                                     "n_seeds": int(c["n_seeds"]), "icc": icc,
-                                     "passed": bool(icc >= c["icc_min"])}}, {}
-
-                hit = cells.run("gate", {"gate": "seed_stability", "controls": c, **cells.channel(ch),
-                                         **embed_ident(readout), "targets": list(p["targets"]),
-                                         "gp_params": p["gp_params"]},
-                                f"seed stability {readout} {ch.label}", seed_stability)
-                if hit is not None:
-                    gates.append(hit[0]["gate"])
-
-        # --- CKA (b) placement (Step 6) of the feature-token mean, one cell per (grid, t, draw) ---
-        # Channel-independent work at a fixed (grid, t, draw) -- the banks, the bank maps' embeddings at the
-        # context sites, and hence the floor and ceiling -- is done once per cell for every channel of the grid
-        # (2026-09-30). The context sites come from a grid-keyed stream, so the comparison is paired.
         pl = p["placement"]
         prow: list[dict[str, Any]] = []
         if pl["enabled"]:
@@ -2163,17 +1948,6 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
                           f"({len(grid_channels)} channels)", flush=True)
         if prow:
             _write_csv(prow, out, "cka_placement.csv")
-        with open(os.path.join(out, "gates.json"), "w", encoding="utf-8") as fh:
-            json.dump(gates, fh, indent=2, default=_json_default)
-        for g in gates:
-            print(f"[mechanism] gate {g['gate']} ({g.get('readout', '')}): "
-                  f"{'PASS' if g['passed'] else 'FAIL'}", flush=True)
-        if p["shadow"] is not None and rows:
-            verdict = shadow_criterion(pd.DataFrame(rows), p["shadow"])
-            with open(os.path.join(out, "shadow_criterion.json"), "w", encoding="utf-8") as fh:
-                json.dump(verdict, fh, indent=2, default=_json_default)
-            print(f"[mechanism] shadow criterion ({verdict['readout']} vs {verdict['baseline']}): "
-                  f"{'PASS' if verdict['passed'] else 'FAIL'} {verdict['ratios']}", flush=True)
     for path in figs.render_cka(out):
         print(f"[mechanism] wrote {path}")
     if not opts.replot:
@@ -2181,224 +1955,415 @@ def run_cka(cfg: MechanismConfig, opts: RunOptions) -> str:
     return out
 
 
-def shadow_criterion(df: pd.DataFrame, spec: dict[str, Any]) -> dict[str, Any]:
-    """B1 Step 5's pre-registered test: does a shadow readout narrow the between-channel band?
-
-    Per target and context size, at stress level ``spec['level']``: average ``cka_minus_null`` over draws
-    *within* a channel, take the interquartile range over channels at every block, divide the shadow
-    readout's IQR by the baseline's, and take the median of that ratio over blocks. The criterion passes when
-    the median ratio is below ``max_iqr_ratio`` for **every** listed target at **every** context size in the
-    run (pre-registered 2026-10-06: ratio < 0.75, targets K_GT and K_GP).
-
-    Args:
-        df: Rows of ``cka.csv`` holding both readouts.
-        spec: The resolved ``cka.shadow`` block.
-
-    Returns:
-        ``{readout, baseline, ratios: {"<target>@t=<t>": ratio}, max_iqr_ratio, passed}``.
-
-    Raises:
-        ValueError: If either readout is missing from ``df``.
-    """
-    for r in (spec["readout"], spec["baseline"]):
-        if r not in set(df["readout"]):
-            raise ValueError(f"shadow_criterion: readout {r!r} is not in the run (readouts: {sorted(set(df['readout']))}).")
-    blocks = df[df["level"] == float(spec["level"])]
-    ratios: dict[str, float | None] = {}
-    for target in spec["targets"]:
-        for t in sorted(blocks["context_t"].unique()):
-            sub = blocks[(blocks["target"] == target) & (blocks["context_t"] == t)]
-            iqr = {}
-            for readout in (spec["readout"], spec["baseline"]):
-                per_ch = (sub[sub["readout"] == readout]
-                          .groupby(["subject", "emg", "layer"])["cka_minus_null"].mean().reset_index())
-                g = per_ch.groupby("layer")["cka_minus_null"]
-                iqr[readout] = g.quantile(0.75) - g.quantile(0.25)
-            joined = pd.concat(iqr, axis=1).dropna()
-            base = joined[spec["baseline"]]
-            ratio = (joined[spec["readout"]] / base)[base > 0]
-            ratios[f"{target}@t={int(t)}"] = float(ratio.median()) if len(ratio) else None
-    passed = bool(ratios) and all(v is not None and v < float(spec["max_iqr_ratio"]) for v in ratios.values())
-    return {"readout": spec["readout"], "baseline": spec["baseline"], "level": float(spec["level"]),
-            "ratios": ratios, "max_iqr_ratio": float(spec["max_iqr_ratio"]), "passed": passed}
-
-
-def _cka_ceiling(
-    cfg: MechanismConfig,
-    p: dict[str, Any],
-    cells: _Cells,
-    channels: list[ChannelData],
-    knob: Any,
-) -> list[dict[str, Any]]:
-    """The reachable CKA ceiling per (channel, level, context size): what a perfect method could score.
-
-    Debiased CKA between two Gram matrices with different spectra is bounded well below 1 even when one
-    is a perfect monotone function of the other, so an absolute CKA against ``K_GP`` cannot be read
-    without a ceiling, and the site-permutation null only supplies a floor. Two references are computed,
-    both from closed-form GP fits (no transformer forward passes, so this is cheap):
-
-    * ``noise_ceiling`` -- CKA between two GP posterior covariances fitted on the **same sites** with
-      **independent trial draws**. They differ only by measurement noise, so this is the most any
-      method could score against a target that is itself estimated from noisy data.
-    * ``gp_vs_gt`` -- CKA between the GP's posterior covariance and the ground-truth response kernel:
-      how well the comparator models the surface at all.
-
-    Args:
-        cfg: Resolved config.
-        p: Resolved ``cka`` block.
-        cells: Cell namespace.
-        channels: Loaded channels.
-        knob: Built stress knob.
-
-    Returns:
-        One row per (channel, level, context size, draw).
-    """
-    from ..analysis.cka import cka_debiased, target_kernels  # noqa: PLC0415
-    from ..data.snr import achieved_snr_db  # noqa: PLC0415
-    from ..models.gp.surrogates import GPSurrogate  # noqa: PLC0415
-
-    offset = int(p["ceiling"]["trial_draw_offset"])
-    rows: list[dict[str, Any]] = []
-    for ch in channels:
-        for level in knob.levels:
-            st = knob.apply(ch, level, rng_for(ch.label, "cka", level, base_seed=cfg.seed))
-            snr = achieved_snr_db(st)
-            for t in cfg.context_sizes:
-                if t >= st.n_sites:
-                    continue
-                for rep in range(int(p["n_context_draws"])):
-                    ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
-                             "draw": rep, "gp_params": p["gp_params"], "trial_draw_offset": offset}
-
-                    def compute(ch: ChannelData = ch, st: ChannelData = st, t: int = t, rep: int = rep,
-                                level: float = level) -> tuple[dict[str, Any], dict[str, Any]]:
-                        covs = []
-                        for trial_draw in (rep, rep + offset):
-                            ctx = context_for(st, int(t), rep, base_seed=cfg.seed, level=float(level),
-                                              trial_draw=trial_draw)
-                            gp = GPSurrogate(**p["gp_params"])
-                            gp.fit(ctx.X, ctx.y)
-                            covs.append(gp.posterior_covariance(st.X_pool))
-                        k_gt = target_kernels(st.X_pool, st.y_gt)["K_GT"]
-                        return {
-                            "noise_ceiling": cka_debiased(covs[0], covs[1]),
-                            "gp_vs_gt": cka_debiased(covs[0], k_gt),
-                        }, {}
-
-                    hit = cells.run("ceiling", ident, f"ceiling {ch.label} a={level:g} t={t} d={rep}", compute)
-                    if hit is not None:
-                        rows.append({
-                            "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
-                            "knob": knob.name, "level": float(level), "achieved_snr_db": snr,
-                            "context_t": int(t), "rep": rep,
-                            **{k: v for k, v in hit[0].items() if k != "host"},
-                        })
-    return rows
-
-
 # ---------------------------------------------------------------------------
-# procrustes (M14 revived, 2026-10-14): the spectrum-weighting complement of the CKA analysis
+# representation (OBJECTIVE BETA, 2026-10-21): label-token belief alignment (β2), site-matched predictives (β1a),
+# posterior-covariance alignment (β1b). Replaces CKA (a) and the Procrustes trajectory (BETA §7, D5).
 # ---------------------------------------------------------------------------
-#: Readouts this analysis accepts. ``feature_tokens`` is deliberately excluded: Procrustes is a statistic of one
-#: ``[n_sites, d]`` cloud, and a per-token variant would need a per-token null whose averaging rule is a separate
-#: design question (CKA (a)'s shadow readout, B1 Step 5). The feature-token *mean* is the readout CKA (b) places,
-#: so the two analyses compare the same clouds.
-PROCRUSTES_READOUTS: tuple[str, ...] = ("feature_mean",)
+#: Readouts of the representation analysis: the label token per block (the only token the decoder reads; reportable
+#: against belief targets, G6 / D1), the feature-token mean (a diagnostic line), and the zero-parameter lens's
+#: quantile embedding per block (output space).
+REPRESENTATION_READOUTS: tuple[str, ...] = ("label", "feature_mean", "lens")
 
-PROCRUSTES_DEFAULTS: dict[str, Any] = {
-    "layers": None,                      # None = all 18 blocks
-    "readouts": list(PROCRUSTES_READOUTS),
-    # The disparity baseline: the cloud every other context size is compared against. 2 is the smallest context
-    # TabPFN accepts (analysis/context.context_sites refuses t < 2), so it is the least-informed geometry.
-    # It must be IN the shared ladder, so the cell it needs exists (the loader's _subset_of_ladder rule).
-    "baseline_t": 2,
-    "n_context_draws": 3,
-    # Shuffled-site null replicates (CAVEAT 2). Each costs one [r, r] SVD with r = min(n_sites - 1, d), so the
-    # null runs ~0.8 ms per replicate on the 96-site NHP grid -- unlike CKA's null it cannot be collapsed into a
-    # single contraction, which is why this is 200 while cka.n_perm is 1000. The headline statistic is the
-    # DIFFERENCE disparity - null_mean (analysis/procrustes.HEADLINE_STATISTIC), which 200 replicates resolve far
-    # better than the between-channel spread; only the secondary percentile readout is limited to 1/(n_perm + 1).
-    "n_perm": 200,
-    "inference_seed": 0,
-    # Unstressed by default: this analysis asks how the geometry moves with EVIDENCE, and a stress level would
-    # confound that with signal quality. The knob is still a config key, so a stressed sweep needs no code change.
-    "stress": {"knob": "k2_channel", "levels": [1.0]},
-    # Row subsampling. The legacy M14 code subsampled 300 rows to escape the n < d bias; the NHP grid has 96
-    # sites, so there is nothing to subsample and ``n_rows: null`` (every site) is the only honest setting here.
-    # Kept configurable for larger grids, and because a smaller n is the direct way to SHOW the bias: the same
-    # cell at n_rows = 48 has a higher null. Indices are drawn once per cell and shared by every layer and every
-    # context size, so the row correspondence Procrustes depends on survives.
-    "subsample": {"n_rows": None},
-    # Debiased linear CKA between the SAME two clouds, so a Procrustes panel and a CKA panel are read on
-    # identical pairs (that comparison is the point of the analysis). Cheap: one Gram pair per (layer, t).
-    "cka_companion": True,
-    # Layers drawn in the disparity-vs-context figure (every layer is in the CSV; an 18-trace legend is
-    # unreadable). Must be a subset of the computed layers.
-    "figures": {"context_layers": [0, 1, 5, 11, 17]},
+#: Statistic set a ``cell`` payload carries; in the identity, so a change supersedes old cells without deleting them.
+REPRESENTATION_STATS_VERSION: int = 1
+
+#: GP engines whose predictive given D can be a belief (BETA D3e: GP-MLL refit and GP-fixed; GP-Bayes optional).
+REPRESENTATION_GP_ENGINES: tuple[str, ...] = ("gp_mll_refit", "gp_fixed", "gp_bayes")
+
+REPRESENTATION_DEFAULTS: dict[str, Any] = {
+    "stress": {"knob": "k2_channel", "levels": [1.0, 2.0, 4.0]},
+    "n_context_draws": 2,
+    "layers": None,                                    # null = all 18 blocks
+    "readouts": list(REPRESENTATION_READOUTS),
+    # Targets <kind>_<code>: kind in mean | sd | quant | cov; code in own (TabPFN's final predictive) | mll (GP-MLL
+    # refit) | fixed (GP-fixed) | bayes (GP-Bayes, optional); plus K_X and K_GT (analysis/representation.py).
+    "targets": ["mean_own", "sd_own", "mean_mll", "sd_mll", "cov_mll", "quant_own", "quant_mll", "K_X", "K_GT"],
+    "belief_engines": ["gp_mll_refit", "gp_fixed"],
+    "layout_confound": "gp_fixed",                     # its posterior covariance: the extra confound of cov targets
+    "n_quantiles": 32,
+    "site_sets": ["all"],                              # all | unobserved (demoted pitfall; never at t = 80)
+    # The seed rule of every Hyp C analysis: the inference seed of a cell is inference_seed + its context draw.
+    "tabpfn": {"inference_seed": 0, "softmax_temperature": 0.9, "precision": "fp32", "max_batch_tokens": 400000},
+    "gp_params": {"n_opt_steps": 50, "lr": 1.0, "optimizer": "lbfgs", "dtype": "float64", "noise_floor": 1.0e-3,
+                  "n_restarts": 5, "lengthscale_floor": 0.05},
+    "fixed_gp_params": {"lengthscale": 0.6931471805599453, "outputscale": 1.0, "noise": 0.05},
+    "gp_bayes": {"lengthscale": [0.05, 2.0, 23], "outputscale": [0.05, 5.0, 11], "noise": [1.0e-3, 1.0, 13],
+                 "b2": 1.0, "prune_mass": 1.0e-10, "chunk": 2048, "exact_max_components": 64, "sd_bins": 32},
+    "deconfound": {"bandwidth_multipliers": [0.25, 0.5, 1.0, 2.0], "min_residual_frac": 1.0e-10},
+    "surrogate": {"lengthscales": [0.10, 0.15, 0.30], "n_fields": 192, "n_replicates": 20, "jitter": 1.0e-8,
+                  "quantile": 0.95},
+    "permutation": {"n_perm": 200},                    # descriptive only (D4); 0 = off
+    # The reachable ceiling (user, 2026-10-12, generalised in BETA §5): the same target built from an independent
+    # trial draw at the same sites; trial_draw_offset re-keys the trial stream only (analysis/context.context_for).
+    "ceiling": {"enabled": True, "trial_draw_offset": 100},
+    # Belief ceilings (D2 with D3e): pairs (target_a, target_b) scored per cell; never a pair of two models' beliefs
+    # (BETA §4: models are compared site by site, not through their across-site Grams).
+    "target_relations": [["quant_mll", "K_GT"], ["mean_mll", "K_GT"]],
+    "site_match": {"references": ["gp_mll_refit", "gp_fixed"]},
+    # OPEN (research_design §4, 2026-10-19): the provisional headline and its alternative (b) are selectable here;
+    # both are computable from representation.csv whatever is selected.
+    "headline": {"statistic": "deconfounded_vs_surrogate", "readout": "label"},
+    "inference": {"n_boot": 2000, "ci": 0.95},
+    # β1b: C_PFN from Part A's implied covariance with every site as an anchor (OMEGA A3, refit engine), against the
+    # references' latent covariances. Coverage filters as in bayes_update.coverage (context_ts null = the ladder).
+    "posterior_cov": {
+        "enabled": False, "engine": "tabpfn_v2_5", "references": ["gp_mll_refit", "gp_fixed"],
+        "coverage": {"levels": [1.0], "context_ts": None, "draws": [0], "channels_per_subject": 2},
+        "quadrature": {"method": "rqmc", "K": 8, "u_min": 1.0e-12, "central_mass": 1.0, "n_scrambles": 8},
+        "eps": 0.01, "y_grid": {"points": 512, "u_tail": 1.0e-4}, "moment_matched": True,
+    },
+    "figures": {"level": None},                        # null = the nominal (lowest) stress level
 }
 
+#: Engines β1b can build C_PFN for (a GP engine reproduces its own closed form: the exactness check of the tests).
+POSTERIOR_COV_ENGINES: tuple[str, ...] = (*TABPFN_ENGINES, *REPRESENTATION_GP_ENGINES)
 
-def _procrustes_rows(
-    clouds: dict[int, Any],
-    baseline_t: int,
-    n_perm: int,
-    rng: np.random.Generator,
-    *,
-    cka_companion: bool,
-) -> list[dict[str, Any]]:
-    """Disparity + shuffled-site null (and the CKA companion) for every (layer, context size) of one cell.
+
+def _validate_representation(p: dict[str, Any], ladder: Sequence[int]) -> dict[str, Any]:
+    """Resolve the ``representation`` block over its defaults, refusing unknown keys and impossible settings.
 
     Args:
-        clouds: ``{context_t: LayerEmbeddings}`` of one channel, level, draw and readout; all share the layer set
-            and the site rows, so row ``i`` is the same electrode everywhere.
-        baseline_t: The context size whose cloud every other one is compared against.
-        n_perm: Shuffled-site replicates per pair.
-        rng: Generator for the null (keyed per cell by the caller).
-        cka_companion: Also report debiased linear CKA between the same two clouds.
+        p: User block.
+        ladder: ``context.sizes``.
 
     Returns:
-        Rows with ``layer``, ``context_t``, ``is_baseline`` and every field of
-        :class:`~pfns4neurostim.analysis.procrustes.ProcrustesNull` (plus ``cka`` when requested).
+        The resolved parameters.
 
     Raises:
-        KeyError: If ``baseline_t`` was not embedded.
+        ValueError: On unknown keys, readouts, targets, engines or statistics, or a target whose belief is not built.
     """
-    from ..analysis.cka import cka_debiased, linear_gram  # noqa: PLC0415
-    from ..analysis.procrustes import procrustes_with_null  # noqa: PLC0415
+    from ..analysis import representation as R  # noqa: PLC0415
 
-    base = clouds[int(baseline_t)]
-    rows: list[dict[str, Any]] = []
-    for t in sorted(clouds):
-        emb = clouds[t]
-        for i, layer in enumerate(emb.layers):
-            X = base.arrays[i]                                             # [n_sites, d]
-            Y = emb.arrays[i]                                              # [n_sites, d]
-            row: dict[str, Any] = {"layer": int(layer), "context_t": int(t),
-                                   "is_baseline": int(t) == int(baseline_t)}
-            row.update(procrustes_with_null(X, Y, n_perm=n_perm, rng=rng).as_row())
-            if cka_companion:
-                row["cka"] = cka_debiased(linear_gram(X), linear_gram(Y))
-            rows.append(row)
-    return rows
+    d = REPRESENTATION_DEFAULTS
+    p = _check_keys(p, d, "representation")
+    for sub in ("stress", "tabpfn", "fixed_gp_params", "gp_bayes", "deconfound", "surrogate", "permutation",
+                "ceiling", "site_match", "headline", "inference", "posterior_cov", "figures"):
+        p[sub] = _check_keys(p[sub] or {}, d[sub], f"representation.{sub}")
+    pc = p["posterior_cov"]
+    for sub in ("coverage", "quadrature", "y_grid"):
+        pc[sub] = _check_keys(pc[sub] or {}, d["posterior_cov"][sub], f"representation.posterior_cov.{sub}")
+    bad = [r for r in p["readouts"] if r not in REPRESENTATION_READOUTS]
+    if bad or not p["readouts"]:
+        raise ValueError(f"representation.readouts: unknown {bad}; known {list(REPRESENTATION_READOUTS)}.")
+    bad = [e for e in p["belief_engines"] if e not in REPRESENTATION_GP_ENGINES]
+    if bad:
+        raise ValueError(f"representation.belief_engines: unknown {bad}; known {list(REPRESENTATION_GP_ENGINES)}.")
+    codes = {"own"} | {c for c, e in R.BELIEF_CODES.items() if e in p["belief_engines"]}
+    for name in p["targets"]:
+        _, code = R.parse_target(name)
+        if code is not None and code not in codes:
+            raise ValueError(f"representation.targets: {name!r} needs {R.BELIEF_CODES[code]!r} in "
+                             f"representation.belief_engines {p['belief_engines']}.")
+    if p["layout_confound"] not in p["belief_engines"]:
+        raise ValueError(f"representation.layout_confound {p['layout_confound']!r} must be one of "
+                         f"representation.belief_engines {p['belief_engines']} (its covariance is the confound).")
+    bad = [r for r in p["site_match"]["references"] if r not in p["belief_engines"]]
+    if bad:
+        raise ValueError(f"representation.site_match.references {bad} are not in representation.belief_engines.")
+    for pair in p["target_relations"]:
+        if len(pair) != 2 or any(n not in p["targets"] for n in pair):
+            raise ValueError(f"representation.target_relations: {pair} must name two of representation.targets.")
+        codes_pair = {R.parse_target(n)[1] for n in pair} - {None}
+        if len(codes_pair) > 1:
+            raise ValueError(f"representation.target_relations: {pair} compares two models' beliefs through their "
+                             f"across-site Grams; models are compared site by site (BETA §4, D3).")
+    bad = [s for s in p["site_sets"] if s not in R.SITE_SETS]
+    if bad or not p["site_sets"]:
+        raise ValueError(f"representation.site_sets: unknown {bad}; known {list(R.SITE_SETS)}.")
+    if p["headline"]["statistic"] not in R.HEADLINE_STATISTICS:
+        raise ValueError(f"representation.headline.statistic must be one of {R.HEADLINE_STATISTICS}, got "
+                         f"{p['headline']['statistic']!r}.")
+    if p["headline"]["readout"] not in p["readouts"]:
+        raise ValueError(f"representation.headline.readout {p['headline']['readout']!r} is not a computed readout.")
+    if int(p["n_quantiles"]) < 2:
+        raise ValueError(f"representation.n_quantiles must be >= 2, got {p['n_quantiles']}.")
+    s = p["surrogate"]
+    if not s["lengthscales"] or int(s["n_replicates"]) < 2 or int(s["n_fields"]) < 1 or not 0 < float(s["quantile"]) < 1:
+        raise ValueError(f"representation.surrogate: need lengthscales, n_replicates >= 2, n_fields >= 1 and "
+                         f"0 < quantile < 1, got {s}.")
+    if int(p["inference"]["n_boot"]) < 1 or not 0 < float(p["inference"]["ci"]) < 1:
+        raise ValueError(f"representation.inference: need n_boot >= 1 and 0 < ci < 1, got {p['inference']}.")
+    if pc["enabled"]:
+        if pc["engine"] not in POSTERIOR_COV_ENGINES:
+            raise ValueError(f"representation.posterior_cov.engine must be one of {POSTERIOR_COV_ENGINES}.")
+        bad = [r for r in pc["references"] if r not in p["belief_engines"]]
+        if bad:
+            raise ValueError(f"representation.posterior_cov.references {bad} are not in representation.belief_engines.")
+        if pc["quadrature"]["method"] not in B_QUADRATURE_METHODS:
+            raise ValueError(f"representation.posterior_cov.quadrature.method must be one of {B_QUADRATURE_METHODS}.")
+        if pc["coverage"]["context_ts"] is None:
+            pc["coverage"]["context_ts"] = [int(t) for t in ladder]
+        _subset_of_ladder(pc["coverage"]["context_ts"], ladder, "representation.posterior_cov.coverage.context_ts")
+    return p
 
 
-def run_procrustes(cfg: MechanismConfig, opts: RunOptions) -> str:
-    """M14 revived: Procrustes disparity of the layer-wise site geometry along the context ladder.
+def _representation_gp(name: str, p: dict[str, Any]) -> Any:
+    """An unfitted GP belief engine of the representation analysis (same classes as ``bayes_update``)."""
+    from ..analysis import bayes_update as B  # noqa: PLC0415
 
-    For one channel and one context draw, TabPFN is conditioned on ``t`` observations and all N grid sites are
-    embedded at every block -- exactly the clouds :func:`run_cka` forms. The disparity between the cloud at
-    ``baseline_t`` and the cloud at each ``t`` is then reported **against a shuffled-site null**, per layer, with
-    debiased linear CKA on the same pair beside it.
+    if name == "gp_mll_refit":
+        return B.GPRefitEngine(p["gp_params"], name=name)
+    if name == "gp_fixed":
+        return B.GPFixedEngine(**p["fixed_gp_params"], name=name)
+    g = p["gp_bayes"]
+    return B.GPBayesEngine(g["lengthscale"], g["outputscale"], g["noise"], b2=float(g["b2"]),
+                           prune_mass=float(g["prune_mass"]), chunk=int(g["chunk"]), name=name,
+                           exact_max_components=int(g["exact_max_components"]), sd_bins=int(g["sd_bins"]))
 
-    Two things the reporting must keep apart (they answer different questions):
 
-    * the **t ladder** tests whether the geometric drift depends on how much evidence the network has;
-    * the **shuffled-site null** tests whether a disparity number means anything at all at ``n < d``
-      (96 rows in 192 dimensions). It is not a context-size control, and the ladder is not a null.
+def _representation_gp_params(name: str, p: dict[str, Any]) -> dict[str, Any]:
+    """The settings of one GP belief engine that enter a cell identity."""
+    if name == "gp_mll_refit":
+        return {"gp_params": p["gp_params"]}
+    if name == "gp_fixed":
+        return {"fixed_gp_params": p["fixed_gp_params"]}
+    return {k: v for k, v in p["gp_bayes"].items() if k != "chunk"}
 
-    Procrustes quotients out rotation, which the fixed, non-rotation-equivariant prediction head does not: these
-    numbers are representation-similarity readouts to be read beside the output-space ones, never a claim about
-    the model's prediction (Caveat 1, :mod:`pfns4neurostim.analysis.procrustes`).
+
+def _representation_beliefs(
+    ctx: Any,
+    Q: np.ndarray,
+    p: dict[str, Any],
+    tabpfn: Any,
+    u: np.ndarray,
+) -> tuple[dict[str, Any], Any, Any]:
+    """Fit TabPFN (one hooked pass) and every GP belief engine on one context.
+
+    Args:
+        ctx: The context.
+        Q: Readout sites, shape [M, D].
+        p: Resolved ``representation`` block.
+        tabpfn: A :class:`~pfns4neurostim.models.pfn.tabpfn.FrozenTabPFN` (refitted here).
+        u: Quantile levels, shape [J].
+
+    Returns:
+        ``(beliefs, states, lens)``: belief per code (:class:`analysis.representation.Belief`), the block states of
+        the pass, and ``{'quantiles' [L, M, J], 'means' [L, M]}`` of the zero-parameter lens.
+
+    Raises:
+        RuntimeError: On non-finite TabPFN quantiles or lens moments.
+    """
+    from ..analysis import bayes_update as B  # noqa: PLC0415
+    from ..analysis import representation as R  # noqa: PLC0415
+    from ..analysis.embeddings import capture_states_and_predictive, lens_log_probs  # noqa: PLC0415
+
+    tabpfn.fit(ctx.X, ctx.y)
+    states, lp = capture_states_and_predictive(tabpfn, Q, layers=p["layers"])     # lp [1, M, bars]
+    mean, sd = tabpfn.moments(lp)                                                   # [1, M] x2
+    E = np.asarray(tabpfn.ppf(lp, u), dtype=np.float64)[0]                          # [M, J]
+    lens_lp = lens_log_probs(tabpfn, states.label_token)                            # [L, M, bars]
+    lens_mean, _ = tabpfn.moments(lens_lp)                                          # [L, M]
+    lens_q = np.asarray(tabpfn.ppf(lens_lp, u), dtype=np.float64)                   # [L, M, J]
+    for name, arr in (("final quantiles", E), ("lens quantiles", lens_q), ("lens means", lens_mean)):
+        if not np.isfinite(arr).all():
+            raise RuntimeError(f"representation: non-finite TabPFN {name}.")
+    beliefs: dict[str, Any] = {"own": R.Belief(mean[0], sd[0], E, None)}
+    codes = {e: c for c, e in R.BELIEF_CODES.items()}
+    for name in p["belief_engines"]:
+        g = _representation_gp(name, p)
+        g.fit(ctx.X, ctx.y)
+        base = g.base(Q)
+        beliefs[codes[name]] = R.Belief(base.mean[0], base.sd[0], B.belief_embedding(base, u),
+                                        B.latent_covariance_of(g, Q))
+    return beliefs, states, {"quantiles": lens_q, "means": lens_mean}
+
+
+def _representation_cell(
+    st: ChannelData,
+    level: float,
+    t: int,
+    draw: int,
+    p: dict[str, Any],
+    cfg: MechanismConfig,
+    tabpfn: Any,
+    surrogate_grams: Callable[[float], list[np.ndarray]],
+) -> dict[str, Any]:
+    """One (channel, level, t, draw) cell of BETA: β2 alignment rows, the surrogate floor, ceilings, β1a, the lens.
+
+    Args:
+        st: The channel at this stress level.
+        level: Stress level.
+        t: Context size.
+        draw: Context draw.
+        p: Resolved ``representation`` block.
+        cfg: Resolved config.
+        tabpfn: The cell's ``FrozenTabPFN`` (inference seed ``tabpfn.inference_seed + draw``).
+        surrogate_grams: ``lengthscale -> [surrogate Gram over every site of the grid]`` (channel-independent).
+
+    Returns:
+        ``alignment``, ``surrogate``, ``ceiling``, ``relations``, ``site_match`` and ``lens`` rows, diagnostics, the
+        host and the wall time (guardrail G5).
+    """
+    import socket  # noqa: PLC0415
+
+    from ..analysis import bayes_update as B  # noqa: PLC0415
+    from ..analysis import cka as C  # noqa: PLC0415
+    from ..analysis import representation as R  # noqa: PLC0415
+
+    t0 = time.time()
+    Q = st.X_pool
+    M = st.n_sites
+    u = B.belief_levels(int(p["n_quantiles"]))
+    ctx = context_for(st, int(t), int(draw), base_seed=cfg.seed, level=float(level))
+    observed = np.isin(np.arange(M), ctx.sites)                                     # [M]
+    beliefs, states, lens = _representation_beliefs(ctx, Q, p, tabpfn, u)
+    codes = {e: c for c, e in R.BELIEF_CODES.items()}
+    layout_code = codes[p["layout_confound"]]
+    layout = beliefs[layout_code].cov
+    targets = R.target_grams(p["targets"], beliefs, Q, st.y_gt)
+    reps: dict[tuple[str, int], np.ndarray] = {}
+    for i, layer in enumerate(states.layers):
+        if "label" in p["readouts"]:
+            reps[("label", int(layer))] = C.linear_gram(states.label_token[i])                    # [M, M]
+        if "feature_mean" in p["readouts"]:
+            reps[("feature_mean", int(layer))] = C.linear_gram(states.feature_tokens[i].mean(axis=1))
+        if "lens" in p["readouts"]:
+            reps[("lens", int(layer))] = C.centered_linear_gram(lens["quantiles"][i])
+    geometry = C.geometry_confounds(Q, p["deconfound"]["bandwidth_multipliers"])
+    min_res = float(p["deconfound"]["min_residual_frac"])
+    alt_targets: dict[str, np.ndarray] = {}
+    if p["ceiling"]["enabled"]:
+        alt_ctx = context_for(st, int(t), int(draw), base_seed=cfg.seed, level=float(level),
+                              trial_draw=int(draw) + int(p["ceiling"]["trial_draw_offset"]))
+        alt_beliefs, _, _ = _representation_beliefs(alt_ctx, Q, p, tabpfn, u)
+        alt_targets = R.target_grams(p["targets"], alt_beliefs, Q, st.y_gt)
+    out: dict[str, list[dict[str, Any]]] = {k: [] for k in ("alignment", "surrogate", "ceiling", "relations")}
+    sur_full = {float(ell): surrogate_grams(float(ell)) for ell in p["surrogate"]["lengthscales"]}
+    for site_set in p["site_sets"]:
+        idx = np.arange(M) if site_set == "all" else np.flatnonzero(~observed)
+        if idx.size < 4:
+            continue
+
+        def sub(G: np.ndarray, idx: np.ndarray = idx) -> np.ndarray:
+            return G[np.ix_(idx, idx)]
+
+        dec_cache: dict[bool, C.Deconfounder] = {}
+        decs: dict[str, C.Deconfounder] = {}
+        for name in p["targets"]:
+            confs = R.target_confounds(name, geometry, layout, layout_code)
+            with_layout = len(confs) > len(geometry)
+            if with_layout not in dec_cache:
+                dec_cache[with_layout] = C.Deconfounder([sub(c) for c in confs])
+            decs[name] = dec_cache[with_layout]
+        tg = {n: sub(G) for n, G in targets.items()}
+        rows = R.alignment_rows({k: sub(G) for k, G in reps.items()}, tg, decs,
+                                n_perm=int(p["permutation"]["n_perm"]),
+                                rng=rng_for(st.label, "representation-perm", level, t, draw, site_set,
+                                            base_seed=cfg.seed),
+                                min_residual_frac=min_res)
+        sur = R.surrogate_rows({ell: [sub(G) for G in gs] for ell, gs in sur_full.items()}, tg, decs,
+                               quantile=float(p["surrogate"]["quantile"]), min_residual_frac=min_res)
+        floors = R.surrogate_floors(sur)
+        out["alignment"] += [{"site_set": site_set, **r, **floors.get(r["target"], {})} for r in rows]
+        out["surrogate"] += [{"site_set": site_set, **r} for r in sur]
+        out["relations"] += [{"site_set": site_set, **r} for r in R.pair_rows(
+            [tuple(x) for x in p["target_relations"]], tg, tg, decs, min_residual_frac=min_res,
+            label="belief_ceiling")]
+        if alt_targets:
+            beliefs_only = [n for n in p["targets"] if R.parse_target(n)[1] is not None]
+            out["ceiling"] += [{"site_set": site_set, **r} for r in R.pair_rows(
+                [(n, n) for n in beliefs_only], tg, {n: sub(G) for n, G in alt_targets.items()}, decs,
+                min_residual_frac=min_res, label="trial_ceiling")]
+    refs = [codes[r] for r in p["site_match"]["references"]]
+    last = len(states.layers) - 1
+    diagnostics = {"n_observed": int(observed.sum())}
+    if int(states.layers[last]) == len(tabpfn._model.transformer_encoder.layers) - 1:  # noqa: SLF001
+        # The lens at the last block IS the final predictive (same pass, same head): a built-in check.
+        diagnostics["lens_final_max_abs_mean"] = float(np.abs(lens["means"][last] - beliefs["own"].mean).max())
+    return {
+        **out,
+        "site_match": R.site_match_rows(beliefs["own"].quantiles, beliefs, refs, observed),
+        "lens": R.lens_rows(lens["quantiles"], lens["means"], states.layers, beliefs, refs, observed),
+        "diagnostics": diagnostics,
+        "host": socket.gethostname(),
+        "device": cfg.device,
+        "seconds": time.time() - t0,
+    }
+
+
+def _posterior_cov_cell(
+    st: ChannelData,
+    level: float,
+    t: int,
+    draw: int,
+    p: dict[str, Any],
+    cfg: MechanismConfig,
+) -> dict[str, Any]:
+    """β1b at one (channel, level, t, draw): C_PFN with every site as an anchor against each reference's covariance.
+
+    Statistics per reference: debiased CKA and NBS / shape distance of the double-centred matrices (shape), the
+    deconfounded CKA (geometry, plus GP-fixed's covariance for any other reference, D3d), the Bures distance of the
+    uncentred matrices (= W2 between the zero-mean Gaussian posteriors on the grid) and its ratio to
+    ``sqrt(tr Sigma_ref)``, and the trace ratio ``tr C_PFN / tr Sigma_ref`` (overall latent uncertainty).
+
+    Args:
+        st: The channel at this stress level.
+        level: Stress level.
+        t: Context size.
+        draw: Context draw.
+        p: Resolved ``representation`` block.
+        cfg: Resolved config.
+
+    Returns:
+        ``rows`` (one per reference), C_PFN's ``asymmetry`` and ``clipped_mass``, the host and the wall time.
+    """
+    import socket  # noqa: PLC0415
+
+    from ..analysis import bayes_update as B  # noqa: PLC0415
+    from ..analysis import cka as C  # noqa: PLC0415
+    from ..analysis import procrustes as P  # noqa: PLC0415
+
+    t0 = time.time()
+    pc = p["posterior_cov"]
+    Q = st.X_pool
+    M = st.n_sites
+    ctx = context_for(st, int(t), int(draw), base_seed=cfg.seed, level=float(level))
+    name = pc["engine"]
+    if name in TABPFN_ENGINES:
+        tp = {**p["tabpfn"], **TABPFN_ENGINES[name]}
+        eng: Any = B.PFNRefitEngine(device=cfg.device, random_state=int(tp["inference_seed"]) + int(draw),
+                                    softmax_temperature=float(tp["softmax_temperature"]), name=name)
+    else:
+        eng = _representation_gp(name, p)
+    eng.fit(ctx.X, ctx.y)
+    qd = pc["quadrature"]
+    _, C_raw, C_c = B.coherence(
+        eng, Q, np.arange(M), int(qd["K"]), float(pc["eps"]), method=str(qd["method"]), u_min=float(qd["u_min"]),
+        central_mass=float(qd["central_mass"]), n_scrambles=int(qd["n_scrambles"]),
+        rng=rng_for(st.label, "representation_posterior_cov", level, t, draw, base_seed=cfg.seed),
+        u_tail=float(pc["y_grid"]["u_tail"]), grid_points=int(pc["y_grid"]["points"]))
+    imp = B.implied_posterior_covariance(C_c if pc["moment_matched"] else C_raw)
+    C_pfn = imp["cov"]                                                              # [M, M]
+    geometry = C.geometry_confounds(Q, p["deconfound"]["bandwidth_multipliers"])
+    layout_eng = _representation_gp(p["layout_confound"], p)
+    layout_eng.fit(ctx.X, ctx.y)
+    layout = B.latent_covariance_of(layout_eng, Q)
+    rows = []
+    for ref in pc["references"]:
+        g = _representation_gp(ref, p)
+        g.fit(ctx.X, ctx.y)
+        S = B.latent_covariance_of(g, Q)                                            # [M, M]
+        confs = geometry if ref == p["layout_confound"] else [*geometry, layout]
+        dc = C.cka_deconfounded(C_pfn, S, C.Deconfounder(confs),
+                                min_residual_frac=float(p["deconfound"]["min_residual_frac"]))
+        v = P.nbs(C_pfn, S)
+        bd = P.bures(C_pfn, S)
+        rows.append({"engine": name, "reference": ref, "cka": C.cka_or_none(C_pfn, S), "cka_deconf": dc["value"],
+                     "deconf_degenerate": bool(dc["degenerate"]), "nbs": v,
+                     "shape_distance": float(np.arccos(np.clip(v, 0.0, 1.0))), "bures": bd,
+                     "bures_rel": bd / float(np.sqrt(np.trace(S))),
+                     "trace_ratio": float(np.trace(C_pfn) / np.trace(S))})
+    return {"rows": rows, "asymmetry": imp["asymmetry"], "clipped_mass": imp["clipped_mass"],
+            "host": socket.gethostname(), "device": cfg.device, "seconds": time.time() - t0}
+
+
+def run_representation(cfg: MechanismConfig, opts: RunOptions) -> str:
+    """BETA β2 / β1a / β1b on the grid channel x level x t x draw; summaries and figures.
+
+    Cells (one per (channel, level, t, draw), kind ``cell``; β1b's kind ``posterior_cov`` on its coverage) are cached
+    as everywhere else, so ``--only-cached`` assembles what exists and a subject can be added without recomputing
+    the others. Per channel rather than per grid (the plan's §7 layout): β3, the only analysis that needs every
+    channel of a grid in one cell, moved to an optional appendix (D6a), and per-channel cells shard by subject.
 
     Args:
         cfg: Resolved config.
@@ -2407,122 +2372,166 @@ def run_procrustes(cfg: MechanismConfig, opts: RunOptions) -> str:
     Returns:
         The run directory.
     """
-    from ..analysis.embeddings import READOUTS, readout_embeddings  # noqa: PLC0415
-    from ..analysis.procrustes import HEADLINE_STATISTIC  # noqa: PLC0415
+    from ..analysis import cka as C  # noqa: PLC0415
+    from ..analysis import representation as R  # noqa: PLC0415
     from ..data.snr import achieved_snr_db  # noqa: PLC0415
     from ..data.stress import build_knob  # noqa: PLC0415
     from ..models.pfn.tabpfn import FrozenTabPFN  # noqa: PLC0415
     from ..visualization import mechanism as figs  # noqa: PLC0415
 
-    p = _check_keys(cfg.params, PROCRUSTES_DEFAULTS, "procrustes")
-    p["stress"] = _check_keys(p["stress"], PROCRUSTES_DEFAULTS["stress"], "procrustes.stress")
-    p["subsample"] = _check_keys(p["subsample"], PROCRUSTES_DEFAULTS["subsample"], "procrustes.subsample")
-    p["figures"] = _check_keys(p["figures"], PROCRUSTES_DEFAULTS["figures"], "procrustes.figures")
-    bad = [r for r in p["readouts"] if r not in READOUTS]
-    if bad:
-        raise ValueError(f"procrustes.readouts: unknown {bad}; expected a subset of {READOUTS}.")
-    unsupported = [r for r in p["readouts"] if r not in PROCRUSTES_READOUTS]
-    if unsupported:
-        raise ValueError(
-            f"procrustes.readouts: {unsupported} is not supported here (only {list(PROCRUSTES_READOUTS)}); a "
-            "per-token Procrustes would need a per-token null whose averaging rule is undefined."
-        )
-    _subset_of_ladder([p["baseline_t"]], cfg.context_sizes, "procrustes.baseline_t")
-    if int(p["n_perm"]) < 1:
-        raise ValueError(f"procrustes.n_perm must be >= 1, got {p['n_perm']}.")
+    p = _validate_representation(cfg.params, cfg.context_sizes)
     out = cfg.run_dir
     if not opts.replot:
         set_seed(cfg.seed)
         _write_config(cfg, p, out)
         cells = _Cells(cfg, opts)
-        engine_box: dict[str, Any] = {}
-
-        def engine() -> Any:
-            if "e" not in engine_box:
-                engine_box["e"] = FrozenTabPFN(device=cfg.device, random_state=int(p["inference_seed"]))
-            return engine_box["e"]
-
-        def embed(ctx: Any, X_sites: np.ndarray, readout: str) -> Any:
-            eng = engine()
-            eng.fit(ctx.X, ctx.y)
-            return readout_embeddings(eng, X_sites, readouts=(readout,), layers=p["layers"])[readout]
-
-        channels = _channels(cfg)
         knob = build_knob(p["stress"]["knob"], p["stress"]["levels"])
-        rows: list[dict[str, Any]] = []
+        channels = _channels(cfg)
+        tp = p["tabpfn"]
+        engines: dict[int, Any] = {}
+
+        def tabpfn(draw: int) -> Any:
+            seed = int(tp["inference_seed"]) + int(draw)
+            if seed not in engines:
+                engines[seed] = FrozenTabPFN(device=cfg.device, random_state=seed, precision=str(tp["precision"]),
+                                             max_batch_tokens=int(tp["max_batch_tokens"]),
+                                             softmax_temperature=float(tp["softmax_temperature"]))
+            return engines[seed]
+
+        sur_cache: dict[tuple[str, float], list[np.ndarray]] = {}
+
+        def surrogate_grams_for(X: np.ndarray) -> Callable[[float], list[np.ndarray]]:
+            gid = grid_id(X)
+            sp = p["surrogate"]
+
+            def grams(ell: float) -> list[np.ndarray]:
+                if (gid, ell) not in sur_cache:
+                    sur_cache[(gid, ell)] = [C.linear_gram(C.smooth_field_surrogate(
+                        X, ell, int(sp["n_fields"]), rng_for(gid, "representation-surrogate", ell, rep,
+                                                             base_seed=cfg.seed), jitter=float(sp["jitter"])))
+                        for rep in range(int(sp["n_replicates"]))]
+                return sur_cache[(gid, ell)]
+            return grams
+
+        gp_ident = {e: _representation_gp_params(e, p) for e in p["belief_engines"]}
+        common = {k: p[k] for k in ("layers", "readouts", "targets", "belief_engines", "layout_confound", "n_quantiles",
+                                    "site_sets", "deconfound", "surrogate", "permutation", "ceiling",
+                                    "target_relations", "site_match")}
+        tables: dict[str, list[dict[str, Any]]] = {k: [] for k in (
+            "alignment", "surrogate", "ceiling", "relations", "site_match", "lens", "posterior_cov")}
+        pc = p["posterior_cov"]
+        allowed = _first_per_subject(channels, int(pc["coverage"]["channels_per_subject"])) \
+            if pc["coverage"]["channels_per_subject"] is not None else {c.label for c in channels}
+        t0 = time.time()
         for ch in channels:
             for level in knob.levels:
-                st = knob.apply(ch, level, rng_for(ch.label, "procrustes", level, base_seed=cfg.seed))
+                st = knob.apply(ch, level, rng_for(ch.label, "representation", level, base_seed=cfg.seed))
                 snr = achieved_snr_db(st)
-                # t == n_sites is allowed here (CKA skips it): the fully-observed grid is the informed end of the
-                # ladder, and context_sites accepts t up to N. It is NOT a fix for n < d -- the cloud's rows are
-                # the readout sites, so no context size changes how many rows it has (that is the null's job).
-                ladder = tuple(int(t) for t in cfg.context_sizes if t <= st.n_sites)
-                if int(p["baseline_t"]) not in ladder:
-                    raise ValueError(
-                        f"procrustes: baseline_t={p['baseline_t']} exceeds {st.label}'s {st.n_sites} sites."
-                    )
-                for rep in range(int(p["n_context_draws"])):
-                    for readout in p["readouts"]:
-                        ident = {
-                            **cells.channel(ch), "knob": knob.name, "level": float(level), "draw": rep,
-                            "readout": readout, "layers": p["layers"], "ladder": list(ladder),
-                            "baseline_t": int(p["baseline_t"]), "n_perm": int(p["n_perm"]),
-                            "subsample": p["subsample"], "cka_companion": bool(p["cka_companion"]),
-                            "inference_seed": int(p["inference_seed"]),
-                        }
-
-                        def compute(level: float = level, rep: int = rep, readout: str = readout,
-                                    st: ChannelData = st, ladder: tuple[int, ...] = ladder,
-                                    ) -> tuple[dict[str, Any], dict[str, Any]]:
-                            # One row subsample per cell, shared by every layer and every context size, so the
-                            # site-to-row correspondence holds across the whole cell.
-                            n_rows = p["subsample"]["n_rows"]
-                            sel: np.ndarray | None = None
-                            if n_rows is not None:
-                                if not 3 <= int(n_rows) <= st.n_sites:
-                                    raise ValueError(
-                                        f"procrustes.subsample.n_rows={n_rows} must be in [3, {st.n_sites}]."
-                                    )
-                                sub_rng = rng_for(st.label, "procrustes-subsample", level, rep, base_seed=cfg.seed)
-                                sel = np.sort(sub_rng.choice(st.n_sites, size=int(n_rows), replace=False))
-                            X_sites = st.X_pool if sel is None else st.X_pool[sel]    # [n_rows, D]
-                            clouds: dict[int, Any] = {}
-                            for t in ladder:
-                                ctx = context_for(st, int(t), rep, base_seed=cfg.seed, level=float(level))
-                                clouds[int(t)] = embed(ctx, X_sites, readout)
-                            null_rng = rng_for(st.label, "procrustes-null", level, rep, readout, base_seed=cfg.seed)
-                            return {"rows": _procrustes_rows(
-                                clouds, int(p["baseline_t"]), int(p["n_perm"]), null_rng,
-                                cka_companion=bool(p["cka_companion"]),
-                            )}, {}
-
-                        hit = cells.run("trajectory", ident, f"{ch.label} a={level:g} d={rep} {readout}", compute)
-                        if hit is None:
-                            continue
-                        for r in hit[0]["rows"]:
-                            rows.append({
-                                "dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg,
-                                "model": MECHANISM_MODEL, "readout": readout, "knob": knob.name,
-                                "level": float(level), "achieved_snr_db": snr, "rep": rep,
-                                "baseline_t": int(p["baseline_t"]), **r,
-                            })
-            print(f"[mechanism] procrustes {ch.label} done", flush=True)
-        _write_csv(rows, out, "procrustes.csv")
-        with open(os.path.join(out, "headline.json"), "w", encoding="utf-8") as fh:
-            json.dump({
-                "headline_statistic": HEADLINE_STATISTIC,
-                "null": "shuffled-site (the row correspondence of one cloud is permuted)",
-                "n_perm": int(p["n_perm"]),
-                "rotation_quotient_caveat": (
-                    "Procrustes quotients out rotation; the prediction head is not rotation-equivariant. "
-                    "Representation-similarity readout only -- never a claim about the model's output."
-                ),
-            }, fh, indent=2)
+                for t in cfg.context_sizes:
+                    if t >= st.n_sites:
+                        continue
+                    for draw in range(int(p["n_context_draws"])):
+                        keys = {"dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg, "knob": knob.name,
+                                "level": float(level), "achieved_snr_db": snr, "context_t": int(t), "draw": draw}
+                        ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
+                                 "draw": draw, "stats_version": REPRESENTATION_STATS_VERSION,
+                                 "tabpfn": {"inference_seed": int(tp["inference_seed"]) + draw,
+                                            "softmax_temperature": float(tp["softmax_temperature"]),
+                                            "precision": str(tp["precision"])},
+                                 "gp": gp_ident, **common}
+                        hit = cells.run("cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
+                                        lambda st=st, level=level, t=t, draw=draw: (_representation_cell(
+                                            st, float(level), int(t), draw, p, cfg, tabpfn(draw),
+                                            surrogate_grams_for(st.X_pool)), {}))
+                        if hit is not None:
+                            pay = hit[0]
+                            prov = {"host": pay["host"], "seconds": pay["seconds"]}
+                            for k in ("alignment", "surrogate", "ceiling", "relations", "site_match", "lens"):
+                                tables[k] += [{**keys, **r, **(prov if k == "alignment" else {})} for r in pay[k]]
+                        cov = pc["coverage"]
+                        if pc["enabled"] and ch.label in allowed and any(np.isclose(level, lv) for lv in cov["levels"]) \
+                                and int(t) in {int(v) for v in cov["context_ts"]} and draw in {int(v) for v in cov["draws"]}:
+                            pident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
+                                      "draw": draw, "engine": pc["engine"],
+                                      "engine_params": _engine_params(pc["engine"], p, draw),
+                                      "references": pc["references"], "gp": gp_ident,
+                                      "layout_confound": p["layout_confound"], "deconfound": p["deconfound"],
+                                      **{k: pc[k] for k in ("quadrature", "eps", "y_grid", "moment_matched")}}
+                            hit = cells.run("posterior_cov", pident, f"posterior_cov {ch.label} a={level:g} t={t} d={draw}",
+                                            lambda st=st, level=level, t=t, draw=draw: (_posterior_cov_cell(
+                                                st, float(level), int(t), draw, p, cfg), {}))
+                            if hit is not None:
+                                pay = hit[0]
+                                tables["posterior_cov"] += [
+                                    {**keys, **r, "asymmetry": pay["asymmetry"], "clipped_mass": pay["clipped_mass"],
+                                     "host": pay["host"], "seconds": pay["seconds"]} for r in pay["rows"]]
+                print(f"[mechanism] representation {ch.label} level={level} done ({time.time() - t0:.0f}s)",
+                      flush=True)
+        names = {"alignment": "representation.csv", "surrogate": "surrogate.csv", "ceiling": "ceiling.csv",
+                 "relations": "target_relations.csv", "site_match": "site_match.csv", "lens": "lens.csv",
+                 "posterior_cov": "posterior_cov.csv"}
+        for k, rows in tables.items():
+            if rows:
+                _write_csv(rows, out, names[k])
+        if tables["alignment"]:
+            _representation_summaries(out, p, cfg.seed)
         cells.report()
-    for path in figs.render_procrustes(out):
-        print(f"[mechanism] wrote {path}", flush=True)
+    for path in figs.render_representation(out):
+        print(f"[mechanism] wrote {path}")
     return out
+
+
+def _representation_summaries(out: str, p: dict[str, Any], seed: int) -> None:
+    """Headline columns, channel-bootstrap summaries and ``headline.json`` from the assembled CSVs (BETA D4).
+
+    Args:
+        out: Run directory (holds the assembled CSVs).
+        p: Resolved ``representation`` block.
+        seed: Bootstrap seed.
+    """
+    from ..analysis import representation as R  # noqa: PLC0415
+
+    inf = p["inference"]
+    kw = {"n_boot": int(inf["n_boot"]), "ci": float(inf["ci"]), "seed": int(seed)}
+    stat = p["headline"]["statistic"]
+    rep = R.add_headline(pd.read_csv(os.path.join(out, "representation.csv")), stat)
+    rep["headline_margin"] = rep["headline_value"] - rep["headline_floor"]
+    rep.to_csv(os.path.join(out, "representation.csv"), index=False)
+    R.channel_summary(rep, ["headline_value", "headline_floor", "headline_margin", "cka", "cka_deconf", "nbs"],
+                      ["level", "context_t", "site_set", "readout", "layer", "target"], **kw).to_csv(
+        os.path.join(out, "representation_summary.csv"), index=False)
+    path = os.path.join(out, "site_match.csv")
+    if os.path.exists(path):
+        sm = pd.read_csv(path)
+        sm["site_pool"] = np.where(sm["observed"].astype(bool), "observed", "unobserved")
+        # matched per site first (site_match.csv), then the median over the sites of a pool, per cell
+        cell = (sm.groupby(["subject", "emg", "level", "context_t", "draw", "reference", "site_pool"])
+                [["w2", "w2_over_sd", "location", "spread", "shape"]].median().reset_index())
+        R.channel_summary(cell, ["w2", "w2_over_sd", "location", "spread", "shape"],
+                          ["level", "context_t", "reference", "site_pool"], **kw).to_csv(
+            os.path.join(out, "site_match_summary.csv"), index=False)
+    path = os.path.join(out, "lens.csv")
+    if os.path.exists(path):
+        R.channel_summary(pd.read_csv(path), ["w2", "w2_over_sd", "location", "spread", "shape",
+                                              "lens_site_sd_ratio", "lens_r_final"],
+                          ["level", "context_t", "layer", "comparison", "site_pool"], **kw).to_csv(
+            os.path.join(out, "lens_summary.csv"), index=False)
+    path = os.path.join(out, "posterior_cov.csv")
+    if os.path.exists(path):
+        R.channel_summary(pd.read_csv(path), ["nbs", "cka", "cka_deconf", "shape_distance", "bures_rel",
+                                              "trace_ratio", "asymmetry", "clipped_mass"],
+                          ["level", "context_t", "engine", "reference"], **kw).to_csv(
+            os.path.join(out, "posterior_cov_summary.csv"), index=False)
+    with open(os.path.join(out, "headline.json"), "w", encoding="utf-8") as fh:
+        json.dump({
+            "status": "OPEN (research_design.md §4, 2026-10-19): settled after the real-grid re-check",
+            "statistic": stat, "readout": p["headline"]["readout"],
+            "computable_alternatives": [s for s in R.HEADLINE_STATISTICS if s != stat],
+            "floor": "smooth-field surrogate: the max over lengthscales of the per-lengthscale upper quantile",
+            "surrogate": p["surrogate"],
+            "lens_flag_rule": "OPEN (research_design.md §4, 2026-10-19): lens diagnostics written, nothing flagged",
+            "claim": "decodability beyond geometry and layout (G6); never 'GP-like' from a gap between two CKA scores",
+        }, fh, indent=2)
 
 
 #: Analysis runners by name.
@@ -2530,7 +2539,7 @@ ANALYSES: dict[str, Callable[[MechanismConfig, RunOptions], str]] = {
     "bayes_update": run_bayes_update,
     "placement": run_placement,
     "cka": run_cka,
-    "procrustes": run_procrustes,
+    "representation": run_representation,
 }
 
 

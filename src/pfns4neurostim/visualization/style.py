@@ -59,6 +59,9 @@ __all__ = [
     "ACQUISITION_LINESTYLES",
     "READOUT_LINESTYLES",
     "READOUT_LABELS",
+    "BELIEF_TARGET_LABELS",
+    "SITE_POOL_LINESTYLES",
+    "SURROGATE_BAND_LABEL",
     "SUBJECT_COLOR_RANGE",
     "SUBJECT_MARKERS",
     "SUBJECT_LABEL",
@@ -740,15 +743,27 @@ AXIS_LABELS: dict[str, str] = {
     "p_rank": "Rank placement (fraction of references exceeded)",
     "rank_vs_floor": "Rank vs prior floor (fraction exceeded)",
     "rank_vs_ceiling": "Rank vs noise ceiling (fraction exceeded)",
-    "cka_minus_null": "Debiased CKA minus permutation null",
-    # Procrustes complement of the CKA analysis (M14 revived, 2026-10-14). The disparity is the residual of the
-    # best rigid alignment of two row-matched site clouds, so it keeps the anisotropy CKA is invariant to; the
-    # headline axis is the DIFFERENCE against the shuffled-site null, because a raw disparity is biased low at
-    # 96 rows in 192 dimensions (analysis/procrustes.py, Caveat 2).
-    "procrustes_disparity": "Procrustes disparity (0-1)",
-    "disparity_minus_null": "Procrustes disparity\nminus shuffled-site null",
-    "disparity_ratio": "Procrustes disparity / null mean",
-    "cka_pairwise": "Debiased CKA of the same two clouds",
+    # BETA representation analysis (2026-10-21). CKA and Procrustes share their invariance group (translation,
+    # isotropic scale, orthogonal maps) and differ in how they weight the cross-covariance spectrum: CKA by a
+    # Frobenius norm (leading directions dominate), NBS by a nuclear norm (every direction counts;
+    # analysis/procrustes.py). Every statistic here is read against the smooth-field surrogate (BETA D3d); the
+    # deconfounded CKA removes 4-bandwidth geometry (and GP-fixed's covariance for covariance targets).
+    "cka_debiased": "Debiased CKA",
+    "cka_deconfounded": "Deconfounded debiased CKA\n(geometry removed)",
+    "headline_deconfounded_vs_surrogate": "Deconfounded debiased CKA\n(geometry removed)",
+    "headline_floor_subtracted_raw": "Debiased CKA minus\nsurrogate median",
+    "nbs": "Normalised Bures similarity (NBS)",
+    "shape_distance": r"Procrustes shape distance $\arccos$(NBS) (rad)",
+    "bures": "Bures distance (z-units)",
+    "bures_rel": r"Bures distance / $\sqrt{\mathrm{tr}\,\Sigma_\mathrm{ref}}$",
+    "trace_ratio": r"Trace ratio $\mathrm{tr}\,C_\mathrm{PFN}$ / $\mathrm{tr}\,\Sigma_\mathrm{ref}$",
+    "mantel_r": r"Mantel Spearman $r$",
+    "w2_site": "Per-site W2 (z-units)",
+    "w2_over_sd": "Per-site W2 / reference SD",
+    "w2_location": "Location term (z-units$^2$)",
+    "w2_spread": "Spread term (z-units$^2$)",
+    "w2_shape": "Shape term (z-units$^2$)",
+    "lens_w2_over_sd": "Lens W2 / reference SD\n(median over sites)",
     "layer": "Transformer layer",
     # OMEGA bayes_update (2026-10-15). Part A: every coherent Bayesian model scores 0 drift, a shrink / move
     # ratio of 1 and 0 asymmetry, whatever its prior. Part B: TabPFN's update against a GP reference, matched per
@@ -796,18 +811,51 @@ AXIS_LABELS: dict[str, str] = {
     "cvar10_level_mean": "CVaR$_{10\\%}$ of recommended regret\n(mean over levels)",
 }
 
-#: Linestyle of each embedding readout (B1 Step 3). Readouts are told apart by linestyle so that colour stays
-#: free for the context size or stress level of the series; never a new hex colour.
+#: Linestyle of each embedding readout (B1 Step 3; BETA 2026-10-21). Readouts are told apart by linestyle so that
+#: colour stays free for the context size or stress level of the series; never a new hex colour. The label token is
+#: the reported readout (solid); the feature-token mean is a diagnostic line (G6).
 READOUT_LINESTYLES: dict[str, str] = {
-    "feature_mean": "-",
-    "feature_tokens": ":",
+    "label": "-",
+    "feature_mean": ":",
+    "lens": "--",
+    "feature_tokens": "-.",
 }
 
 #: Legend text of each readout.
 READOUT_LABELS: dict[str, str] = {
-    "feature_mean": "Feature-token mean",
-    "feature_tokens": "Per feature token (avg. CKA)",
+    "label": "Label token",
+    "feature_mean": "Feature-token mean (diagnostic)",
+    "lens": "Lens predictive (quantile embedding)",
+    "feature_tokens": "Per feature token",
 }
+
+#: Panel titles of the BETA belief targets (D3c / D3e). Location and spread are separate targets, never averaged.
+BELIEF_TARGET_LABELS: dict[str, str] = {
+    "mean_own": "TabPFN-2.5 mean map",
+    "sd_own": "TabPFN-2.5 SD map",
+    "quant_own": "TabPFN-2.5 quantile embedding",
+    "mean_mll": "GP-MLL refit mean map",
+    "sd_mll": "GP-MLL refit SD map",
+    "quant_mll": "GP-MLL refit quantile embedding",
+    "cov_mll": r"GP-MLL refit covariance $\Sigma_\mathrm{MLL}$",
+    "mean_fixed": "GP-fixed mean map",
+    "sd_fixed": "GP-fixed SD map",
+    "quant_fixed": "GP-fixed quantile embedding",
+    "cov_fixed": r"GP-fixed covariance $\Sigma_\mathrm{fixed}$",
+    "mean_bayes": "GP-Bayes mean map",
+    "sd_bayes": "GP-Bayes SD map",
+    "quant_bayes": "GP-Bayes quantile embedding",
+    "cov_bayes": r"GP-Bayes covariance $\Sigma_\mathrm{B}$",
+    "K_X": r"Electrode geometry $K_X$",
+    "K_GT": r"Ground-truth map $K_\mathrm{GT}$",
+}
+
+#: Linestyle of the two site pools of a site-matched readout (β1a; never pooled).
+SITE_POOL_LINESTYLES: dict[str, str] = {"unobserved": "-", "observed": "--"}
+
+#: Legend text of the smooth-field surrogate chance level (BETA D3d), drawn in :data:`NEUTRAL_GREY`: a chance level
+#: is a non-learning baseline, never a model anchor nor the prior / noise reference colours of the placement figures.
+SURROGATE_BAND_LABEL: str = "Smooth-field surrogate (95th pct.)"
 
 #: Subject identity in per-channel scatters (the M8 predictive link, 2026-10-21). Subjects are an ordered handful
 #: (NHP 0-3), so their colours are evenly spaced samples of :data:`SEQUENTIAL_CMAP` over this range (the top of

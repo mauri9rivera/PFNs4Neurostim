@@ -1,4 +1,4 @@
-"""Hyp C mechanism figures: placement (MMD / sliced W2), CKA, Procrustes.
+"""Hyp C mechanism figures: OMEGA, placement (MMD / sliced W2), CKA (b) placement, BETA representation.
 
 The legacy ID/OOD dashboard that used to live under this name (its own hardcoded palette)
 is in :mod:`pfns4neurostim.legacy_code.visualization_id_ood`; everything here takes geometry,
@@ -23,7 +23,7 @@ __all__ = [
     "render_predictive_link",
     "render_placement",
     "render_cka",
-    "render_procrustes",
+    "render_representation",
 ]
 
 #: Legend title over the stress-level series of the placement trajectory, so the lines are not an
@@ -35,15 +35,6 @@ PLACEMENT_LEVEL_LEGEND_TITLE: str = "Achieved SNR (dB)"
 
 #: Half-width of the floor / ceiling reference bands, in placement units.
 REFERENCE_BAND_HALF_WIDTH: float = 0.05
-
-
-#: CKA (a) target kernels that get a panel, in display order. ``K_X`` (electrode geometry) and
-#: ``K_GT_linear`` were dropped from the figure on 2026-09-27: ``K_X`` is an explicit *control* -- the model's
-#: input IS the coordinates, so agreement with geometry is trivial and it read highest, which invited the
-#: wrong conclusion -- and ``K_GT_linear`` is a bandwidth *sensitivity* check on ``K_GT``. Both stay in
-#: ``cka.csv`` and in the config's ``targets``, so the control and the sensitivity check remain auditable;
-#: they are simply not headline panels. The targets of interest are the response and the GP posterior.
-CKA_PLOTTED_TARGETS: tuple[str, ...] = ("K_GT", "K_GP")
 
 
 def _level_snr_labels(df: pd.DataFrame) -> dict[float, str]:
@@ -668,54 +659,11 @@ def render_placement(run_dir: str) -> list[str]:
     return written
 
 
-#: Height / width of a CKA (a) panel: one row per context size stacks four or more rows, so panels are kept flat.
-_CKA_PANEL_ASPECT: float = 0.45
-
-
-def _cka_a_figure(df: pd.DataFrame, readout: str, targets: list[str], run_dir: str) -> list[str]:
-    """CKA (a) of one feature readout: rows = context sizes, columns = targets, colour = stress level."""
-    levels = sorted(df["level"].unique())
-    snr_labels = _level_snr_labels(df)
-    # ONE ROW PER CONTEXT SIZE (2026-09-30): the figure's subject is what the network does with its evidence.
-    contexts = sorted(df["context_t"].unique())
-    fig, axes = style.figure("wide", nrows=len(contexts), ncols=len(targets), panel_aspect=_CKA_PANEL_ASPECT,
-                             sharey=True, sharex=True, squeeze=False)
-    base = style.model_color("tabpfn_v2_5")
-    for r, t_ctx in enumerate(contexts):
-        for c, target in enumerate(targets):
-            ax = axes[r, c]
-            sub = df[(df["target"] == target) & (df["context_t"] == t_ctx)]
-            for i, level in enumerate(levels):
-                color = base if i == 0 else style.derive_shade(base, i - 1, max(len(levels) - 1, 1))
-                # Average the draws WITHIN a channel first, then spread over channels: the band is then
-                # between-channel heterogeneity (a finding) and not draw noise (an artefact).
-                per_channel = (sub[sub["level"] == level]
-                               .groupby(["subject", "emg", "layer"])["cka_minus_null"].mean().reset_index())
-                agg = per_channel.groupby("layer")["cka_minus_null"]
-                med, q1, q3 = agg.median(), agg.quantile(0.25), agg.quantile(0.75)
-                ax.plot(med.index, med.values, color=color, ls=style.READOUT_LINESTYLES.get(readout, "-"),
-                        label=snr_labels.get(float(level), f"{level:g}"))
-                ax.fill_between(med.index, q1.values, q3.values, color=color, alpha=style.BAND_ALPHA, lw=0)
-            ax.axhline(0.0, color=style.NEUTRAL_GREY, lw=style.LINE_WIDTH / 2)
-            if r == 0:
-                ax.set_title(target.replace("_", " "))
-            style.set_integer_xaxis(ax)
-            if r == len(contexts) - 1:
-                ax.set_xlabel(style.axis_label("layer"))
-            if c == 0:
-                ax.set_ylabel(f"$t$ = {int(t_ctx)}")
-    fig.supylabel(style.axis_label("cka_minus_null"), fontsize=style.FONT_SIZES["base"])
-    axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"], title=style.READOUT_LABELS.get(readout, readout),
-                      title_fontsize=style.FONT_SIZES["legend"])
-    return style.save_figure(fig, run_dir, f"cka_vs_layer_{readout}")
-
-
 def render_cka(run_dir: str) -> list[str]:
-    """CKA (a) minus null vs layer per feature readout and target, and CKA (b) placement vs layer.
+    """CKA (b): placement of the feature-token mean vs layer, and its layer x context surface.
 
-    Only feature-token readouts exist (the label token was dropped on 2026-10-07, see
-    :mod:`pfns4neurostim.analysis.embeddings`), so there is no readout-comparison figure: ``feature_tokens`` is the
-    shadow run's readout and its verdict is ``shadow_criterion.json``.
+    CKA (a) and its figure (``cka_vs_layer_<readout>``) were removed on 2026-10-21 (BETA §7): the ``representation``
+    analysis replaces them (:func:`render_representation`).
 
     Args:
         run_dir: CKA run directory.
@@ -723,22 +671,15 @@ def render_cka(run_dir: str) -> list[str]:
     Returns:
         Written paths.
     """
-    written: list[str] = []
-    path_a = os.path.join(run_dir, "cka.csv")
-    if _has_rows(path_a):
-        df = pd.read_csv(path_a)
-        targets = [t for t in CKA_PLOTTED_TARGETS if t in set(df["target"])]
-        for readout in [r for r in style.READOUT_LINESTYLES if r in set(df["readout"])]:
-            written += _cka_a_figure(df[df["readout"] == readout], readout, targets, run_dir)
     path_b = os.path.join(run_dir, "cka_placement.csv")
-    if _has_rows(path_b):
-        written += _cka_placement_figures(pd.read_csv(path_b), run_dir)
-    return written
+    if not _has_rows(path_b):
+        return []
+    return _cka_placement_figures(pd.read_csv(path_b), run_dir)
 
 
 #: Style key of each placement statistic's axis label. The CSV column name is NOT the key: the ratio's label is
-#: registered as ``placement`` (it predates the column), and ``p`` alone is the permutation p-value in ``cka.csv``,
-#: so looking the column up directly silently falls back to a title-cased "P".
+#: registered as ``placement`` (it predates the column), and ``p`` alone was the permutation p-value of the retired
+#: CKA (a) table, so looking the column up directly silently falls back to a title-cased "P".
 PLACEMENT_AXIS_KEYS: dict[str, str] = {"p": "placement", "p_rank": "p_rank"}
 
 
@@ -800,171 +741,6 @@ def _placement_vs_layer(
         ax.set_ylim(lo, hi)
     ax.legend(loc="best", fontsize=style.FONT_SIZES["legend"])
     return style.save_figure(fig, run_dir, name)
-
-
-# ---------------------------------------------------------------------------
-# procrustes (M14 revived, 2026-10-14): the spectrum-weighting complement of CKA
-# ---------------------------------------------------------------------------
-#: Linestyle of the shuffled-site null reference in every Procrustes figure. The null is drawn in
-#: :data:`style.NEUTRAL_GREY` -- the token for a non-learning baseline, which is exactly what a row-permutation
-#: reference is -- and never in a model anchor or in the prior/noise reference colours (those mean something else
-#: in this project's figures).
-PROCRUSTES_NULL_LINESTYLE: tuple[int, tuple[int, int]] = (0, (3, 2))
-
-#: Aggregation of a Procrustes panel: the context draws of a channel are averaged FIRST and the spread is taken
-#: over channels, so the band is between-channel heterogeneity (a finding) and not draw noise (an artefact).
-PROCRUSTES_CHANNEL_KEYS: tuple[str, ...] = ("subject", "emg")
-
-
-def _procrustes_context_layers(run_dir: str, available: Sequence[int]) -> list[int]:
-    """Layers to draw in the disparity-vs-context figure, from the run's own resolved config.
-
-    Args:
-        run_dir: Procrustes run directory (holds ``config.yaml``).
-        available: Layers present in ``procrustes.csv``.
-
-    Returns:
-        The configured subset, or every available layer when the config does not pin one. Honours ``--replot``:
-        the resolved config written by the run is part of the run directory, so nothing is recomputed.
-    """
-    path = os.path.join(run_dir, "config.yaml")
-    wanted: Sequence[int] | None = None
-    if os.path.exists(path):
-        import yaml  # noqa: PLC0415 - only needed when a config is present
-
-        with open(path, encoding="utf-8") as fh:
-            doc = yaml.safe_load(fh) or {}
-        wanted = ((doc.get("procrustes") or {}).get("figures") or {}).get("context_layers")
-    if not wanted:
-        return sorted(int(v) for v in available)
-    return sorted(int(v) for v in wanted if int(v) in set(int(a) for a in available))
-
-
-def _procrustes_median(df: pd.DataFrame, column: str, by: str) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Median and interquartile band of ``column`` over channels, after averaging each channel's draws.
-
-    Args:
-        df: Rows of ``procrustes.csv`` (already filtered to one series).
-        column: Value column.
-        by: Grouping axis (``'layer'`` or ``'context_t'``).
-
-    Returns:
-        ``(median, q1, q3)``, each indexed by ``by``.
-    """
-    per_channel = df.groupby([*PROCRUSTES_CHANNEL_KEYS, by])[column].mean().reset_index()
-    agg = per_channel.groupby(by)[column]
-    return agg.median(), agg.quantile(0.25), agg.quantile(0.75)
-
-
-def _procrustes_vs_context(df: pd.DataFrame, run_dir: str) -> list[str]:
-    """Disparity along the context ladder, per layer, with the shuffled-site null drawn as its reference.
-
-    The two axes of this figure answer different questions and must not be conflated: the **ladder** asks whether
-    the geometric drift depends on how much evidence the network has, while the **null** asks whether a disparity
-    number means anything at all at 96 rows in 192 dimensions. The null is a property of the clouds' marginal
-    geometry, not of the context size.
-    """
-    layers = _procrustes_context_layers(run_dir, sorted(df["layer"].unique()))
-    if not layers:
-        return []
-    base = style.model_color("tabpfn_v2_5")
-    fig, ax = style.figure("onehalf")
-    for i, layer in enumerate(layers):
-        sub = df[df["layer"] == layer]
-        color = base if len(layers) == 1 else style.derive_shade(base, i, len(layers))
-        med, q1, q3 = _procrustes_median(sub, "disparity", "context_t")
-        ax.plot(med.index, med.values, color=color, marker="o", label=rf"$\ell$ = {int(layer)}")
-        ax.fill_between(med.index, q1.values, q3.values, color=color, alpha=style.BAND_ALPHA, lw=0)
-        null_med, _, _ = _procrustes_median(sub, "null_mean", "context_t")
-        ax.plot(null_med.index, null_med.values, color=style.NEUTRAL_GREY, ls=PROCRUSTES_NULL_LINESTYLE,
-                lw=style.LINE_WIDTH, label="Shuffled-site null" if i == 0 else None)
-    ax.set_xlabel(style.axis_label("context_t"))
-    ax.set_ylabel(style.axis_label("procrustes_disparity"))
-    ax.legend(loc="best", fontsize=style.FONT_SIZES["legend"], ncol=2)
-    return style.save_figure(fig, run_dir, "procrustes_vs_context")
-
-
-def _procrustes_vs_layer(df: pd.DataFrame, run_dir: str) -> list[str]:
-    """The headline statistic (disparity minus the shuffled-site null) over layers, one trace per context size.
-
-    The baseline context size is dropped: it is each cloud compared with itself, so its disparity is 0 by
-    construction and the statistic degenerates to minus the null.
-    """
-    moved = df[~df["is_baseline"].astype(bool)]
-    if moved.empty:
-        return []
-    contexts = sorted(moved["context_t"].unique())
-    base = style.model_color("tabpfn_v2_5")
-    fig, ax = style.figure("onehalf")
-    for i, t in enumerate(contexts):
-        color = base if len(contexts) == 1 else style.derive_shade(base, i, len(contexts))
-        med, q1, q3 = _procrustes_median(moved[moved["context_t"] == t], "disparity_minus_null", "layer")
-        ax.plot(med.index, med.values, color=color, marker="o", label=f"$t$ = {int(t)}")
-        ax.fill_between(med.index, q1.values, q3.values, color=color, alpha=style.BAND_ALPHA, lw=0)
-    ax.axhline(0.0, color=style.NEUTRAL_GREY, ls=PROCRUSTES_NULL_LINESTYLE, lw=style.LINE_WIDTH,
-               label="Shuffled-site null")
-    ax.set_xlabel(style.axis_label("layer"))
-    style.set_integer_xaxis(ax)
-    ax.set_ylabel(style.axis_label("disparity_minus_null"))
-    ax.legend(loc="best", fontsize=style.FONT_SIZES["legend"], ncol=2)
-    baseline = int(df["baseline_t"].iloc[0])
-    ax.set_title(rf"vs the $t$ = {baseline} cloud", fontsize=style.FONT_SIZES["base"])
-    return style.save_figure(fig, run_dir, "procrustes_vs_layer")
-
-
-def _procrustes_vs_cka(df: pd.DataFrame, run_dir: str) -> list[str]:
-    """Procrustes and CKA over layers **on the same pairs of clouds** -- the comparison this analysis exists for.
-
-    Top: the disparity with its shuffled-site null. Bottom: debiased linear CKA of the same two clouds. The two
-    statistics share an invariance group (translation, isotropic scale, orthogonal maps) but weight the
-    cross-covariance spectrum differently -- CKA by a Frobenius norm, so the leading directions dominate, the
-    disparity by a nuclear norm, so every direction counts equally (see
-    :mod:`pfns4neurostim.analysis.procrustes`). A layer where the two curves disagree is a layer whose change
-    sits in the weakly-populated directions CKA discounts. Neither panel speaks to the model's prediction:
-    Procrustes declares a global rotation irrelevant and the prediction head is not rotation-equivariant.
-    """
-    moved = df[~df["is_baseline"].astype(bool)]
-    if moved.empty or "cka" not in moved.columns or moved["cka"].isna().all():
-        return []
-    contexts = sorted(moved["context_t"].unique())
-    base = style.model_color("tabpfn_v2_5")
-    fig, axes = style.figure("onehalf", nrows=2, sharex=True, squeeze=False)
-    top, bottom = axes[0][0], axes[1][0]
-    for i, t in enumerate(contexts):
-        color = base if len(contexts) == 1 else style.derive_shade(base, i, len(contexts))
-        sub = moved[moved["context_t"] == t]
-        for ax, column in ((top, "disparity"), (bottom, "cka")):
-            med, q1, q3 = _procrustes_median(sub, column, "layer")
-            ax.plot(med.index, med.values, color=color, marker="o", label=f"$t$ = {int(t)}")
-            ax.fill_between(med.index, q1.values, q3.values, color=color, alpha=style.BAND_ALPHA, lw=0)
-        null_med, _, _ = _procrustes_median(sub, "null_mean", "layer")
-        top.plot(null_med.index, null_med.values, color=style.NEUTRAL_GREY, ls=PROCRUSTES_NULL_LINESTYLE,
-                 lw=style.LINE_WIDTH, label="Shuffled-site null" if i == 0 else None)
-    top.set_ylabel(style.axis_label("procrustes_disparity"))
-    bottom.set_ylabel(style.axis_label("cka_pairwise"))
-    bottom.set_xlabel(style.axis_label("layer"))
-    style.set_integer_xaxis(bottom)
-    top.legend(loc="best", fontsize=style.FONT_SIZES["legend"], ncol=2)
-    style.panel_letters([top, bottom])
-    return style.save_figure(fig, run_dir, "procrustes_vs_cka")
-
-
-def render_procrustes(run_dir: str) -> list[str]:
-    """Figures of the Procrustes complement: disparity vs context, vs layer, and against CKA on the same pairs.
-
-    Args:
-        run_dir: Procrustes run directory (``output/mechanism/procrustes/cka/<dataset>/<tag>/``).
-
-    Returns:
-        Written paths.
-    """
-    path = os.path.join(run_dir, "procrustes.csv")
-    if not _has_rows(path):
-        return []
-    df = pd.read_csv(path)
-    written = _procrustes_vs_context(df, run_dir)
-    written += _procrustes_vs_layer(df, run_dir)
-    return written + _procrustes_vs_cka(df, run_dir)
 
 
 def _cka_placement_figures(pl: pd.DataFrame, run_dir: str) -> list[str]:
@@ -1063,3 +839,240 @@ def _cka_placement_surface(
         ax.text(0.98, 1.02, "; ".join(notes), transform=ax.transAxes, ha="right", va="bottom",
                 fontsize=style.FONT_SIZES["annotation"], alpha=0.8)
     return style.save_figure(fig, run_dir, name)
+
+
+# ---------------------------------------------------------------------------
+# representation (OBJECTIVE BETA, 2026-10-21): β2 alignment vs block, β1a site matching, lens, β1b covariances
+# ---------------------------------------------------------------------------
+#: The primary β2 panel grid (D3c / D3e): rows = location / spread, columns = TabPFN's own belief / GP-MLL refit's.
+#: The two columns sit side by side and are never averaged or differenced (G6).
+REPRESENTATION_PRIMARY_GRID: tuple[tuple[str, str], ...] = (("mean_own", "mean_mll"), ("sd_own", "sd_mll"))
+
+#: Panel height / width of the representation figures (wide grids of short panels).
+_REPRESENTATION_PANEL_ASPECT: float = 0.7
+
+#: Columns of the secondary β2 grid.
+_REPRESENTATION_SECONDARY_COLUMNS: int = 3
+
+#: Statistics of the β1a site-match figure (rows), with their axis-label keys.
+SITE_MATCH_STATS: dict[str, str] = {"w2_over_sd": "w2_over_sd", "location": "w2_location", "spread": "w2_spread",
+                                    "shape": "w2_shape"}
+
+#: Statistics of the β1b posterior-covariance figure (columns), with the value of a perfect match.
+POSTERIOR_COV_STATS: dict[str, float] = {"nbs": 1.0, "cka": 1.0, "bures_rel": 0.0, "trace_ratio": 1.0}
+
+
+def _figure_level(df: pd.DataFrame, run_dir: str) -> pd.DataFrame:
+    """Rows at ``representation.figures.level`` of the run's config (null = the nominal, lowest level)."""
+    import yaml  # noqa: PLC0415
+
+    level = None
+    path = os.path.join(run_dir, "config.yaml")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            level = (((yaml.safe_load(fh) or {}).get("representation") or {}).get("figures") or {}).get("level")
+    if level is None:
+        return _nominal(df)
+    return df[np.isclose(df["level"], float(level))]
+
+
+def _t_color(i: int, n: int) -> str:
+    """Shade of the TabPFN anchor for the i-th of n context sizes (one trace per t, as in every Hyp C figure)."""
+    base = style.model_color("tabpfn_v2_5")
+    return base if n == 1 else style.derive_shade(base, i, n)
+
+
+def _alignment_panel(ax: Any, sub: pd.DataFrame, readouts: Sequence[str], ts: Sequence[int], *, legend: bool) -> None:
+    """One target: the headline statistic vs block, one trace per (readout, t), the surrogate floor as a band."""
+    floors = sub[sub["value"] == "headline_floor"]
+    if not floors.empty:
+        band = floors.groupby("layer")["median"]
+        ax.fill_between(band.min().index, band.min().values, band.max().values, color=style.NEUTRAL_GREY,
+                        alpha=style.BAND_ALPHA, lw=0, label=style.SURROGATE_BAND_LABEL if legend else None, zorder=0)
+    vals = sub[sub["value"] == "headline_value"]
+    for readout in readouts:
+        for i, t in enumerate(ts):
+            part = vals[(vals["readout"] == readout) & (vals["context_t"] == t)].sort_values("layer")
+            if part.empty:
+                continue
+            color = _t_color(i, len(ts))
+            label = f"$t$ = {int(t)}" if (legend and readout == readouts[0]) else None
+            ax.plot(part["layer"], part["median"], color=color, ls=style.READOUT_LINESTYLES.get(readout, "-"),
+                    lw=style.LINE_WIDTH if readout == readouts[0] else style.LINE_WIDTH / 2, label=label)
+            if readout == readouts[0]:
+                ax.fill_between(part["layer"], part["ci_low"], part["ci_high"], color=color, alpha=style.BAND_ALPHA,
+                                lw=0)
+    ax.axhline(0.0, color=style.NEUTRAL_GREY, lw=style.LINE_WIDTH / 2, zorder=0)
+    style.set_integer_xaxis(ax)
+
+
+def _representation_grid(summary: pd.DataFrame, grid: Sequence[Sequence[str | None]], readouts: Sequence[str],
+                         statistic: str, run_dir: str, name: str) -> list[str]:
+    """A grid of alignment panels (one target each), shared y, blocks on x."""
+    nrows, ncols = len(grid), max(len(r) for r in grid)
+    ts = sorted(summary["context_t"].unique())
+    fig, axes = style.figure("wide", nrows=nrows, ncols=ncols, squeeze=False, sharex=True, sharey=True,
+                             panel_aspect=_REPRESENTATION_PANEL_ASPECT)
+    first = True
+    for r, row in enumerate(grid):
+        for c in range(ncols):
+            ax = axes[r][c]
+            target = row[c] if c < len(row) else None
+            if target is None:
+                ax.set_visible(False)
+                continue
+            _alignment_panel(ax, summary[summary["target"] == target], readouts, ts, legend=first)
+            first = False
+            ax.set_title(style.BELIEF_TARGET_LABELS.get(target, target), fontsize=style.FONT_SIZES["base"])
+            if r == nrows - 1:
+                ax.set_xlabel(style.axis_label("layer"))
+    fig.supylabel(style.axis_label(f"headline_{statistic}"), fontsize=style.FONT_SIZES["base"])
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    for readout in readouts:
+        handles.append(plt.Line2D([], [], color=style.NEUTRAL_GREY, ls=style.READOUT_LINESTYLES.get(readout, "-")))
+        labels.append(style.READOUT_LABELS.get(readout, readout))
+    fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 4), fontsize=style.FONT_SIZES["legend"],
+               bbox_to_anchor=(0.5, 1.0), frameon=False)
+    style.panel_letters([ax for row in axes for ax in row if ax.get_visible()])
+    return style.save_figure(fig, run_dir, name)
+
+
+def _representation_vs_layer(summary: pd.DataFrame, statistic: str, headline_readout: str,
+                             run_dir: str) -> list[str]:
+    """β2: the primary 2 x 2 grid (location / spread x own / GP-MLL refit) and a grid of the secondary targets."""
+    present = set(summary["target"])
+    readouts = [headline_readout] + [r for r in ("feature_mean",) if r in set(summary["readout"])
+                                     and r != headline_readout]
+    written: list[str] = []
+    primary = [[t if t in present else None for t in row] for row in REPRESENTATION_PRIMARY_GRID]
+    if any(t is not None for row in primary for t in row):
+        written += _representation_grid(summary, primary, readouts, statistic, run_dir, "representation_vs_layer")
+    rest = [t for t in style.BELIEF_TARGET_LABELS if t in present
+            and t not in {x for row in REPRESENTATION_PRIMARY_GRID for x in row}]
+    if rest:
+        n = _REPRESENTATION_SECONDARY_COLUMNS
+        grid = [rest[i:i + n] for i in range(0, len(rest), n)]
+        written += _representation_grid(summary, grid, readouts, statistic, run_dir, "representation_vs_layer_secondary")
+    return written
+
+
+def _site_match_figure(sm: pd.DataFrame, run_dir: str) -> list[str]:
+    """β1a: per-site W2 to each reference and its location / spread / shape split vs t, site pools apart."""
+    refs = list(dict.fromkeys(sm["reference"]))
+    stats = [s for s in SITE_MATCH_STATS if s in set(sm["value"])]
+    if not refs or not stats:
+        return []
+    fig, axes = style.figure("wide", nrows=len(stats), ncols=len(refs), squeeze=False, sharex=True,
+                             panel_aspect=_REPRESENTATION_PANEL_ASPECT)
+    ts = sorted(sm["context_t"].unique())
+    for c, ref in enumerate(refs):
+        st = arm_style(ref)
+        for r, stat in enumerate(stats):
+            ax = axes[r][c]
+            for pool, ls in style.SITE_POOL_LINESTYLES.items():
+                part = sm[(sm["reference"] == ref) & (sm["value"] == stat) & (sm["site_pool"] == pool)]
+                part = part.sort_values("context_t")
+                if part.empty:
+                    continue
+                ax.plot(part["context_t"], part["median"], color=st.color, ls=ls, marker=st.marker,
+                        label=f"{pool} sites" if (r == 0 and c == 0) else None)
+                ax.fill_between(part["context_t"], part["ci_low"], part["ci_high"], color=st.color,
+                                alpha=style.BAND_ALPHA, lw=0)
+            _context_axis(ax, ts)
+            if r == 0:
+                ax.set_title(f"TabPFN-2.5 vs {st.label}", fontsize=style.FONT_SIZES["base"])
+            if c == 0:
+                ax.set_ylabel(style.axis_label(SITE_MATCH_STATS[stat]))
+    axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    style.panel_letters([ax for row in axes for ax in row])
+    return style.save_figure(fig, run_dir, "site_match")
+
+
+def _lens_figure(lens: pd.DataFrame, run_dir: str) -> list[str]:
+    """Lens predictive of every block against TabPFN's final one and each reference (W2 / reference SD), per t."""
+    part = lens[(lens["value"] == "w2_over_sd") & (lens["site_pool"] == "unobserved")]
+    comps = list(dict.fromkeys(part["comparison"]))
+    if not comps:
+        return []
+    ts = sorted(part["context_t"].unique())
+    fig, axes = style.figure("wide", ncols=len(comps), squeeze=False, sharey=True,
+                             panel_aspect=_REPRESENTATION_PANEL_ASPECT)
+    for c, comp in enumerate(comps):
+        ax = axes[0][c]
+        for i, t in enumerate(ts):
+            sub = part[(part["comparison"] == comp) & (part["context_t"] == t)].sort_values("layer")
+            color = _t_color(i, len(ts))
+            ax.plot(sub["layer"], sub["median"], color=color, marker="o", label=f"$t$ = {int(t)}" if c == 0 else None)
+            ax.fill_between(sub["layer"], sub["ci_low"], sub["ci_high"], color=color, alpha=style.BAND_ALPHA, lw=0)
+        title = "vs final TabPFN-2.5" if comp == "tabpfn_v2_5" else f"vs {arm_style(comp).label}"
+        ax.set_title(title, fontsize=style.FONT_SIZES["base"])
+        ax.set_xlabel(style.axis_label("layer"))
+        style.set_integer_xaxis(ax)
+    axes[0][0].set_ylabel(style.axis_label("lens_w2_over_sd"))
+    axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    style.panel_letters(list(axes[0]))
+    return style.save_figure(fig, run_dir, "lens_distance")
+
+
+def _posterior_cov_figure(pc: pd.DataFrame, run_dir: str) -> list[str]:
+    """β1b: NBS, CKA, relative Bures distance and trace ratio of C_PFN vs each reference's covariance, vs t."""
+    stats = [s for s in POSTERIOR_COV_STATS if s in set(pc["value"])]
+    if not stats:
+        return []
+    ts = sorted(pc["context_t"].unique())
+    fig, axes = style.figure("wide", ncols=len(stats), squeeze=False, panel_aspect=_REPRESENTATION_PANEL_ASPECT)
+    for c, stat in enumerate(stats):
+        ax = axes[0][c]
+        for ref in dict.fromkeys(pc["reference"]):
+            st = arm_style(ref)
+            sub = pc[(pc["reference"] == ref) & (pc["value"] == stat)].sort_values("context_t")
+            ax.plot(sub["context_t"], sub["median"], color=st.color, ls=st.linestyle, marker=st.marker,
+                    label=st.label if c == 0 else None)
+            ax.fill_between(sub["context_t"], sub["ci_low"], sub["ci_high"], color=st.color, alpha=style.BAND_ALPHA,
+                            lw=0)
+        _bayes_value(ax, POSTERIOR_COV_STATS[stat])
+        _context_axis(ax, ts)
+        ax.set_ylabel(style.axis_label(stat if stat != "cka" else "cka_debiased"))
+    axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    style.panel_letters(list(axes[0]))
+    return style.save_figure(fig, run_dir, "posterior_cov")
+
+
+def render_representation(run_dir: str) -> list[str]:
+    """Every BETA figure, from the run's summary CSVs alone (``--replot``).
+
+    ``representation_vs_layer.svg`` (β2 primary: location / spread x own / GP-MLL refit, label token solid, feature
+    mean dotted, surrogate floor as a grey band), ``representation_vs_layer_secondary.svg`` (covariance, quantile
+    embeddings, K_GT, K_X), ``site_match.svg`` (β1a), ``lens_distance.svg`` and ``posterior_cov.svg`` (β1b). The
+    level shown is ``representation.figures.level`` (null = nominal). Captions follow G6 / G7: decodability wording,
+    no "GP-like" from a gap between two scores, no bare "Bayesian".
+
+    Args:
+        run_dir: Representation run directory.
+
+    Returns:
+        Written paths.
+    """
+    import json  # noqa: PLC0415
+
+    written: list[str] = []
+    path = os.path.join(run_dir, "representation_summary.csv")
+    if _has_rows(path):
+        summary = _figure_level(pd.read_csv(path), run_dir)
+        summary = summary[summary["site_set"] == "all"]
+        statistic, readout = "deconfounded_vs_surrogate", "label"
+        head = os.path.join(run_dir, "headline.json")
+        if os.path.exists(head):
+            with open(head, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            statistic, readout = doc.get("statistic", statistic), doc.get("readout", readout)
+        if not summary.empty:
+            written += _representation_vs_layer(summary, statistic, readout, run_dir)
+    for name, fn in (("site_match_summary.csv", _site_match_figure), ("lens_summary.csv", _lens_figure),
+                     ("posterior_cov_summary.csv", _posterior_cov_figure)):
+        p = os.path.join(run_dir, name)
+        if _has_rows(p):
+            df = _figure_level(pd.read_csv(p), run_dir)
+            if not df.empty:
+                written += fn(df, run_dir)
+    return written

@@ -1,0 +1,101 @@
+# OBJECTIVE BETA (Hyp C, C2 internal level): does TabPFN-2.5's label token carry the belief -- its own final
+# predictive and GP-MLL refit's -- beyond electrode geometry and the evidence layout, by block and context size? NHP.
+# Plan of record: .research_assistant/beta_cka_procrustes_review.md (D1-D7, D3a-D3e, D6a); research_design.md §2.
+#
+# ============================== PRE-REGISTRATION (written 2026-10-21, before any BETA cell ran) ==============================
+# TARGETS (D3c, D3e). Built separately and never averaged, one Gram over the 96 sites each:
+#   primary    mean_own, sd_own   TabPFN-2.5's final predictive mean / SD map (centred linear kernels), read from the
+#                                 SAME forward pass as the states (FrozenTabPFN on D, T 0.9, seed = inference_seed + draw)
+#              mean_mll, sd_mll   GP-MLL refit's predictive mean / SD map given D (P0.10 converged fit)
+#              cov_mll            Sigma_MLL, GP-MLL refit's latent posterior covariance
+#   secondary  quant_own, quant_mll   the 32-quantile belief embeddings E_out / E_MLL (location-dominated, audit 2026-10-19)
+#              K_GT               accuracy reference, read against the belief ceiling CKA(E_MLL, K_GT) (target_relations)
+#   confound   K_X                geometry itself (reported raw; its deconfounded value is 0 by construction)
+#   GP-Bayes left the grid on 2026-10-21 (D3e); it is re-enabled by adding gp_bayes to belief_engines (targets *_bayes).
+# READOUTS (D1, G6). label = the label token per block (reportable); feature_mean = diagnostic line only; lens = the
+#   zero-parameter lens's quantile embedding per block (output space). Decoder hidden states are never read here.
+# STATISTICS. Per (channel, level, t, draw, block, readout, target): debiased CKA; deconfounded CKA (joint
+#   least-squares on the off-diagonals of the double-centred Grams, Cui et al. 2022) on RBF geometry kernels at 0.25x,
+#   0.5x, 1x, 2x the median inter-site distance, applied identically to both sides, plus GP-fixed's posterior covariance
+#   for covariance targets (D3d); NBS and the shape distance arccos(NBS) (read only against the surrogate); the
+#   effective rank of both sides; a site-permutation null mean (DESCRIPTIVE only, D4).
+# CHANCE LEVEL (D3d). Smooth-field surrogate: n_replicates representations of 192 independent GP fields per lengthscale
+#   in {0.10, 0.15, 0.30}, through the identical pipeline, for every target and statistic. A claim needs the value
+#   above the surrogate's 95th percentile; the floor used is the MAX over the three lengthscales (most demanding).
+# HEADLINE STATISTIC -- OPEN (research_design.md §4, 2026-10-19). Provisional: deconfounded debiased CKA vs the
+#   surrogate (headline.statistic: deconfounded_vs_surrogate). Alternative (b), floor-subtracted raw CKA, is selectable
+#   (floor_subtracted_raw) and computable from representation.csv whatever is selected. Alternative (a) -- the surrogate
+#   as the chance level across ALL of Hypothesis C -- needs no switch inside BETA (every statistic here already gets a
+#   surrogate band); extending it to the CKA (b) embedding placement is a separate decision about that analysis.
+#   Settle both after the real-grid re-check (GP-MLL refit targets, all channels, both draws) before reading a result.
+# LENS FLAG RULE -- OPEN (research_design.md §4, 2026-10-19). lens.csv carries lens_site_sd_ratio and lens_r_final
+#   per block; nothing is flagged until the rule is chosen. Block 0 of the label token is "pre-information".
+# INFERENCE UNIT (D4). Draws reduced within a channel (median), then the median over the 22 channels with a channel
+#   bootstrap resampling within subject (n_boot 2000, 95 %). Comparisons within t only.
+# CEILINGS. trial_ceiling: each belief target vs the same target from an independent trial draw at the same sites;
+#   belief_ceiling: CKA(E_MLL, K_GT) and CKA(mean_MLL, K_GT) (D2 with D3e).
+# β1a (D3). Per site, W2 between TabPFN's final predictive and GP-MLL refit's (GP-fixed beside it), split into location /
+#   spread / shape; medians over sites (observed and unobserved apart), then draws, then the channel bootstrap. Never
+#   averaged before matching; never compared through two separately aggregated CKA scores (G6).
+# β1b (D6a). C_PFN = OMEGA Part A's implied covariance with all 96 sites as anchors (refit engine, RQMC 8 x 8,
+#   moment-matched rows, symmetrised, negative eigenvalues clipped and reported) vs Sigma_MLL and Sigma_fixed: CKA, NBS,
+#   deconfounded CKA, Bures (= W2 of the zero-mean Gaussian posteriors) and the trace ratio. Coverage: 2 channels per
+#   subject (8), level 1, the whole ladder, draw 0 -- ~6 k refits per cell, ~30 min GPU (D3b): run on Narval only.
+# WORDING (G6, G7). Claims are decodability claims ("readable from the label token at block l beyond geometry and
+#   layout"); covariance targets at ~0 for both TabPFN and the surrogate read "not distinguishable from geometry and
+#   layout"; never "GP-like" from the gap between two CKA scores; never the bare words "Bayesian" / "non-Bayesian".
+# ===================================================================================================================
+#
+# Cells: one per (channel, level, t, draw) (kind `cell`), and one per β1b cell (kind `posterior_cov`), cached under
+# output/cells/nhp/mechanism_representation/; per-channel cells shard by subject (--set dataset.subjects=[2]) and are
+# assembled with --only-cached. The contexts are OMEGA's (sites by (grid, t, draw), trials by (channel, level, t, draw)).
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_nhp.yaml
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_nhp.yaml --set representation.posterior_cov.enabled=false
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_nhp.yaml --only-cached
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_nhp.yaml --replot
+defaults:
+  dataset: nhp
+  context: nhp
+
+analysis: representation
+tag: nhp
+device: cpu
+seed: 42
+output_root: output
+
+dataset:
+  subjects: [0, 1, 2, 3]
+
+representation:
+  stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
+  n_context_draws: 2
+  layers: null
+  readouts: [label, feature_mean, lens]
+  targets: [mean_own, sd_own, mean_mll, sd_mll, cov_mll, quant_own, quant_mll, K_X, K_GT]
+  belief_engines: [gp_mll_refit, gp_fixed]
+  layout_confound: gp_fixed
+  n_quantiles: 32
+  site_sets: [all]
+  tabpfn: {inference_seed: 0, softmax_temperature: 0.9, precision: fp32, max_batch_tokens: 400000}
+  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5,
+              lengthscale_floor: 0.05}
+  fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.05}
+  deconfound: {bandwidth_multipliers: [0.25, 0.5, 1.0, 2.0], min_residual_frac: 1.0e-10}
+  surrogate: {lengthscales: [0.10, 0.15, 0.30], n_fields: 192, n_replicates: 20, jitter: 1.0e-8, quantile: 0.95}
+  permutation: {n_perm: 200}
+  ceiling: {enabled: true, trial_draw_offset: 100}
+  target_relations: [[quant_mll, K_GT], [mean_mll, K_GT]]
+  site_match: {references: [gp_mll_refit, gp_fixed]}
+  headline: {statistic: deconfounded_vs_surrogate, readout: label}
+  inference: {n_boot: 2000, ci: 0.95}
+  posterior_cov:
+    enabled: true
+    engine: tabpfn_v2_5
+    references: [gp_mll_refit, gp_fixed]
+    coverage: {levels: [1.0], context_ts: null, draws: [0], channels_per_subject: 2}
+    quadrature: {method: rqmc, K: 8, u_min: 1.0e-12, central_mass: 1.0, n_scrambles: 8}
+    eps: 0.01
+    y_grid: {points: 512, u_tail: 1.0e-4}
+    moment_matched: true
+  figures: {level: null}
