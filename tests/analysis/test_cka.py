@@ -1,4 +1,4 @@
-"""Debiased CKA, target kernels, permutation null and controls (task #5 Steps 1-4)."""
+"""Debiased CKA, target kernels, deconfounding, the smooth-field surrogate and the permutation null."""
 from __future__ import annotations
 
 import numpy as np
@@ -95,25 +95,31 @@ def test_gp_posterior_covariance_is_psd_and_matches_predictive_sd() -> None:
 
 @pytest.mark.slow
 @pytest.mark.gpu
-def test_layer_embeddings_shape_and_determinism() -> None:
-    from pfns4neurostim.analysis.embeddings import site_embeddings
+def test_feature_mean_embeddings_shape_and_determinism() -> None:
     from pfns4neurostim.analysis.context import draw_context
+    from pfns4neurostim.analysis.embeddings import readout_embeddings
     from pfns4neurostim.data.synthetic_neurostim import gp_channel
+    from pfns4neurostim.models.pfn.tabpfn import FrozenTabPFN
 
     ch = gp_channel(8, 0.25, 0.2, 5, np.random.default_rng(0))
     ctx = draw_context(ch, 20, np.random.default_rng(0))
-    E1 = site_embeddings(ctx.X, ctx.y, ch.X_pool, device="cuda", inference_seed=0)
-    E2 = site_embeddings(ctx.X, ctx.y, ch.X_pool, device="cuda", inference_seed=0)
+
+    def embed() -> np.ndarray:
+        eng = FrozenTabPFN(device="cuda", random_state=0)
+        eng.fit(ctx.X, ctx.y)
+        return np.stack(readout_embeddings(eng, ch.X_pool)["feature_mean"].arrays)
+
+    E1, E2 = embed(), embed()
     assert E1.shape == (18, ch.n_sites, 192)
     np.testing.assert_allclose(E1, E2, atol=1e-5)
     # The last layer of the feature tokens carries the response: CKA to K_GT beats the permutation null.
-    K = C.linear_gram(site_embeddings(ctx.X, ctx.y, ch.X_pool, device="cuda", readout="feature_mean")[-1])
-    _, _, p = C.permutation_null(K, C.target_kernels(ch.X_pool, ch.y_gt)["K_GT"], 200, np.random.default_rng(0))
+    _, _, p = C.permutation_null(C.linear_gram(E1[-1]), C.target_kernels(ch.X_pool, ch.y_gt)["K_GT"], 200,
+                                 np.random.default_rng(0))
     assert p < 0.05
 
 
 # ---------------------------------------------------------------------------
-# B1 (2026-10-06): batched null, stage tables, shadow criterion, decoder stages
+# B1 (2026-10-06): the batched null (descriptive since BETA D4)
 # ---------------------------------------------------------------------------
 def _loop_null(K: np.ndarray, L: np.ndarray, n_perm: int, rng: np.random.Generator) -> np.ndarray:
     """The pre-2026-10-06 null: one gather and one HSIC per permutation."""
@@ -143,55 +149,11 @@ def test_batched_null_equals_the_permutation_loop() -> None:
     assert (o, m) == pytest.approx((obs[0], null[0].mean())) and 0 < p <= 1
 
 
-def test_stage_table_averages_feature_tokens_draw_by_draw() -> None:
-    """feature_tokens: CKA per token, averaged; the null is averaged per permutation, so p tests the mean."""
-    from pfns4neurostim.analysis.embeddings import LayerEmbeddings
-    from pfns4neurostim.experiments.mechanism import _cka_layer_table
-
-    rng = np.random.default_rng(0)
-    X = rng.uniform(size=(25, 2))
-    y = np.sin(5 * X[:, 0])
-    tokens = np.stack([np.c_[y, rng.normal(size=(25, 3))], rng.normal(size=(25, 4))])     # [2, 25, 4]
-    emb = LayerEmbeddings("feature_tokens", (3,), (tokens,))
-    kernels = {"K_GT": C.target_kernels(X, y)["K_GT"]}
-    (row,) = _cka_layer_table(emb, kernels, 200, np.random.default_rng(1))
-    per_token = [C.cka_debiased(C.linear_gram(t), kernels["K_GT"]) for t in tokens]
-    assert row["value"] == pytest.approx(np.mean(per_token)) and row["n_tokens"] == 2
-    assert row["layer"] == 3 and "stage" not in row
-    single = LayerEmbeddings("feature_mean", (3,), (tokens[0],))
-    (r0,) = _cka_layer_table(single, kernels, 200, np.random.default_rng(1))
-    assert r0["value"] == pytest.approx(per_token[0]) and r0["n_tokens"] == 1
-
-
-def test_shadow_criterion_passes_only_when_the_band_narrows() -> None:
-    import pandas as pd
-
-    from pfns4neurostim.experiments.mechanism import CKA_SHADOW_KEYS, shadow_criterion
-
-    rng = np.random.default_rng(0)
-    rows = []
-    for readout, spread in (("feature_mean", 1.0), ("feature_tokens", 0.5)):
-        for ch in range(12):
-            offset = spread * rng.normal()
-            for layer in range(18):
-                for target in ("K_GT", "K_GP"):
-                    for rep in range(3):
-                        rows.append({"readout": readout, "subject": 0, "emg": ch, "layer": layer,
-                                     "target": target, "context_t": 25, "level": 1.0, "rep": rep,
-                                     "cka_minus_null": offset + 0.01 * rng.normal()})
-    df = pd.DataFrame(rows)
-    verdict = shadow_criterion(df, dict(CKA_SHADOW_KEYS))
-    assert verdict["passed"] and all(0.3 < v < 0.75 for v in verdict["ratios"].values())
-    assert not shadow_criterion(df, {**CKA_SHADOW_KEYS, "max_iqr_ratio": 0.3})["passed"]
-    with pytest.raises(ValueError, match="bogus"):
-        shadow_criterion(df, {**CKA_SHADOW_KEYS, "readout": "bogus"})
-
-
 @pytest.mark.slow
 @pytest.mark.gpu
 def test_readout_embeddings_are_feature_tokens_only() -> None:
     """Both readouts come from one pass over the FEATURE tokens; the label token is never read (2026-10-07)."""
-    from pfns4neurostim.analysis.embeddings import READOUTS, layer_embeddings, readout_embeddings
+    from pfns4neurostim.analysis.embeddings import READOUTS, readout_embeddings
     from pfns4neurostim.analysis.context import draw_context
     from pfns4neurostim.data.synthetic_neurostim import gp_channel
     from pfns4neurostim.models.pfn.tabpfn import FrozenTabPFN
@@ -207,6 +169,136 @@ def test_readout_embeddings_are_feature_tokens_only() -> None:
     assert fm.arrays[0].shape == (ch.n_sites, 192) and tok.arrays[0].shape == (2, ch.n_sites, 192)
     for a, b in zip(fm.arrays, tok.arrays):
         np.testing.assert_allclose(b.mean(axis=0), a, atol=1e-6)
-    np.testing.assert_allclose(layer_embeddings(eng, ch.X_pool, layers=[0, 5, 17]), np.stack(fm.arrays), atol=1e-6)
     with pytest.raises(ValueError, match="label_token"):
         readout_embeddings(eng, ch.X_pool, readouts=("label_token",))
+
+
+# ---------------------------------------------------------------------------
+# BETA Phase 1 (2026-10-21): double centring, 4-bandwidth deconfounding, the smooth-field surrogate
+# ---------------------------------------------------------------------------
+def _nhp_grid() -> np.ndarray:
+    """The 8 x 12 NHP electrode grid in [0, 1]^2 (96 sites)."""
+    ax, ay = np.linspace(0, 1, 12), np.linspace(0, 1, 8)
+    return np.stack(np.meshgrid(ax, ay, indexing="ij"), -1).reshape(-1, 2)
+
+
+_MULTIPLIERS = (0.25, 0.5, 1.0, 2.0)
+
+
+def test_double_center_is_the_gram_of_the_centred_cloud(rng: np.random.Generator) -> None:
+    Z = rng.normal(size=(20, 4))
+    np.testing.assert_allclose(C.double_center(C.linear_gram(Z)), C.centered_linear_gram(Z), atol=1e-12)
+    H = np.eye(20) - np.ones((20, 20)) / 20
+    K = rng.normal(size=(20, 20))
+    np.testing.assert_allclose(C.double_center(K), H @ K @ H, atol=1e-12)
+
+
+def test_unbiased_hsic_ignores_double_centring(rng: np.random.Generator) -> None:
+    """Why deconfounding may work on double-centred Grams: HSIC_1 does not see the centring itself."""
+    K, L = C.linear_gram(rng.normal(size=(30, 5))), C.linear_gram(rng.normal(size=(30, 3)))
+    assert C.hsic_unbiased(C.double_center(K), L) == pytest.approx(C.hsic_unbiased(K, L), rel=1e-10)
+
+
+def test_pure_geometry_representation_deconfounds_to_zero(rng: np.random.Generator) -> None:
+    """A representation in the span of the geometry confounds has no residual: deconfounded CKA 0, flagged."""
+    X = _nhp_grid()
+    dec = C.Deconfounder(C.geometry_confounds(X, _MULTIPLIERS))
+    K_X = C.rbf_gram(X, C.median_distance(X))
+    for K in (K_X, 3.0 * K_X + 2.0, C.rbf_gram(X, 0.5 * C.median_distance(X)) + K_X):
+        assert dec.residual_fraction(K) < 1e-12
+        out = C.cka_deconfounded(K, K_X, dec)
+        assert out["value"] == 0.0 and out["degenerate"]
+    # ... and against a target with real signal it is still 0 (nothing beyond the confounds to align)
+    y = C.smooth_field_surrogate(X, 0.2, 1, rng, jitter=1e-8)[:, 0]
+    assert C.cka_deconfounded(K_X, C.centered_linear_gram(y), dec)["value"] == 0.0
+
+
+def test_smooth_field_surrogate_deconfounds_to_near_zero(rng: np.random.Generator) -> None:
+    """Unrelated smooth fields share a smoothness floor in raw CKA; after 4-bandwidth deconfounding it is ~0."""
+    X = _nhp_grid()
+    dec = C.Deconfounder(C.geometry_confounds(X, _MULTIPLIERS))
+    raw, dc = [], []
+    for _ in range(20):
+        K = C.linear_gram(C.smooth_field_surrogate(X, 0.15, 192, rng, jitter=1e-8))
+        L = C.centered_linear_gram(C.smooth_field_surrogate(X, 0.15, 1, rng, jitter=1e-8)[:, 0])
+        raw.append(C.cka_debiased(K, L))
+        dc.append(C.cka_deconfounded(K, L, dec)["value"])
+    assert np.median(raw) > 0.1                                      # the floor a site permutation would hide
+    assert abs(np.median(dc)) < 0.05 and np.median(dc) < 0.5 * np.median(raw)
+
+
+def test_planted_mean_map_survives_deconfounding(rng: np.random.Generator) -> None:
+    X = _nhp_grid()
+    dec = C.Deconfounder(C.geometry_confounds(X, _MULTIPLIERS))
+    y = C.smooth_field_surrogate(X, 0.2, 1, rng, jitter=1e-8)[:, 0]
+    geometry = C.rbf_gram(X, C.median_distance(X))[:, :40]            # pure-geometry columns
+    Z = np.c_[3.0 * y, geometry, 0.1 * rng.normal(size=(len(X), 10))]
+    out = C.cka_deconfounded(C.linear_gram(Z), C.centered_linear_gram(y), dec)
+    assert not out["degenerate"] and out["value"] > 0.5
+
+
+def test_layout_confound_removes_a_covariance_that_is_geometry_plus_layout() -> None:
+    """A target equal to GP-fixed's covariance plus geometry is removed by the D3d confound set (layout included)."""
+    from pfns4neurostim.analysis.bayes_update import GPFixedEngine
+
+    X = _nhp_grid()
+    rng = np.random.default_rng(3)
+    ctx = rng.choice(len(X), 25, replace=False)
+    fixed = GPFixedEngine(0.6931471805599453, 1.0, 0.05)
+    fixed.fit(X[ctx], rng.normal(size=25))
+    S = fixed.posterior_covariance(X)
+    geom = C.geometry_confounds(X, _MULTIPLIERS)
+    with_layout = C.Deconfounder([*geom, S])
+    assert with_layout.residual_fraction(S + 0.5 * geom[1]) < 1e-12
+    assert C.Deconfounder(geom).residual_fraction(S) > 1e-6          # geometry alone does not explain the layout
+
+
+def test_deconfounder_validates_and_is_fail_fast() -> None:
+    X = _nhp_grid()
+    with pytest.raises(ValueError, match="at least one"):
+        C.Deconfounder([])
+    with pytest.raises(ValueError, match="shape"):
+        C.Deconfounder([np.eye(len(X)), np.eye(5)])
+    bad = np.eye(len(X))
+    bad[0, 1] = np.nan
+    with pytest.raises(RuntimeError, match="NaN"):
+        C.Deconfounder([bad])
+    with pytest.raises(RuntimeError, match="NaN"):
+        C.Deconfounder([np.eye(len(X))]).residual(bad)
+    with pytest.raises(ValueError, match="positive"):
+        C.geometry_confounds(X, [0.5, 0.0])
+
+
+def test_deconfound_function_matches_the_class_and_zeroes_the_diagonal(rng: np.random.Generator) -> None:
+    X = _nhp_grid()
+    confs = C.geometry_confounds(X, _MULTIPLIERS)
+    K = C.linear_gram(rng.normal(size=(len(X), 7)))
+    R = C.deconfound(K, confs)
+    np.testing.assert_allclose(R, C.Deconfounder(confs).residual(K), atol=1e-12)
+    assert np.all(np.diag(R) == 0.0)
+
+
+def test_cka_or_none_flags_a_constant_representation(rng: np.random.Generator) -> None:
+    """The block-0 label token is constant across sites: its CKA is None (reported), not an exception."""
+    const = C.linear_gram(np.ones((30, 4)))
+    L = C.linear_gram(rng.normal(size=(30, 3)))
+    assert C.cka_or_none(const, L) is None
+    assert C.cka_or_none(L, L) == pytest.approx(1.0)
+
+
+def test_effective_rank_of_a_rank_one_target_is_one(rng: np.random.Generator) -> None:
+    y = rng.normal(size=40)
+    assert C.effective_rank(C.centered_linear_gram(y)) == pytest.approx(1.0)
+    assert C.effective_rank(C.linear_gram(rng.normal(size=(40, 30)))) > 5.0
+
+
+def test_smooth_field_surrogate_shape_smoothness_and_validation(rng: np.random.Generator) -> None:
+    X = _nhp_grid()
+    Z = C.smooth_field_surrogate(X, 0.3, 50, rng, jitter=1e-8)
+    assert Z.shape == (96, 50)
+    # neighbouring sites are more alike than distant ones (a smooth field, unlike a permutation)
+    near = np.corrcoef(Z[0], Z[1])[0, 1]
+    far = np.corrcoef(Z[0], Z[-1])[0, 1]
+    assert near > far
+    with pytest.raises(ValueError, match="lengthscale"):
+        C.smooth_field_surrogate(X, 0.0, 5, rng, jitter=1e-8)

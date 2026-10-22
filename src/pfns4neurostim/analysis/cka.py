@@ -1,4 +1,4 @@
-"""Debiased centred kernel alignment and CKA target kernels (task #5, P0.5).
+"""Debiased centred kernel alignment, geometry deconfounding and the smooth-field surrogate (task #5, P0.5; BETA).
 
 CKA compares two *pictures of the same sites*: rows correspond (site i in one matrix is
 site i in the other). The estimator is the **debiased** CKA built on the unbiased HSIC
@@ -12,10 +12,21 @@ number of sites (32-96) is far below the embedding dimension (192); the debiased
 (Kornblith et al. 2019; Murphy et al. 2024). ``biased_linear_cka`` is the pre-restructure
 estimator, kept only for comparison.
 
-Target kernels over the same N sites (P0.5): ``K_X`` = RBF on coordinates (median
-bandwidth; a *control*, since coordinates are the input), ``K_GT`` = RBF on the
-standardized ground-truth response (median |dy| bandwidth; linear ``y y'`` as sensitivity),
-``K_GP`` = latent posterior covariance of the MLL-tuned GP fitted on the same context.
+**Geometry deconfounding (BETA D3d, 2026-10-19; Cui et al. 2022).** Every kernel over the electrode grid inherits the
+grid's geometry, so unrelated smooth fields reach a debiased CKA of 0.2-0.9 with one another. :class:`Deconfounder`
+regresses the off-diagonal entries of a double-centred Gram on those of a set of confound Grams -- RBF kernels on the
+coordinates at several bandwidths (:func:`geometry_confounds`), plus GP-fixed's posterior covariance for covariance
+targets -- in ONE joint least-squares fit, and keeps the residual. The same confound set is applied to the
+representation and to the target, and the deconfounded CKA is the debiased CKA of the two residuals
+(:func:`cka_deconfounded`). Only the off-diagonal entries enter: the unbiased HSIC zeroes the diagonals anyway.
+
+**Chance level (BETA D3d).** :func:`smooth_field_surrogate` draws a representation of independent GP fields on the
+same sites; run through the identical pipeline it gives the CKA unrelated smooth fields reach. The site-permutation
+null (:func:`cka_null_draws`) destroys spatial smoothness, so it is kept as a *descriptive* chance level only.
+
+Target kernels over the same N sites (:func:`target_kernels`): ``K_X`` = RBF on coordinates (median bandwidth; the
+confound itself), ``K_GT`` = RBF on the standardized ground-truth response (median |dy| bandwidth; a secondary,
+accuracy reference), ``K_GT_linear`` = ``y y'``.
 """
 from __future__ import annotations
 
@@ -26,20 +37,36 @@ import numpy as np
 __all__ = [
     "biased_linear_cka",
     "linear_gram",
+    "centered_linear_gram",
+    "double_center",
     "hsic_unbiased",
     "cka_debiased",
+    "cka_or_none",
     "rbf_gram",
     "median_distance",
     "target_kernels",
+    "geometry_confounds",
+    "Deconfounder",
+    "deconfound",
+    "cka_deconfounded",
+    "smooth_field_surrogate",
+    "effective_rank",
     "permutation_null",
     "cka_null_draws",
     "permutation_p",
     "PERM_CHUNK",
+    "MIN_RESIDUAL_FRAC",
 ]
 
 #: Permutations evaluated per vectorised chunk of :func:`cka_null_draws`. A memory bound, not a statistical
 #: setting: one chunk holds ``PERM_CHUNK x N x N`` float64 (19 MB at N = 96), whatever ``n_perm`` is.
 PERM_CHUNK: int = 256
+
+#: Default share of a Gram's off-diagonal energy that must survive deconfounding for the residual to be read. Below it
+#: the Gram lies in the span of its confounds (a pure-geometry representation), so there is no signal beyond the
+#: confounds and :func:`cka_deconfounded` returns 0 with ``degenerate = True`` instead of dividing rounding noise.
+#: The runners pass ``representation.deconfound.min_residual_frac``.
+MIN_RESIDUAL_FRAC: float = 1e-10
 
 
 def biased_linear_cka(X: Any, Y: Any) -> float:
@@ -63,6 +90,38 @@ def linear_gram(Z: np.ndarray) -> np.ndarray:
     """
     Z = np.asarray(Z, dtype=np.float64)
     return Z @ Z.T
+
+
+def centered_linear_gram(Z: np.ndarray) -> np.ndarray:
+    """Linear Gram of the column-centred representation: ``(Z - 1 z_bar')(Z - 1 z_bar')'``.
+
+    A vector (a mean map, an SD map) is treated as a one-column representation, so its Gram is the outer product of
+    the centred map -- the BETA location / spread targets (D3c).
+
+    Args:
+        Z: Representations, shape [N, d] or [N].
+
+    Returns:
+        Gram matrix, shape [N, N].
+    """
+    Z = np.asarray(Z, dtype=np.float64).reshape(len(Z), -1)               # [N, d]
+    Zc = Z - Z.mean(axis=0, keepdims=True)                                 # [N, d]
+    return Zc @ Zc.T
+
+
+def double_center(K: np.ndarray) -> np.ndarray:
+    """Double-centre a Gram matrix: ``H K H`` with ``H = I - 11'/n``.
+
+    Args:
+        K: Gram matrix, shape [N, N].
+
+    Returns:
+        The centred matrix, shape [N, N]; for a linear Gram it is the Gram of the column-centred representation.
+    """
+    K = np.asarray(K, dtype=np.float64)
+    row = K.mean(axis=1, keepdims=True)                                    # [N, 1]
+    col = K.mean(axis=0, keepdims=True)                                    # [1, N]
+    return K - row - col + K.mean()
 
 
 def hsic_unbiased(K: np.ndarray, L: np.ndarray) -> float:
@@ -111,6 +170,29 @@ def cka_debiased(K: np.ndarray, L: np.ndarray) -> float:
     return float(hsic_unbiased(K, L) / np.sqrt(kk * ll))
 
 
+def cka_or_none(K: np.ndarray, L: np.ndarray) -> float | None:
+    """Debiased CKA, or ``None`` when either side is degenerate (non-positive self-HSIC).
+
+    The explicit ``None`` (an empty CSV cell, flagged by the caller) replaces the exception for readouts that are
+    degenerate *by construction* -- the block-0 label token is constant across sites (BETA §2.5, pitfall 3) -- so a
+    whole cell is not lost to one pre-information block. Every other failure still raises.
+
+    Args:
+        K: Gram matrix, shape [N, N].
+        L: Gram matrix, shape [N, N].
+
+    Returns:
+        The CKA, or ``None``.
+    """
+    kk, ll = hsic_unbiased(K, K), hsic_unbiased(L, L)
+    if kk <= 0 or ll <= 0:
+        return None
+    value = float(hsic_unbiased(K, L) / np.sqrt(kk * ll))
+    if not np.isfinite(value):
+        raise RuntimeError(f"cka_or_none: non-finite CKA ({value}) from finite self-HSICs ({kk:.3g}, {ll:.3g}).")
+    return value
+
+
 def median_distance(V: np.ndarray) -> float:
     """Median pairwise Euclidean distance (the median heuristic bandwidth).
 
@@ -148,13 +230,13 @@ def target_kernels(
     y_gt: np.ndarray,
     gp_posterior_cov: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    """The P0.5 target kernels over the same sites.
+    """Coordinate and ground-truth kernels over the same sites.
 
     Args:
         X: Coordinates in [0, 1]^D, shape [N, D].
         y_gt: Ground-truth responses, shape [N] (standardized here).
-        gp_posterior_cov: Latent posterior covariance of the MLL GP on the same context,
-            shape [N, N]; omitted when ``None``.
+        gp_posterior_cov: A GP latent posterior covariance on the same sites, shape [N, N]; returned as ``K_GP``
+            when given (the retired CKA (a) target; kept for callers that compare against one).
 
     Returns:
         ``{'K_X', 'K_GT', 'K_GT_linear'[, 'K_GP']}``.
@@ -170,6 +252,195 @@ def target_kernels(
     return out
 
 
+def geometry_confounds(X: np.ndarray, multipliers: Sequence[float]) -> list[np.ndarray]:
+    """RBF kernels on the coordinates at ``multipliers x`` the median inter-site distance (BETA D3d).
+
+    Args:
+        X: Site coordinates, shape [N, D].
+        multipliers: Bandwidth multipliers (``representation.deconfound.bandwidth_multipliers``; 0.25, 0.5, 1, 2).
+
+    Returns:
+        One Gram per multiplier, each [N, N].
+
+    Raises:
+        ValueError: For an empty or non-positive multiplier list.
+    """
+    mult = [float(m) for m in multipliers]
+    if not mult or any(m <= 0 for m in mult):
+        raise ValueError(f"geometry_confounds: multipliers must be positive and non-empty, got {list(multipliers)}.")
+    med = median_distance(X)
+    return [rbf_gram(X, m * med) for m in mult]
+
+
+def _offdiag(K: np.ndarray) -> np.ndarray:
+    """Off-diagonal entries of a square matrix in row-major order, shape [N (N - 1)]."""
+    n = K.shape[0]
+    return np.asarray(K, dtype=np.float64)[~np.eye(n, dtype=bool)]
+
+
+class Deconfounder:
+    """Joint least-squares removal of confound Grams from the off-diagonals of double-centred Grams (Cui et al. 2022).
+
+    For a Gram ``K`` the residual is ``R = HKH - b0 - sum_j b_j H C_j H`` on the off-diagonal entries, with
+    ``(b0, b)`` the ordinary least-squares fit of ``offdiag(HKH)`` on an intercept and ``offdiag(H C_j H)``, and
+    ``R``'s diagonal set to 0 (the unbiased HSIC never reads it). The design is factorised once, so every Gram of a
+    cell -- each block, readout and surrogate -- is residualised by one projection.
+
+    Args:
+        confounds: Confound Grams, each [N, N] (geometry at every bandwidth; GP-fixed's covariance for covariance
+            targets). An empty list removes the intercept only.
+
+    Raises:
+        RuntimeError: If a confound is non-finite.
+        ValueError: On mismatched shapes or fewer than 4 sites.
+    """
+
+    def __init__(self, confounds: Sequence[np.ndarray]) -> None:
+        mats = [np.asarray(C, dtype=np.float64) for C in confounds]
+        if not mats:
+            raise ValueError("Deconfounder needs at least one confound Gram (an intercept alone is not a confound).")
+        n = mats[0].shape[0]
+        if n < 4:
+            raise ValueError(f"Deconfounder needs n >= 4 sites, got {n}.")
+        for C in mats:
+            if C.shape != (n, n):
+                raise ValueError(f"Deconfounder: confound shape {C.shape} != ({n}, {n}).")
+            if not np.isfinite(C).all():
+                raise RuntimeError("Deconfounder: a confound Gram holds NaN/Inf.")
+        self.n = n
+        self.n_confounds = len(mats)
+        design = np.column_stack([np.ones(n * (n - 1))] + [_offdiag(double_center(C)) for C in mats])   # [n(n-1), 1+c]
+        Q, _ = np.linalg.qr(design)                                         # [n(n-1), r] orthonormal basis
+        self._Q = Q
+        self._mask = ~np.eye(n, dtype=bool)
+
+    def residual(self, K: np.ndarray) -> np.ndarray:
+        """The deconfounded Gram: off-diagonal residual of ``HKH``, zero diagonal.
+
+        Args:
+            K: Gram matrix, shape [N, N].
+
+        Returns:
+            Residual matrix, shape [N, N].
+
+        Raises:
+            RuntimeError: On non-finite input.
+            ValueError: On a shape mismatch.
+        """
+        K = np.asarray(K, dtype=np.float64)
+        if K.shape != (self.n, self.n):
+            raise ValueError(f"Deconfounder.residual: shape {K.shape} != ({self.n}, {self.n}).")
+        if not np.isfinite(K).all():
+            raise RuntimeError("Deconfounder.residual: Gram holds NaN/Inf.")
+        v = _offdiag(double_center(K))                                     # [n(n-1)]
+        r = v - self._Q @ (self._Q.T @ v)                                   # [n(n-1)]
+        out = np.zeros((self.n, self.n))
+        out[self._mask] = r
+        return out
+
+    def residual_fraction(self, K: np.ndarray) -> float:
+        """Share of ``offdiag(HKH)``'s squared norm that survives the projection (0 = entirely confound)."""
+        v = _offdiag(double_center(np.asarray(K, dtype=np.float64)))
+        total = float(v @ v)
+        if total <= 0:
+            return 0.0
+        r = v - self._Q @ (self._Q.T @ v)
+        return float(r @ r) / total
+
+
+def deconfound(K: np.ndarray, confounds: Sequence[np.ndarray]) -> np.ndarray:
+    """One Gram deconfounded on a set of confound Grams (see :class:`Deconfounder`).
+
+    Args:
+        K: Gram matrix, shape [N, N].
+        confounds: Confound Grams, each [N, N].
+
+    Returns:
+        The residual matrix, shape [N, N] (zero diagonal).
+    """
+    return Deconfounder(confounds).residual(K)
+
+
+def cka_deconfounded(
+    K: np.ndarray,
+    L: np.ndarray,
+    deconfounder: Deconfounder,
+    *,
+    min_residual_frac: float = MIN_RESIDUAL_FRAC,
+) -> dict[str, Any]:
+    """Debiased CKA of two Grams after removing the same confounds from both (BETA D3d; Cui et al. 2022).
+
+    Args:
+        K: Representation Gram, shape [N, N].
+        L: Target Gram, shape [N, N].
+        deconfounder: The confound set, applied identically to ``K`` and ``L``.
+        min_residual_frac: Below this surviving share of either side's off-diagonal energy the side is "entirely
+            confound": the value is then 0 (no alignment beyond the confounds) and ``degenerate`` is ``True``.
+
+    Returns:
+        ``{'value', 'residual_frac_rep', 'residual_frac_target', 'degenerate'}``; ``value`` is ``None`` only when a
+        residual is non-degenerate by the energy test but has a non-positive self-HSIC (reported, never silent).
+    """
+    fk, fl = deconfounder.residual_fraction(K), deconfounder.residual_fraction(L)
+    out: dict[str, Any] = {"residual_frac_rep": fk, "residual_frac_target": fl, "degenerate": False}
+    if fk < float(min_residual_frac) or fl < float(min_residual_frac):
+        return {**out, "value": 0.0, "degenerate": True}
+    return {**out, "value": cka_or_none(deconfounder.residual(K), deconfounder.residual(L))}
+
+
+def smooth_field_surrogate(
+    X: np.ndarray,
+    lengthscale: float,
+    n_fields: int,
+    rng: np.random.Generator,
+    *,
+    jitter: float,
+) -> np.ndarray:
+    """A surrogate representation: ``n_fields`` independent unit-variance RBF-GP fields on the sites (BETA D3d).
+
+    Unrelated to any target by construction yet as smooth as the grid allows, so its CKA against a target is the
+    chance level of smooth fields (Burt et al. 2020: a site-permutation null destroys exactly this smoothness).
+
+    Args:
+        X: Site coordinates in [0, 1]^D, shape [N, D].
+        lengthscale: RBF lengthscale of the fields (normalised coordinates).
+        n_fields: Fields (columns), the representation width.
+        rng: Generator.
+        jitter: Diagonal added before the Cholesky factorisation.
+
+    Returns:
+        Surrogate representation, shape [N, n_fields].
+
+    Raises:
+        ValueError: On a non-positive lengthscale or field count.
+    """
+    if float(lengthscale) <= 0 or int(n_fields) < 1:
+        raise ValueError(f"smooth_field_surrogate: lengthscale > 0 and n_fields >= 1 required, got "
+                         f"{lengthscale}, {n_fields}.")
+    X = np.asarray(X, dtype=np.float64)
+    d2 = ((X[:, None, :] - X[None, :, :]) ** 2).sum(-1)                   # [N, N]
+    K = np.exp(-0.5 * d2 / float(lengthscale) ** 2) + float(jitter) * np.eye(len(X))
+    Lc = np.linalg.cholesky(K)                                              # [N, N]
+    return Lc @ rng.standard_normal((len(X), int(n_fields)))                # [N, n_fields]
+
+
+def effective_rank(K: np.ndarray) -> float:
+    """Participation ratio ``(sum lambda)^2 / sum lambda^2`` of a double-centred Gram's eigenvalues.
+
+    1 for a rank-one target (a mean-map outer product), up to N - 1 for an isotropic cloud; the audit's replacement
+    for the "remove PC1" remedy on belief targets (BETA §2.5 amendment, pitfall 2).
+
+    Args:
+        K: Gram matrix, shape [N, N].
+
+    Returns:
+        The effective rank (0 for an all-zero Gram).
+    """
+    lam = np.clip(np.linalg.eigvalsh(0.5 * (double_center(K) + double_center(K).T)), 0.0, None)   # [N]
+    s2 = float((lam ** 2).sum())
+    return 0.0 if s2 == 0 else float(lam.sum() ** 2 / s2)
+
+
 def cka_null_draws(
     Ks: Sequence[np.ndarray],
     L: np.ndarray,
@@ -178,12 +449,14 @@ def cka_null_draws(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Observed debiased CKA of every ``K`` against ``L``, and its site-permutation null draws.
 
+    A *descriptive* chance level since BETA D4 / D3d: it destroys the spatial smoothness every grid kernel has, so it
+    reports ~0 where unrelated smooth fields reach 0.2-0.9 (the smooth-field surrogate is the chance level).
+
     The null permutes the rows *and* columns of ``L`` jointly. Its permutations depend on the target
     alone, so ONE set of ``n_perm`` permutations is drawn and shared by every ``K`` -- every layer and
-    decoder stage of a cell, every feature token. That is what makes the null cheap: the permuted
-    ``L~`` stack is gathered once per chunk and each ``K`` costs one contraction over it, instead of a
-    fresh gather per (layer, permutation) as before 2026-10-06 (~10x faster on the NHP grid, and the
-    95 %-of-cost term of CKA (a)). Sharing permutations across layers correlates their p-values;
+    readout of a cell. That is what makes the null cheap: the permuted
+    ``L~`` stack is gathered once per chunk and each ``K`` costs one contraction over it.
+    Sharing permutations across layers correlates their p-values;
     Bonferroni over layers stays valid under any dependence.
 
     The unbiased HSIC (Song et al. 2012, Eq. 5) of ``K`` with a permuted ``L`` needs only three terms:
@@ -250,12 +523,12 @@ def permutation_null(
     n_perm: int,
     rng: np.random.Generator,
 ) -> tuple[float, float, float]:
-    """Site-permutation null: permute rows *and* columns of ``L`` together.
+    """Site-permutation null: permute rows *and* columns of ``L`` together (descriptive only, see above).
 
     Args:
         K: Gram matrix, shape [N, N].
         L: Gram matrix, shape [N, N].
-        n_perm: Permutations (1000 in the protocol).
+        n_perm: Permutations.
         rng: Generator.
 
     Returns:

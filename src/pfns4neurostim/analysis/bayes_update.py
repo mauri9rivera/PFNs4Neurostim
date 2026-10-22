@@ -72,6 +72,12 @@ __all__ = [
     "heldout_trials",
     "headtohead_anchor",
     "transfer_profile",
+    # BETA (2026-10-21), purely additive: belief embeddings, the site-matched W2 split, posterior covariances
+    "belief_levels",
+    "belief_embedding",
+    "site_w2_split",
+    "latent_covariance_of",
+    "implied_posterior_covariance",
 ]
 
 #: Anchor strata (overlapping labels recorded per anchor; anchors are drawn uniformly within a pool).
@@ -1880,3 +1886,146 @@ def headtohead_anchor(
     return rows, surprise, profile
 
 
+# ---------------------------------------------------------------------------
+# BETA (2026-10-21): belief embeddings, site-matched W2 split, posterior covariances. Purely additive -- nothing above
+# calls these, so no ``bayes_update`` cell identity or payload depends on them (OMEGA's grid runs at ``bb0bba5``).
+# ---------------------------------------------------------------------------
+def belief_levels(n_quantiles: int) -> np.ndarray:
+    """Midpoint quantile levels ``u_j = (j - 1/2) / J`` of the belief embedding (BETA §4).
+
+    Args:
+        n_quantiles: ``J`` (``representation.n_quantiles``; 32 in the plan).
+
+    Returns:
+        Levels, shape [J].
+
+    Raises:
+        ValueError: For ``J < 2`` (no spread can be read from one quantile).
+    """
+    if int(n_quantiles) < 2:
+        raise ValueError(f"belief_levels: need >= 2 quantiles, got {n_quantiles}.")
+    return (np.arange(int(n_quantiles)) + 0.5) / int(n_quantiles)
+
+
+def belief_embedding(pred: Predictive, levels: np.ndarray, probe: int = 0) -> np.ndarray:
+    """Belief embedding ``E(x) = [Q(u_1 | x, D), ..., Q(u_J | x, D)]`` at every site (BETA §4).
+
+    ``||E(x) - E(x')||^2 / J`` approximates ``W2^2`` between the two sites' predictives, so the linear Gram of the
+    centred embedding is the 2-Wasserstein geometry of the model's beliefs over the sites.
+
+    Args:
+        pred: A predictive over ``M`` sites (TabPFN's bar distribution, a GP's Gaussian mixture).
+        levels: Quantile levels, shape [J] (:func:`belief_levels`).
+        probe: Conditioning state to read (0 = the base predictive given D).
+
+    Returns:
+        Quantiles, shape [M, J].
+
+    Raises:
+        RuntimeError: If a quantile is non-finite.
+    """
+    E = np.asarray(pred.ppf(np.asarray(levels, dtype=np.float64), np.arange(pred.mean.shape[1]))[int(probe)],
+                   dtype=np.float64)                                               # [M, J]
+    if not np.isfinite(E).all():
+        raise RuntimeError(f"belief_embedding: {int((~np.isfinite(E)).sum())} non-finite quantile(s).")
+    return E
+
+
+def site_w2_split(E_a: np.ndarray, E_b: np.ndarray) -> dict[str, np.ndarray]:
+    """Per-site 2-Wasserstein distance between two models' predictives, split into location / spread / shape (β1a).
+
+    Computed from the quantile embeddings, ``W2^2(x) = mean_j (Q_a(u_j | x) - Q_b(u_j | x))^2``, and split with the
+    embedding's own first two moments ``m = mean_j Q``, ``s = sd_j Q`` (BETA §4)::
+
+        W2^2 = (m_a - m_b)^2 + (s_a - s_b)^2 + 2 s_a s_b (1 - rho_ab)
+                location         spread          shape >= 0
+
+    where ``rho_ab`` is the correlation of the two centred quantile vectors (Cauchy-Schwarz makes the shape term
+    non-negative exactly, so the split is an identity, not an approximation). Matched per site before any aggregate
+    (BETA D3).
+
+    Args:
+        E_a: Belief embedding of model a, shape [M, J].
+        E_b: Belief embedding of model b, shape [M, J].
+
+    Returns:
+        ``{'w2', 'location', 'spread', 'shape', 'sd_a', 'sd_b'}``, each [M]; ``location`` / ``spread`` / ``shape`` are
+        squared terms summing to ``w2 ** 2``.
+
+    Raises:
+        ValueError: On mismatched shapes.
+        RuntimeError: On non-finite input.
+    """
+    A, Bm = np.asarray(E_a, dtype=np.float64), np.asarray(E_b, dtype=np.float64)
+    if A.shape != Bm.shape:
+        raise ValueError(f"site_w2_split: embeddings differ in shape, {A.shape} vs {Bm.shape}.")
+    if not (np.isfinite(A).all() and np.isfinite(Bm).all()):
+        raise RuntimeError("site_w2_split: non-finite quantiles.")
+    ma, mb = A.mean(axis=1), Bm.mean(axis=1)                                       # [M]
+    Ac, Bc = A - ma[:, None], Bm - mb[:, None]                                     # [M, J]
+    sa, sb = np.sqrt((Ac ** 2).mean(axis=1)), np.sqrt((Bc ** 2).mean(axis=1))      # [M]
+    w2sq = ((A - Bm) ** 2).mean(axis=1)                                            # [M]
+    location, spread = (ma - mb) ** 2, (sa - sb) ** 2
+    shape = np.maximum(w2sq - location - spread, 0.0)                              # [M]; >= 0 up to rounding
+    return {"w2": np.sqrt(w2sq), "location": location, "spread": spread, "shape": shape, "sd_a": sa, "sd_b": sb}
+
+
+def latent_covariance_of(engine: Any, Q: np.ndarray) -> np.ndarray:
+    """Latent posterior covariance over ``Q`` of a fitted GP engine (Sigma_MLL, Sigma_fixed or GP-Bayes's Sigma_B).
+
+    Args:
+        engine: A fitted :class:`GPRefitEngine` / :class:`GPFrozenEngine` (context-fitted hyperparameters),
+            :class:`GPFixedEngine` or :class:`GPBayesEngine` (the mixture's total covariance).
+        Q: Sites, shape [M, D].
+
+    Returns:
+        Symmetric covariance, shape [M, M].
+
+    Raises:
+        TypeError: For an engine with no closed-form posterior covariance (TabPFN: use
+            :func:`implied_posterior_covariance` on Part A's implied rows).
+        RuntimeError: If the covariance is non-finite.
+    """
+    if isinstance(engine, (GPRefitEngine, GPFixedEngine)):
+        S = engine.posterior_covariance(Q)
+    elif isinstance(engine, GPBayesEngine):
+        S = engine.latent_covariance(Q)
+    else:
+        raise TypeError(f"latent_covariance_of: {type(engine).__name__} has no closed-form posterior covariance.")
+    S = np.asarray(S, dtype=np.float64)
+    if not np.isfinite(S).all():
+        raise RuntimeError(f"latent_covariance_of: non-finite covariance from {getattr(engine, 'name', engine)}.")
+    return 0.5 * (S + S.T)
+
+
+def implied_posterior_covariance(C_rows: np.ndarray) -> dict[str, Any]:
+    """C_PFN from Part A's implied-covariance rows with every site as an anchor (BETA §4, β1b).
+
+    ``C(x'_i, x) = Cov(y', mu_new(x))`` estimates the latent ``Cov(f(x'_i), f(x) | D)`` row by row (tower property,
+    OMEGA A3), so with all sites as anchors the rows form a full matrix. It is symmetrised and projected to the PSD
+    cone; the asymmetry ``||C - C'||_F / ||C||_F`` and the clipped negative-eigenvalue mass are reported, never hidden.
+
+    Args:
+        C_rows: Implied rows, shape [M, M] (row ``i`` anchored at site ``i``).
+
+    Returns:
+        ``{'cov': [M, M] symmetric PSD, 'asymmetry': float, 'clipped_mass': float}``.
+
+    Raises:
+        ValueError: If the rows do not form a square matrix.
+        RuntimeError: On non-finite rows or an all-zero matrix.
+    """
+    C = np.asarray(C_rows, dtype=np.float64)
+    if C.ndim != 2 or C.shape[0] != C.shape[1]:
+        raise ValueError(f"implied_posterior_covariance: need one row per site ([M, M]), got {C.shape}.")
+    if not np.isfinite(C).all():
+        raise RuntimeError("implied_posterior_covariance: non-finite implied covariance rows.")
+    norm = float(np.linalg.norm(C))
+    if norm == 0:
+        raise RuntimeError("implied_posterior_covariance: all-zero implied covariance.")
+    S = 0.5 * (C + C.T)
+    lam, V = np.linalg.eigh(S)                                                     # [M], [M, M]
+    total = float(np.abs(lam).sum())
+    return {"cov": (V * np.clip(lam, 0.0, None)[None, :]) @ V.T,
+            "asymmetry": float(np.linalg.norm(C - C.T) / norm),
+            "clipped_mass": float(np.abs(lam[lam < 0]).sum() / total) if total > 0 else 0.0}

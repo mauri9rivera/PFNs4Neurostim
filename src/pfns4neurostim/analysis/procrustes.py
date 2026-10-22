@@ -1,58 +1,36 @@
-"""Orthogonal Procrustes disparity with a shuffled-site null: the complement of the CKA analysis.
+"""Procrustes shape metrics on Gram matrices: NBS, Bures, shape distance, disparity (BETA Phase 1, 2026-10-21).
 
-**Why this exists next to** :mod:`pfns4neurostim.analysis.cka`, **stated correctly.** The motivating claim was
-that CKA is blind to anisotropy and Procrustes is not. That is **false as stated**, and the tests record why:
-centred linear CKA and Procrustes have the *same* invariance group -- translation, isotropic rescaling and any
-orthogonal map -- so a general anisotropic stretch changes the Gram matrix and CKA *does* register it
-(``tests/analysis/test_procrustes.py::test_sensitive_to_anisotropic_stretch``; a 1->6 gain ramp moves debiased
-CKA by 0.20 and the disparity by only 0.06).
+**Why Gram matrices.** For centred linear kernels ``K = X X'`` and ``L = Y Y'`` of two row-matched point clouds, the
+orthogonal Procrustes problem depends on the clouds only through their kernels (Harvey, Larsen & Williams 2024,
+"Duality of Bures and shape distances")::
 
-The real difference is the **norm each puts on the cross-covariance spectrum**. Linear CKA is a Frobenius
-(sum-of-squares) alignment of Gram matrices, so it is dominated by the leading directions; the Procrustes
-residual is ``1 - (sum_i sigma_i) ** 2``, a **nuclear-norm** (plain sum) quantity, so it weights every
-direction's alignment equally. Neither dominates the other: a reweighting that inflates the 95 weak directions
-of a 96-site cloud while leaving the dominant one alone moves the disparity by 0.17 and debiased CKA by < 0.01
-(``test_spectrum_reweighting_that_cka_is_nearly_blind_to``), and the gain-ramp case above goes the other way.
-Procrustes therefore adds a channel that is sensitive to change spread across the weakly-populated directions,
-which CKA's Frobenius weighting discounts -- and *that* is the complementarity worth reporting.
+    NBS(K, L)       = tr((K^1/2 L K^1/2)^1/2) / sqrt(tr K tr L)          normalised Bures similarity, in [0, 1]
+    bures(K, L)^2   = tr K + tr L - 2 tr((K^1/2 L K^1/2)^1/2)              = min_R ||X - Y R||_F^2 (R orthogonal)
+    shape_distance  = arccos(NBS)                                         angular Procrustes distance, a metric
+    disparity       = 1 - NBS^2                                           ``scipy.spatial.procrustes``'s value
 
-The context in which that matters: each transformer block of the probed checkpoint ends in a *parameter-free
-post-LayerNorm*, which puts every token on a sqrt(192) sphere, so the per-site norm of a representation change
-is a pure rotation magnitude and the headline mechanism readouts (``rho_shape``, ``||dZ||``) are direction-blind.
-Procrustes and CKA are both direction-aware; they disagree about which directions count.
+with ``tr((K^1/2 L K^1/2)^1/2) = ||A' B||_*`` (nuclear norm) for any factors ``K = A A'``, ``L = B B'``. Two
+consequences the old cloud-only module could not offer:
 
-**CAVEAT 1 -- the rotation quotient is a choice, not a free win.** The prediction head has fixed weights and is
-**not** rotation-equivariant (``Linear 192->384 -> GELU -> Linear 384->5000``), so a global rotation of all
-tokens genuinely changes the model's output. Procrustes declares that rotation irrelevant. That is defensible for
-a *"did the geometry change shape?"* question and **indefensible for any claim about the prediction**. Every
-number this module produces is therefore a representation-similarity readout reported *alongside*
-output-space readouts, never a substitute for one, and must not carry a claim about what the model predicts.
+* **No feature map is needed.** A posterior covariance -- C_PFN, Sigma_MLL, Sigma_fixed -- is a valid argument, and
+  so is a 192-d layer Gram against a 32-d belief embedding: only the row count (the sites) must match. The width
+  restriction of the pre-BETA ``procrustes_disparity`` is gone (BETA §2.6).
+* **Bures is the 2-Wasserstein distance between N(0, K) and N(0, L).** On *uncentred* covariances it is the
+  scale-aware comparison of two zero-mean Gaussian posteriors on the grid (BETA β1b), which CKA and NBS, both scale
+  invariant, cannot make.
 
-**CAVEAT 2 -- the n < d regime, and the control that fixes it.** The NHP array has 96 sites and the
-representation is 192-dimensional. Two centred 96-row clouds each span at most a 95-dimensional subspace of a
-192-dimensional space, so an orthogonal map can align them far better than chance and the raw disparity is
-**biased low**. (The reduction in :func:`procrustes_disparity` makes this explicit: the statistic only ever sees
-a ``[r, r]`` matrix with ``r <= min(n, d)``.) The legacy M14 implementation sidestepped the bias by subsampling
-300 rows, which a 96-site grid cannot do. The fix here is a **shuffled-site null**, and it is part of the same
-primitive -- :func:`procrustes_with_null` is the only public entry point that returns a disparity, so a raw
-disparity can never be reported without the null it must be read against. The null permutes the row
-correspondence of one cloud (destroying the site matching while leaving both clouds' marginal geometry
-untouched), which is exactly "what disparity do two unrelated 96-row clouds in 192 dimensions reach".
+**What Procrustes adds next to CKA, stated correctly.** Centred linear CKA and Procrustes share their invariance
+group (translation, isotropic scale, orthogonal maps), so an anisotropic stretch changes both. They differ in how they
+weight the cross-covariance spectrum: CKA is a Frobenius (sum-of-squares) alignment dominated by the leading
+directions, NBS a nuclear-norm (plain sum) quantity in which every direction counts (Ding et al. 2021). Neither
+orders the other (``tests/analysis/test_procrustes.py``).
 
-**Pre-declared headline statistic:** ``disparity_minus_null`` = ``disparity - null_mean``, the *difference*. It is
-chosen over the ratio and the percentile because (i) it mirrors CKA's ``cka_minus_null``, so a Procrustes panel
-and a CKA panel over the same pairs are read on the same kind of axis; (ii) the ratio is unstable when the null
-mean sits close to its ceiling (disparity is bounded in [0, 1] and the null is typically near the top of that
-range, so small absolute moves become large ratio moves); and (iii) the percentile saturates -- with ``n_perm``
-replicates it cannot resolve anything finer than ``1 / (n_perm + 1)``, and the measured disparities are expected
-to sit far below the whole null distribution. The ratio and the percentile are still returned and written, as
-secondary readouts.
-
-Relation to the legacy code: :func:`pfns4neurostim.analysis.id_ood.compute_procrustes_disparity` is *not* reused.
-It returns ``nan`` on non-finite input (against the project's fail-fast rule), subsamples with a hardcoded
-``RandomState`` seed, and has no null -- the three things that make a disparity uninterpretable here. The
-statistic computed below is the same quantity as ``scipy.spatial.procrustes`` (asserted in the tests) by a
-reduction that makes the permutation null affordable.
+**Caveats.** (1) The rotation quotient is a choice: the prediction head is not rotation-equivariant, so every number
+here is a representation-similarity readout reported beside output-space readouts, never a claim about the
+prediction. (2) NBS has no zero baseline and is biased high at n < d (96 sites, 192 dims); BETA reads it only
+against the smooth-field surrogate (D3d). The shuffled-site null of :func:`gram_null` permutes the site
+correspondence of one kernel; like the CKA permutation null it destroys spatial smoothness, so it is a
+**descriptive** chance level only.
 """
 from __future__ import annotations
 
@@ -61,238 +39,289 @@ from typing import Any
 
 import numpy as np
 
+from .cka import double_center
+
 __all__ = [
-    "ProcrustesNull",
-    "standardize_cloud",
-    "procrustes_disparity",
-    "procrustes_with_null",
-    "HEADLINE_STATISTIC",
+    "GramNull",
+    "gram_factor",
+    "nbs_factors",
+    "psd_project",
+    "nbs",
+    "bures",
+    "shape_distance",
+    "disparity",
+    "gram_null",
+    "STATISTICS",
     "MIN_ROWS",
-    "NEGATIVE_DISPARITY_TOL",
+    "EIG_REL_TOL",
+    "NEGATIVE_TOL",
 ]
 
-#: The pre-declared headline statistic (see the module docstring); the others are secondary.
-HEADLINE_STATISTIC: str = "disparity_minus_null"
-
-#: Fewest rows a disparity is computed on. Below 3 the best rigid alignment is exact for any pair of clouds
-#: (2 centred points in any dimension differ by a rotation and a scale alone), so the statistic is identically 0.
+#: Fewest sites a shape metric is computed on. Below 3 the best rigid alignment of two centred clouds is exact for any
+#: pair (2 centred points differ by a rotation and a scale alone), so every statistic is trivial.
 MIN_ROWS: int = 3
 
-#: ``1 - nuclear_norm ** 2`` is non-negative in exact arithmetic; a float64 SVD may undershoot by ~1e-15.
-#: Anything below this is a bug, not rounding, and raises.
-NEGATIVE_DISPARITY_TOL: float = 1e-8
+#: Eigenvalues below ``EIG_REL_TOL x`` the largest one are treated as 0 when a Gram is factorised (rounding noise of a
+#: PSD matrix). Negative eigenvalues beyond it are *clipped* and their mass is reported by :func:`psd_project`.
+EIG_REL_TOL: float = 1e-12
+
+#: Relative tolerance on quantities that are non-negative in exact arithmetic (a squared Bures distance, ``1 - NBS``):
+#: anything more negative than this times the scale is a bug, not rounding, and raises.
+NEGATIVE_TOL: float = 1e-8
+
+#: Statistics :func:`gram_null` can draw a shuffled-site null for.
+STATISTICS: tuple[str, ...] = ("nbs", "shape_distance", "disparity")
 
 
 @dataclass(frozen=True)
-class ProcrustesNull:
-    """One Procrustes comparison and its shuffled-site null.
+class GramNull:
+    """One shape statistic and its shuffled-site null (descriptive chance level).
 
     Attributes:
-        disparity: Orthogonal Procrustes disparity in [0, 1] of the matched clouds.
-        null_mean: Mean disparity over the shuffled-site replicates.
+        statistic: One of :data:`STATISTICS`.
+        observed: The statistic on the matched sites.
+        null_mean: Mean over the shuffled-site replicates.
         null_sd: Standard deviation over the replicates.
-        null_q05: 5th percentile of the replicates (the low tail the measurement is compared against).
-        disparity_minus_null: ``disparity - null_mean`` -- the :data:`HEADLINE_STATISTIC`.
-        disparity_ratio: ``disparity / null_mean`` (secondary).
-        null_percentile: Fraction of replicates at or below ``disparity`` (secondary; resolution
-            ``1 / (n_perm + 1)``).
+        null_q05: 5th percentile of the replicates.
+        null_q95: 95th percentile of the replicates.
         n_perm: Replicates drawn.
-        n_rows: Rows (matched sites) per cloud.
-        n_dim: Representation dimension.
-        n_rank: Rank of the reduction, ``min(n_rows - 1, n_dim)``; ``n_rank < n_dim`` *is* the n < d regime.
+        n_rows: Sites.
     """
 
-    disparity: float
+    statistic: str
+    observed: float
     null_mean: float
     null_sd: float
     null_q05: float
-    disparity_minus_null: float
-    disparity_ratio: float
-    null_percentile: float
+    null_q95: float
     n_perm: int
     n_rows: int
-    n_dim: int
-    n_rank: int
 
     def as_row(self) -> dict[str, Any]:
-        """Return the result as a flat, JSON-safe mapping for a tidy CSV row."""
-        return {k: (int(v) if k.startswith("n_") else float(v)) for k, v in asdict(self).items()}
+        """Flat, JSON-safe mapping for a tidy CSV row."""
+        return {k: (v if isinstance(v, str) else int(v) if k.startswith("n_") else float(v))
+                for k, v in asdict(self).items()}
 
 
-def _check_finite(Z: np.ndarray, name: str) -> np.ndarray:
-    """Return ``Z`` as float64, raising on NaN/Inf (no silent propagation).
-
-    Args:
-        Z: Candidate array.
-        name: Argument name, for the message.
-
-    Returns:
-        The array as float64, shape unchanged.
+def _check(K: np.ndarray, name: str) -> np.ndarray:
+    """``K`` as a finite, square float64 matrix with at least :data:`MIN_ROWS` rows, symmetrised.
 
     Raises:
-        RuntimeError: If any entry is NaN or Inf.
+        RuntimeError: On NaN/Inf.
+        ValueError: On a non-square matrix or too few rows.
     """
-    A = np.asarray(Z, dtype=np.float64)
-    if not np.all(np.isfinite(A)):
+    A = np.asarray(K, dtype=np.float64)
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError(f"procrustes: {name} must be a square [n, n] Gram, got shape {A.shape}.")
+    if A.shape[0] < MIN_ROWS:
+        raise ValueError(f"procrustes: {name} needs n >= {MIN_ROWS} rows, got {A.shape[0]}.")
+    if not np.isfinite(A).all():
         bad = int((~np.isfinite(A)).sum())
         raise RuntimeError(f"procrustes: {name} holds {bad} non-finite value(s) of {A.size}; refusing to proceed.")
-    return A
+    return 0.5 * (A + A.T)
 
 
-def standardize_cloud(Z: np.ndarray) -> np.ndarray:
-    """Centre a point cloud on its centroid and scale it to unit Frobenius norm.
+def psd_project(K: np.ndarray) -> tuple[np.ndarray, float]:
+    """Nearest PSD matrix in Frobenius norm (negative eigenvalues set to 0), and the clipped eigenvalue mass.
 
-    This is the standardization ``scipy.spatial.procrustes`` applies, isolated so the permutation null can reuse
-    it: permuting rows changes neither the centroid nor the Frobenius norm, so a row permutation of the
-    standardized cloud *is* the standardization of the row-permuted cloud.
+    The implied posterior covariance C_PFN is estimated by quadrature and need not be PSD (BETA §4); the clipped mass
+    ``sum |lambda_-| / sum |lambda|`` is reported beside every statistic computed on the projection.
 
     Args:
-        Z: Point cloud, shape [n, d].
+        K: Symmetric (or nearly symmetric) matrix, shape [n, n]; symmetrised first.
 
     Returns:
-        The standardized cloud, shape [n, d].
+        ``(K_psd [n, n], clipped_mass in [0, 1])``.
+    """
+    A = _check(K, "K")
+    lam, V = np.linalg.eigh(A)                                             # [n], [n, n]
+    total = float(np.abs(lam).sum())
+    clipped = 0.0 if total == 0 else float(np.abs(lam[lam < 0]).sum() / total)
+    return (V * np.clip(lam, 0.0, None)[None, :]) @ V.T, clipped
+
+
+def gram_factor(K: np.ndarray, *, center: bool) -> np.ndarray:
+    """A factor ``F`` with ``F F' = K_+`` (``K`` double-centred first when ``center``; negative part clipped).
+
+    Args:
+        K: Gram matrix, shape [n, n].
+        center: Double-centre before factorising (the centred kernel of the shape metrics).
+
+    Returns:
+        ``F``, shape [n, r] with ``r`` the numerical rank.
+    """
+    A = _check(K, "K")
+    if center:
+        A = double_center(A)
+    lam, V = np.linalg.eigh(0.5 * (A + A.T))                               # [n], [n, n]
+    top = float(lam.max()) if lam.size else 0.0
+    keep = lam > EIG_REL_TOL * max(top, 0.0)
+    return V[:, keep] * np.sqrt(lam[keep])[None, :]                        # [n, r]
+
+
+def _nuclear(Fk: np.ndarray, Fl: np.ndarray) -> float:
+    """``||Fk' Fl||_*`` = ``tr((K^1/2 L K^1/2)^1/2)`` for ``K = Fk Fk'``, ``L = Fl Fl'``."""
+    if Fk.shape[1] == 0 or Fl.shape[1] == 0:
+        return 0.0
+    return float(np.linalg.svd(Fk.T @ Fl, compute_uv=False).sum())
+
+
+def _factors(K: np.ndarray, L: np.ndarray, center: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Factors of two Grams over the same sites (shape check included)."""
+    if np.shape(K) != np.shape(L):
+        raise ValueError(f"procrustes: Grams must be over the same sites, got {np.shape(K)} vs {np.shape(L)}.")
+    return gram_factor(K, center=center), gram_factor(L, center=center)
+
+
+def nbs_factors(Fk: np.ndarray, Fl: np.ndarray) -> float:
+    """NBS from precomputed factors (``K = Fk Fk'``, ``L = Fl Fl'``; see :func:`gram_factor`).
+
+    Lets a caller factor each Gram of a cell once and pair it with many others (BETA's representation runner).
+
+    Args:
+        Fk: Factor of the first (centred) Gram, shape [n, r_k].
+        Fl: Factor of the second (centred) Gram, shape [n, r_l].
+
+    Returns:
+        NBS in [0, 1].
 
     Raises:
-        RuntimeError: On non-finite input, or a cloud whose centred Frobenius norm is 0 (all rows identical,
-            so no shape to compare).
-        ValueError: For fewer than :data:`MIN_ROWS` rows or a non-2-D array.
+        RuntimeError: On a degenerate (zero-trace) side, or a value above 1 beyond tolerance.
     """
-    A = _check_finite(Z, "cloud")
-    if A.ndim != 2:
-        raise ValueError(f"standardize_cloud expects a 2-D [n, d] cloud, got shape {A.shape}.")
-    if A.shape[0] < MIN_ROWS:
-        raise ValueError(f"standardize_cloud needs n >= {MIN_ROWS} rows, got {A.shape[0]}.")
-    A = A - A.mean(axis=0, keepdims=True)                                  # [n, d]
-    norm = float(np.linalg.norm(A))
-    if norm <= 0.0:
-        raise RuntimeError("standardize_cloud: zero Frobenius norm after centring (every row identical).")
-    return A / norm                                                        # [n, d]
+    tk, tl = float((Fk ** 2).sum()), float((Fl ** 2).sum())
+    if tk <= 0 or tl <= 0:
+        raise RuntimeError(f"procrustes: zero-trace Gram after centring ({tk:.3g}, {tl:.3g}); no shape to compare.")
+    value = _nuclear(Fk, Fl) / np.sqrt(tk * tl)
+    if value > 1.0 + NEGATIVE_TOL:
+        raise RuntimeError(f"procrustes: NBS {value:.6f} > 1 beyond tolerance (Cauchy-Schwarz violated).")
+    return float(min(value, 1.0))
 
 
-def _reduced_factor(Z_std: np.ndarray) -> np.ndarray:
-    """Factor a standardized cloud as ``Z = F V'`` with ``V`` orthonormal, returning ``F``.
+def nbs(K: np.ndarray, L: np.ndarray, *, center: bool = True) -> float:
+    """Normalised Bures similarity of two Grams over the same sites (Harvey, Larsen & Williams 2024).
 
-    Singular values are invariant under multiplication by a matrix with orthonormal columns, so for two
-    standardized clouds ``X = F_x V_x'`` and ``Y = F_y V_y'`` the singular values of ``X' Y`` equal those of
-    ``F_x' F_y``. ``F`` is ``[n, r]`` with ``r <= min(n, d)``, which turns every permutation replicate into an
-    ``[r, r]`` SVD instead of a ``[d, d]`` one -- the reduction that makes the null affordable, and a direct
-    statement of Caveat 2 (at ``n = 96``, ``d = 192`` only 95 of the 192 directions are ever populated).
+    Implements ``NBS = tr((K^1/2 L K^1/2)^1/2) / sqrt(tr K tr L)``; on centred linear kernels it equals the cosine of
+    the Procrustes angle between the two clouds, and ``1 - NBS^2`` equals ``scipy.spatial.procrustes``'s disparity.
 
     Args:
-        Z_std: Standardized cloud, shape [n, d].
+        K: Gram matrix, shape [n, n] (any width behind it, or a covariance).
+        L: Gram matrix, shape [n, n].
+        center: Double-centre both first (the shape metric; default). ``False`` compares uncentred kernels.
 
     Returns:
-        ``F``, shape [n, r].
+        NBS in [0, 1]; 1 iff the clouds agree up to translation, scale and an orthogonal map.
+
+    Raises:
+        ValueError: On mismatched or non-square shapes, or fewer than :data:`MIN_ROWS` sites.
+        RuntimeError: On non-finite input or a zero-trace (degenerate) side.
     """
-    U, S, _ = np.linalg.svd(Z_std, full_matrices=False)                    # [n, r], [r], [r, d]
-    return U * S[None, :]                                                  # [n, r]
+    return nbs_factors(*_factors(K, L, center))
 
 
-def _disparity_from_factors(Fx: np.ndarray, Fy: np.ndarray) -> float:
-    """Disparity ``1 - (sum of singular values of Fx' Fy) ** 2`` of two unit-norm reduced factors.
+def bures(K: np.ndarray, L: np.ndarray, *, center: bool = False) -> float:
+    """Bures distance of two PSD Grams: the 2-Wasserstein distance between N(0, K) and N(0, L).
+
+    ``bures^2 = tr K + tr L - 2 tr((K^1/2 L K^1/2)^1/2)``; for linear kernels of row-matched clouds it equals the
+    unnormalised Procrustes distance ``min_R ||X - Y R||_F`` (centred clouds when ``center``). Scale-aware, so it
+    sees what NBS and CKA cannot: a posterior that has the right shape at the wrong size.
 
     Args:
-        Fx: Reduced factor of the first standardized cloud, shape [n, rx].
-        Fy: Reduced factor of the second standardized cloud, shape [n, ry].
+        K: PSD Gram / covariance, shape [n, n] (negative eigenvalues are clipped; see :func:`psd_project`).
+        L: PSD Gram / covariance, shape [n, n].
+        center: Double-centre both first (default ``False``: the uncentred posterior covariances of β1b).
+
+    Returns:
+        The distance, in the units of ``sqrt(K)``.
+
+    Raises:
+        ValueError: On mismatched shapes or too few sites.
+        RuntimeError: On non-finite input or a squared distance negative beyond tolerance.
+    """
+    Fk, Fl = _factors(K, L, center)
+    tk, tl = float((Fk ** 2).sum()), float((Fl ** 2).sum())
+    sq = tk + tl - 2.0 * _nuclear(Fk, Fl)
+    if sq < -NEGATIVE_TOL * max(tk + tl, 1.0):
+        raise RuntimeError(f"bures: squared distance {sq:.3e} is negative beyond tolerance.")
+    return float(np.sqrt(max(sq, 0.0)))
+
+
+def shape_distance(K: np.ndarray, L: np.ndarray, *, center: bool = True) -> float:
+    """Angular Procrustes shape distance ``arccos(NBS)`` (Williams et al. 2021): a true metric, in [0, pi/2].
+
+    Args:
+        K: Gram matrix, shape [n, n].
+        L: Gram matrix, shape [n, n].
+        center: Double-centre both first (default).
+
+    Returns:
+        The angle in radians.
+    """
+    return float(np.arccos(np.clip(nbs(K, L, center=center), 0.0, 1.0)))
+
+
+def disparity(K: np.ndarray, L: np.ndarray, *, center: bool = True) -> float:
+    """Procrustes disparity ``1 - NBS^2``: ``scipy.spatial.procrustes``'s third value, from Gram matrices.
+
+    Args:
+        K: Gram matrix, shape [n, n].
+        L: Gram matrix, shape [n, n].
+        center: Double-centre both first (default; scipy centres its clouds).
 
     Returns:
         The disparity in [0, 1].
-
-    Raises:
-        RuntimeError: If the value falls below ``-``:data:`NEGATIVE_DISPARITY_TOL` (a bug, not rounding).
     """
-    sv = np.linalg.svd(Fx.T @ Fy, compute_uv=False)                        # [min(rx, ry)]
-    value = 1.0 - float(sv.sum()) ** 2
-    if value < -NEGATIVE_DISPARITY_TOL:
-        raise RuntimeError(f"procrustes: disparity {value:.3e} is negative beyond tolerance; clouds not unit-norm?")
-    return max(value, 0.0)
+    return float(1.0 - nbs(K, L, center=center) ** 2)
 
 
-def procrustes_disparity(X: np.ndarray, Y: np.ndarray) -> float:
-    """Orthogonal Procrustes disparity between two row-matched point clouds.
-
-    Both clouds are centred and scaled to unit Frobenius norm, the orthogonal map ``R`` (rotation or reflection)
-    and scale ``s`` minimizing ``||X - s Y R||_F`` are solved in closed form, and the residual
-    ``1 - (sum_i sigma_i(X' Y)) ** 2`` is returned. Identical to ``scipy.spatial.procrustes``'s third return
-    value (asserted in ``tests/analysis/test_procrustes.py``); computed through the reduction of
-    :func:`_reduced_factor` so that :func:`procrustes_with_null`'s replicates are cheap.
-
-    Row ``i`` of ``X`` must be the same site as row ``i`` of ``Y``: the statistic is only meaningful under that
-    correspondence, and destroying it is exactly what the null of :func:`procrustes_with_null` does.
-
-    **Prefer** :func:`procrustes_with_null`. A bare disparity is uninterpretable at ``n < d`` (Caveat 2 of the
-    module docstring); this function exists for the tests and as the primitive the null is built from.
-
-    Args:
-        X: First cloud, shape [n, d].
-        Y: Second cloud, shape [n, d].
-
-    Returns:
-        The disparity in [0, 1]; 0 iff the clouds agree up to translation, scale and an orthogonal map.
-
-    Raises:
-        ValueError: On mismatched shapes, a non-2-D array, or fewer than :data:`MIN_ROWS` rows.
-        RuntimeError: On non-finite input or a degenerate (zero-norm) cloud.
-    """
-    if np.asarray(X).shape != np.asarray(Y).shape:
-        raise ValueError(f"procrustes_disparity needs matching shapes, got {np.shape(X)} vs {np.shape(Y)}.")
-    return _disparity_from_factors(_reduced_factor(standardize_cloud(X)), _reduced_factor(standardize_cloud(Y)))
+def _from_nbs(statistic: str, value: float) -> float:
+    """Map an NBS value to one of :data:`STATISTICS`."""
+    if statistic == "nbs":
+        return value
+    if statistic == "shape_distance":
+        return float(np.arccos(np.clip(value, 0.0, 1.0)))
+    return float(1.0 - value ** 2)
 
 
-def procrustes_with_null(
-    X: np.ndarray,
-    Y: np.ndarray,
+def gram_null(
+    K: np.ndarray,
+    L: np.ndarray,
     *,
+    statistic: str,
     n_perm: int,
     rng: np.random.Generator,
-) -> ProcrustesNull:
-    """Procrustes disparity of two row-matched clouds **and** its shuffled-site null, in one primitive.
+    center: bool = True,
+) -> GramNull:
+    """A shape statistic of two Grams and its shuffled-site null (rows and columns of ``L`` permuted jointly).
 
-    The null permutes the row correspondence of ``Y``, which destroys the site matching while leaving both
-    clouds' marginal geometry (centroid, Frobenius norm, spectrum) untouched. It answers the question a raw
-    disparity cannot at ``n < d``: how well can an orthogonal map align two *unrelated* ``n``-row clouds in ``d``
-    dimensions? See Caveat 2 in the module docstring; the disparity and the null are returned together by
-    construction so that one can never be reported without the other.
+    The null keeps both kernels' marginal geometry (spectrum, trace) and destroys only the site matching, which is
+    "what two unrelated n-site clouds reach" -- at 96 sites in 192 dimensions far from the no-similarity value, the
+    n < d bias. It also destroys spatial smoothness, so it is descriptive only (BETA D4; the smooth-field surrogate is
+    the chance level). Each replicate re-indexes ``L``'s factor and costs one ``[r_K, r_L]`` SVD.
 
     Args:
-        X: First cloud, shape [n, d] (the baseline).
-        Y: Second cloud, shape [n, d], row-matched to ``X``.
-        n_perm: Shuffled-site replicates; must be >= 1. Comes from a config key, never a literal
-            (``procrustes.n_perm``). The percentile readout resolves ``1 / (n_perm + 1)``.
-        rng: Generator, keyed by the cell's coordinates via :func:`pfns4neurostim.seeding.rng_for`
-            (never a bare ``default_rng(0)``). Consumed: ``n_perm`` permutations.
+        K: Gram matrix, shape [n, n].
+        L: Gram matrix, shape [n, n].
+        statistic: One of :data:`STATISTICS`.
+        n_perm: Replicates (>= 1), from a config key.
+        rng: Generator keyed by the cell (:func:`pfns4neurostim.seeding.rng_for`); consumed: ``n_perm`` permutations.
+        center: Double-centre both first (default).
 
     Returns:
-        The :class:`ProcrustesNull` record, headline field :data:`HEADLINE_STATISTIC`.
+        The :class:`GramNull` record.
 
     Raises:
-        ValueError: On mismatched shapes, too few rows, or ``n_perm < 1``.
-        RuntimeError: On non-finite input or a degenerate cloud.
+        ValueError: On an unknown statistic or ``n_perm < 1`` (and see :func:`nbs`).
     """
+    if statistic not in STATISTICS:
+        raise ValueError(f"gram_null: unknown statistic {statistic!r}; known {STATISTICS}.")
     if int(n_perm) < 1:
-        raise ValueError(f"procrustes_with_null: n_perm must be >= 1, got {n_perm}.")
-    if np.asarray(X).shape != np.asarray(Y).shape:
-        raise ValueError(f"procrustes_with_null needs matching shapes, got {np.shape(X)} vs {np.shape(Y)}.")
-    Xs, Ys = standardize_cloud(X), standardize_cloud(Y)                    # [n, d] each
-    Fx, Fy = _reduced_factor(Xs), _reduced_factor(Ys)                      # [n, rx], [n, ry]
-    n_rows, n_dim = Xs.shape
-    observed = _disparity_from_factors(Fx, Fy)
-    # A row permutation of the standardized cloud is the standardization of the row-permuted cloud, so the
-    # reduced factor can simply be re-indexed: no re-standardization and no second [n, d] SVD per replicate.
-    null = np.empty(int(n_perm), dtype=np.float64)                         # [n_perm]
-    for i in range(int(n_perm)):
-        null[i] = _disparity_from_factors(Fx, Fy[rng.permutation(n_rows)])
-    null_mean = float(null.mean())
-    return ProcrustesNull(
-        disparity=observed,
-        null_mean=null_mean,
-        null_sd=float(null.std(ddof=1)) if len(null) > 1 else 0.0,
-        null_q05=float(np.quantile(null, 0.05)),
-        disparity_minus_null=observed - null_mean,
-        disparity_ratio=observed / null_mean if null_mean > 0 else float("inf"),
-        null_percentile=float((null <= observed).mean()),
-        n_perm=int(n_perm),
-        n_rows=int(n_rows),
-        n_dim=int(n_dim),
-        n_rank=int(min(n_rows - 1, n_dim)),
-    )
+        raise ValueError(f"gram_null: n_perm must be >= 1, got {n_perm}.")
+    Fk, Fl = _factors(K, L, center)
+    n = Fk.shape[0]
+    observed = _from_nbs(statistic, nbs_factors(Fk, Fl))
+    null = np.array([_from_nbs(statistic, nbs_factors(Fk, Fl[rng.permutation(n)]))
+                     for _ in range(int(n_perm))])                          # [n_perm]
+    return GramNull(statistic=statistic, observed=observed, null_mean=float(null.mean()),
+                    null_sd=float(null.std(ddof=1)) if len(null) > 1 else 0.0,
+                    null_q05=float(np.quantile(null, 0.05)), null_q95=float(np.quantile(null, 0.95)),
+                    n_perm=int(n_perm), n_rows=int(n))
