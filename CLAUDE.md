@@ -364,6 +364,7 @@ or axis string. Settled with the user on 2026-09-18 for the JNE/IOP target:
 | Never commit `data/` or `output/` | See `.gitignore` |
 | No backwards-compatibility shims | Remove or replace cleanly; don't wrap |
 | No multi-line CLI commands | All flags on one line; never use `\` continuations — breaks copy-paste on Windows |
+| No AI attribution in commits or PRs | Never add `Co-Authored-By: Claude …`, "Generated with Claude Code" or any other Claude line to a commit message or PR description (user, 2026-10-21) |
 
 ---
 
