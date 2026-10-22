@@ -9,7 +9,10 @@
 #   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml
 defaults:
   dataset: nhp
-  model: [tabpfn_v2_5, gp_mll, gp_naive, random]
+  # tabicl added 2026-10-22 (user): shown beside TabPFN-2.5 in the Hyp A figures and its own TOST family;
+  # TabPFN-2.5 stays the pre-registered model and the only PFN of Hyp B / C. Its cells are the PFN-bench ones
+  # (same settings and model group), so nothing is recomputed.
+  model: [tabpfn_v2_5, tabicl, gp_mll, gp_naive, random]
   acquisition: [ts_marginal, random]
 
 experiment: bo_benchmark

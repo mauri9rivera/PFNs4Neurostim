@@ -9,6 +9,9 @@ subject-level table (channels averaged within a subject) is the sensitivity chec
 correction over metrics x comparisons within each dataset. Equivalence is the Hyp A claim only against GP-MLL; against
 GP-fixed and Random the CI of the difference is the readout (superiority when it lies below 0).
 
+TabPFN-2.5 is the pre-registered PFN. TabICL (added 2026-10-22, user) is tested the same way in its **own** Holm family,
+so TabPFN-2.5's family -- and its adjusted p-values -- are exactly the pre-registered ones.
+
     python scripts/hyp_a_tost.py
     python scripts/hyp_a_tost.py --pooled output/aggregated/pooled.csv --out output/aggregated/hyp_a_tost.csv
 """
@@ -28,9 +31,11 @@ OUTPUT_ROOT: str = "output"
 DATASETS: tuple[str, ...] = ("nhp", "5d_rat", "spinal")
 POOLED_LABEL: str = "pooled"
 #: Each model under its headline acquisition (random search serves the `random` acquisition only).
-ARMS: tuple[tuple[str, str], ...] = (("tabpfn_v2_5", "ts_marginal"), ("gp_mll", "ts_marginal"),
+ARMS: tuple[tuple[str, str], ...] = (("tabpfn_v2_5", "ts_marginal"), ("tabicl", "ts_marginal"), ("gp_mll", "ts_marginal"),
                                      ("gp_naive", "ts_marginal"), ("random", "random"))
-COMPARISONS: list[tuple[str, str]] = [("tabpfn_v2_5", "gp_mll"), ("tabpfn_v2_5", "gp_naive"), ("tabpfn_v2_5", "random")]
+#: The PFNs tested, each against every baseline in a Holm family of its own (TabPFN-2.5 first: pre-registered).
+PFNS: tuple[str, ...] = ("tabpfn_v2_5", "tabicl")
+BASELINES: tuple[str, ...] = ("gp_mll", "gp_naive", "random")
 METRICS: list[str] = ["recommended_regret", "best_queried_regret", "mean_query_regret"]
 UNITS: dict[str, tuple[str, ...]] = {"channel": ("dataset", "subject", "emg"), "subject": ("dataset", "subject")}
 
@@ -73,14 +78,15 @@ def main() -> None:
 
     pooled = pd.read_csv(args.pooled, low_memory=False)
     frame, margin = hyp_a_frame(pooled)
-    tables = [tost_table(frame, COMPARISONS, METRICS, margin, by=["dataset"], unit=unit).assign(level=level)
-              for level, unit in UNITS.items()]
+    tables = [tost_table(frame, [(pfn, b) for b in BASELINES], METRICS, margin, by=["dataset"], unit=unit)
+              .assign(level=level) for pfn in PFNS for level, unit in UNITS.items()]
     out = pd.concat(tables, ignore_index=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     out.to_csv(args.out, index=False)
-    cols = ["level", "dataset", "model_b", "metric", "n", "mean_diff", "ci_lo", "ci_hi", "tost_p_holm", "equivalent_holm"]
-    with pd.option_context("display.width", 200, "display.max_rows", 200):
-        print(f"margin = {margin}  (differences are TabPFN-2.5 minus model_b; 90% CI)")
+    cols = ["level", "dataset", "model_a", "model_b", "metric", "n", "mean_diff", "ci_lo", "ci_hi", "tost_p_holm",
+            "equivalent_holm"]
+    with pd.option_context("display.width", 200, "display.max_rows", 300):
+        print(f"margin = {margin}  (differences are model_a minus model_b; 90% CI; one Holm family per model_a)")
         print(out[cols].round(4).to_string(index=False))
     print(f"-> {args.out}")
 
