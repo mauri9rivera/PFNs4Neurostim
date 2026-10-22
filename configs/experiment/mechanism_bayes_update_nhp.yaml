@@ -172,7 +172,9 @@ bayes_update:
   fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.05}
   exemplar: {enabled: true, subject: null, emg: null, level: 1.0, draw: 0,
              engines: [tabpfn_v2_5, gp_mll_refit]}
-  panel_ts: [10, 50]
+  # Figure-only key (not in any cell identity): context sizes drawn as panels of the surprise and distance figures.
+  # t = 80 added after the grid (user, 2026-10-22); the grid computed every t, so nothing is recomputed.
+  panel_ts: [10, 50, 80]
   # gates / discrepancy off (2026-10-21): G1 / G2 / G4 passed 2026-10-19 and are recorded; the discrepancy
   # report is done. Both stay runnable by config.
   run: {gates: false, grid: true, discrepancy: false}

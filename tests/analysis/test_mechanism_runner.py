@@ -189,6 +189,12 @@ def test_bayes_update_runner_writes_every_table_and_figure_and_reassembles_from_
     fixed = tables["coherence_cell"][tables["coherence_cell"]["engine"] == "gp_fixed"]
     assert (fixed["drift_abs"].abs() < 1e-8).all() and (fixed["cov_asymmetry"] < 1e-8).all()
     assert tables["coherence_cell"].loc[tables["coherence_cell"]["engine"] == "gp_bayes", "ess"].notna().all()
+    # the pooled row (every anchor of a cell) is rebuilt at assembly from the cached rows; GP-fixed stays exact on it
+    cc = tables["coherence_cell"]
+    assert set(cc["pool"]) == {"unobserved", "observed", "all"}
+    by_pool = cc.groupby(["engine", "subject", "emg", "context_t", "draw", "pool"])["n_anchors"].sum().unstack("pool")
+    assert (by_pool["all"] == by_pool["unobserved"] + by_pool["observed"]).all()
+    assert (fixed["cov_asymmetry"] < 1e-8).all()
     h = tables["headtohead"]
     assert set(h.loc[h["reference"] == "gp_bayes", "engine"]) == {"gp_fixed"}
     for name in ("coherence", "implied_noise", "headtohead", "surprise_response", "implied_cov_exemplar"):

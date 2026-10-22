@@ -98,4 +98,5 @@ representation:
     eps: 0.01
     y_grid: {points: 512, u_tail: 1.0e-4}
     moment_matched: true
-  figures: {level: null}
+  # Figure-only keys (no cell identity). exclude_ts: t = 10 left out of site_match / lens_distance (user, 2026-10-22).
+  figures: {level: null, exclude_ts: [10]}

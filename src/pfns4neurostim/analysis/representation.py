@@ -466,6 +466,10 @@ def add_headline(df: pd.DataFrame, statistic: str) -> pd.DataFrame:
     return out
 
 
+#: Site-pool label of the β1a summary over every site, observed and unobserved together (user, 2026-10-22).
+SITE_POOL_ALL: str = "all"
+
+
 def channel_summary(
     df: pd.DataFrame,
     values: Sequence[str],

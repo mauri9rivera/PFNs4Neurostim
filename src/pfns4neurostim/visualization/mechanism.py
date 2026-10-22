@@ -8,6 +8,7 @@ every figure without re-running an analysis.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 from typing import Any, Sequence
 
@@ -15,6 +16,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from ..analysis.bayes_update import POOLED_ANCHORS
+from ..analysis.representation import SITE_POOL_ALL, channel_summary
 from . import style
 
 __all__ = [
@@ -127,7 +130,38 @@ def arm_style(engine: str) -> style.ModelStyle:
     """
     if engine in _TABPFN_VARIANTS[1:]:
         return style.series_style("tabpfn_v2_5", engine, list(_TABPFN_VARIANTS))
-    return style.model_style(_ENGINE_MODEL.get(engine, engine))
+    st = style.model_style(_ENGINE_MODEL.get(engine, engine))
+    return dataclasses.replace(st, label=style.ENGINE_LABELS[engine]) if engine in style.ENGINE_LABELS else st
+
+
+#: Engines left out of every Hyp C figure; their rows stay in the CSVs. The T 1.0 temperature control is visually
+#: indistinguishable from the deployed T 0.9, the default the benchmark runs (user, 2026-10-22).
+FIGURE_EXCLUDED_ENGINES: tuple[str, ...] = ("tabpfn_v2_5_t1",)
+
+
+def _shown(df: pd.DataFrame, col: str = "engine") -> pd.DataFrame:
+    """Rows of the engines the figures draw (:data:`FIGURE_EXCLUDED_ENGINES` removed)."""
+    return df[~df[col].isin(FIGURE_EXCLUDED_ENGINES)] if col in df else df
+
+
+def _channel_band(df: pd.DataFrame, col: str, x: str) -> pd.DataFrame:
+    """Median over channels per ``x`` with its within-subject channel-bootstrap interval (BETA D4).
+
+    Args:
+        df: Rows holding ``subject``, ``emg``, ``draw``, ``x`` and ``col`` (one row per cell, or several that the
+            within-channel median reduces).
+        col: Value column.
+        x: Column on the x-axis.
+
+    Returns:
+        Columns ``x``, ``median``, ``ci_low``, ``ci_high``, sorted by ``x``.
+    """
+    sub = df.dropna(subset=[col])
+    if sub.empty:
+        return pd.DataFrame(columns=[x, "median", "ci_low", "ci_high"])
+    out = channel_summary(sub, [col], [x], n_boot=style.HYPC_BAND_N_BOOT, ci=style.HYPC_BAND_CI,
+                          seed=style.HYPC_BAND_SEED)
+    return out.sort_values(x)[[x, "median", "ci_low", "ci_high"]]
 
 
 # ---------------------------------------------------------------------------
@@ -149,16 +183,26 @@ def _nominal(df: pd.DataFrame) -> pd.DataFrame:
     return df[np.isclose(df["level"], df["level"].min())]
 
 
-def _median_band(ax: Any, df: pd.DataFrame, col: str, st: style.ModelStyle) -> None:
-    """Median over cells vs context size, with an IQR band, in one engine's style."""
-    g = df.dropna(subset=[col]).groupby("context_t")[col]
-    if g.ngroups == 0:
+def _median_band(ax: Any, df: pd.DataFrame, col: str, st: style.ModelStyle, x: str = "context_t") -> None:
+    """Median over channels vs ``x`` with its channel-bootstrap interval, in one engine's style.
+
+    Engines of :data:`style.HYPC_LINE_ONLY_ENGINES` get the median line alone.
+
+    Args:
+        ax: Target axes.
+        df: One engine's rows (``subject``, ``emg``, ``draw``, ``engine``, ``x``, ``col``).
+        col: Value column.
+        st: Engine style.
+        x: Column on the x-axis.
+    """
+    band = _channel_band(df, col, x)
+    if band.empty:
         return
-    med = g.median()
-    ax.plot(med.index, med.values, color=st.color, ls=st.linestyle, marker=st.marker, label=st.label,
+    ax.plot(band[x], band["median"], color=st.color, ls=st.linestyle, marker=st.marker, label=st.label,
             zorder=st.zorder)
-    ax.fill_between(med.index, g.quantile(0.25).values, g.quantile(0.75).values, color=st.color,
-                    alpha=style.BAND_ALPHA, lw=0)
+    engines = set(df["engine"]) if "engine" in df else set()
+    if not engines & set(style.HYPC_LINE_ONLY_ENGINES):
+        ax.fill_between(band[x], band["ci_low"], band["ci_high"], color=st.color, alpha=style.BAND_ALPHA, lw=0)
 
 
 def _bayes_value(ax: Any, value: float) -> None:
@@ -173,52 +217,117 @@ def _context_axis(ax: Any, ts: Sequence[int]) -> None:
     ax.set_xlabel(style.axis_label("context_t"))
 
 
+#: Panels per row of the pooled coherence figure.
+_COHERENCE_COLUMNS: int = 2
+
+
 def _omega_coherence(cell: pd.DataFrame, run_dir: str) -> list[str]:
-    """Omega-1: Part A headlines vs context size; rows = anchor pool (never pooled)."""
-    cell = _nominal(cell)
-    pools = [p for p in ("unobserved", "observed") if p in set(cell["pool"])]
+    """Omega-1: Part A headlines vs context size, over every anchor (``coherence.svg``) and per pool (supplement).
+
+    The pooled figure is the headline (user, 2026-10-22); ``coherence_by_pool.svg`` keeps the pre-registered split,
+    since a repeated measurement at a site already in D (observed anchor) and an extrapolation (unobserved anchor)
+    test the update in different regimes.
+
+    Args:
+        cell: ``coherence_cell.csv`` rows.
+        run_dir: Output directory.
+
+    Returns:
+        Written paths.
+    """
+    cell = _shown(_nominal(cell))
     metrics = [m for m in OMEGA_COHERENCE_METRICS if m in cell]
     ts = sorted(cell["context_t"].unique())
-    fig, axes = style.figure("wide", nrows=len(pools), ncols=len(metrics), squeeze=False,
-                             panel_aspect=_OMEGA_PANEL_ASPECT)
-    for r, pool in enumerate(pools):
-        sub = cell[cell["pool"] == pool]
-        for c, metric in enumerate(metrics):
-            ax = axes[r][c]
-            for engine in sub["engine"].unique():
-                _median_band(ax, sub[sub["engine"] == engine], metric, arm_style(engine))
+    written: list[str] = []
+    pooled = cell[cell["pool"] == POOLED_ANCHORS]
+    if not pooled.empty:
+        ncols = _COHERENCE_COLUMNS
+        fig, axes = style.figure("double", nrows=-(-len(metrics) // ncols), ncols=ncols, squeeze=False,
+                                 panel_aspect=_OMEGA_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
+        for ax, metric in zip(axes.ravel(), metrics):
+            for engine in pooled["engine"].unique():
+                _median_band(ax, pooled[pooled["engine"] == engine], metric, arm_style(engine))
             _bayes_value(ax, OMEGA_COHERENCE_METRICS[metric])
             _context_axis(ax, ts)
             ax.set_ylabel(style.axis_label(metric))
-            ax.set_title(f"{pool} anchors", fontsize=style.FONT_SIZES["legend"])
-    axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
-    style.panel_letters(axes.ravel())
-    return style.save_figure(fig, run_dir, "coherence")
+        for ax in axes.ravel()[len(metrics):]:
+            ax.set_axis_off()
+        axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
+        style.panel_letters(axes.ravel()[:len(metrics)])
+        written += style.save_figure(fig, run_dir, "coherence")
+    pools = [p for p in ("unobserved", "observed") if p in set(cell["pool"])]
+    if pools:
+        fig, axes = style.figure("wide", nrows=len(pools), ncols=len(metrics), squeeze=False,
+                                 panel_aspect=_OMEGA_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
+        for r, pool in enumerate(pools):
+            sub = cell[cell["pool"] == pool]
+            for c, metric in enumerate(metrics):
+                ax = axes[r][c]
+                for engine in sub["engine"].unique():
+                    _median_band(ax, sub[sub["engine"] == engine], metric, arm_style(engine))
+                _bayes_value(ax, OMEGA_COHERENCE_METRICS[metric])
+                _context_axis(ax, ts)
+                ax.set_ylabel(style.axis_label(metric))
+                ax.set_title(f"{pool} anchors", fontsize=style.FONT_SIZES["legend"])
+        axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
+        style.panel_letters(axes.ravel())
+        written += style.save_figure(fig, run_dir, "coherence_by_pool")
+    return written
+
+
+#: Legend of the implied-noise scatter: below the axes (axes coordinates), markers enlarged to be readable.
+_IMPLIED_NOISE_LEGEND_ANCHOR: tuple[float, float] = (0.5, -0.22)
+_SCATTER_LEGEND_MARKER_SCALE: float = 3.0
 
 
 def _omega_implied_noise(cell: pd.DataFrame, coh: pd.DataFrame, run_dir: str) -> list[str]:
-    """Omega-2: latent share of the predictive variance vs t; implied noise vs the trials' own variance."""
-    cell, coh = _nominal(cell), _nominal(coh)
-    fig, axes = style.figure("double", ncols=2, squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT)
+    """Omega-2: how much of the predictive variance at x' a model treats as noise, and whether that noise is real.
+
+    (a) Latent share C(x', x') / s^2(x') vs t, over every anchor: the part of the predictive variance at x' that an
+    observation there can remove (1 - share = what the model calls observation noise). (b) Implied noise
+    s^2(x') - C(x', x') against the empirical variance of the repeated trials at x', one point per anchor, on log
+    axes (the values span four decades); a model that has learned the site's noise sits on the diagonal. Implied noise
+    <= 0 (C(x', x') >= s^2(x'), impossible for a coherent model) cannot be drawn on a log axis, so its share is in the
+    legend next to the median Spearman rho over cells.
+
+    Args:
+        cell: ``coherence_cell.csv`` rows.
+        coh: ``coherence.csv`` rows (one per anchor).
+        run_dir: Output directory.
+
+    Returns:
+        Written paths.
+    """
+    cell, coh = _shown(_nominal(cell)), _shown(_nominal(coh))
+    pooled = cell[cell["pool"] == POOLED_ANCHORS]
+    fig, axes = style.figure("double", ncols=2, squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT,
+                             layout=style.LAYOUT_ENGINE)
     ax = axes[0][0]
-    for engine in cell["engine"].unique():
-        _median_band(ax, cell[(cell["engine"] == engine) & (cell["pool"] == "observed")], "latent_frac",
-                     arm_style(engine))
+    for engine in pooled["engine"].unique():
+        _median_band(ax, pooled[pooled["engine"] == engine], "latent_frac", arm_style(engine))
     _context_axis(ax, sorted(cell["context_t"].unique()))
     ax.set_ylabel(style.axis_label("latent_frac"))
     ax.legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
     ax = axes[0][1]
+    positive = coh[(coh["trial_var"] > 0) & (coh["implied_noise"] > 0)]
     for engine in coh["engine"].unique():
         st = arm_style(engine)
         sub = coh[coh["engine"] == engine]
-        rho = cell[cell["engine"] == engine]["sigma_recovery_rho"].median()
-        ax.scatter(sub["trial_var"], sub["implied_noise"], s=style.MARKER_SIZE, color=st.color, marker=st.marker,
-                   alpha=style.FAINT_ALPHA * 3, label=f"{st.label} (median rho {rho:.2f})", lw=0)
-    lim = [0.0, float(np.nanmax(coh[["trial_var", "implied_noise"]].to_numpy()))]
+        rho = pooled[pooled["engine"] == engine]["sigma_recovery_rho"].median()
+        neg = float((sub["implied_noise"] <= 0).mean())
+        pts = positive[positive["engine"] == engine]
+        ax.scatter(pts["trial_var"], pts["implied_noise"], s=style.MARKER_SIZE, color=st.color, marker=st.marker,
+                   alpha=style.FAINT_ALPHA * 3, lw=0,
+                   label=style.IMPLIED_NOISE_LEGEND.format(model=st.label, rho=rho, neg=100 * neg))
+    vals = positive[["trial_var", "implied_noise"]].to_numpy()
+    lim = [float(np.nanmin(vals)), float(np.nanmax(vals))]
     ax.plot(lim, lim, color=style.NEUTRAL_GREY, lw=style.LINE_WIDTH / 2, ls=":")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.set_xlabel(style.axis_label("trial_var"))
     ax.set_ylabel(style.axis_label("implied_noise"))
-    ax.legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
+    ax.legend(loc="upper center", bbox_to_anchor=_IMPLIED_NOISE_LEGEND_ANCHOR, fontsize=style.FONT_SIZES["legend"] - 1,
+              frameon=False, markerscale=_SCATTER_LEGEND_MARKER_SCALE)
     style.panel_letters(axes.ravel())
     return style.save_figure(fig, run_dir, "implied_noise")
 
@@ -228,7 +337,7 @@ def _omega_headtohead(h2h: pd.DataFrame, run_dir: str) -> list[str]:
 
     Every other engine is drawn against each reference, so the GP-vs-GP spread sits next to TabPFN's.
     """
-    sub = _nominal(h2h)
+    sub = _shown(_nominal(h2h))
     sub = sub[(sub["reference"] != "none") & (sub["source"] == "trial") & (sub["pool"] == "unobserved")]
     refs = [r for r in ("gp_bayes", "gp_mll_refit", "gp_fixed") if r in set(sub["reference"])]
     metrics = [m for m in OMEGA_CONTRAST_METRICS if m in sub]
@@ -238,7 +347,7 @@ def _omega_headtohead(h2h: pd.DataFrame, run_dir: str) -> list[str]:
     keys = ["subject", "emg", "level", "context_t", "draw", "engine", "reference"]
     per_cell = sub.groupby(keys)[metrics].median().reset_index()                  # anchors -> cell
     fig, axes = style.figure("wide", nrows=len(refs), ncols=len(metrics), squeeze=False,
-                             panel_aspect=_OMEGA_PANEL_ASPECT)
+                             panel_aspect=_OMEGA_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
     for r, ref in enumerate(refs):
         for c, metric in enumerate(metrics):
             ax = axes[r][c]
@@ -272,28 +381,37 @@ def _omega_surprise(surprise: pd.DataFrame, panel_ts: Sequence[int], run_dir: st
     Returns:
         Written paths.
     """
-    sub = _nominal(surprise)
+    sub = _shown(_nominal(surprise))
     sub = sub[sub["pool"] == "unobserved"]
     if engines is not None:
         sub = sub[sub["engine"].isin(list(engines))]
     ts = [t for t in panel_ts if t in set(sub["context_t"])]
     if not ts:
         return []
-    fig, axes = style.figure("double", ncols=len(ts), squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT,
+    cell_keys = ["subject", "emg", "level", "context_t", "draw", "engine"]
+    per_cell = sub.groupby([*cell_keys, "c"])["update_anchor_sd"].median().reset_index()   # anchors -> cell
+    # least-squares slope through the origin of the update on the surprise, per anchor, then per cell
+    slope = (sub.assign(cu=sub["c"] * sub["update_anchor_sd"], cc=sub["c"] ** 2)
+             .groupby([*cell_keys, "anchor"])[["cu", "cc"]].sum())
+    slope = (slope["cu"] / slope["cc"]).rename("surprise_slope").reset_index()
+    slope = slope.groupby(cell_keys)["surprise_slope"].median().reset_index()
+    fig, axes = style.figure("wide", ncols=len(ts) + 1, squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT,
                              layout=style.LAYOUT_ENGINE)
     for ax, t in zip(axes[0], ts):
-        at = sub[sub["context_t"] == t]
+        at = per_cell[per_cell["context_t"] == t]
         for engine in at["engine"].unique():
-            st = arm_style(engine)
-            g = at[at["engine"] == engine].groupby("c")["update_anchor_sd"]
-            ax.plot(g.median().index, g.median().values, color=st.color, ls=st.linestyle, marker=st.marker,
-                    label=st.label, zorder=st.zorder)
-            ax.fill_between(g.median().index, g.quantile(0.25).values, g.quantile(0.75).values, color=st.color,
-                            alpha=style.BAND_ALPHA, lw=0)
+            _median_band(ax, at[at["engine"] == engine], "update_anchor_sd", arm_style(engine), x="c")
         ax.axhline(0.0, color=style.NEUTRAL_GREY, lw=style.LINE_WIDTH / 2, ls=":", zorder=0)
         ax.set_xlabel(style.axis_label("ladder_c"))
         ax.set_ylabel(style.axis_label("update_anchor_sd"))
         ax.set_title(f"$t$ = {int(t)}", fontsize=style.FONT_SIZES["legend"])
+    ax = axes[0][-1]
+    for engine in slope["engine"].unique():
+        _median_band(ax, slope[slope["engine"] == engine], "surprise_slope", arm_style(engine))
+    _bayes_value(ax, 1.0)
+    _context_axis(ax, sorted(slope["context_t"].unique()))
+    ax.set_ylabel(style.axis_label("surprise_slope"))
+    ax.set_title("slope vs context size", fontsize=style.FONT_SIZES["legend"])
     axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
     style.panel_letters(axes.ravel())
     if reference is not None:
@@ -325,7 +443,8 @@ def _omega_exemplar(run_dir: str, npz: str = "exemplar.npz", key: str = "C", lab
     ex = np.load(path)
     C, ts, engines, xy = ex[key], ex["context_ts"], [str(e) for e in ex["engines"]], ex["ch2xy"].astype(int)
     shape = tuple(xy.max(axis=0) + 1)
-    fig, axes = style.figure("full", nrows=len(engines), ncols=len(ts), squeeze=False, panel_aspect=_OMEGA_MAP_ASPECT)
+    fig, axes = style.figure("full", nrows=len(engines), ncols=len(ts), squeeze=False, panel_aspect=_OMEGA_MAP_ASPECT,
+                             layout=style.LAYOUT_ENGINE)
     for r, engine in enumerate(engines):
         vmax = float(np.abs(C[:, r]).max()) or 1.0
         for c, t in enumerate(ts):
@@ -378,6 +497,7 @@ def _c1_readouts(h2h: pd.DataFrame, reference: str, engines: Sequence[str], run_
     Returns:
         Written paths.
     """
+    engines = [e for e in engines if e not in FIGURE_EXCLUDED_ENGINES]
     sub = _nominal(h2h)
     sub = sub[(sub["pool"] == "unobserved") & sub["engine"].isin(list(engines))]
     panels = [m for m in C1_READOUTS if m in sub]
@@ -389,7 +509,8 @@ def _c1_readouts(h2h: pd.DataFrame, reference: str, engines: Sequence[str], run_
     # must list the reference too (panel (a) skips it: a contrast against itself is not drawn)
     ncols = _C1_READOUT_COLUMNS
     nrows = -(-(len(panels) + 1) // ncols)
-    fig, axes = style.figure("wide", nrows=nrows, ncols=ncols, squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT)
+    fig, axes = style.figure("wide", nrows=nrows, ncols=ncols, squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT,
+                             layout=style.LAYOUT_ENGINE)
     flat = list(axes.ravel())
     for ax, metric in zip(flat, panels):
         perfect, kind, source = C1_READOUTS[metric]
@@ -428,6 +549,7 @@ def _c1_distance(profile: pd.DataFrame, engines: Sequence[str], panel_ts: Sequen
     Returns:
         Written paths.
     """
+    engines = [e for e in engines if e not in FIGURE_EXCLUDED_ENGINES]
     sub = _nominal(profile)
     sub = sub[(sub["pool"] == "unobserved") & (sub["site_pool"] == "unobserved") & sub["engine"].isin(list(engines))]
     ts = [t for t in panel_ts if t in set(sub["context_t"])]
@@ -436,18 +558,12 @@ def _c1_distance(profile: pd.DataFrame, engines: Sequence[str], panel_ts: Sequen
     sub = sub.assign(bin_mid=0.5 * (sub["bin_lo"] + sub["bin_hi"]))
     keys = ["subject", "emg", "level", "context_t", "draw", "engine", "bin_mid"]
     per_cell = sub.groupby(keys)["abs_transfer"].median().reset_index()
-    fig, axes = style.figure("double", ncols=len(ts), squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT)
+    fig, axes = style.figure("wide" if len(ts) > 2 else "double", ncols=len(ts), squeeze=False,
+                             panel_aspect=_OMEGA_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
     for ax, t in zip(axes[0], ts):
         at = per_cell[per_cell["context_t"] == t]
         for engine in engines:
-            st = arm_style(engine)
-            g = at[at["engine"] == engine].groupby("bin_mid")["abs_transfer"]
-            if g.ngroups == 0:
-                continue
-            ax.plot(g.median().index, g.median().values, color=st.color, ls=st.linestyle, marker=st.marker,
-                    label=st.label, zorder=st.zorder)
-            ax.fill_between(g.median().index, g.quantile(0.25).values, g.quantile(0.75).values, color=st.color,
-                            alpha=style.BAND_ALPHA, lw=0)
+            _median_band(ax, at[at["engine"] == engine], "abs_transfer", arm_style(engine), x="bin_mid")
         ax.set_xlabel(style.axis_label("distance_pitch"))
         ax.set_ylabel(style.axis_label("abs_transfer"))
         ax.set_title(f"$t$ = {int(t)}", fontsize=style.FONT_SIZES["legend"])
@@ -854,6 +970,9 @@ _REPRESENTATION_PANEL_ASPECT: float = 0.7
 #: Columns of the secondary β2 grid.
 _REPRESENTATION_SECONDARY_COLUMNS: int = 3
 
+#: Panel height / width of the one-column site-match figure.
+_SITE_MATCH_PANEL_ASPECT: float = 0.55
+
 #: Statistics of the β1a site-match figure (rows), with their axis-label keys.
 SITE_MATCH_STATS: dict[str, str] = {"w2_over_sd": "w2_over_sd", "location": "w2_location", "spread": "w2_spread",
                                     "shape": "w2_shape"}
@@ -862,18 +981,29 @@ SITE_MATCH_STATS: dict[str, str] = {"w2_over_sd": "w2_over_sd", "location": "w2_
 POSTERIOR_COV_STATS: dict[str, float] = {"nbs": 1.0, "cka": 1.0, "bures_rel": 0.0, "trace_ratio": 1.0}
 
 
-def _figure_level(df: pd.DataFrame, run_dir: str) -> pd.DataFrame:
-    """Rows at ``representation.figures.level`` of the run's config (null = the nominal, lowest level)."""
+def _figures_block(run_dir: str) -> dict[str, Any]:
+    """The ``representation.figures`` block of the run's resolved config (empty when absent)."""
     import yaml  # noqa: PLC0415
 
-    level = None
     path = os.path.join(run_dir, "config.yaml")
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as fh:
-            level = (((yaml.safe_load(fh) or {}).get("representation") or {}).get("figures") or {}).get("level")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        return ((yaml.safe_load(fh) or {}).get("representation") or {}).get("figures") or {}
+
+
+def _figure_level(df: pd.DataFrame, run_dir: str) -> pd.DataFrame:
+    """Rows at ``representation.figures.level`` of the run's config (null = the nominal, lowest level)."""
+    level = _figures_block(run_dir).get("level")
     if level is None:
         return _nominal(df)
     return df[np.isclose(df["level"], float(level))]
+
+
+def _drop_excluded_ts(df: pd.DataFrame, run_dir: str) -> pd.DataFrame:
+    """Rows without the context sizes of ``representation.figures.exclude_ts`` (site match and lens only)."""
+    drop = [int(t) for t in (_figures_block(run_dir).get("exclude_ts") or [])]
+    return df[~df["context_t"].isin(drop)]
 
 
 def _t_color(i: int, n: int) -> str:
@@ -882,14 +1012,30 @@ def _t_color(i: int, n: int) -> str:
     return base if n == 1 else style.derive_shade(base, i, n)
 
 
-def _alignment_panel(ax: Any, sub: pd.DataFrame, readouts: Sequence[str], ts: Sequence[int], *, legend: bool) -> None:
-    """One target: the headline statistic vs block, one trace per (readout, t), the surrogate floor as a band."""
-    floors = sub[sub["value"] == "headline_floor"]
+#: The β2 figure without geometry regression: (value rows, floor rows, y-axis key, figure-name suffix). It sits
+#: beside the headline (deconfounded) figure so the share that geometry explains is visible (user, 2026-10-22).
+_RAW_ALIGNMENT: tuple[str, str, str, str] = ("cka", "surrogate_q_cka", "cka_debiased", "_raw")
+
+
+def _alignment_panel(ax: Any, sub: pd.DataFrame, readouts: Sequence[str], ts: Sequence[int], *, value: str,
+                     floor: str, legend: bool) -> None:
+    """One target: a statistic vs block, one trace per (readout, t), its surrogate floor as a band.
+
+    Args:
+        ax: Target axes.
+        sub: Summary rows of one target.
+        readouts: Readouts drawn (the first solid with its interval, the rest thin).
+        ts: Context sizes, one trace each.
+        value: ``value`` rows drawn as lines.
+        floor: ``value`` rows drawn as the chance band (min to max over t of the median, first readout).
+        legend: Attach legend labels.
+    """
+    floors = sub[(sub["value"] == floor) & (sub["readout"] == readouts[0])]
     if not floors.empty:
         band = floors.groupby("layer")["median"]
         ax.fill_between(band.min().index, band.min().values, band.max().values, color=style.NEUTRAL_GREY,
                         alpha=style.BAND_ALPHA, lw=0, label=style.SURROGATE_BAND_LABEL if legend else None, zorder=0)
-    vals = sub[sub["value"] == "headline_value"]
+    vals = sub[sub["value"] == value]
     for readout in readouts:
         for i, t in enumerate(ts):
             part = vals[(vals["readout"] == readout) & (vals["context_t"] == t)].sort_values("layer")
@@ -907,12 +1053,12 @@ def _alignment_panel(ax: Any, sub: pd.DataFrame, readouts: Sequence[str], ts: Se
 
 
 def _representation_grid(summary: pd.DataFrame, grid: Sequence[Sequence[str | None]], readouts: Sequence[str],
-                         statistic: str, run_dir: str, name: str) -> list[str]:
+                         value: str, floor: str, ylabel: str, run_dir: str, name: str) -> list[str]:
     """A grid of alignment panels (one target each), shared y, blocks on x."""
     nrows, ncols = len(grid), max(len(r) for r in grid)
     ts = sorted(summary["context_t"].unique())
     fig, axes = style.figure("wide", nrows=nrows, ncols=ncols, squeeze=False, sharex=True, sharey=True,
-                             panel_aspect=_REPRESENTATION_PANEL_ASPECT)
+                             panel_aspect=_REPRESENTATION_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
     first = True
     for r, row in enumerate(grid):
         for c in range(ncols):
@@ -921,68 +1067,95 @@ def _representation_grid(summary: pd.DataFrame, grid: Sequence[Sequence[str | No
             if target is None:
                 ax.set_visible(False)
                 continue
-            _alignment_panel(ax, summary[summary["target"] == target], readouts, ts, legend=first)
+            _alignment_panel(ax, summary[summary["target"] == target], readouts, ts, value=value, floor=floor,
+                             legend=first)
             first = False
             ax.set_title(style.BELIEF_TARGET_LABELS.get(target, target), fontsize=style.FONT_SIZES["base"])
             if r == nrows - 1:
                 ax.set_xlabel(style.axis_label("layer"))
-    fig.supylabel(style.axis_label(f"headline_{statistic}"), fontsize=style.FONT_SIZES["base"])
+    fig.supylabel(style.axis_label(ylabel), fontsize=style.FONT_SIZES["base"])
     handles, labels = axes[0][0].get_legend_handles_labels()
     for readout in readouts:
         handles.append(plt.Line2D([], [], color=style.NEUTRAL_GREY, ls=style.READOUT_LINESTYLES.get(readout, "-")))
         labels.append(style.READOUT_LABELS.get(readout, readout))
-    fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 4), fontsize=style.FONT_SIZES["legend"],
-               bbox_to_anchor=(0.5, 1.0), frameon=False)
+    fig.legend(handles, labels, loc="outside upper center", ncol=min(len(labels), 4),
+               fontsize=style.FONT_SIZES["legend"], frameon=False)
     style.panel_letters([ax for row in axes for ax in row if ax.get_visible()])
     return style.save_figure(fig, run_dir, name)
 
 
 def _representation_vs_layer(summary: pd.DataFrame, statistic: str, headline_readout: str,
                              run_dir: str) -> list[str]:
-    """β2: the primary 2 x 2 grid (location / spread x own / GP-MLL refit) and a grid of the secondary targets."""
+    """β2: the primary 2 x 2 grid (location / spread x own / GP-MLL refit) and the secondary targets.
+
+    Each is drawn twice: the headline statistic (geometry regressed out) and raw debiased CKA (``*_raw``), whose
+    chance band is the raw surrogate quantile.
+
+    Args:
+        summary: ``representation_summary.csv`` rows at the figure level and site set.
+        statistic: Headline statistic (``headline.json``).
+        headline_readout: Readout drawn solid with its interval.
+        run_dir: Output directory.
+
+    Returns:
+        Written paths.
+    """
     present = set(summary["target"])
     readouts = [headline_readout] + [r for r in ("feature_mean",) if r in set(summary["readout"])
                                      and r != headline_readout]
-    written: list[str] = []
     primary = [[t if t in present else None for t in row] for row in REPRESENTATION_PRIMARY_GRID]
-    if any(t is not None for row in primary for t in row):
-        written += _representation_grid(summary, primary, readouts, statistic, run_dir, "representation_vs_layer")
     rest = [t for t in style.BELIEF_TARGET_LABELS if t in present
             and t not in {x for row in REPRESENTATION_PRIMARY_GRID for x in row}]
-    if rest:
-        n = _REPRESENTATION_SECONDARY_COLUMNS
-        grid = [rest[i:i + n] for i in range(0, len(rest), n)]
-        written += _representation_grid(summary, grid, readouts, statistic, run_dir, "representation_vs_layer_secondary")
+    n = _REPRESENTATION_SECONDARY_COLUMNS
+    secondary = [rest[i:i + n] for i in range(0, len(rest), n)]
+    raw_value, raw_floor, raw_label, raw_suffix = _RAW_ALIGNMENT
+    variants = [("headline_value", "headline_floor", f"headline_{statistic}", "")]
+    if raw_value in set(summary["value"]):
+        variants.append((raw_value, raw_floor, raw_label, raw_suffix))
+    written: list[str] = []
+    for value, floor, ylabel, suffix in variants:
+        if any(t is not None for row in primary for t in row):
+            written += _representation_grid(summary, primary, readouts, value, floor, ylabel, run_dir,
+                                            f"representation_vs_layer{suffix}")
+        if secondary:
+            written += _representation_grid(summary, secondary, readouts, value, floor, ylabel, run_dir,
+                                            f"representation_vs_layer_secondary{suffix}")
     return written
 
 
 def _site_match_figure(sm: pd.DataFrame, run_dir: str) -> list[str]:
-    """β1a: per-site W2 to each reference and its location / spread / shape split vs t, site pools apart."""
+    """β1a: per-site W2 to each reference and its location / spread / shape split vs t, every site pooled.
+
+    One column: the references share each panel, told apart by colour and line style (user, 2026-10-22). The
+    observed / unobserved split stays in ``site_match_summary.csv``.
+
+    Args:
+        sm: ``site_match_summary.csv`` rows at the figure level, excluded context sizes removed.
+        run_dir: Output directory.
+
+    Returns:
+        Written paths.
+    """
+    sm = sm[sm["site_pool"] == SITE_POOL_ALL] if SITE_POOL_ALL in set(sm["site_pool"]) else sm
     refs = list(dict.fromkeys(sm["reference"]))
     stats = [s for s in SITE_MATCH_STATS if s in set(sm["value"])]
     if not refs or not stats:
         return []
-    fig, axes = style.figure("wide", nrows=len(stats), ncols=len(refs), squeeze=False, sharex=True,
-                             panel_aspect=_REPRESENTATION_PANEL_ASPECT)
+    fig, axes = style.figure("single", nrows=len(stats), ncols=1, squeeze=False, sharex=True,
+                             panel_aspect=_SITE_MATCH_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
     ts = sorted(sm["context_t"].unique())
-    for c, ref in enumerate(refs):
-        st = arm_style(ref)
-        for r, stat in enumerate(stats):
-            ax = axes[r][c]
-            for pool, ls in style.SITE_POOL_LINESTYLES.items():
-                part = sm[(sm["reference"] == ref) & (sm["value"] == stat) & (sm["site_pool"] == pool)]
-                part = part.sort_values("context_t")
-                if part.empty:
-                    continue
-                ax.plot(part["context_t"], part["median"], color=st.color, ls=ls, marker=st.marker,
-                        label=f"{pool} sites" if (r == 0 and c == 0) else None)
-                ax.fill_between(part["context_t"], part["ci_low"], part["ci_high"], color=st.color,
-                                alpha=style.BAND_ALPHA, lw=0)
-            _context_axis(ax, ts)
-            if r == 0:
-                ax.set_title(f"TabPFN-2.5 vs {st.label}", fontsize=style.FONT_SIZES["base"])
-            if c == 0:
-                ax.set_ylabel(style.axis_label(SITE_MATCH_STATS[stat]))
+    for r, stat in enumerate(stats):
+        ax = axes[r][0]
+        for ref in refs:
+            st = arm_style(ref)
+            part = sm[(sm["reference"] == ref) & (sm["value"] == stat)].sort_values("context_t")
+            ax.plot(part["context_t"], part["median"], color=st.color, ls=st.linestyle, marker=st.marker,
+                    label=f"vs {st.label}" if r == 0 else None)
+            ax.fill_between(part["context_t"], part["ci_low"], part["ci_high"], color=st.color,
+                            alpha=style.BAND_ALPHA, lw=0)
+        ax.set_xticks(list(ts), [str(int(t)) for t in ts])
+        ax.set_ylabel(style.axis_label(SITE_MATCH_STATS[stat]))
+    axes[-1][0].set_xlabel(style.axis_label("context_t"))
     axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
     style.panel_letters([ax for row in axes for ax in row])
     return style.save_figure(fig, run_dir, "site_match")
@@ -996,7 +1169,7 @@ def _lens_figure(lens: pd.DataFrame, run_dir: str) -> list[str]:
         return []
     ts = sorted(part["context_t"].unique())
     fig, axes = style.figure("wide", ncols=len(comps), squeeze=False, sharey=True,
-                             panel_aspect=_REPRESENTATION_PANEL_ASPECT)
+                             panel_aspect=_REPRESENTATION_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
     for c, comp in enumerate(comps):
         ax = axes[0][c]
         for i, t in enumerate(ts):
@@ -1020,7 +1193,8 @@ def _posterior_cov_figure(pc: pd.DataFrame, run_dir: str) -> list[str]:
     if not stats:
         return []
     ts = sorted(pc["context_t"].unique())
-    fig, axes = style.figure("wide", ncols=len(stats), squeeze=False, panel_aspect=_REPRESENTATION_PANEL_ASPECT)
+    fig, axes = style.figure("wide", ncols=len(stats), squeeze=False, panel_aspect=_REPRESENTATION_PANEL_ASPECT,
+                             layout=style.LAYOUT_ENGINE)
     for c, stat in enumerate(stats):
         ax = axes[0][c]
         for ref in dict.fromkeys(pc["reference"]):
@@ -1073,6 +1247,8 @@ def render_representation(run_dir: str) -> list[str]:
         p = os.path.join(run_dir, name)
         if _has_rows(p):
             df = _figure_level(pd.read_csv(p), run_dir)
+            if fn is not _posterior_cov_figure:
+                df = _drop_excluded_ts(df, run_dir)
             if not df.empty:
                 written += fn(df, run_dir)
     return written

@@ -845,6 +845,39 @@ def _bayes_cell(
     }
 
 
+#: Suffix of the moment-matched Part A companions, which the pooled row cannot rebuild (their C rows are not cached).
+_MOMENT_MATCHED_SUFFIX: str = "_c"
+
+
+def _pooled_coherence_cell(pay: dict[str, Any], B: Any) -> list[dict[str, Any]]:
+    """Part A summary over every anchor of a cached cell, the pooled row of ``coherence_cell.csv``.
+
+    Built at assembly from the payload's per-anchor rows and implied-covariance rows, so no cell is recomputed and
+    no cell identity changes (user, 2026-10-22: the pooled figure is the headline; the per-pool rows stay).
+
+    Args:
+        pay: Cached ``bayes_update`` cell payload.
+        B: The :mod:`~pfns4neurostim.analysis.bayes_update` module.
+
+    Returns:
+        One row per Part A engine with ``pool = 'all'``.
+    """
+    anchors = np.asarray(pay["anchors"])
+    out: list[dict[str, Any]] = []
+    for engine, C in pay["C"].items():
+        rows = [r for r in pay["coherence"] if r["engine"] == engine]                # anchor order
+        pooled = B.coherence_cell(rows, np.asarray(C), anchors, [B.POOLED_ANCHORS] * len(rows),
+                                  np.array([r["trial_var"] for r in rows], dtype=np.float64),
+                                  pool_names=(B.POOLED_ANCHORS,))
+        # engine diagnostics (GP-Bayes's ESS, ...) are cell-level: every per-pool row carries the same values
+        per_pool = [r for r in pay["coherence_cell"] if r["engine"] == engine]
+        shared = {k: v for k, v in (per_pool[0] if per_pool else {}).items()
+                  if k not in {"engine", "pool", "n_anchors"} and not k.endswith(_MOMENT_MATCHED_SUFFIX)
+                  and all(k in r and r[k] == v for r in per_pool)}
+        out += [{"engine": engine, **shared, **c} for c in pooled]
+    return out
+
+
 def _rel_ok(a: float | None, b: float | None, rel: float, abs_tol: float) -> bool:
     """``|a - b| <= rel |a|`` or ``<= abs_tol`` (gate G4); two undefined values agree."""
     if a is None or b is None:
@@ -1263,6 +1296,7 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                             prov = {"host": pay["host"], "seconds": pay["seconds"]}
                             coh_rows += [{**keys, **r, **prov} for r in pay["coherence"]]
                             cell_rows += [{**keys, **r, **prov} for r in pay["coherence_cell"]]
+                            cell_rows += [{**keys, **r, **prov} for r in _pooled_coherence_cell(pay, B)]
                             h2h_rows += [{**keys, **r} for r in pay["headtohead"]]
                             sur_rows += [{**keys, **r} for r in pay["surprise"]]
                             prof_rows += [{**keys, **r} for r in pay.get("profile", [])]
@@ -2012,7 +2046,9 @@ REPRESENTATION_DEFAULTS: dict[str, Any] = {
         "quadrature": {"method": "rqmc", "K": 8, "u_min": 1.0e-12, "central_mass": 1.0, "n_scrambles": 8},
         "eps": 0.01, "y_grid": {"points": 512, "u_tail": 1.0e-4}, "moment_matched": True,
     },
-    "figures": {"level": None},                        # null = the nominal (lowest) stress level
+    # level: null = the nominal (lowest) stress level; exclude_ts: context sizes left out of site_match and
+    # lens_distance (figure-only, user 2026-10-22)
+    "figures": {"level": None, "exclude_ts": []},
 }
 
 #: Engines β1b can build C_PFN for (a GP engine reproduces its own closed form: the exactness check of the tests).
@@ -2497,13 +2533,17 @@ def _representation_summaries(out: str, p: dict[str, Any], seed: int) -> None:
     rep = R.add_headline(pd.read_csv(os.path.join(out, "representation.csv")), stat)
     rep["headline_margin"] = rep["headline_value"] - rep["headline_floor"]
     rep.to_csv(os.path.join(out, "representation.csv"), index=False)
-    R.channel_summary(rep, ["headline_value", "headline_floor", "headline_margin", "cka", "cka_deconf", "nbs"],
+    # surrogate_q_cka: the raw (not deconfounded) CKA's chance level, for the figure without geometry regression
+    R.channel_summary(rep, ["headline_value", "headline_floor", "headline_margin", "cka", "cka_deconf", "nbs",
+                            "surrogate_q_cka"],
                       ["level", "context_t", "site_set", "readout", "layer", "target"], **kw).to_csv(
         os.path.join(out, "representation_summary.csv"), index=False)
     path = os.path.join(out, "site_match.csv")
     if os.path.exists(path):
         sm = pd.read_csv(path)
         sm["site_pool"] = np.where(sm["observed"].astype(bool), "observed", "unobserved")
+        # every site as one pool too (the figure's default, user 2026-10-22); the split stays in the summary
+        sm = pd.concat([sm, sm.assign(site_pool=R.SITE_POOL_ALL)], ignore_index=True)
         # matched per site first (site_match.csv), then the median over the sites of a pool, per cell
         cell = (sm.groupby(["subject", "emg", "level", "context_t", "draw", "reference", "site_pool"])
                 [["w2", "w2_over_sd", "location", "spread", "shape"]].median().reset_index())

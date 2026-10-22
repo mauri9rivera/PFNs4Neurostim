@@ -84,6 +84,8 @@ __all__ = [
 ANCHOR_STRATA: tuple[str, ...] = ("high", "low", "edge", "centre")
 #: Anchor pools, never pooled in a summary: a new site, or a second trial at an observed site (the revisit).
 ANCHOR_POOLS: tuple[str, ...] = ("unobserved", "observed")
+#: Pool label of the Part A summary over every anchor of a cell (written at assembly, user 2026-10-22).
+POOLED_ANCHORS: str = "all"
 
 
 # ---------------------------------------------------------------------------
@@ -1676,6 +1678,7 @@ def coherence_cell(
     pools: Sequence[str],
     trial_var: np.ndarray,
     C_c: np.ndarray | None = None,
+    pool_names: Sequence[str] = ANCHOR_POOLS,
 ) -> list[dict[str, Any]]:
     """Per-pool cell summaries of Part A.
 
@@ -1686,13 +1689,14 @@ def coherence_cell(
         pools: Pool of each anchor.
         trial_var: Empirical variance of the trials at each anchor, shape [A].
         C_c: Moment-matched implied covariance rows, shape [A, M]; adds the ``*_c`` companions.
+        pool_names: Pools summarised, in output order (pass every anchor as one pool for the pooled summary).
 
     Returns:
         One row per pool present: medians of the per-anchor metrics, ``cov_asymmetry``, ``psd_neg_mass`` and
         ``sigma_recovery_rho`` (and their ``*_c`` versions when ``C_c`` is given).
     """
     out = []
-    for pool in ANCHOR_POOLS:
+    for pool in pool_names:
         idx = np.flatnonzero(np.asarray(pools) == pool)
         if idx.size == 0:
             continue

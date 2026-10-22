@@ -69,6 +69,12 @@ __all__ = [
     "LINK_SLOPE_NOTE",
     "LINK_TITLE",
     "SURPRISE_REFERENCE_TITLE",
+    "ENGINE_LABELS",
+    "IMPLIED_NOISE_LEGEND",
+    "HYPC_LINE_ONLY_ENGINES",
+    "HYPC_BAND_N_BOOT",
+    "HYPC_BAND_CI",
+    "HYPC_BAND_SEED",
     "subject_style",
     "set_integer_xaxis",
     "derive_shade",
@@ -769,28 +775,30 @@ AXIS_LABELS: dict[str, str] = {
     # ratio of 1 and 0 asymmetry, whatever its prior. Part B: TabPFN's update against a GP reference, matched per
     # site before any aggregate. ``cov_asymmetry`` is the tower-property covariance -- never the retired
     # ``sym_err``, which divided by (1 - gain) and so assumed homoscedastic noise.
-    "drift_abs": r"Mean drift $|\delta|$ (predictive SD)",
+    # Hyp C labels sit in grids of four narrow panels, so the long ones break over two lines (user, 2026-10-22).
+    "drift_abs": "Mean drift $|\\delta|$\n(predictive SD)",
     "drift_w1": "Distributional drift W1 (predictive SD)",
     "shrink_move_ratio": "Expected shrink / mean movement (1 = Bayes)",
-    "total_var_ratio": "Total-variance ratio (1 = Bayes)",
-    "cov_asymmetry": "Implied-covariance asymmetry",
-    "latent_frac": r"Latent share of predictive variance at $x'$",
+    "total_var_ratio": "Total-variance ratio\n(1 = Bayes)",
+    "cov_asymmetry": "Implied-covariance\nasymmetry (0 = Bayes)",
+    "latent_frac": "Latent share of predictive\nvariance at $x'$",
     "implied_noise": r"Implied noise variance at $x'$ (z-units$^2$)",
     "trial_var": r"Trial variance at $x'$ (z-units$^2$)",
     "sigma_recovery_rho": r"Spearman $\rho$, implied noise vs trial variance",
     "gain": r"Gain $T(x')$",
-    "transfer_slope": "Transfer slope vs reference",
-    "footprint_r": r"Footprint correlation (Pearson $r$)",
-    "gap_change": "Change of W1 gap to reference (ref. SD)",
-    "delta_crps": r"$\Delta$CRPS, TabPFN $-$ reference (z-units)",
-    "saturation": "Saturation (1 = linear response)",
+    "transfer_slope": "Transfer slope\nvs reference",
+    "footprint_r": "Footprint correlation\n(Pearson $r$)",
+    "gap_change": "Change of W1 gap to\nreference (ref. SD)",
+    "delta_crps": "$\\Delta$CRPS, model $-$\nreference (z-units)",
+    "saturation": "Saturation\n(1 = linear response)",
     # The ladder unit is the predictive SD of the run's ladder reference (bayes_update.shared.reference, user
     # 2026-10-21); the surprise figures name that engine in their title (SURPRISE_REFERENCE_TITLE).
-    "ladder_c": r"Injected surprise $c$ (ladder-reference SD at $x'$)",
-    "update_anchor_sd": r"Update at $x'$ (ladder-reference SD at $x'$)",
+    "ladder_c": "Injected surprise $c$\n(ladder-reference SD at $x'$)",
+    "update_anchor_sd": "Update at $x'$\n(ladder-reference SD at $x'$)",
+    "surprise_slope": "Slope of the update at $x'$\nvs surprise (1 = full update)",
     "implied_cov": r"Implied covariance $C(x', x)$",
-    "far_field_share": "Far-field share of update energy",
-    "abs_transfer": r"Mean $|T(x)|$ (update per unit surprise)",
+    "far_field_share": "Far-field share\nof update energy",
+    "abs_transfer": "Mean $|T(x)|$\n(update per unit surprise)",
     "distance_pitch": r"Distance from $x'$ (electrode pitches)",
     "dmu_exemplar": r"Change of mean $\Delta\mu(x)$ (z-units)",
     # M8 predictive link (2026-10-21): the per-channel breakdown outcome is a count on the stress ladder (levels
@@ -880,6 +888,20 @@ LINK_TITLE: str = ("Exploratory link to {outcome}: {model}, {pool} anchors, leve
                    "random-intercept slope, 95% channel-bootstrap CI")
 #: Figure title of the surprise-response figures (Omega-4, C1): the engine whose predictive SD is the ladder unit.
 SURPRISE_REFERENCE_TITLE: str = "Surprise in {reference} predictive SD at $x'$"
+#: Hypothesis C engine labels that differ from the model's palette label: GP-MLL refit and GP-MLL frozen share the
+#: GP-MLL identity, so the refit one is named in full wherever both can appear (user, 2026-10-22).
+ENGINE_LABELS: dict[str, str] = {"gp_mll_refit": "GP-MLL refit"}
+#: Legend entry of the implied-noise scatter (Omega-2): median sigma-recovery rho and the share of anchors whose
+#: implied noise is <= 0 (off a log axis).
+IMPLIED_NOISE_LEGEND: str = r"{model}: median $\rho$ {rho:.2f}; {neg:.0f}% $\leq 0$"
+#: Line bands of the Hypothesis C figures: median over channels with a within-subject channel bootstrap interval
+#: (BETA D4), replicates and central mass. Replaces the inter-quartile range over cells (user, 2026-10-22).
+#: Engines drawn as the median line alone: GP-MLL's channel-to-channel spread is wide even as an interval of the
+#: median (its refits often collapse the noise to the floor), and the band hid the other engines (user, 2026-10-22).
+HYPC_LINE_ONLY_ENGINES: tuple[str, ...] = ("gp_mll_refit", "gp_mll_frozen")
+HYPC_BAND_N_BOOT: int = 2000
+HYPC_BAND_CI: float = 0.95
+HYPC_BAND_SEED: int = 42
 
 
 def subject_style(subject: object, subjects: Sequence[object]) -> ModelStyle:
