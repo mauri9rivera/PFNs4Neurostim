@@ -19,12 +19,14 @@ Layout::
     {store_root}/{dataset}/{experiment}/{key}.pkl    trajectory
     {store_root}/{dataset}/{experiment}/{key}.claim  work-pool claim, only while a pool lane computes the cell
 
-**Work pool (added 2026-10-23).** With ``claim_ttl_s`` set, a cache miss is first *claimed*: the lane creates the
-``.claim`` file atomically (``O_CREAT | O_EXCL``) and computes the cell only if that succeeds, so any number of lanes,
-in any number of jobs, can walk the same cell list and never compute a cell twice. A claim is honoured while it is
+**Work pool (added 2026-10-23).** With ``claim_ttl_s`` set, a cache miss is first *claimed*: the lane writes the
+``.claim`` file to a private temp file and hard-links it into place, which fails if the claim exists, so it is created
+with its content in one atomic step and any number of lanes, in any number of jobs, can walk the same cell list and
+never compute a cell twice (an ``O_CREAT | O_EXCL`` create-then-write, the first version, was visible empty on Lustre
+long enough for other lanes to take it over: 192 lanes computed 43 cells, 2026-10-23). A claim is honoured while it is
 younger than ``claim_ttl_s`` and was not written by an earlier run of *this* Slurm job (a requeued job re-claims its
-own unfinished cells at once; another job's orphaned claim is taken over after the TTL). The claim is removed when
-the cell is saved or fails.
+own unfinished cells at once; another job's orphaned claim is taken over after the TTL). The claim is removed when the
+cell is saved, fails, or its lane is interrupted (SIGTERM from ``scancel``, see ``experiments/mechanism.py``).
 """
 from __future__ import annotations
 
@@ -116,19 +118,47 @@ def _claim_is_live(path: str, ttl_s: float, me: Mapping[str, Any]) -> bool:
 
     Returns:
         ``False`` if the claim is gone, older than ``ttl_s``, or left by an earlier run of the caller's own Slurm job
-        (a requeue bumps ``SLURM_RESTART_COUNT``).
+        (a requeue bumps ``SLURM_RESTART_COUNT``). A young claim that cannot be read is **live**: reading it as stale
+        let several lanes take over one fresh claim on Narval (2026-10-23, 192 lanes computing 43 cells).
     """
     try:
         age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return False                        # vanished: nobody holds it
+    if age >= ttl_s:
+        return False
+    try:
         with open(path, encoding="utf-8") as fh:
             owner = json.load(fh)
     except (OSError, ValueError):
-        return False                        # vanished or torn while being read: not a valid claim
-    if age >= ttl_s:
-        return False
+        return True                         # young but unreadable: assume its owner is still writing it
     if me["job"] is not None and owner.get("job") == me["job"] and owner.get("restart") != me["restart"]:
         return False
     return True
+
+
+def _link_claim(path: str, me: Mapping[str, Any]) -> bool:
+    """Create the claim with its content in one step: write a private temp file, then hard-link it into place.
+
+    ``os.link`` fails if ``path`` exists, so exactly one process wins, and the claim is never visible empty (an
+    ``O_EXCL`` create followed by a write was, on Lustre, visible empty long enough for other lanes to read it as torn).
+
+    Args:
+        path: Claim file.
+        me: :func:`_claim_owner` of the caller.
+
+    Returns:
+        ``True`` if this process created the claim.
+    """
+    tmp = f"{path}.tmp.{me['host']}.{me['pid']}"
+    _write_json_file(tmp, me)
+    try:
+        os.link(tmp, path)
+        return True
+    except FileExistsError:
+        return False
+    finally:
+        os.remove(tmp)
 
 
 def claim_cell(cell_json: str, ttl_s: float) -> bool:
@@ -144,22 +174,16 @@ def claim_cell(cell_json: str, ttl_s: float) -> bool:
     path = cell_json + CLAIM_SUFFIX
     os.makedirs(os.path.dirname(path), exist_ok=True)
     me = _claim_owner()
+    if _link_claim(path, me):
+        return True
+    if _claim_is_live(path, ttl_s, me):
+        return False
+    # stale: remove it and race for a fresh link, so at most one lane wins the takeover too
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        if _claim_is_live(path, ttl_s, me):
-            return False
-        # stale: take it over atomically, then confirm the takeover was ours (two lanes may race for one stale claim)
-        _atomic_write(path, lambda tmp: _write_json_file(tmp, me))
-        try:
-            with open(path, encoding="utf-8") as fh:
-                owner = json.load(fh)
-        except (OSError, ValueError):
-            return False
-        return owner.get("pid") == me["pid"] and owner.get("host") == me["host"]
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(me, fh)
-    return True
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    return _link_claim(path, me)
 
 
 def release_claim(cell_json: str) -> None:
@@ -348,6 +372,10 @@ class CellStore:
             if pooled:
                 release_claim(path)
             return None
+        except BaseException:               # SIGTERM (scancel, requeue) or Ctrl-C: give the cell back to the pool
+            if pooled:
+                release_claim(path)
+            raise
         self.computed += 1
         payload = {**payload, "host": self.host}  # provenance only; never part of the cell identity
         if self.enabled:

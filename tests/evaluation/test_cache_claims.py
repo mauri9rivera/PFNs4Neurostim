@@ -75,3 +75,46 @@ def test_without_ttl_no_claim_is_written(tmp_path: Any) -> None:
     root = str(tmp_path)
     CellStore(root).run("nhp", "x", IDENT, "c", lambda: ({"row": {}}, {}))
     assert not os.path.exists(_claim_path(root))
+
+
+def _race(args: tuple[str, float, Any]) -> bool:
+    """One process of the race test: wait at the barrier, then claim."""
+    path, ttl, barrier = args
+    barrier.wait()
+    return claim_cell(path, ttl)
+
+
+def test_concurrent_claims_have_exactly_one_winner(tmp_path: Any) -> None:
+    """The 2026-10-23 Narval failure: many lanes reaching one unclaimed cell together must not all win."""
+    import multiprocessing as mp
+
+    path = cell_path(str(tmp_path), "nhp", "x", cell_key(IDENT))
+    n = 8
+    with mp.Manager() as manager:
+        barrier = manager.Barrier(n)
+        with mp.Pool(n) as pool:
+            wins = pool.map(_race, [(path, TTL_S, barrier)] * n)
+    assert sum(wins) == 1
+    assert not [f for f in os.listdir(os.path.dirname(path)) if ".tmp." in f]       # no temp file left
+
+
+def test_young_unreadable_claim_is_live(tmp_path: Any) -> None:
+    path = cell_path(str(tmp_path), "nhp", "x", cell_key(IDENT))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path + CLAIM_SUFFIX, "w").close()                       # empty, as if its owner were still writing it
+    assert not claim_cell(path, TTL_S)
+    old = time.time() - 2 * TTL_S
+    os.utime(path + CLAIM_SUFFIX, (old, old))
+    assert claim_cell(path, TTL_S)                               # once stale, it is taken over
+
+
+def test_interrupted_compute_releases_claim(tmp_path: Any) -> None:
+    root = str(tmp_path)
+    store = CellStore(root, claim_ttl_s=TTL_S)
+
+    def killed() -> tuple[dict[str, Any], dict[str, Any]]:
+        raise SystemExit(143)                                    # what the lane's SIGTERM handler raises
+
+    with pytest.raises(SystemExit):
+        store.run("nhp", "x", IDENT, "c", killed)
+    assert not os.path.exists(_claim_path(root))

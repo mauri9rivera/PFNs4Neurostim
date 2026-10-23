@@ -56,6 +56,7 @@ import argparse
 import itertools
 import json
 import os
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -99,6 +100,8 @@ COMPUTE_ONLY_ANALYSES: frozenset[str] = frozenset({"bayes_update", "representati
 #: single-threaded lanes are up to ~1.6x slower, so 4 h never lets a live claim expire.
 DEFAULT_CLAIM_TTL_HOURS: float = 4.0
 SECONDS_PER_HOUR: float = 3600.0
+#: Exit code of a work-pool lane stopped by SIGTERM (128 + 15, as the shell reports it).
+SIGTERM_EXIT_CODE: int = 143
 
 
 @dataclass(frozen=True)
@@ -2693,6 +2696,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[mechanism] work-pool lane {lane}/{lanes}", flush=True)
     if not args.claim_ttl_hours > 0:
         raise ValueError(f"--claim-ttl-hours must be > 0, got {args.claim_ttl_hours}.")
+    if compute_only:
+        # scancel and the dispatcher's requeue send SIGTERM: turn it into SystemExit, so the cell store releases the
+        # claim of the cell in progress before the lane dies (otherwise it blocks the pool until the TTL).
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(SIGTERM_EXIT_CODE))
     run_mechanism(args.config, args.overrides, replot=args.replot, use_cache=not args.no_cache,
                   only_cached=args.only_cached, compute_only=compute_only,
                   claim_ttl_s=args.claim_ttl_hours * SECONDS_PER_HOUR)
