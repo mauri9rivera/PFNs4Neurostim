@@ -1,6 +1,8 @@
 # M8 predictive link, exploratory reading (2026-10-22): mechanism_bayes_update_nhp.yaml with only the `link` block switched on
 # (Hyp A NHP + K2 draws outcomes) and its own tag. Reads the cached OMEGA cells (--only-cached); the pre-registered config keeps
 # link off until the user decides on the proposed link: diff. No confirmatory claim (research_design §2, M8).
+# DECIDED 2026-10-23 (user): the pre-registered config keeps link OFF; this tag (nhp-m8link) is the exploratory result,
+# reported in the supplement only.
 # OBJECTIVE OMEGA (Sprint #4) -- Hypothesis C, re-founded 2026-10-19 (research_design.md §2 and §4):
 #   C2 (roadmap M15) "is TabPFN-2.5's in-context update Bayesian-like?" -- Part A coherence + Part B head-to-head;
 #   C1 (roadmap M10) "is it GP-like?" -- descriptive readouts against GP-MLL frozen, computed in the SAME cells.

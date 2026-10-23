@@ -169,7 +169,34 @@ def _channel_band(df: pd.DataFrame, col: str, x: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #: Part A headline metrics of Omega-1, one column each, with the value every coherent Bayesian model scores.
 OMEGA_COHERENCE_METRICS: dict[str, float] = {"drift_abs": 0.0, "total_var_ratio": 1.0, "cov_asymmetry": 0.0,
-                                            "latent_frac": float("nan")}
+                                            "latent_frac": float("nan"), "update_share": float("nan"),
+                                            "drift_abs_anchor": 0.0}
+#: Cell keys of the per-anchor rows, to reduce them to one row per cell, engine and pool.
+_OMEGA_CELL_KEYS: tuple[str, ...] = ("dataset", "subject", "emg", "knob", "level", "context_t", "draw", "engine")
+
+
+def _anchor_readouts(anchors: pd.DataFrame) -> pd.DataFrame:
+    """Per-cell readouts that need every anchor, from ``coherence.csv`` (M15, user 2026-10-23).
+
+    ``drift_abs`` and ``total_var_ratio`` are medians over the influenced sites I and are undefined at an anchor where
+    the update moves no site by ``eps s^2``, so a cell's value rests on its anchors with a non-empty I only. This
+    returns, per cell, engine and pool (and over every anchor as :data:`POOLED_ANCHORS`): ``update_share``, the share
+    of anchors with a non-empty I, and ``drift_abs_anchor``, the median over anchors of the drift at x' itself, which
+    is defined everywhere.
+
+    Args:
+        anchors: ``coherence.csv`` rows (one per anchor), with ``pool``, ``n_influenced`` and ``drift_abs_anchor``.
+
+    Returns:
+        One row per cell key, engine and pool with the two readouts.
+    """
+    keys = [k for k in _OMEGA_CELL_KEYS if k in anchors]
+    a = anchors.assign(update_share=(anchors["n_influenced"] > 0).astype(float))
+    parts = [a.groupby([*keys, "pool"])[["update_share", "drift_abs_anchor"]].agg(
+                 {"update_share": "mean", "drift_abs_anchor": "median"}).reset_index(),
+             a.groupby(keys)[["update_share", "drift_abs_anchor"]].agg(
+                 {"update_share": "mean", "drift_abs_anchor": "median"}).reset_index().assign(pool=POOLED_ANCHORS)]
+    return pd.concat(parts, ignore_index=True)
 #: Part B headline contrasts of Omega-3, with the value of a perfect match to the reference.
 OMEGA_CONTRAST_METRICS: dict[str, float] = {"transfer_slope": 1.0, "footprint_r": 1.0, "gap_change": 0.0,
                                            "delta_crps": 0.0}
@@ -687,9 +714,15 @@ def render_bayes_update(run_dir: str) -> list[str]:
     paths = {k: os.path.join(run_dir, f"{k}.csv") for k in ("coherence", "coherence_cell", "headtohead", "surprise")}
     if _has_rows(paths["coherence_cell"]):
         cell = pd.read_csv(paths["coherence_cell"])
+        anchors = pd.read_csv(paths["coherence"]) if _has_rows(paths["coherence"]) else None
+        if anchors is not None and {"n_influenced", "drift_abs_anchor", "pool"} <= set(anchors):
+            derived = _anchor_readouts(anchors)
+            cell = cell.drop(columns=[c for c in ("update_share", "drift_abs_anchor") if c in cell])
+            cell = cell.merge(derived, on=[k for k in (*_OMEGA_CELL_KEYS, "pool") if k in cell and k in derived],
+                              how="left")
         written += _omega_coherence(cell, run_dir)
-        if _has_rows(paths["coherence"]):
-            written += _omega_implied_noise(cell, pd.read_csv(paths["coherence"]), run_dir)
+        if anchors is not None:
+            written += _omega_implied_noise(cell, anchors, run_dir)
     if _has_rows(paths["headtohead"]):
         written += _omega_headtohead(pd.read_csv(paths["headtohead"]), run_dir)
     cfg_path = os.path.join(run_dir, "config.yaml")

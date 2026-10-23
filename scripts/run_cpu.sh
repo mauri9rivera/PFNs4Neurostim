@@ -8,6 +8,11 @@
 # Usage (the USER runs sbatch):
 #   sbatch scripts/run_cpu.sh bo_benchmark configs/experiment/hyp_a_5d_rat.yaml "models=[gp_mll,gp_naive,random]"
 #   sbatch scripts/run_cpu.sh stress_sweep configs/experiment/stress_k2_channel_draws_nhp.yaml "models=[gp_mll,gp_naive]"
+#   sbatch scripts/run_cpu.sh mechanism configs/experiment/mechanism_bayes_update_nhp.yaml device=cpu ...
+#
+# `mechanism` (bayes_update and representation, 2026-10-23): the lanes are a WORK POOL, not a channel partition -- each lane walks
+# every grid cell (draw-major) and claims one before computing it (evaluation/cache.py), so several identical jobs can
+# share one grid and stay balanced whenever Narval starts them. Assemble afterwards with `--only-cached`.
 #
 # Everything after the config path is forwarded to `--set`. Cells are cached in output/cells and shared
 # with the GPU jobs of the same config; assemble the union with a final `--only-cached` run.

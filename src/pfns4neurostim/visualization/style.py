@@ -763,7 +763,6 @@ AXIS_LABELS: dict[str, str] = {
     "bures": "Bures distance (z-units)",
     "bures_rel": r"Bures distance / $\sqrt{\mathrm{tr}\,\Sigma_\mathrm{ref}}$",
     "trace_ratio": r"Trace ratio $\mathrm{tr}\,C_\mathrm{PFN}$ / $\mathrm{tr}\,\Sigma_\mathrm{ref}$",
-    "mantel_r": r"Mantel Spearman $r$",
     "w2_site": "Per-site W2 (z-units)",
     "w2_over_sd": "Per-site W2 / reference SD",
     "w2_location": "Location term (z-units$^2$)",
@@ -782,6 +781,11 @@ AXIS_LABELS: dict[str, str] = {
     "total_var_ratio": "Total-variance ratio\n(1 = Bayes)",
     "cov_asymmetry": "Implied-covariance\nasymmetry (0 = Bayes)",
     "latent_frac": "Latent share of predictive\nvariance at $x'$",
+    # M15 (user, 2026-10-23): drift_abs / total_var_ratio are medians over the influenced sites I, undefined at an
+    # anchor whose update moves no site by eps s^2; these two say how many anchors they rest on, and the drift at x'
+    # itself, which is defined at every anchor.
+    "update_share": "Anchors with a measurable\nupdate (share)",
+    "drift_abs_anchor": "Drift at $x'$ $|\\delta(x')|$\n(predictive SD)",
     "implied_noise": r"Implied noise variance at $x'$ (z-units$^2$)",
     "trial_var": r"Trial variance at $x'$ (z-units$^2$)",
     "sigma_recovery_rho": r"Spearman $\rho$, implied noise vs trial variance",

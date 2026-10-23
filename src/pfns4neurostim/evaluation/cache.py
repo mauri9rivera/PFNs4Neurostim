@@ -17,6 +17,14 @@ Layout::
 
     {store_root}/{dataset}/{experiment}/{key}.json   identity, tidy row, extras
     {store_root}/{dataset}/{experiment}/{key}.pkl    trajectory
+    {store_root}/{dataset}/{experiment}/{key}.claim  work-pool claim, only while a pool lane computes the cell
+
+**Work pool (added 2026-10-23).** With ``claim_ttl_s`` set, a cache miss is first *claimed*: the lane creates the
+``.claim`` file atomically (``O_CREAT | O_EXCL``) and computes the cell only if that succeeds, so any number of lanes,
+in any number of jobs, can walk the same cell list and never compute a cell twice. A claim is honoured while it is
+younger than ``claim_ttl_s`` and was not written by an earlier run of *this* Slurm job (a requeued job re-claims its
+own unfinished cells at once; another job's orphaned claim is taken over after the TTL). The claim is removed when
+the cell is saved or fails.
 """
 from __future__ import annotations
 
@@ -24,6 +32,8 @@ import hashlib
 import json
 import os
 import pickle
+import socket
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Mapping
 
@@ -32,7 +42,9 @@ from . import pickle_compat as _pickle_compat
 __all__ = [
     "cell_key",
     "cell_path",
+    "claim_cell",
     "load_cell",
+    "release_claim",
     "save_cell",
     "CellStore",
     "CellFailure",
@@ -40,6 +52,8 @@ __all__ = [
 ]
 
 _KEY_LEN: int = 12
+#: Suffix of a work-pool claim next to the cell's JSON.
+CLAIM_SUFFIX: str = ".claim"
 
 
 def _canonical(identity: Mapping[str, Any]) -> str:
@@ -84,6 +98,82 @@ def _atomic_write(path: str, write: Callable[[str], None]) -> None:
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def _claim_owner() -> dict[str, Any]:
+    """Who is claiming: the Slurm job and its restart count (``None`` outside Slurm), host and process."""
+    return {"job": os.environ.get("SLURM_JOB_ID"), "restart": os.environ.get("SLURM_RESTART_COUNT", "0"),
+            "host": socket.gethostname(), "pid": os.getpid(), "time": time.time()}
+
+
+def _claim_is_live(path: str, ttl_s: float, me: Mapping[str, Any]) -> bool:
+    """Whether an existing claim still holds.
+
+    Args:
+        path: Claim file.
+        ttl_s: Claim lifetime in seconds.
+        me: :func:`_claim_owner` of the caller.
+
+    Returns:
+        ``False`` if the claim is gone, older than ``ttl_s``, or left by an earlier run of the caller's own Slurm job
+        (a requeue bumps ``SLURM_RESTART_COUNT``).
+    """
+    try:
+        age = time.time() - os.path.getmtime(path)
+        with open(path, encoding="utf-8") as fh:
+            owner = json.load(fh)
+    except (OSError, ValueError):
+        return False                        # vanished or torn while being read: not a valid claim
+    if age >= ttl_s:
+        return False
+    if me["job"] is not None and owner.get("job") == me["job"] and owner.get("restart") != me["restart"]:
+        return False
+    return True
+
+
+def claim_cell(cell_json: str, ttl_s: float) -> bool:
+    """Try to claim a cell for this process (work-pool mode).
+
+    Args:
+        cell_json: The cell's JSON path (:func:`cell_path`); the claim sits next to it.
+        ttl_s: Claim lifetime in seconds: longer than the slowest cell, so a live claim is never taken over.
+
+    Returns:
+        ``True`` if this process now owns the cell and should compute it.
+    """
+    path = cell_json + CLAIM_SUFFIX
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    me = _claim_owner()
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        if _claim_is_live(path, ttl_s, me):
+            return False
+        # stale: take it over atomically, then confirm the takeover was ours (two lanes may race for one stale claim)
+        _atomic_write(path, lambda tmp: _write_json_file(tmp, me))
+        try:
+            with open(path, encoding="utf-8") as fh:
+                owner = json.load(fh)
+        except (OSError, ValueError):
+            return False
+        return owner.get("pid") == me["pid"] and owner.get("host") == me["host"]
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(me, fh)
+    return True
+
+
+def release_claim(cell_json: str) -> None:
+    """Remove this cell's claim (after the cell was saved or failed); a missing claim is not an error."""
+    try:
+        os.remove(cell_json + CLAIM_SUFFIX)
+    except FileNotFoundError:
+        pass
+
+
+def _write_json_file(path: str, obj: Mapping[str, Any]) -> None:
+    """Write ``obj`` as JSON to ``path``."""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(dict(obj), fh)
 
 
 def save_cell(
@@ -179,8 +269,11 @@ class CellStore:
             harvested, everything else is skipped. Used to assemble partial output.
         on_cell: Called once per cell that was served (computed or cached), e.g. to
             feed a progress/throughput counter. Not called for failed cells.
+        claim_ttl_s: Work-pool mode (module docstring): claim a missed cell before computing it and skip it when
+            another lane holds a live claim. ``None`` (default) computes every miss.
         hits: Cells served from the cache this run.
         computed: Cells computed this run.
+        claimed_elsewhere: Misses skipped because another lane held the claim (work-pool mode).
         failures: Cells that raised.
     """
 
@@ -188,8 +281,10 @@ class CellStore:
     enabled: bool = True
     only_cached: bool = False
     on_cell: Callable[[], None] | None = None
+    claim_ttl_s: float | None = None
     hits: int = 0
     computed: int = 0
+    claimed_elsewhere: int = 0
     failures: list[CellFailure] = field(default_factory=list)
     host: dict[str, Any] = field(default_factory=dict)
 
@@ -231,16 +326,34 @@ class CellStore:
                 return hit
         if self.only_cached:
             return None
+        pooled = self.enabled and self.claim_ttl_s is not None
+        path = cell_path(self.root, dataset, experiment, key)
+        if pooled:
+            if not claim_cell(path, float(self.claim_ttl_s)):
+                self.claimed_elsewhere += 1
+                print(f"[cache] claimed elsewhere {label}", flush=True)
+                return None
+            # another lane may have saved it between our miss and our claim
+            hit = load_cell(self.root, dataset, experiment, key, identity)
+            if hit is not None:
+                release_claim(path)
+                self.hits += 1
+                self._served()
+                return hit
         try:
             payload, trajectory = compute()
         except Exception as exc:  # noqa: BLE001 - one bad cell must not kill the grid
             self.failures.append(CellFailure(label, f"{type(exc).__name__}: {exc}"))
             print(f"[cache] FAILED {label}: {type(exc).__name__}: {exc}", flush=True)
+            if pooled:
+                release_claim(path)
             return None
         self.computed += 1
         payload = {**payload, "host": self.host}  # provenance only; never part of the cell identity
         if self.enabled:
             save_cell(self.root, dataset, experiment, key, identity, payload, trajectory)
+        if pooled:
+            release_claim(path)
         self._served()
         return payload, trajectory
 

@@ -67,7 +67,7 @@ import yaml
 
 from ..config import DatasetConfig, apply_overrides, compose, dataset_config_from_raw
 from ..analysis.context import context_for, context_sites, grid_id
-from ..data.channels import ChannelData, iter_channels
+from ..data.channels import ChannelData, iter_channels, parse_shard
 from ..evaluation.cache import CellStore
 from ..seeding import rng_for, set_seed
 
@@ -92,6 +92,13 @@ MECHANISM_CACHE_VERSION: int = 1
 
 #: The TabPFN checkpoint every mechanism analysis probes (its registry version string enters the identity).
 MECHANISM_MODEL: str = "tabpfn_v2_5"
+
+#: Analyses that can run as work-pool lanes (``--compute-only`` / ``--shard``, 2026-10-23).
+COMPUTE_ONLY_ANALYSES: frozenset[str] = frozenset({"bayes_update", "representation"})
+#: Default work-pool claim lifetime. The slowest OMEGA cell measured on Narval took 59 min on 2 cores (2026-10-21);
+#: single-threaded lanes are up to ~1.6x slower, so 4 h never lets a live claim expire.
+DEFAULT_CLAIM_TTL_HOURS: float = 4.0
+SECONDS_PER_HOUR: float = 3600.0
 
 
 @dataclass(frozen=True)
@@ -140,11 +147,17 @@ class RunOptions:
         replot: Rebuild figures from the CSVs only; compute and assemble nothing.
         use_cache: ``False`` (``--no-cache``) neither reads nor writes cells.
         only_cached: ``True`` (``--only-cached``) assembles from cached cells and computes nothing.
+        compute_only: ``True`` (``--compute-only`` / ``--shard``) computes grid cells and writes nothing else -- no
+            run directory, CSVs, exemplar or figures; ``bayes_update`` and ``representation`` (added 2026-10-23).
+        claim_ttl_s: Work-pool lifetime of a cell claim (``evaluation/cache.py``); set with ``compute_only`` so any
+            number of lanes and jobs can share one grid. ``None`` computes every miss.
     """
 
     replot: bool = False
     use_cache: bool = True
     only_cached: bool = False
+    compute_only: bool = False
+    claim_ttl_s: float | None = None
 
 
 def load_mechanism_config(path: str, overrides: list[str] | None = None) -> MechanismConfig:
@@ -296,7 +309,8 @@ class _Cells:
 
     def __init__(self, cfg: MechanismConfig, opts: RunOptions) -> None:
         self.cfg = cfg
-        self.store = CellStore(cfg.cell_root, enabled=opts.use_cache, only_cached=opts.only_cached)
+        self.store = CellStore(cfg.cell_root, enabled=opts.use_cache, only_cached=opts.only_cached,
+                               claim_ttl_s=opts.claim_ttl_s)
         self.experiment = f"mechanism_{cfg.analysis}"
         self.base = {
             "cache_version": MECHANISM_CACHE_VERSION,
@@ -345,7 +359,8 @@ class _Cells:
     def report(self) -> None:
         """Print the cache tally and raise if any cell failed (after the outputs are written)."""
         s = self.store
-        print(f"[mechanism] cells: {s.computed} computed, {s.hits} cached, {len(s.failures)} failed", flush=True)
+        pool = f", {s.claimed_elsewhere} claimed by other lanes" if s.claim_ttl_s is not None else ""
+        print(f"[mechanism] cells: {s.computed} computed, {s.hits} cached, {len(s.failures)} failed{pool}", flush=True)
         s.raise_if_failed()
 
 
@@ -1233,9 +1248,13 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
 
     p = _validate_bayes_update(cfg.params, cfg.context_sizes)
     out = cfg.run_dir
+    if opts.compute_only and (p["run"]["gates"] or p["run"]["discrepancy"] or not p["run"]["grid"]):
+        raise ValueError("bayes_update --compute-only runs grid cells only: set bayes_update.run to "
+                         "{gates: false, discrepancy: false, grid: true}.")
     if not opts.replot:
         set_seed(cfg.seed)
-        _write_config(cfg, p, out)
+        if not opts.compute_only:
+            _write_config(cfg, p, out)
         cells = _Cells(cfg, opts)
         knob = build_knob(p["stress"]["knob"], p["stress"]["levels"])
         channels = _channels(cfg)
@@ -1263,44 +1282,54 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                 if spec and "channels_per_subject" in spec}}
             coh_rows, cell_rows, h2h_rows, sur_rows, prof_rows = [], [], [], [], []
             t0 = time.time()
+            # One task per (channel, level, t, draw). A work-pool lane (compute-only) walks them draw-major, so a grid
+            # stopped part-way holds complete context draws (layouts) over every channel and t, not some channels only.
+            tasks = []
             for ch in channels:
                 for level in knob.levels:
                     st = knob.apply(ch, level, rng_for(ch.label, "bayes_update", level, base_seed=cfg.seed))
                     snr = achieved_snr_db(st)
-                    for t in cfg.context_sizes:
-                        if t >= st.n_sites:
-                            continue
-                        for draw in range(int(p["n_context_draws"])):
-                            cov = {part: [e for e in p["engines"] if _covered(
-                                (p["coverage"].get(e) or {}).get(part), ch.label, allowed, level, t, draw)
-                                and not (part == "A" and e in B_ONLY_ENGINES)]
-                                for part in ("A", "B")}
-                            # the ladder reference is fitted wherever Part B runs (shared.reference), never added
-                            # to Part A or Part B; its settings enter the identity through engine_params
-                            fitted = set(cov["A"]) | set(cov["B"]) | ({p["shared"]["reference"]} if cov["B"] else set())
-                            keys = {"dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg, "knob": knob.name,
-                                    "level": float(level), "achieved_snr_db": snr, "context_t": int(t), "draw": draw}
-                            ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
-                                     "draw": draw, "engines_a": cov["A"], "engines_b": cov["B"],
-                                     "engine_params": {e: _engine_params(e, p, draw) for e in fitted},
-                                     **{k: p[k] for k in ("references", "anchors", "quadrature", "eps", "y_grid",
-                                                          "shared", "far_pitch")}}
-                            hit = cells.run(
-                                "cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
-                                lambda st=st, ch=ch, level=level, t=t, draw=draw, cov=cov: (_bayes_cell(
-                                    st, ch.label, float(level), int(t), draw, p, cfg, cov["A"], cov["B"],
-                                    lambda n, draw=draw: _make_engine(n, p, cfg.device, draw)), {}))
-                            if hit is None:
-                                continue
-                            pay = hit[0]
-                            prov = {"host": pay["host"], "seconds": pay["seconds"]}
-                            coh_rows += [{**keys, **r, **prov} for r in pay["coherence"]]
-                            cell_rows += [{**keys, **r, **prov} for r in pay["coherence_cell"]]
-                            cell_rows += [{**keys, **r, **prov} for r in _pooled_coherence_cell(pay, B)]
-                            h2h_rows += [{**keys, **r} for r in pay["headtohead"]]
-                            sur_rows += [{**keys, **r} for r in pay["surprise"]]
-                            prof_rows += [{**keys, **r} for r in pay.get("profile", [])]
+                    tasks += [(ch, level, st, snr, t, draw) for t in cfg.context_sizes if t < st.n_sites
+                              for draw in range(int(p["n_context_draws"]))]
+            if opts.compute_only:
+                tasks.sort(key=lambda task: (task[5], task[4], float(task[1]), task[0].subject, task[0].emg))
+            for i, (ch, level, st, snr, t, draw) in enumerate(tasks):
+                cov = {part: [e for e in p["engines"] if _covered(
+                    (p["coverage"].get(e) or {}).get(part), ch.label, allowed, level, t, draw)
+                    and not (part == "A" and e in B_ONLY_ENGINES)]
+                    for part in ("A", "B")}
+                # the ladder reference is fitted wherever Part B runs (shared.reference), never added
+                # to Part A or Part B; its settings enter the identity through engine_params
+                fitted = set(cov["A"]) | set(cov["B"]) | ({p["shared"]["reference"]} if cov["B"] else set())
+                keys = {"dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg, "knob": knob.name,
+                        "level": float(level), "achieved_snr_db": snr, "context_t": int(t), "draw": draw}
+                ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
+                         "draw": draw, "engines_a": cov["A"], "engines_b": cov["B"],
+                         "engine_params": {e: _engine_params(e, p, draw) for e in fitted},
+                         **{k: p[k] for k in ("references", "anchors", "quadrature", "eps", "y_grid",
+                                              "shared", "far_pitch")}}
+                hit = cells.run(
+                    "cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
+                    lambda st=st, ch=ch, level=level, t=t, draw=draw, cov=cov: (_bayes_cell(
+                        st, ch.label, float(level), int(t), draw, p, cfg, cov["A"], cov["B"],
+                        lambda n, draw=draw: _make_engine(n, p, cfg.device, draw)), {}))
+                last = i + 1 == len(tasks) or tasks[i + 1][0] is not ch or tasks[i + 1][1] != level
+                if last and not opts.compute_only:
                     print(f"[mechanism] {ch.label} level={level} done ({time.time() - t0:.0f}s)", flush=True)
+                if hit is None or opts.compute_only:
+                    continue
+                pay = hit[0]
+                prov = {"host": pay["host"], "seconds": pay["seconds"]}
+                coh_rows += [{**keys, **r, **prov} for r in pay["coherence"]]
+                cell_rows += [{**keys, **r, **prov} for r in pay["coherence_cell"]]
+                cell_rows += [{**keys, **r, **prov} for r in _pooled_coherence_cell(pay, B)]
+                h2h_rows += [{**keys, **r} for r in pay["headtohead"]]
+                sur_rows += [{**keys, **r} for r in pay["surprise"]]
+                prof_rows += [{**keys, **r} for r in pay.get("profile", [])]
+            if opts.compute_only:
+                print(f"[mechanism] compute-only: {len(tasks)} grid tasks walked ({time.time() - t0:.0f}s)", flush=True)
+                cells.report()
+                return out
             for rows, name in ((coh_rows, "coherence.csv"), (cell_rows, "coherence_cell.csv"),
                                (h2h_rows, "headtohead.csv"), (sur_rows, "surprise.csv"),
                                (prof_rows, "transfer_profile.csv")):
@@ -2398,8 +2427,8 @@ def run_representation(cfg: MechanismConfig, opts: RunOptions) -> str:
 
     Cells (one per (channel, level, t, draw), kind ``cell``; β1b's kind ``posterior_cov`` on its coverage) are cached
     as everywhere else, so ``--only-cached`` assembles what exists and a subject can be added without recomputing
-    the others. Per channel rather than per grid (the plan's §7 layout): β3, the only analysis that needs every
-    channel of a grid in one cell, moved to an optional appendix (D6a), and per-channel cells shard by subject.
+    the others. Per channel rather than per grid (the plan's §7 layout): β3, the only analysis that needed every
+    channel of a grid in one cell, was pruned (user, 2026-10-23), and per-channel cells shard by subject.
 
     Args:
         cfg: Resolved config.
@@ -2419,7 +2448,8 @@ def run_representation(cfg: MechanismConfig, opts: RunOptions) -> str:
     out = cfg.run_dir
     if not opts.replot:
         set_seed(cfg.seed)
-        _write_config(cfg, p, out)
+        if not opts.compute_only:
+            _write_config(cfg, p, out)
         cells = _Cells(cfg, opts)
         knob = build_knob(p["stress"]["knob"], p["stress"]["levels"])
         channels = _channels(cfg)
@@ -2459,50 +2489,60 @@ def run_representation(cfg: MechanismConfig, opts: RunOptions) -> str:
         allowed = _first_per_subject(channels, int(pc["coverage"]["channels_per_subject"])) \
             if pc["coverage"]["channels_per_subject"] is not None else {c.label for c in channels}
         t0 = time.time()
+        # One task per (channel, level, t, draw); a work-pool lane (compute-only, 2026-10-23) walks them draw-major so a
+        # grid stopped part-way holds complete context draws (layouts) over every channel and t.
+        tasks = []
         for ch in channels:
             for level in knob.levels:
                 st = knob.apply(ch, level, rng_for(ch.label, "representation", level, base_seed=cfg.seed))
                 snr = achieved_snr_db(st)
-                for t in cfg.context_sizes:
-                    if t >= st.n_sites:
-                        continue
-                    for draw in range(int(p["n_context_draws"])):
-                        keys = {"dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg, "knob": knob.name,
-                                "level": float(level), "achieved_snr_db": snr, "context_t": int(t), "draw": draw}
-                        ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
-                                 "draw": draw, "stats_version": REPRESENTATION_STATS_VERSION,
-                                 "tabpfn": {"inference_seed": int(tp["inference_seed"]) + draw,
-                                            "softmax_temperature": float(tp["softmax_temperature"]),
-                                            "precision": str(tp["precision"])},
-                                 "gp": gp_ident, **common}
-                        hit = cells.run("cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
-                                        lambda st=st, level=level, t=t, draw=draw: (_representation_cell(
-                                            st, float(level), int(t), draw, p, cfg, tabpfn(draw),
-                                            surrogate_grams_for(st.X_pool)), {}))
-                        if hit is not None:
-                            pay = hit[0]
-                            prov = {"host": pay["host"], "seconds": pay["seconds"]}
-                            for k in ("alignment", "surrogate", "ceiling", "relations", "site_match", "lens"):
-                                tables[k] += [{**keys, **r, **(prov if k == "alignment" else {})} for r in pay[k]]
-                        cov = pc["coverage"]
-                        if pc["enabled"] and ch.label in allowed and any(np.isclose(level, lv) for lv in cov["levels"]) \
-                                and int(t) in {int(v) for v in cov["context_ts"]} and draw in {int(v) for v in cov["draws"]}:
-                            pident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
-                                      "draw": draw, "engine": pc["engine"],
-                                      "engine_params": _engine_params(pc["engine"], p, draw),
-                                      "references": pc["references"], "gp": gp_ident,
-                                      "layout_confound": p["layout_confound"], "deconfound": p["deconfound"],
-                                      **{k: pc[k] for k in ("quadrature", "eps", "y_grid", "moment_matched")}}
-                            hit = cells.run("posterior_cov", pident, f"posterior_cov {ch.label} a={level:g} t={t} d={draw}",
-                                            lambda st=st, level=level, t=t, draw=draw: (_posterior_cov_cell(
-                                                st, float(level), int(t), draw, p, cfg), {}))
-                            if hit is not None:
-                                pay = hit[0]
-                                tables["posterior_cov"] += [
-                                    {**keys, **r, "asymmetry": pay["asymmetry"], "clipped_mass": pay["clipped_mass"],
-                                     "host": pay["host"], "seconds": pay["seconds"]} for r in pay["rows"]]
+                tasks += [(ch, level, st, snr, t, draw) for t in cfg.context_sizes if t < st.n_sites
+                          for draw in range(int(p["n_context_draws"]))]
+        if opts.compute_only:
+            tasks.sort(key=lambda task: (task[5], task[4], float(task[1]), task[0].subject, task[0].emg))
+        for i, (ch, level, st, snr, t, draw) in enumerate(tasks):
+            keys = {"dataset": ch.dataset, "subject": ch.subject, "emg": ch.emg, "knob": knob.name,
+                    "level": float(level), "achieved_snr_db": snr, "context_t": int(t), "draw": draw}
+            ident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
+                     "draw": draw, "stats_version": REPRESENTATION_STATS_VERSION,
+                     "tabpfn": {"inference_seed": int(tp["inference_seed"]) + draw,
+                                "softmax_temperature": float(tp["softmax_temperature"]),
+                                "precision": str(tp["precision"])},
+                     "gp": gp_ident, **common}
+            hit = cells.run("cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
+                            lambda st=st, level=level, t=t, draw=draw: (_representation_cell(
+                                st, float(level), int(t), draw, p, cfg, tabpfn(draw),
+                                surrogate_grams_for(st.X_pool)), {}))
+            if hit is not None and not opts.compute_only:
+                pay = hit[0]
+                prov = {"host": pay["host"], "seconds": pay["seconds"]}
+                for k in ("alignment", "surrogate", "ceiling", "relations", "site_match", "lens"):
+                    tables[k] += [{**keys, **r, **(prov if k == "alignment" else {})} for r in pay[k]]
+            cov = pc["coverage"]
+            if pc["enabled"] and ch.label in allowed and any(np.isclose(level, lv) for lv in cov["levels"])                     and int(t) in {int(v) for v in cov["context_ts"]} and draw in {int(v) for v in cov["draws"]}:
+                pident = {**cells.channel(ch), "knob": knob.name, "level": float(level), "t": int(t),
+                          "draw": draw, "engine": pc["engine"],
+                          "engine_params": _engine_params(pc["engine"], p, draw),
+                          "references": pc["references"], "gp": gp_ident,
+                          "layout_confound": p["layout_confound"], "deconfound": p["deconfound"],
+                          **{k: pc[k] for k in ("quadrature", "eps", "y_grid", "moment_matched")}}
+                hit = cells.run("posterior_cov", pident, f"posterior_cov {ch.label} a={level:g} t={t} d={draw}",
+                                lambda st=st, level=level, t=t, draw=draw: (_posterior_cov_cell(
+                                    st, float(level), int(t), draw, p, cfg), {}))
+                if hit is not None and not opts.compute_only:
+                    pay = hit[0]
+                    tables["posterior_cov"] += [
+                        {**keys, **r, "asymmetry": pay["asymmetry"], "clipped_mass": pay["clipped_mass"],
+                         "host": pay["host"], "seconds": pay["seconds"]} for r in pay["rows"]]
+            last = i + 1 == len(tasks) or tasks[i + 1][0] is not ch or tasks[i + 1][1] != level
+            if last and not opts.compute_only:
                 print(f"[mechanism] representation {ch.label} level={level} done ({time.time() - t0:.0f}s)",
                       flush=True)
+        if opts.compute_only:
+            print(f"[mechanism] compute-only: {len(tasks)} representation tasks walked ({time.time() - t0:.0f}s)",
+                  flush=True)
+            cells.report()
+            return out
         names = {"alignment": "representation.csv", "surrogate": "surrogate.csv", "ceiling": "ceiling.csv",
                  "relations": "target_relations.csv", "site_match": "site_match.csv", "lens": "lens.csv",
                  "posterior_cov": "posterior_cov.csv"}
@@ -2590,6 +2630,8 @@ def run_mechanism(
     replot: bool = False,
     use_cache: bool = True,
     only_cached: bool = False,
+    compute_only: bool = False,
+    claim_ttl_s: float | None = None,
 ) -> str:
     """Load a mechanism config and run its analysis.
 
@@ -2599,12 +2641,26 @@ def run_mechanism(
         replot: Rebuild figures from existing CSVs.
         use_cache: Read and write the cell cache (``--no-cache`` turns it off).
         only_cached: Assemble from cached cells only (``--only-cached``).
+        compute_only: Compute grid cells only, as one lane of a work pool (``bayes_update``, ``representation``).
+        claim_ttl_s: Work-pool claim lifetime in seconds (with ``compute_only``).
 
     Returns:
         The run directory.
+
+    Raises:
+        ValueError: On ``compute_only`` for an analysis without a work pool, or combined with ``replot`` /
+            ``only_cached`` / ``--no-cache``.
     """
     cfg = load_mechanism_config(config_path, overrides)
-    return ANALYSES[cfg.analysis](cfg, RunOptions(replot=replot, use_cache=use_cache, only_cached=only_cached))
+    if compute_only:
+        if cfg.analysis not in COMPUTE_ONLY_ANALYSES:
+            raise ValueError(f"--compute-only / --shard: only {sorted(COMPUTE_ONLY_ANALYSES)} supports a work pool, "
+                             f"not {cfg.analysis!r}.")
+        if replot or only_cached or not use_cache:
+            raise ValueError("--compute-only / --shard cannot be combined with --replot, --only-cached or --no-cache.")
+    return ANALYSES[cfg.analysis](cfg, RunOptions(replot=replot, use_cache=use_cache, only_cached=only_cached,
+                                                  compute_only=compute_only,
+                                                  claim_ttl_s=claim_ttl_s if compute_only else None))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2623,7 +2679,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-cache", action="store_true", help="Neither read nor write the mechanism cells.")
     parser.add_argument("--only-cached", action="store_true",
                         help="Assemble the CSVs from cached cells only; compute nothing.")
+    parser.add_argument("--compute-only", action="store_true",
+                        help="Work-pool lane (bayes_update, representation): claim and compute cells, write nothing else.")
+    parser.add_argument("--shard", default=None, metavar="I/N",
+                        help="Lane I of N (scripts/_job_common.sh); implies --compute-only. Lanes share one work pool "
+                             "through cell claims, so I/N only labels the lane.")
+    parser.add_argument("--claim-ttl-hours", type=float, default=DEFAULT_CLAIM_TTL_HOURS,
+                        help="Lifetime of a work-pool claim; must exceed the slowest cell.")
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    compute_only = bool(args.compute_only or args.shard)
+    if args.shard:
+        lane, lanes = parse_shard(args.shard)
+        print(f"[mechanism] work-pool lane {lane}/{lanes}", flush=True)
+    if not args.claim_ttl_hours > 0:
+        raise ValueError(f"--claim-ttl-hours must be > 0, got {args.claim_ttl_hours}.")
     run_mechanism(args.config, args.overrides, replot=args.replot, use_cache=not args.no_cache,
-                  only_cached=args.only_cached)
+                  only_cached=args.only_cached, compute_only=compute_only,
+                  claim_ttl_s=args.claim_ttl_hours * SECONDS_PER_HOUR)
     return 0
