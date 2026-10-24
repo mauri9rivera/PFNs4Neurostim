@@ -33,6 +33,9 @@ class BOState:
         step: Zero-based acquisition step index.
         n_steps: Total acquisition steps in this run.
         n_dims: Search-space dimensionality (used by ``auto_dim`` schedules).
+        fit_values: The observations as the surrogate was fitted on them (after the online y scaler, when there is
+            one), so an acquisition can compare them with the surrogate's predictions. Empty = ``observed_values``
+            (no online scaler).
     """
 
     observed_indices: tuple[int, ...]
@@ -40,11 +43,24 @@ class BOState:
     step: int
     n_steps: int
     n_dims: int = 1
+    fit_values: tuple[float, ...] = ()
 
     @property
     def incumbent_value(self) -> float:
         """Best observed value so far; ``-inf`` before the first observation."""
         return float(max(self.observed_values)) if self.observed_values else float("-inf")
+
+    @property
+    def incumbent_fit_value(self) -> float:
+        """Best observed value so far in the surrogate's y space; ``-inf`` before the first observation.
+
+        Raises:
+            ValueError: If ``fit_values`` is given but does not match ``observed_values`` in length.
+        """
+        if self.fit_values and len(self.fit_values) != len(self.observed_values):
+            raise ValueError(f"BOState: {len(self.fit_values)} fit_values for {len(self.observed_values)} observations.")
+        vals = self.fit_values or self.observed_values
+        return float(max(vals)) if vals else float("-inf")
 
 
 @dataclass(frozen=True)

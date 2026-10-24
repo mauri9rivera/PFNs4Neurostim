@@ -80,20 +80,33 @@ class AcqParams:
             state: Loop state.
 
         Returns:
-            Mapping parameter name -> value at this step.
+            Mapping parameter name -> value at this step. Non-numeric parameters (e.g. EI's ``incumbent`` rule) are
+            constant over a run and recorded in the cell identity and the resolved config, so they are not logged
+            per step.
         """
         return {
             f.name: self.value(f.name, state)
             for f in fields(self)
-            if f.name != "schedules"
+            if f.name != "schedules" and not isinstance(getattr(self, f.name), str)
         }
+
+
+#: EI incumbent rules. ``best_observed`` (default since 2026-10-23, user): the best observation so far, in the
+#: surrogate's y space. ``best_predicted``: the best predicted mean at the observed sites (the rule until 2026-10-23).
+EI_INCUMBENTS: tuple[str, ...] = ("best_observed", "best_predicted")
 
 
 @dataclass(frozen=True)
 class EIParams(AcqParams):
-    """Expected Improvement. ``xi`` is the exploration offset added to the incumbent."""
+    """Expected Improvement. ``xi`` is the exploration offset added to the incumbent; ``incumbent`` its rule."""
 
     xi: float = 0.0
+    incumbent: str = "best_observed"
+
+    def __post_init__(self) -> None:
+        """Refuse an unknown incumbent rule at config-load time."""
+        if self.incumbent not in EI_INCUMBENTS:
+            raise ValueError(f"ei.incumbent must be one of {list(EI_INCUMBENTS)}, got {self.incumbent!r}.")
 
 
 @dataclass(frozen=True)
@@ -151,9 +164,13 @@ def _score_ei(
 ) -> np.ndarray:
     """Expected Improvement over the incumbent (Jones et al., 1998, Eq. 15).
 
-    The incumbent is the best *predicted* value among queried sites, not the best
-    noisy observation: with trial-to-trial noise the running max of raw
-    observations is upward-biased, which makes EI far too conservative.
+    The incumbent follows ``params.incumbent``. ``best_observed`` (default since 2026-10-23, user) is the best
+    observation so far, taken in the surrogate's own y space (``state.fit_values``, i.e. after the online y scaler),
+    as in Jones et al. (1998) and Prior Labs' TabPFN BO mode. ``best_predicted`` is the best predicted mean at the
+    observed sites, the rule until 2026-10-23: it was meant to avoid the upward bias of the running max of noisy
+    observations, but with TabPFN's smooth predictive it sits low, inflates every candidate's improvement and makes EI
+    over-exploit (research_design §4, 2026-10-22: +0.117 / +0.112 recommended regret and -0.20 / -0.30 R² on NHP /
+    5d_rat against the best-observed rule).
 
     Args:
         surrogate: Fitted surrogate.
@@ -168,7 +185,12 @@ def _score_ei(
     mean, std = marginals(surrogate, X_pool)                       # [N], [N]
     xi = params.value("xi", state)
     observed = np.asarray(state.observed_indices, dtype=int)
-    incumbent = float(np.max(mean[observed])) if observed.size else float(np.max(mean))
+    if params.incumbent == "best_observed" and observed.size:
+        incumbent = state.incumbent_fit_value
+    elif observed.size:
+        incumbent = float(np.max(mean[observed]))
+    else:
+        incumbent = float(np.max(mean))
     gap = mean - incumbent - xi                                    # [N]
     safe = np.maximum(std, 1e-12)                                  # [N]
     z = gap / safe                                                 # [N]

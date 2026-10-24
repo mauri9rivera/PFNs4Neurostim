@@ -1,5 +1,9 @@
-# Expected Improvement over the incumbent (best predicted value among queried
-# sites). Working default since 2026-09-17 (task #4 Step 5a).
+# Expected Improvement over the incumbent. Working default since 2026-09-17 (task #4 Step 5a).
+# incumbent (user, 2026-10-23): best_observed = the best observation so far in the surrogate's y space (Jones et al. 1998;
+# Prior Labs' TabPFN BO mode); best_predicted = the best predicted mean at the observed sites (the rule until 2026-10-23,
+# which made TabPFN's EI over-exploit: research_design §4, 2026-10-22). EI cells computed before 2026-10-23 carry no
+# incumbent key in their identity, so they are not served for either rule.
 type: ei
 params:
   xi: 0.0
+  incumbent: best_observed

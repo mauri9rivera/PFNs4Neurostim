@@ -109,6 +109,36 @@ class TestClosedForms:
         want = gap * stats.norm.cdf(z) + std * stats.norm.pdf(z)
         np.testing.assert_allclose(got, want, rtol=1e-10)
 
+    def test_ei_best_observed_incumbent_uses_the_surrogates_y_space(self) -> None:
+        """Default since 2026-10-23: the best observation, as the surrogate saw it (after the online y scaler)."""
+        mean, std = np.array([0.0, 1.0, 2.0, 0.5]), np.array([1.0, 0.5, 2.0, 0.1])
+        spec, params = build_acquisition("ei")
+        assert params.incumbent == "best_observed"
+        state = BOState((0, 3), (10.0, 30.0), 0, 10, n_dims=2, fit_values=(0.2, 0.8))   # raw vs scaled
+        got = spec.score_fn(_FakeSurrogate(mean, std), np.zeros((4, 2)), state, None, params)
+        gap = mean - 0.8
+        z = gap / std
+        np.testing.assert_allclose(got, gap * stats.norm.cdf(z) + std * stats.norm.pdf(z), rtol=1e-10)
+
+    def test_ei_best_predicted_incumbent_is_the_best_mean_at_observed_sites(self) -> None:
+        mean, std = np.array([0.0, 1.0, 2.0, 0.5]), np.array([1.0, 0.5, 2.0, 0.1])
+        spec, params = build_acquisition("ei", {"incumbent": "best_predicted"})
+        state = BOState((0, 3), (10.0, 30.0), 0, 10, n_dims=2, fit_values=(0.2, 0.8))
+        got = spec.score_fn(_FakeSurrogate(mean, std), np.zeros((4, 2)), state, None, params)
+        gap = mean - 0.5                                          # max(mean[[0, 3]])
+        z = gap / std
+        np.testing.assert_allclose(got, gap * stats.norm.cdf(z) + std * stats.norm.pdf(z), rtol=1e-10)
+
+    def test_ei_unknown_incumbent_raises_and_is_not_logged_per_step(self) -> None:
+        with pytest.raises(ValueError, match="incumbent"):
+            build_acquisition("ei", {"incumbent": "running_max"})
+        _, params = build_acquisition("ei")
+        assert params.resolved(_state((0,))) == {"xi": 0.0}
+
+    def test_fit_values_must_match_observations(self) -> None:
+        with pytest.raises(ValueError, match="fit_values"):
+            BOState((0, 1), (1.0, 2.0), 0, 10, fit_values=(1.0,)).incumbent_fit_value
+
     def test_ei_is_non_negative(self) -> None:
         rng = np.random.default_rng(0)
         mean, std = rng.normal(size=50), rng.uniform(0.1, 2.0, size=50)

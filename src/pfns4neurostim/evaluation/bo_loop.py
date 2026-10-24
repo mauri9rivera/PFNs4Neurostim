@@ -139,7 +139,7 @@ def _fit_scaled(
     X_pool: np.ndarray,
     traj: "BOTrajectory",
     online_y: OnlineYScaler | None,
-) -> None:
+) -> np.ndarray:
     """Fit the surrogate on the observations so far, through the online y scaler when there is one.
 
     Args:
@@ -147,6 +147,9 @@ def _fit_scaled(
         X_pool: Candidate coordinates, shape [N, D].
         traj: Trajectory holding the observations so far.
         online_y: Causal y scaler, or None.
+
+    Returns:
+        The targets the surrogate was fitted on (scaled when ``online_y`` is active), shape [t].
     """
     idx = np.asarray(traj.observed_indices, dtype=int)              # [t]
     y_obs = np.asarray(traj.observed_values, dtype=np.float64)      # [t]
@@ -154,6 +157,7 @@ def _fit_scaled(
         y_obs = online_y.fit(y_obs).transform(y_obs)
     surrogate.fit(X_pool[idx], y_obs)
     _record_fit(surrogate, traj)
+    return y_obs
 
 
 def _record_fit(surrogate: Any, traj: "BOTrajectory") -> None:
@@ -287,14 +291,15 @@ def run_bo_loop(
     n_steps = budget - n_init
     for step in range(n_steps):
         t0 = time.time()
+        y_fit = _fit_scaled(surrogate, X_pool, traj, online_y)          # [t], the surrogate's y space
         state = BOState(
             observed_indices=tuple(traj.observed_indices),
             observed_values=tuple(traj.observed_values),
             step=step,
             n_steps=n_steps,
             n_dims=channel.n_dims,
+            fit_values=tuple(float(v) for v in y_fit),
         )
-        _fit_scaled(surrogate, X_pool, traj, online_y)
         result = acquire(spec.score_fn, surrogate, X_pool, state, rng, params)
 
         # Pure-exploitation recommendation over the whole pool, back in the channel's own y space.
