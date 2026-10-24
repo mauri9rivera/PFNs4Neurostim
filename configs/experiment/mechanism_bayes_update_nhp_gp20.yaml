@@ -1,0 +1,71 @@
+# EXPLORATORY -- NOT PRE-REGISTERED (2026-10-23; task plan row Omega12, option (b)). OMEGA Part A only:
+# the "converged empirical-Bayes yardstick", GP-MLL refit with 20 multi-start restarts in place of 5.
+#
+# WHY. TabPFN-2.5's Part A coherence readouts (drift_abs, total_var_ratio, cov_asymmetry) are read against the
+# empirical-Bayes band, GP-MLL refit's readouts on the same cells (mechanism_bayes_update_nhp.yaml). The t = 50 bump
+# of that band was diagnosed on 2026-10-23 (output/diagnostics/omega_t50/, gp_layout_diag.py, read_variants.py) as
+# an optimiser artefact: with 5 restarts (inits seeded by N in models/gp/surrogates.py::GPSurrogate.fit) the
+# per-probe refits jump between an interpolating and a noisy marginal-likelihood basin; other restart seeds move the
+# peak (seed 2: t = 60); with 20 restarts the refit nonlinearity is ~0 (93 % of fits at the noise floor, only 49 % of
+# cells in the same basin as with 5 restarts). The band therefore depends on the optimiser budget. This arm
+# measures the converged band on the same cells as TabPFN, to be read beside the 5-restart band, never in its place
+# and never in a pre-registered table. GP-fixed is left out (closed form: already at its floor whatever the seeds
+# or the restarts), and so is TabPFN (its cells are the refinement grid's, tag nhp-l1-refine).
+#
+# SAME CELLS AS THE REFINEMENT GRID (tag nhp-l1-refine): level 1, t [30, 40, 50, 60, 80], NHP subjects [0, 1, 2, 3]
+# (22 channels). Context layouts, anchors (8 unobserved + 4 observed) and the RQMC levels (8 scrambles x 8 points)
+# are drawn from the same seed streams (rng_for(label, 'bayes_update', level, t, draw)), so every anchor and every
+# y' is the one the 5-restart refit and TabPFN saw. n_context_draws: 2 here (220 cells); the 10-draw variant
+# (1,100 cells) is --set bayes_update.n_context_draws=10 and reuses the 2-draw cells (a cell is keyed by its draw).
+#
+# WHAT RUNS. Part A on gp_mll_refit only: 12 anchors x 64 RQMC values = 768 refits + 1 base fit per cell. Part B is
+# off through coverage (B: levels []), so no shared trials, no ladder, no head-to-head, no surprise rows; no C1
+# (its reference gp_mll_frozen is not an engine), no exemplar, no gates, no discrepancy, no link.
+#
+# IDENTITY. engines_a = [gp_mll_refit], engines_b = [], engine_params.gp_mll_refit.gp_params.n_restarts = 20 and
+# references = [] all enter the cell key, so no cell of output/cells/nhp/mechanism_bayes_update/ is reused.
+#
+# Everything in gp_params other than n_restarts is the base config's (P0.10 converged L-BFGS GP + the mechanism
+# lengthscale floor); anchors / quadrature / eps / y_grid / shared / far_pitch are copied verbatim.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp_gp20.yaml --only-cached
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp_gp20.yaml --set bayes_update.n_context_draws=10 --only-cached
+#   python scripts/omega_gp20_band.py
+defaults:
+  dataset: nhp
+  context: nhp
+
+analysis: bayes_update
+tag: nhp-gp20
+device: cpu
+seed: 42
+output_root: output
+
+dataset:
+  subjects: [0, 1, 2, 3]
+
+context:
+  sizes: [30, 40, 50, 60, 80]
+
+bayes_update:
+  engines: [gp_mll_refit]
+  references: []
+  # Part A everywhere, Part B nowhere (an empty level filter matches no cell).
+  coverage:
+    gp_mll_refit:
+      B: {levels: []}
+  stress: {knob: k2_channel, levels: [1.0]}
+  n_context_draws: 2
+  anchors: {n_unobserved: 8, n_observed: 4}
+  quadrature: {method: rqmc, K: 8, u_min: 1.0e-12, central_mass: 1.0, n_scrambles: 8}
+  eps: 0.01
+  y_grid: {points: 512, u_tail: 1.0e-4}
+  shared: {n_trials: 8, ladder: [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0], saturation_c: [1.0, 3.0],
+           reference: gp_mll_refit}
+  far_pitch: 4.0
+  # The only change from mechanism_bayes_update_nhp.yaml: n_restarts 5 -> 20.
+  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 20,
+              lengthscale_floor: 0.05}
+  exemplar: {enabled: false, engines: [gp_mll_refit]}
+  panel_ts: [50, 80]
+  run: {gates: false, grid: true, discrepancy: false}

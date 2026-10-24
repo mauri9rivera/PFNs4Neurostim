@@ -48,7 +48,8 @@ for t in "${TARGETS[@]}"; do
     mkdir -p "${LOCAL_OUT}/${t}"
     echo "Syncing ${t}"
     case "${t}" in
-        cells*) POLICY=(--ignore-existing) ;;
+        # *.claim: work-pool claims are transient lane state on the cluster (evaluation/cache.py), never results
+        cells*) POLICY=(--ignore-existing --exclude '*.claim' --exclude '*.claim.tmp.*') ;;
         *)      POLICY=(--update --backup "--backup-dir=${BACKUP_DIR}/${t}") ;;
     esac
     rsync -avz --progress "${POLICY[@]}" -e "${SSH_CMD}" "${MILA_HOST}:${REMOTE_OUT}/${t}/" "${LOCAL_OUT}/${t}/"
