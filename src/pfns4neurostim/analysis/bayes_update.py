@@ -1724,6 +1724,103 @@ def coherence_cell(
     return out
 
 
+#: Per-anchor Part A ratios and the bounded / symmetric readouts derived from them at assembly (user, 2026-10-23).
+#: ``shrink_move_ratio`` (Bayes 1) is unbounded above and below and explodes where the mean barely moves; its bounded
+#: index lives in [-1, 1) with Bayes at 0. ``total_var_ratio`` (Bayes 1) is a positive ratio, so its log is symmetric
+#: (a doubling and a halving are equally far from Bayes).
+VARIANCE_INDEX_SOURCES: dict[str, str] = {"shrink_move_ratio": "shrink_move_index",
+                                          "shrink_move_ratio_c": "shrink_move_index_c"}
+LOG_RATIO_SOURCES: dict[str, str] = {"total_var_ratio": "log_total_var_ratio",
+                                     "total_var_ratio_c": "log_total_var_ratio_c"}
+
+
+def bounded_variance_index(r: float | None) -> float | None:
+    """Bounded index of the expected-shrink / mean-movement ratio: ``kappa = (r - 1) / (|r| + 1)``.
+
+    ``kappa`` is 0 for a Bayesian update (``r = 1``), tends to 1 when the update shrinks the variance far more than the
+    mean moves (``r -> inf``), is -1 at ``r = 0`` (the mean moves but the variance does not shrink) and stays -1 for
+    ``r < 0`` (the variance grows). It is monotone in ``r``, so ranks and medians of anchors keep their order, while a
+    handful of exploding anchors can no longer dominate a mean or a regression.
+
+    Args:
+        r: Per-anchor ``shrink_move_ratio`` (``None`` when the anchor has no influenced site).
+
+    Returns:
+        ``kappa``, or ``None`` for ``None``.
+
+    Raises:
+        ValueError: If ``r`` is not finite.
+    """
+    if r is None:
+        return None
+    if not np.isfinite(r):
+        raise ValueError(f"bounded_variance_index: shrink_move_ratio must be finite, got {r}.")
+    return float((r - 1.0) / (abs(r) + 1.0))
+
+
+def log_variance_ratio(R: float | None) -> float | None:
+    """Natural log of the total-variance ratio (Bayes 0).
+
+    Args:
+        R: Per-anchor ``total_var_ratio`` = (E[s^2_new] + Var[mu_new]) / s^2_old (``None`` without influenced sites).
+
+    Returns:
+        ``log R``, or ``None`` for ``None``.
+
+    Raises:
+        ValueError: If ``R`` is not finite and positive (it is a ratio of variances, positive by construction).
+    """
+    if R is None:
+        return None
+    if not (np.isfinite(R) and R > 0.0):
+        raise ValueError(f"log_variance_ratio: total_var_ratio must be finite and > 0, got {R}.")
+    return float(np.log(R))
+
+
+def anchor_variance_readouts(row: Mapping[str, Any]) -> dict[str, float | None]:
+    """The bounded / log readouts of one per-anchor Part A row (keys absent from the row are skipped).
+
+    Args:
+        row: A per-anchor row of :func:`coherence_anchor` (as stored in a cell payload).
+
+    Returns:
+        ``{shrink_move_index[_c], log_total_var_ratio[_c]}`` for the source keys the row has.
+    """
+    out: dict[str, float | None] = {}
+    for src, dst in VARIANCE_INDEX_SOURCES.items():
+        if src in row:
+            out[dst] = bounded_variance_index(row[src])
+    for src, dst in LOG_RATIO_SOURCES.items():
+        if src in row:
+            out[dst] = log_variance_ratio(row[src])
+    return out
+
+
+def pool_variance_readouts(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], dict[str, float | None]]:
+    """Per (engine, pool) medians over anchors of :func:`anchor_variance_readouts`, plus the pooled summary.
+
+    The transforms are applied per anchor and the median is taken afterwards: a cell row's ratio is a median over an
+    even number of anchors (8 / 4 / 12), so transforming the stored median would not equal the median of the index.
+
+    Args:
+        rows: A cell payload's per-anchor ``coherence`` rows (with ``engine`` and ``pool``).
+
+    Returns:
+        ``{(engine, pool): {readout: median}}`` for every pool present and for :data:`POOLED_ANCHORS`.
+    """
+    groups: dict[tuple[str, str], list[dict[str, float | None]]] = {}
+    for row in rows:
+        vals = anchor_variance_readouts(row)
+        groups.setdefault((str(row["engine"]), str(row["pool"])), []).append(vals)
+        groups.setdefault((str(row["engine"]), POOLED_ANCHORS), []).append(vals)
+    out: dict[tuple[str, str], dict[str, float | None]] = {}
+    for key, vals in groups.items():
+        names = sorted({k for v in vals for k in v})
+        out[key] = {k: _median(np.array([v[k] for v in vals if v.get(k) is not None], dtype=np.float64))
+                    for k in names}
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Part B: head-to-head on shared y'
 # ---------------------------------------------------------------------------

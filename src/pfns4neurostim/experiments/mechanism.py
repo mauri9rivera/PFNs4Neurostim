@@ -1323,9 +1323,12 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                     continue
                 pay = hit[0]
                 prov = {"host": pay["host"], "seconds": pay["seconds"]}
-                coh_rows += [{**keys, **r, **prov} for r in pay["coherence"]]
-                cell_rows += [{**keys, **r, **prov} for r in pay["coherence_cell"]]
-                cell_rows += [{**keys, **r, **prov} for r in _pooled_coherence_cell(pay, B)]
+                # bounded shrink/move index and log total-variance ratio (user, 2026-10-23): per anchor, then
+                # medians per pool, from the stored per-anchor rows (no recompute, no cell identity change)
+                vidx = B.pool_variance_readouts(pay["coherence"])
+                coh_rows += [{**keys, **r, **B.anchor_variance_readouts(r), **prov} for r in pay["coherence"]]
+                cell_rows += [{**keys, **r, **vidx.get((r["engine"], r["pool"]), {}), **prov}
+                              for r in [*pay["coherence_cell"], *_pooled_coherence_cell(pay, B)]]
                 h2h_rows += [{**keys, **r} for r in pay["headtohead"]]
                 sur_rows += [{**keys, **r} for r in pay["surprise"]]
                 prof_rows += [{**keys, **r} for r in pay.get("profile", [])]
@@ -2607,7 +2610,7 @@ def _representation_summaries(out: str, p: dict[str, Any], seed: int) -> None:
             os.path.join(out, "posterior_cov_summary.csv"), index=False)
     with open(os.path.join(out, "headline.json"), "w", encoding="utf-8") as fh:
         json.dump({
-            "status": "OPEN (research_design.md §4, 2026-10-19): settled after the real-grid re-check",
+            "status": "DECIDED 2026-10-23 (user; research_design.md §4): deconfounded_vs_surrogate is the headline",
             "statistic": stat, "readout": p["headline"]["readout"],
             "computable_alternatives": [s for s in R.HEADLINE_STATISTICS if s != stat],
             "floor": "smooth-field surrogate: the max over lengthscales of the per-lengthscale upper quantile",

@@ -267,7 +267,7 @@ def test_representation_runner_end_to_end_cache_and_replot(tmp_path, tiny_channe
     assert (self_ref["bures_rel"] < 1e-4).all() and np.allclose(self_ref["trace_ratio"], 1.0, atol=1e-6)
     assert (pc["asymmetry"] < 1e-8).all()
     head = json.load(open(os.path.join(out, "headline.json"), encoding="utf-8"))
-    assert head["status"].startswith("OPEN") and head["computable_alternatives"] == ["floor_subtracted_raw"]
+    assert head["status"].startswith("DECIDED") and head["computable_alternatives"] == ["floor_subtracted_raw"]
     figures = ("representation_vs_layer", "representation_vs_layer_secondary", "site_match", "lens_distance",
                "posterior_cov")
     for name in figures:

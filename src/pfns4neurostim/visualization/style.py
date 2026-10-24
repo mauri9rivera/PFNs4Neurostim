@@ -785,6 +785,9 @@ AXIS_LABELS: dict[str, str] = {
     # anchor whose update moves no site by eps s^2; these two say how many anchors they rest on, and the drift at x'
     # itself, which is defined at every anchor.
     "update_share": "Anchors with a measurable\nupdate (share)",
+    # Bounded / symmetric companions of the two variance ratios (user, 2026-10-23); Bayes 0 for both.
+    "shrink_move_index": "Shrink / move index $\\kappa$\n(0 = Bayes, bounded)",
+    "log_total_var_ratio": "log total-variance ratio\n(0 = Bayes)",
     "drift_abs_anchor": "Drift at $x'$ $|\\delta(x')|$\n(predictive SD)",
     "implied_noise": r"Implied noise variance at $x'$ (z-units$^2$)",
     "trial_var": r"Trial variance at $x'$ (z-units$^2$)",

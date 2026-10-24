@@ -248,6 +248,38 @@ def _context_axis(ax: Any, ts: Sequence[int]) -> None:
 _COHERENCE_COLUMNS: int = 2
 
 
+#: Supplementary readouts of the variance identities: the bounded shrink / move index and the log total-variance ratio
+#: (user, 2026-10-23), both 0 for a Bayesian update.
+OMEGA_VARIANCE_INDEX_METRICS: dict[str, float] = {"shrink_move_index": 0.0, "log_total_var_ratio": 0.0}
+
+
+def _omega_variance_index(pooled: pd.DataFrame, ts: Sequence[int], run_dir: str) -> list[str]:
+    """Supplementary figure ``coherence_variance_index.svg``: the bounded / log companions of the variance ratios.
+
+    Args:
+        pooled: Pooled-anchor ``coherence_cell.csv`` rows at the nominal level.
+        ts: Context sizes on the x-axis.
+        run_dir: Output directory.
+
+    Returns:
+        Written paths (none when the run predates the columns).
+    """
+    metrics = [m for m in OMEGA_VARIANCE_INDEX_METRICS if m in pooled and pooled[m].notna().any()]
+    if not metrics:
+        return []
+    fig, axes = style.figure("double", nrows=1, ncols=len(metrics), squeeze=False,
+                             panel_aspect=_OMEGA_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
+    for ax, metric in zip(axes[0], metrics):
+        for engine in pooled["engine"].unique():
+            _median_band(ax, pooled[pooled["engine"] == engine], metric, arm_style(engine))
+        _bayes_value(ax, OMEGA_VARIANCE_INDEX_METRICS[metric])
+        _context_axis(ax, ts)
+        ax.set_ylabel(style.axis_label(metric))
+    axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
+    style.panel_letters(axes[0][:len(metrics)])
+    return style.save_figure(fig, run_dir, "coherence_variance_index")
+
+
 def _omega_coherence(cell: pd.DataFrame, run_dir: str) -> list[str]:
     """Omega-1: Part A headlines vs context size, over every anchor (``coherence.svg``) and per pool (supplement).
 
@@ -282,6 +314,7 @@ def _omega_coherence(cell: pd.DataFrame, run_dir: str) -> list[str]:
         axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
         style.panel_letters(axes.ravel()[:len(metrics)])
         written += style.save_figure(fig, run_dir, "coherence")
+        written += _omega_variance_index(pooled, ts, run_dir)
     pools = [p for p in ("unobserved", "observed") if p in set(cell["pool"])]
     if pools:
         fig, axes = style.figure("wide", nrows=len(pools), ncols=len(metrics), squeeze=False,
