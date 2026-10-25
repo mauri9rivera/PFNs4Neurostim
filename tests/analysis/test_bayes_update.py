@@ -559,3 +559,82 @@ def test_tabpfn_injected_row_is_train_hashed_unlike_the_query_row(channel, ctx) 
     # Several probes at one anchor share ONE fingerprint, as one refit on D + {x'} would assign it.
     out = eng.probe(np.repeat(x, 3, axis=0), np.array([-0.5, 0.0, 0.5]), channel.X_pool)
     assert out.mean.shape == (3, channel.n_sites) and np.isfinite(out.var).all()
+
+
+# ---------------------------------------------------------------------------
+# 9. shuffling-history (2026-10-24): row orders and the order-averaged predictive
+# ---------------------------------------------------------------------------
+def test_context_order_modes() -> None:
+    rng = np.random.default_rng(0)
+    np.testing.assert_array_equal(B.context_order(5, 6, "none", None), np.arange(6))
+    hist = B.context_order(5, 7, "history", rng)
+    assert sorted(hist[:5]) == list(range(5)) and list(hist[5:]) == [5, 6]          # D permuted, probes stay last
+    assert sorted(B.context_order(5, 6, "all", rng)) == list(range(6))
+    # under 'all' the probed row reaches every position
+    assert {int(np.flatnonzero(B.context_order(5, 6, "all", rng) == 5)[0]) for _ in range(200)} == set(range(6))
+    with pytest.raises(ValueError, match="mode"):
+        B.context_order(5, 6, "reverse", rng)
+    with pytest.raises(ValueError, match="generator"):
+        B.context_order(5, 6, "all", None)
+    with pytest.raises(ValueError, match="n_context"):
+        B.context_order(7, 6, "history", rng)
+
+
+def _gauss(mean: np.ndarray, var: np.ndarray) -> B.MixturePredictive:
+    """One-component predictive, mean / var [P, M]."""
+    return B.MixturePredictive(np.ones((mean.shape[0], 1)), mean[..., None], var[..., None])
+
+
+def test_equal_mixture_matches_the_two_component_mixture() -> None:
+    rng = np.random.default_rng(3)
+    m1, m2 = rng.normal(size=(2, 5)), rng.normal(size=(2, 5)) + 1.0                 # [P, M]
+    v1, v2 = rng.uniform(0.2, 1.5, size=(2, 5)), rng.uniform(0.2, 1.5, size=(2, 5))
+    mix = B.EqualMixturePredictive([_gauss(m1, v1), _gauss(m2, v2)])
+    ref = B.MixturePredictive(np.full((2, 2), 0.5), np.stack([m1, m2], -1), np.stack([v1, v2], -1))
+    np.testing.assert_allclose(mix.mean, ref.mean, rtol=1e-12)
+    np.testing.assert_allclose(mix.var, ref.var, rtol=1e-10)
+    grid = np.linspace(-4.0, 5.0, 33)[None].repeat(5, 0)                            # [M, G]
+    np.testing.assert_allclose(mix.cdf(grid), ref.cdf(grid), atol=1e-12)
+    u, sites = np.array([0.01, 0.3, 0.5, 0.97]), np.array([0, 3])
+    np.testing.assert_allclose(mix.ppf(u, sites), ref.ppf(u, sites), atol=1e-9)     # P = 2: the probe-matched block
+    sup = mix.support(1e-4)
+    assert (sup[..., 0] <= ref.ppf(np.array([1e-3]), np.arange(5))[..., 0]).all()
+    assert (sup[..., 1] >= ref.ppf(np.array([1 - 1e-3]), np.arange(5))[..., 0]).all()
+    taken = mix.take([1])
+    np.testing.assert_allclose(taken.mean, mix.mean[[1]])
+    np.testing.assert_allclose(taken.ppf(u, sites), mix.ppf(u, sites)[[1]], atol=1e-9)
+
+
+def test_equal_mixture_of_identical_components_is_the_component() -> None:
+    rng = np.random.default_rng(4)
+    g = _gauss(rng.normal(size=(1, 4)), rng.uniform(0.3, 1.0, size=(1, 4)))
+    mix = B.EqualMixturePredictive([g, g, g])
+    np.testing.assert_allclose(mix.mean, g.mean)
+    np.testing.assert_allclose(mix.var, g.var, rtol=1e-12)
+    u = np.array([0.05, 0.5, 0.95])
+    np.testing.assert_allclose(mix.ppf(u, np.arange(4)), g.ppf(u, np.arange(4)), atol=1e-12)
+    with pytest.raises(ValueError, match="at least one"):
+        B.EqualMixturePredictive([])
+    with pytest.raises(ValueError, match="disagree"):
+        B.EqualMixturePredictive([g, _gauss(np.zeros((1, 3)), np.ones((1, 3)))])
+
+
+@pytest.mark.slow
+def test_refit_engine_row_orders(channel, ctx) -> None:
+    """Default order = the OMEGA engine bit for bit; 'all' reorders it; S orders average into one mixture."""
+    Q = channel.X_pool
+    plain = B.PFNRefitEngine(device="cpu")
+    plain.fit(ctx.X, ctx.y)
+    ref = plain.base(Q)
+    again = B.PFNRefitEngine(device="cpu", shuffle="none")
+    again.fit(ctx.X, ctx.y)
+    np.testing.assert_array_equal(again.base(Q).mean, ref.mean)
+    avg = B.PFNRefitEngine(device="cpu", shuffle="all", n_permutations=2, rng=np.random.default_rng(0))
+    avg.fit(ctx.X, ctx.y)
+    pr = avg.probe(Q[[3, 3]], np.array([-0.4, 0.6]), Q)
+    assert isinstance(pr, B.EqualMixturePredictive) and pr.mean.shape == (2, channel.n_sites)
+    assert len(pr.components) == 2 and np.isfinite(pr.var).all()
+    with pytest.raises(ValueError, match="n_permutations"):
+        B.PFNRefitEngine(device="cpu", n_permutations=2)
+    with pytest.raises(ValueError, match="generator"):
+        B.PFNRefitEngine(device="cpu", shuffle="history")

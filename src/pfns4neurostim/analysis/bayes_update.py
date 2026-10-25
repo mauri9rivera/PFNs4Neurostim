@@ -55,6 +55,9 @@ __all__ = [
     "ToyUpdater",
     "PFNRefitEngine",
     "CriterionPredictive",
+    "EqualMixturePredictive",
+    "SHUFFLE_MODES",
+    "context_order",
     "QUADRATURE_METHODS",
     "gh_nodes",
     "quadrature_levels",
@@ -617,6 +620,107 @@ class CriterionPredictive(Predictive):
         return CriterionPredictive([self.parts[int(i)] for i in np.asarray(idx, dtype=int)])
 
 
+class EqualMixturePredictive(Predictive):
+    """Equal-weight mixture of ``S`` predictives over the same probes and sites (the permutation average).
+
+    Component ``s`` holds the predictive of every probe under one context row order; the mixture is the predictive
+    averaged over orders, the exchangeable version of an order-sensitive model (shuffling-history, 2026-10-24).
+
+    Args:
+        components: ``S`` predictives with identical ``[P, M]`` shapes.
+        bisection_steps: Iterations of the quantile bisection.
+
+    Raises:
+        ValueError: If there are no components or their shapes differ.
+    """
+
+    def __init__(self, components: Sequence[Predictive], bisection_steps: int = 60) -> None:
+        self.components = list(components)
+        if not self.components:
+            raise ValueError("EqualMixturePredictive: need at least one component.")
+        shapes = {c.mean.shape for c in self.components}
+        if len(shapes) != 1:
+            raise ValueError(f"EqualMixturePredictive: components disagree on [P, M]: {sorted(shapes)}.")
+        self.bisection_steps = int(bisection_steps)
+        means = np.stack([c.mean for c in self.components])                        # [S, P, M]
+        second = np.stack([c.var + c.mean ** 2 for c in self.components])          # [S, P, M]
+        self.mean = means.mean(0)                                                  # [P, M]
+        self.var = np.clip(second.mean(0) - self.mean ** 2, 0.0, None)             # [P, M]
+
+    def cdf(self, y_grid: np.ndarray) -> np.ndarray:
+        """See :meth:`Predictive.cdf`."""
+        return np.mean([c.cdf(y_grid) for c in self.components], axis=0)           # [P, M, G]
+
+    def ppf(self, u: np.ndarray, sites: np.ndarray) -> np.ndarray:
+        """See :meth:`Predictive.ppf` (bisection on the mixture CDF).
+
+        The mixture quantile at level ``u`` lies between the smallest and the largest component quantile at ``u``
+        (each component CDF is ``<= u`` at the first and ``>= u`` at the second), which brackets the bisection. The
+        mixture CDF is evaluated on a full ``[M, P U]`` grid and the probe-matched block kept, so the cost grows as
+        ``P^2``; quantiles are only ever taken of a base predictive (``P = 1``).
+        """
+        u = np.asarray(u, dtype=np.float64).reshape(-1)                            # [U]
+        sites = np.asarray(sites, dtype=int).reshape(-1)                           # [S_]
+        comp = np.stack([c.ppf(u, sites) for c in self.components])                # [S, P, S_, U]
+        lo, hi = comp.min(0), comp.max(0)                                          # [P, S_, U]
+        P, M, U = self.mean.shape[0], self.mean.shape[1], u.size
+        target = np.broadcast_to(u, lo.shape)
+        p_idx = np.arange(P)
+        for _ in range(self.bisection_steps):
+            mid = 0.5 * (lo + hi)                                                  # [P, S_, U]
+            grid = np.zeros((M, P * U))
+            grid[sites] = mid.transpose(1, 0, 2).reshape(sites.size, P * U)        # [M, P U]
+            F = self.cdf(grid)[:, sites].reshape(P, sites.size, P, U)              # [P, S_, P, U]
+            below = F[p_idx, :, p_idx] < target                                    # [P, S_, U]
+            lo = np.where(below, mid, lo)
+            hi = np.where(below, hi, mid)
+        return 0.5 * (lo + hi)
+
+    def support(self, u_tail: float) -> np.ndarray:
+        """See :meth:`Predictive.support`: the union of the components' ranges."""
+        sup = np.stack([c.support(u_tail) for c in self.components])               # [S, P, M, 2]
+        return np.stack([sup[..., 0].min(0), sup[..., 1].max(0)], axis=-1)
+
+    def take(self, idx: Sequence[int] | np.ndarray) -> "EqualMixturePredictive":
+        """See :meth:`Predictive.take`."""
+        return EqualMixturePredictive([c.take(idx) for c in self.components], bisection_steps=self.bisection_steps)
+
+
+#: Context row orders a refit can be given (shuffling-history, 2026-10-24). ``none``: the context as stored (sites
+#: sorted by index) with the probed row appended last -- every OMEGA / β1b cell; ``history``: the context rows
+#: permuted afresh at every refit, the probed row still last; ``all``: every row, the probed one included, permuted
+#: afresh at every refit.
+SHUFFLE_MODES: tuple[str, ...] = ("none", "history", "all")
+
+
+def context_order(n_context: int, n_rows: int, mode: str, rng: np.random.Generator | None) -> np.ndarray:
+    """Row order of one refit on ``n_rows`` rows whose first ``n_context`` are the context D.
+
+    Args:
+        n_context: Rows of D (the rest are the probed observations, appended after D).
+        n_rows: Rows of the refit.
+        mode: One of :data:`SHUFFLE_MODES`.
+        rng: Generator of the permutation (unused for ``none``).
+
+    Returns:
+        Row indices, shape [n_rows].
+
+    Raises:
+        ValueError: On an unknown mode, ``n_context > n_rows``, or a shuffling mode without a generator.
+    """
+    if mode not in SHUFFLE_MODES:
+        raise ValueError(f"context_order: mode must be one of {SHUFFLE_MODES}, got {mode!r}.")
+    if not 0 <= n_context <= n_rows:
+        raise ValueError(f"context_order: need 0 <= n_context <= n_rows, got {n_context}, {n_rows}.")
+    if mode == "none":
+        return np.arange(n_rows)
+    if rng is None:
+        raise ValueError(f"context_order: mode {mode!r} needs a generator.")
+    if mode == "history":
+        return np.concatenate([rng.permutation(n_context), np.arange(n_context, n_rows)])
+    return rng.permutation(n_rows)
+
+
 # ---------------------------------------------------------------------------
 # Engines: one fitted context, many one-observation probes
 # ---------------------------------------------------------------------------
@@ -701,20 +805,45 @@ class PFNRefitEngine:
     the BO loop does. This is TabPFN's engine in OMEGA (user, 2026-10-15); how far the frozen-preprocessing
     :class:`PFNEngine` is from it is a reported discrepancy, not a gate.
 
+    TabPFN is not invariant to the order of its context rows (measured 2026-10-24, NHP subject 0, t 50, CPU:
+    permuting D moves the predictive SD by up to 0.016; at a revisited site, putting the new trial before its
+    earlier one instead of after moves the mean by up to 0.09, a third of the update itself). ``shuffle`` and
+    ``n_permutations`` reorder the rows of every refit (:func:`context_order`); the defaults reproduce the OMEGA
+    engine exactly.
+
     Args:
         device: Torch device.
         random_state: Preprocessing seed (the inference seed).
         softmax_temperature: Deployed 0.9.
         name: Engine name.
+        shuffle: One of :data:`SHUFFLE_MODES`.
+        n_permutations: Row orders per refit; above 1 the predictive is their equal-weight mixture
+            (:class:`EqualMixturePredictive`), which needs a shuffling mode.
+        rng: Generator of the row orders (required unless ``shuffle == 'none'``).
+
+    Raises:
+        ValueError: On an unknown mode, ``n_permutations < 1``, several orders with ``shuffle == 'none'``, or a
+            shuffling mode without a generator.
     """
 
     def __init__(self, device: str = "cpu", random_state: int = 0, softmax_temperature: float = 0.9,
-                 name: str = "tabpfn_v2_5") -> None:
+                 name: str = "tabpfn_v2_5", shuffle: str = "none", n_permutations: int = 1,
+                 rng: np.random.Generator | None = None) -> None:
         from tabpfn import TabPFNRegressor  # noqa: PLC0415 - heavy import
 
+        if shuffle not in SHUFFLE_MODES:
+            raise ValueError(f"PFNRefitEngine: shuffle must be one of {SHUFFLE_MODES}, got {shuffle!r}.")
+        if int(n_permutations) < 1 or (shuffle == "none" and int(n_permutations) > 1):
+            raise ValueError(f"PFNRefitEngine: n_permutations={n_permutations} needs to be >= 1, and 1 when "
+                             f"shuffle is 'none' (every order would be the same).")
+        if shuffle != "none" and rng is None:
+            raise ValueError(f"PFNRefitEngine: shuffle={shuffle!r} needs a generator.")
         self.reg = TabPFNRegressor(n_estimators=1, softmax_temperature=float(softmax_temperature),
                                    random_state=int(random_state), ignore_pretraining_limits=True, device=device)
         self.name = name
+        self.shuffle = shuffle
+        self.n_permutations = int(n_permutations)
+        self.rng = rng
 
     def _fit_predict(self, X: np.ndarray, y: np.ndarray, Q: np.ndarray) -> tuple[Any, Any]:
         """``(criterion, logits [M, bars])`` of one public-API fit."""
@@ -722,20 +851,31 @@ class PFNRefitEngine:
         full = self.reg.predict(np.asarray(Q, dtype=np.float64), output_type="full")
         return full["criterion"], full["logits"]
 
+    def _ordered_fits(self, X: np.ndarray, y: np.ndarray, Q: np.ndarray) -> list[tuple[Any, Any]]:
+        """One fit per row order of ``(X, y)``, whose first ``len(self._y)`` rows are D."""
+        orders = [context_order(len(self._y), len(y), self.shuffle, self.rng) for _ in range(self.n_permutations)]
+        return [self._fit_predict(X[o], y[o], Q) for o in orders]
+
+    def _predictive(self, fits: Sequence[Sequence[tuple[Any, Any]]]) -> Predictive:
+        """Predictive of ``P`` conditioning states from their ``S`` fits each, shape ``[P][S]``."""
+        if self.n_permutations == 1:
+            return CriterionPredictive([f[0] for f in fits])
+        return EqualMixturePredictive([CriterionPredictive([f[s] for f in fits]) for s in range(self.n_permutations)])
+
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         """Keep the context; every prediction is a fresh fit."""
         self._X = np.asarray(X, dtype=np.float64)
         self._y = np.asarray(y, dtype=np.float64)
 
-    def base(self, Q: np.ndarray) -> CriterionPredictive:
+    def base(self, Q: np.ndarray) -> Predictive:
         """Public-API predictive given D."""
-        return CriterionPredictive([self._fit_predict(self._X, self._y, Q)])
+        return self._predictive([self._ordered_fits(self._X, self._y, Q)])
 
-    def probe(self, xs: np.ndarray, ys: np.ndarray, Q: np.ndarray) -> CriterionPredictive:
-        """One public-API refit per probe."""
+    def probe(self, xs: np.ndarray, ys: np.ndarray, Q: np.ndarray) -> Predictive:
+        """One public-API refit per probe (per row order)."""
         xs = np.atleast_2d(np.asarray(xs, dtype=np.float64))
-        return CriterionPredictive([self._fit_predict(np.vstack([self._X, x]), np.append(self._y, yv), Q)
-                                    for x, yv in zip(xs, np.atleast_1d(np.asarray(ys, dtype=np.float64)))])
+        return self._predictive([self._ordered_fits(np.vstack([self._X, x]), np.append(self._y, yv), Q)
+                                 for x, yv in zip(xs, np.atleast_1d(np.asarray(ys, dtype=np.float64)))])
 
 
 def _log_grid(spec: Sequence[float]) -> np.ndarray:

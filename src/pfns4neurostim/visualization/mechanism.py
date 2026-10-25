@@ -1255,6 +1255,9 @@ def _lens_figure(lens: pd.DataFrame, run_dir: str) -> list[str]:
 
 def _posterior_cov_figure(pc: pd.DataFrame, run_dir: str) -> list[str]:
     """β1b: NBS, CKA, relative Bures distance and trace ratio of C_PFN vs each reference's covariance, vs t."""
+    if "shuffle" in pc:
+        # shuffling-history run: the comparison with the references is drawn for the reference (first) arm only
+        pc = pc[pc["shuffle"] == _shuffle_arm_names(run_dir, pc)[0]]
     stats = [s for s in POSTERIOR_COV_STATS if s in set(pc["value"])]
     if not stats:
         return []
@@ -1276,6 +1279,61 @@ def _posterior_cov_figure(pc: pd.DataFrame, run_dir: str) -> list[str]:
     axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
     style.panel_letters(list(axes[0]))
     return style.save_figure(fig, run_dir, "posterior_cov")
+
+
+def _shuffle_arm_names(run_dir: str, df: pd.DataFrame) -> list[str]:
+    """Shuffling-history arm names in config order (the first is the reference), else in order of appearance."""
+    import yaml  # noqa: PLC0415
+
+    path = os.path.join(run_dir, "config.yaml")
+    arms: list[dict[str, Any]] = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            rep = (yaml.safe_load(fh) or {}).get("representation") or {}
+        arms = (rep.get("posterior_cov") or {}).get("shuffle_arms") or []
+    present = list(dict.fromkeys(df["shuffle"]))
+    return [a["name"] for a in arms if a["name"] in present] or present
+
+
+#: Panels of the shuffling-history figure: (readout, pool); Bayes value 0 for every one of them.
+SHUFFLE_PANELS: tuple[tuple[str, str], ...] = (
+    ("cov_asymmetry_c", "all"), ("cov_asymmetry_c", "observed"), ("cov_asymmetry_c", "unobserved"),
+    ("psd_neg_mass_c", "all"))
+
+
+def _posterior_cov_shuffle_figure(coh: pd.DataFrame, run_dir: str) -> list[str]:
+    """Shuffling-history: asymmetry of TabPFN's implied covariance per row-order arm, vs t (2026-10-24).
+
+    One line per arm (median over channels, 95 % within-subject channel bootstrap band), per anchor pool: every site,
+    the context sites (revisits) and the new sites; plus the negative-eigenvalue mass. Paired arm-minus-reference
+    differences are in ``posterior_cov_shuffle_contrast.csv``.
+    """
+    if "shuffle" not in coh:
+        return []
+    names = _shuffle_arm_names(run_dir, coh)
+    panels = [(v, pool) for v, pool in SHUFFLE_PANELS if ((coh["value"] == v) & (coh["pool"] == pool)).any()]
+    if not panels:
+        return []
+    ts = sorted(coh["context_t"].unique())
+    fig, axes = style.figure("wide", ncols=len(panels), squeeze=False, panel_aspect=_REPRESENTATION_PANEL_ASPECT,
+                             layout=style.LAYOUT_ENGINE)
+    for c, (value, pool) in enumerate(panels):
+        ax = axes[0][c]
+        for name in names:
+            st = style.series_style("tabpfn_v2_5", name, names)
+            sub = coh[(coh["shuffle"] == name) & (coh["value"] == value) & (coh["pool"] == pool)]
+            sub = sub.sort_values("context_t")
+            ax.plot(sub["context_t"], sub["median"], color=st.color, ls=st.linestyle, marker=st.marker,
+                    label=st.label if c == 0 else None)
+            ax.fill_between(sub["context_t"], sub["ci_low"], sub["ci_high"], color=st.color, alpha=style.BAND_ALPHA,
+                            lw=0)
+        _bayes_value(ax, 0.0)
+        _context_axis(ax, ts)
+        ax.set_ylabel(style.axis_label(value.removesuffix("_c")))
+        ax.set_title(f"{pool} anchors", fontsize=style.FONT_SIZES["legend"])
+    axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    style.panel_letters(list(axes[0]))
+    return style.save_figure(fig, run_dir, "posterior_cov_shuffle")
 
 
 def render_representation(run_dir: str) -> list[str]:
@@ -1309,11 +1367,12 @@ def render_representation(run_dir: str) -> list[str]:
         if not summary.empty:
             written += _representation_vs_layer(summary, statistic, readout, run_dir)
     for name, fn in (("site_match_summary.csv", _site_match_figure), ("lens_summary.csv", _lens_figure),
-                     ("posterior_cov_summary.csv", _posterior_cov_figure)):
+                     ("posterior_cov_summary.csv", _posterior_cov_figure),
+                     ("posterior_cov_coherence_summary.csv", _posterior_cov_shuffle_figure)):
         p = os.path.join(run_dir, name)
         if _has_rows(p):
             df = _figure_level(pd.read_csv(p), run_dir)
-            if fn is not _posterior_cov_figure:
+            if fn not in (_posterior_cov_figure, _posterior_cov_shuffle_figure):
                 df = _drop_excluded_ts(df, run_dir)
             if not df.empty:
                 written += fn(df, run_dir)

@@ -2042,6 +2042,8 @@ REPRESENTATION_GP_ENGINES: tuple[str, ...] = ("gp_mll_refit", "gp_fixed", "gp_ba
 REPRESENTATION_DEFAULTS: dict[str, Any] = {
     "stress": {"knob": "k2_channel", "levels": [1.0, 2.0, 4.0]},
     "n_context_draws": 2,
+    # false = β1b cells only (shuffling-history, 2026-10-24); never part of a cell identity
+    "beta2_enabled": True,
     "layers": None,                                    # null = all 18 blocks
     "readouts": list(REPRESENTATION_READOUTS),
     # Targets <kind>_<code>: kind in mean | sd | quant | cov; code in own (TabPFN's final predictive) | mll (GP-MLL
@@ -2080,6 +2082,14 @@ REPRESENTATION_DEFAULTS: dict[str, Any] = {
         "coverage": {"levels": [1.0], "context_ts": None, "draws": [0], "channels_per_subject": 2},
         "quadrature": {"method": "rqmc", "K": 8, "u_min": 1.0e-12, "central_mass": 1.0, "n_scrambles": 8},
         "eps": 0.01, "y_grid": {"points": 512, "u_tail": 1.0e-4}, "moment_matched": True,
+        # shuffling-history (2026-10-24): null = the context as stored, the probed row last (every β1b cell so far,
+        # identity unchanged). A list of arms {name, mode, n_permutations} (mode in analysis.bayes_update.SHUFFLE_MODES)
+        # runs every covered cell once per arm with the arm in its identity; arms share the quadrature levels, so
+        # they are paired per cell.
+        "shuffle_arms": None,
+        # null = every site is an anchor (C_PFN is M x M). An integer draws that many anchors per (grid, t, draw) --
+        # shared by every channel and arm -- and every statistic is taken on the anchor x anchor block.
+        "n_anchors": None,
     },
     # level: null = the nominal (lowest) stress level; exclude_ts: context sizes left out of site_match and
     # lens_distance (figure-only, user 2026-10-22)
@@ -2165,7 +2175,89 @@ def _validate_representation(p: dict[str, Any], ladder: Sequence[int]) -> dict[s
         if pc["coverage"]["context_ts"] is None:
             pc["coverage"]["context_ts"] = [int(t) for t in ladder]
         _subset_of_ladder(pc["coverage"]["context_ts"], ladder, "representation.posterior_cov.coverage.context_ts")
+        if pc["shuffle_arms"] is not None:
+            pc["shuffle_arms"] = _validate_shuffle_arms(pc["shuffle_arms"], pc["engine"])
+        if pc["n_anchors"] is not None and int(pc["n_anchors"]) < MIN_POSTERIOR_COV_ANCHORS:
+            raise ValueError(f"representation.posterior_cov.n_anchors must be null or >= {MIN_POSTERIOR_COV_ANCHORS}, "
+                             f"got {pc['n_anchors']}.")
+    elif not p["beta2_enabled"]:
+        raise ValueError("representation: beta2_enabled false with posterior_cov disabled computes nothing.")
     return p
+
+
+#: Fewest β1b anchors: the deconfounded CKA and the Bures distance need a matrix of a few sites at least.
+MIN_POSTERIOR_COV_ANCHORS: int = 4
+
+
+def posterior_cov_anchors(X_pool: np.ndarray, n_anchors: int | None, t: int, draw: int, seed: int) -> np.ndarray:
+    """β1b anchor sites: every site, or ``n_anchors`` drawn per (grid, t, draw), shared by channels and arms.
+
+    Args:
+        X_pool: Grid coordinates, shape [M, D].
+        n_anchors: Anchors to draw; None = every site.
+        t: Context size.
+        draw: Context draw.
+        seed: Base seed.
+
+    Returns:
+        Sorted site indices, shape [A].
+
+    Raises:
+        ValueError: If more anchors are asked than the grid has sites.
+    """
+    M = int(np.asarray(X_pool).shape[0])
+    if n_anchors is None:
+        return np.arange(M)
+    if int(n_anchors) > M:
+        raise ValueError(f"posterior_cov_anchors: n_anchors={n_anchors} exceeds the grid's {M} sites.")
+    rng = rng_for(grid_id(X_pool), "representation_posterior_cov_anchors", int(t), int(draw), base_seed=seed)
+    return np.sort(rng.choice(M, size=int(n_anchors), replace=False))
+
+
+#: Keys of one ``representation.posterior_cov.shuffle_arms`` entry.
+SHUFFLE_ARM_KEYS: tuple[str, ...] = ("name", "mode", "n_permutations")
+
+
+def _validate_shuffle_arms(arms: Any, engine: str) -> list[dict[str, Any]]:
+    """Resolve the shuffling-history arms of β1b.
+
+    Args:
+        arms: List of ``{name, mode, n_permutations}`` (``n_permutations`` defaults to 1).
+        engine: ``posterior_cov.engine``; row order only matters to a TabPFN engine.
+
+    Returns:
+        The arms, with ``n_permutations`` filled in.
+
+    Raises:
+        ValueError: On an empty list, unknown keys, a duplicate name or setting, an unknown mode, an invalid
+            ``n_permutations``, or a GP engine.
+    """
+    from ..analysis.bayes_update import SHUFFLE_MODES  # noqa: PLC0415
+
+    if engine not in TABPFN_ENGINES:
+        raise ValueError(f"representation.posterior_cov.shuffle_arms: {engine!r} is a GP engine; its posterior does "
+                         f"not depend on row order. Use a TabPFN engine ({sorted(TABPFN_ENGINES)}).")
+    if not isinstance(arms, list) or not arms:
+        raise ValueError("representation.posterior_cov.shuffle_arms must be null or a non-empty list of arms.")
+    out = []
+    for arm in arms:
+        unknown = set(arm) - set(SHUFFLE_ARM_KEYS)
+        if unknown or "name" not in arm or "mode" not in arm:
+            raise ValueError(f"representation.posterior_cov.shuffle_arms: {arm} needs name and mode (keys "
+                             f"{list(SHUFFLE_ARM_KEYS)}).")
+        a = {"name": str(arm["name"]), "mode": str(arm["mode"]), "n_permutations": int(arm.get("n_permutations", 1))}
+        if a["mode"] not in SHUFFLE_MODES:
+            raise ValueError(f"representation.posterior_cov.shuffle_arms: mode {a['mode']!r} not in {SHUFFLE_MODES}.")
+        if a["n_permutations"] < 1 or (a["mode"] == "none" and a["n_permutations"] > 1):
+            raise ValueError(f"representation.posterior_cov.shuffle_arms: {a['name']!r} needs n_permutations >= 1, "
+                             f"and 1 with mode 'none'.")
+        out.append(a)
+    names = [a["name"] for a in out]
+    settings = [(a["mode"], a["n_permutations"]) for a in out]
+    if len(set(names)) != len(names) or len(set(settings)) != len(settings):
+        raise ValueError(f"representation.posterior_cov.shuffle_arms: names and (mode, n_permutations) must be "
+                         f"unique, got {out}.")
+    return out
 
 
 def _representation_gp(name: str, p: dict[str, Any]) -> Any:
@@ -2359,13 +2451,16 @@ def _posterior_cov_cell(
     draw: int,
     p: dict[str, Any],
     cfg: MechanismConfig,
+    arm: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """β1b at one (channel, level, t, draw): C_PFN with every site as an anchor against each reference's covariance.
 
     Statistics per reference: debiased CKA and NBS / shape distance of the double-centred matrices (shape), the
     deconfounded CKA (geometry, plus GP-fixed's covariance for any other reference, D3d), the Bures distance of the
     uncentred matrices (= W2 between the zero-mean Gaussian posteriors on the grid) and its ratio to
-    ``sqrt(tr Sigma_ref)``, and the trace ratio ``tr C_PFN / tr Sigma_ref`` (overall latent uncertainty).
+    ``sqrt(tr Sigma_ref)``, and the trace ratio ``tr C_PFN / tr Sigma_ref`` (overall latent uncertainty). Also OMEGA's
+    Part A cell summary per anchor pool (observed = the context sites, unobserved, and every site as one pool),
+    whose ``cov_asymmetry`` is the asymmetry of that pool's block of the implied covariance.
 
     Args:
         st: The channel at this stress level.
@@ -2374,9 +2469,12 @@ def _posterior_cov_cell(
         draw: Context draw.
         p: Resolved ``representation`` block.
         cfg: Resolved config.
+        arm: A shuffling-history arm ``{name, mode, n_permutations}`` (TabPFN engines only); None = the stored order.
+            Row orders come from their own stream, so every arm sees the same quadrature levels.
 
     Returns:
-        ``rows`` (one per reference), C_PFN's ``asymmetry`` and ``clipped_mass``, the host and the wall time.
+        ``rows`` (one per reference), C_PFN's ``asymmetry`` and ``clipped_mass``, ``coherence_cell`` (one row per
+        pool), the host and the wall time.
     """
     import socket  # noqa: PLC0415
 
@@ -2392,28 +2490,35 @@ def _posterior_cov_cell(
     name = pc["engine"]
     if name in TABPFN_ENGINES:
         tp = {**p["tabpfn"], **TABPFN_ENGINES[name]}
+        order: dict[str, Any] = {}
+        if arm is not None:
+            order = {"shuffle": arm["mode"], "n_permutations": int(arm["n_permutations"]), "rng": None if
+                     arm["mode"] == "none" else rng_for(st.label, "representation_posterior_cov_shuffle", arm["mode"],
+                                                        arm["n_permutations"], level, t, draw, base_seed=cfg.seed)}
         eng: Any = B.PFNRefitEngine(device=cfg.device, random_state=int(tp["inference_seed"]) + int(draw),
-                                    softmax_temperature=float(tp["softmax_temperature"]), name=name)
+                                    softmax_temperature=float(tp["softmax_temperature"]), name=name, **order)
     else:
         eng = _representation_gp(name, p)
     eng.fit(ctx.X, ctx.y)
     qd = pc["quadrature"]
-    _, C_raw, C_c = B.coherence(
-        eng, Q, np.arange(M), int(qd["K"]), float(pc["eps"]), method=str(qd["method"]), u_min=float(qd["u_min"]),
+    anchors = posterior_cov_anchors(Q, pc["n_anchors"], int(t), int(draw), cfg.seed)  # [A]
+    block = np.ix_(anchors, anchors)
+    coh_rows, C_raw, C_c = B.coherence(
+        eng, Q, anchors, int(qd["K"]), float(pc["eps"]), method=str(qd["method"]), u_min=float(qd["u_min"]),
         central_mass=float(qd["central_mass"]), n_scrambles=int(qd["n_scrambles"]),
         rng=rng_for(st.label, "representation_posterior_cov", level, t, draw, base_seed=cfg.seed),
-        u_tail=float(pc["y_grid"]["u_tail"]), grid_points=int(pc["y_grid"]["points"]))
-    imp = B.implied_posterior_covariance(C_c if pc["moment_matched"] else C_raw)
-    C_pfn = imp["cov"]                                                              # [M, M]
-    geometry = C.geometry_confounds(Q, p["deconfound"]["bandwidth_multipliers"])
+        u_tail=float(pc["y_grid"]["u_tail"]), grid_points=int(pc["y_grid"]["points"]))   # C [A, M]
+    imp = B.implied_posterior_covariance((C_c if pc["moment_matched"] else C_raw)[:, anchors])
+    C_pfn = imp["cov"]                                                              # [A, A]
+    geometry = C.geometry_confounds(Q[anchors], p["deconfound"]["bandwidth_multipliers"])
     layout_eng = _representation_gp(p["layout_confound"], p)
     layout_eng.fit(ctx.X, ctx.y)
-    layout = B.latent_covariance_of(layout_eng, Q)
+    layout = B.latent_covariance_of(layout_eng, Q)[block]
     rows = []
     for ref in pc["references"]:
         g = _representation_gp(ref, p)
         g.fit(ctx.X, ctx.y)
-        S = B.latent_covariance_of(g, Q)                                            # [M, M]
+        S = B.latent_covariance_of(g, Q)[block]                                     # [A, A]
         confs = geometry if ref == p["layout_confound"] else [*geometry, layout]
         dc = C.cka_deconfounded(C_pfn, S, C.Deconfounder(confs),
                                 min_residual_frac=float(p["deconfound"]["min_residual_frac"]))
@@ -2423,8 +2528,14 @@ def _posterior_cov_cell(
                      "deconf_degenerate": bool(dc["degenerate"]), "nbs": v,
                      "shape_distance": float(np.arccos(np.clip(v, 0.0, 1.0))), "bures": bd,
                      "bures_rel": bd / float(np.sqrt(np.trace(S))),
-                     "trace_ratio": float(np.trace(C_pfn) / np.trace(S))})
+                     "trace_ratio": float(np.trace(C_pfn) / np.trace(S)), "n_anchors": int(anchors.size)})
+    pools = np.where(np.isin(anchors, ctx.sites), "observed", "unobserved")
+    trial_var = np.nanvar(st.Y_trials[anchors], axis=1, ddof=1)                    # [A]
+    coh_cell = [*B.coherence_cell(coh_rows, C_raw, anchors, pools, trial_var, C_c=C_c),
+                *B.coherence_cell(coh_rows, C_raw, anchors, np.full(anchors.size, B.POOLED_ANCHORS), trial_var,
+                                  C_c=C_c, pool_names=(B.POOLED_ANCHORS,))]
     return {"rows": rows, "asymmetry": imp["asymmetry"], "clipped_mass": imp["clipped_mass"],
+            "coherence_cell": [{"engine": name, **c} for c in coh_cell],
             "host": socket.gethostname(), "device": cfg.device, "seconds": time.time() - t0}
 
 
@@ -2490,7 +2601,8 @@ def run_representation(cfg: MechanismConfig, opts: RunOptions) -> str:
                                     "site_sets", "deconfound", "surrogate", "permutation", "ceiling",
                                     "target_relations", "site_match")}
         tables: dict[str, list[dict[str, Any]]] = {k: [] for k in (
-            "alignment", "surrogate", "ceiling", "relations", "site_match", "lens", "posterior_cov")}
+            "alignment", "surrogate", "ceiling", "relations", "site_match", "lens", "posterior_cov",
+            "posterior_cov_coherence")}
         pc = p["posterior_cov"]
         allowed = _first_per_subject(channels, int(pc["coverage"]["channels_per_subject"])) \
             if pc["coverage"]["channels_per_subject"] is not None else {c.label for c in channels}
@@ -2515,10 +2627,10 @@ def run_representation(cfg: MechanismConfig, opts: RunOptions) -> str:
                                 "softmax_temperature": float(tp["softmax_temperature"]),
                                 "precision": str(tp["precision"])},
                      "gp": gp_ident, **common}
-            hit = cells.run("cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
-                            lambda st=st, level=level, t=t, draw=draw: (_representation_cell(
-                                st, float(level), int(t), draw, p, cfg, tabpfn(draw),
-                                surrogate_grams_for(st.X_pool)), {}))
+            hit = None if not p["beta2_enabled"] else cells.run(
+                "cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
+                lambda st=st, level=level, t=t, draw=draw: (_representation_cell(
+                    st, float(level), int(t), draw, p, cfg, tabpfn(draw), surrogate_grams_for(st.X_pool)), {}))
             if hit is not None and not opts.compute_only:
                 pay = hit[0]
                 prov = {"host": pay["host"], "seconds": pay["seconds"]}
@@ -2531,15 +2643,28 @@ def run_representation(cfg: MechanismConfig, opts: RunOptions) -> str:
                           "engine_params": _engine_params(pc["engine"], p, draw),
                           "references": pc["references"], "gp": gp_ident,
                           "layout_confound": p["layout_confound"], "deconfound": p["deconfound"],
-                          **{k: pc[k] for k in ("quadrature", "eps", "y_grid", "moment_matched")}}
-                hit = cells.run("posterior_cov", pident, f"posterior_cov {ch.label} a={level:g} t={t} d={draw}",
-                                lambda st=st, level=level, t=t, draw=draw: (_posterior_cov_cell(
-                                    st, float(level), int(t), draw, p, cfg), {}))
-                if hit is not None and not opts.compute_only:
-                    pay = hit[0]
-                    tables["posterior_cov"] += [
-                        {**keys, **r, "asymmetry": pay["asymmetry"], "clipped_mass": pay["clipped_mass"],
-                         "host": pay["host"], "seconds": pay["seconds"]} for r in pay["rows"]]
+                          **{k: pc[k] for k in ("quadrature", "eps", "y_grid", "moment_matched")},
+                          # a subset of anchors joins the identity; every site (null) keeps the earlier identity
+                          **({} if pc["n_anchors"] is None else {"n_anchors": int(pc["n_anchors"])})}
+                # shuffling-history arms: the row order joins the identity (mode and count, not the label); no arms
+                # keeps every earlier β1b cell's identity
+                for arm in pc["shuffle_arms"] or [None]:
+                    aident = pident if arm is None else {
+                        **pident, "shuffle": {"mode": arm["mode"], "n_permutations": arm["n_permutations"]}}
+                    arm_label = "" if arm is None else f" {arm['name']}"
+                    hit = cells.run("posterior_cov", aident,
+                                    f"posterior_cov{arm_label} {ch.label} a={level:g} t={t} d={draw}",
+                                    lambda st=st, level=level, t=t, draw=draw, arm=arm: (_posterior_cov_cell(
+                                        st, float(level), int(t), draw, p, cfg, arm), {}))
+                    if hit is not None and not opts.compute_only:
+                        pay = hit[0]
+                        akeys = {**keys, **({} if arm is None else {"shuffle": arm["name"]})}
+                        tables["posterior_cov"] += [
+                            {**akeys, **r, "asymmetry": pay["asymmetry"], "clipped_mass": pay["clipped_mass"],
+                             "host": pay["host"], "seconds": pay["seconds"]} for r in pay["rows"]]
+                        # Part A per pool: absent from cells computed before 2026-10-24
+                        tables["posterior_cov_coherence"] += [
+                            {**akeys, **c, "host": pay["host"]} for c in pay.get("coherence_cell", [])]
             last = i + 1 == len(tasks) or tasks[i + 1][0] is not ch or tasks[i + 1][1] != level
             if last and not opts.compute_only:
                 print(f"[mechanism] representation {ch.label} level={level} done ({time.time() - t0:.0f}s)",
@@ -2551,16 +2676,61 @@ def run_representation(cfg: MechanismConfig, opts: RunOptions) -> str:
             return out
         names = {"alignment": "representation.csv", "surrogate": "surrogate.csv", "ceiling": "ceiling.csv",
                  "relations": "target_relations.csv", "site_match": "site_match.csv", "lens": "lens.csv",
-                 "posterior_cov": "posterior_cov.csv"}
+                 "posterior_cov": "posterior_cov.csv", "posterior_cov_coherence": "posterior_cov_coherence.csv"}
         for k, rows in tables.items():
             if rows:
                 _write_csv(rows, out, names[k])
-        if tables["alignment"]:
+        if tables["alignment"] or tables["posterior_cov"]:
             _representation_summaries(out, p, cfg.seed)
         cells.report()
     for path in figs.render_representation(out):
         print(f"[mechanism] wrote {path}")
     return out
+
+
+#: Part A readouts of β1b's per-pool cell summary carried into ``posterior_cov_coherence_summary.csv`` (the moment-
+#: matched ``*_c`` versions are the ones β1b's C_PFN is built from).
+POSTERIOR_COV_COHERENCE_VALUES: tuple[str, ...] = (
+    "cov_asymmetry_c", "psd_neg_mass_c", "cov_asymmetry", "drift_abs_c", "total_var_ratio_c", "shrink_move_ratio_c",
+    "latent_frac_c")
+
+
+def _shuffle_contrasts(
+    coh: pd.DataFrame,
+    values: Sequence[str],
+    arms: Sequence[dict[str, Any]],
+    kw: dict[str, Any],
+) -> pd.DataFrame:
+    """Paired arm-minus-reference differences of β1b's Part A pool summaries (shuffling-history, 2026-10-24).
+
+    The reference is the first arm. Differences are taken per cell -- same channel, level, t, draw, engine and pool,
+    hence the same context and quadrature levels -- before any aggregate (matched first, user 2026-10-15), then
+    summarised like every BETA readout (median over draws within a channel, channel bootstrap within subject).
+
+    Args:
+        coh: ``posterior_cov_coherence.csv`` rows with a ``shuffle`` column.
+        values: Readouts to contrast.
+        arms: Resolved ``posterior_cov.shuffle_arms``.
+        kw: ``channel_summary`` keyword arguments (``n_boot``, ``ci``, ``seed``).
+
+    Returns:
+        One row per (level, t, engine, pool, arm, readout); ``value`` is the readout name, ``reference`` the arm
+        subtracted. Empty when no cell has both arms.
+    """
+    from ..analysis import representation as R  # noqa: PLC0415
+
+    keys = ["subject", "emg", "level", "context_t", "draw", "engine", "pool"]
+    ref = arms[0]["name"]
+    base = coh[coh["shuffle"] == ref].set_index(keys)[list(values)]
+    frames = []
+    for arm in arms[1:]:
+        cur = coh[coh["shuffle"] == arm["name"]].set_index(keys)[list(values)]
+        diff = (cur - base.reindex(cur.index)).dropna(how="all").reset_index()
+        if diff.empty:
+            continue
+        summ = R.channel_summary(diff, list(values), ["level", "context_t", "engine", "pool"], **kw)
+        frames.append(summ.assign(shuffle=arm["name"], reference=ref))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def _representation_summaries(out: str, p: dict[str, Any], seed: int) -> None:
@@ -2576,14 +2746,16 @@ def _representation_summaries(out: str, p: dict[str, Any], seed: int) -> None:
     inf = p["inference"]
     kw = {"n_boot": int(inf["n_boot"]), "ci": float(inf["ci"]), "seed": int(seed)}
     stat = p["headline"]["statistic"]
-    rep = R.add_headline(pd.read_csv(os.path.join(out, "representation.csv")), stat)
-    rep["headline_margin"] = rep["headline_value"] - rep["headline_floor"]
-    rep.to_csv(os.path.join(out, "representation.csv"), index=False)
-    # surrogate_q_cka: the raw (not deconfounded) CKA's chance level, for the figure without geometry regression
-    R.channel_summary(rep, ["headline_value", "headline_floor", "headline_margin", "cka", "cka_deconf", "nbs",
-                            "surrogate_q_cka"],
-                      ["level", "context_t", "site_set", "readout", "layer", "target"], **kw).to_csv(
-        os.path.join(out, "representation_summary.csv"), index=False)
+    path = os.path.join(out, "representation.csv")
+    if p["beta2_enabled"] and os.path.exists(path):
+        rep = R.add_headline(pd.read_csv(path), stat)
+        rep["headline_margin"] = rep["headline_value"] - rep["headline_floor"]
+        rep.to_csv(path, index=False)
+        # surrogate_q_cka: the raw (not deconfounded) CKA's chance level, for the figure without geometry regression
+        R.channel_summary(rep, ["headline_value", "headline_floor", "headline_margin", "cka", "cka_deconf", "nbs",
+                                "surrogate_q_cka"],
+                          ["level", "context_t", "site_set", "readout", "layer", "target"], **kw).to_csv(
+            os.path.join(out, "representation_summary.csv"), index=False)
     path = os.path.join(out, "site_match.csv")
     if os.path.exists(path):
         sm = pd.read_csv(path)
@@ -2604,10 +2776,22 @@ def _representation_summaries(out: str, p: dict[str, Any], seed: int) -> None:
             os.path.join(out, "lens_summary.csv"), index=False)
     path = os.path.join(out, "posterior_cov.csv")
     if os.path.exists(path):
-        R.channel_summary(pd.read_csv(path), ["nbs", "cka", "cka_deconf", "shape_distance", "bures_rel",
-                                              "trace_ratio", "asymmetry", "clipped_mass"],
-                          ["level", "context_t", "engine", "reference"], **kw).to_csv(
+        pcov = pd.read_csv(path)
+        arm = ["shuffle"] if "shuffle" in pcov else []
+        R.channel_summary(pcov, ["nbs", "cka", "cka_deconf", "shape_distance", "bures_rel",
+                                 "trace_ratio", "asymmetry", "clipped_mass"],
+                          ["level", "context_t", "engine", "reference", *arm], **kw).to_csv(
             os.path.join(out, "posterior_cov_summary.csv"), index=False)
+    path = os.path.join(out, "posterior_cov_coherence.csv")
+    if os.path.exists(path):
+        coh = pd.read_csv(path)
+        arm = ["shuffle"] if "shuffle" in coh else []
+        values = [c for c in POSTERIOR_COV_COHERENCE_VALUES if c in coh]
+        R.channel_summary(coh, values, ["level", "context_t", "engine", "pool", *arm], **kw).to_csv(
+            os.path.join(out, "posterior_cov_coherence_summary.csv"), index=False)
+        if arm:
+            _shuffle_contrasts(coh, values, p["posterior_cov"]["shuffle_arms"], kw).to_csv(
+                os.path.join(out, "posterior_cov_shuffle_contrast.csv"), index=False)
     with open(os.path.join(out, "headline.json"), "w", encoding="utf-8") as fh:
         json.dump({
             "status": "DECIDED 2026-10-23 (user; research_design.md §4): deconfounded_vs_surrogate is the headline",
@@ -2620,12 +2804,239 @@ def _representation_summaries(out: str, p: dict[str, Any], seed: int) -> None:
         }, fh, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# update_trajectory: every engine's mean map along one growing history (NFM animation, user 2026-10-24)
+# ---------------------------------------------------------------------------
+#: The ``update_trajectory`` block. One channel, one history: a random site order (keyed by grid and draw) with one trial
+#: per site (keyed by channel, level and draw); the context at step t is the first t sites, in history order (the new
+#: observation last, as in a BO loop). At every t the base predictive of each engine is stored, and, at each anchor,
+#: the predictive after one more observation y' = mu_ref(x') + c s_ref(x') (``y_prime.reference``'s base predictive;
+#: c = 1 with GP-MLL refit is OMEGA's C1 exemplar). Anchors (null) are the n_anchors sites never observed up to t_max,
+#: spread by farthest-point selection from the most central one.
+UPDATE_TRAJECTORY_DEFAULTS: dict[str, Any] = {
+    "subject": None, "emg": None,                     # null = the first channel, as OMEGA's exemplar
+    "stress": {"knob": "k2_channel", "level": 1.0},
+    "draw": 0,
+    "t_min": 2, "t_max": 80, "t_step": 1,
+    "engines": ["tabpfn_v2_5", "gp_mll_refit", "gp_fixed"],
+    "anchors": None, "n_anchors": 6,
+    "y_prime": {"reference": "gp_mll_refit", "c": [1.0]},
+    "tabpfn": {"inference_seed": 0, "precision": "fp32", "max_batch_tokens": 400000, "softmax_temperature": 0.9},
+    "gp_params": {"n_opt_steps": 50, "lr": 1.0, "optimizer": "lbfgs", "dtype": "float64", "noise_floor": 1.0e-3,
+                  "n_restarts": 5, "lengthscale_floor": 0.05},
+    "fixed_gp_params": {"lengthscale": 0.6931471805599453, "outputscale": 1.0, "noise": 0.05},
+}
+
+#: Engines the trajectory can probe (GP-Bayes is left out: its mixture is too slow for one refit per step and anchor).
+UPDATE_TRAJECTORY_ENGINES: tuple[str, ...] = (*TABPFN_ENGINES, "gp_mll_refit", "gp_mll_frozen", "gp_fixed")
+
+
+def _validate_update_trajectory(p: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the ``update_trajectory`` block over its defaults.
+
+    Raises:
+        ValueError: On unknown keys or engines, an empty or invalid t range, or a bad anchor setting.
+    """
+    d = UPDATE_TRAJECTORY_DEFAULTS
+    p = _check_keys(p, d, "update_trajectory")
+    for sub in ("stress", "y_prime", "tabpfn", "fixed_gp_params"):
+        p[sub] = _check_keys(p[sub] or {}, d[sub], f"update_trajectory.{sub}")
+    bad = [e for e in [*p["engines"], p["y_prime"]["reference"]] if e not in UPDATE_TRAJECTORY_ENGINES]
+    if bad or not p["engines"]:
+        raise ValueError(f"update_trajectory.engines / y_prime.reference: unknown {bad}; known "
+                         f"{list(UPDATE_TRAJECTORY_ENGINES)}.")
+    if p["y_prime"]["reference"] in TABPFN_ENGINES:
+        raise ValueError("update_trajectory.y_prime.reference must be a GP engine (model-neutral y', as OMEGA's ladder).")
+    if not 2 <= int(p["t_min"]) <= int(p["t_max"]) or int(p["t_step"]) < 1:
+        raise ValueError(f"update_trajectory: need 2 <= t_min <= t_max and t_step >= 1, got {p['t_min']}, "
+                         f"{p['t_max']}, {p['t_step']}.")
+    if not p["y_prime"]["c"]:
+        raise ValueError("update_trajectory.y_prime.c: need at least one multiplier.")
+    if p["anchors"] is None and int(p["n_anchors"]) < 1:
+        raise ValueError(f"update_trajectory.n_anchors must be >= 1, got {p['n_anchors']}.")
+    return p
+
+
+def spread_anchors(X: np.ndarray, candidates: np.ndarray, n: int) -> np.ndarray:
+    """``n`` candidate sites spread over the grid: the most central first, then farthest-point selection.
+
+    Args:
+        X: Site coordinates, shape [M, D].
+        candidates: Candidate site indices, shape [K].
+        n: Anchors wanted.
+
+    Returns:
+        Site indices in selection order, shape [min(n, K)].
+
+    Raises:
+        ValueError: If there is no candidate.
+    """
+    cand = np.asarray(candidates, dtype=int)
+    if cand.size == 0:
+        raise ValueError("spread_anchors: no candidate site.")
+    centre = (X.min(0) + X.max(0)) / 2.0
+    chosen = [int(cand[np.argmin(np.linalg.norm(X[cand] - centre, axis=1))])]
+    while len(chosen) < min(int(n), cand.size):
+        d = np.min(np.linalg.norm(X[cand][:, None] - X[chosen][None], axis=-1), axis=1)   # [K]
+        chosen.append(int(cand[np.argmax(d)]))
+    return np.array(chosen)
+
+
+def run_update_trajectory(cfg: MechanismConfig, opts: RunOptions) -> str:
+    """Mean maps of every engine at every step of one growing history, with one-observation updates at fixed anchors.
+
+    One cell per t (kind ``trajectory_t``), so a run resumes and ``--only-cached`` reassembles. Writes
+    ``trajectory.npz`` (arrays, documented in ``trajectory_README.md``) and ``mean_maps.csv`` (one row per t, engine,
+    map and site). There is no figure: the data feed the NFM animation (``scripts/``), which replaces the presentation's
+    four-panel C1 exemplar.
+
+    Args:
+        cfg: Resolved config.
+        opts: Cache policy (``--replot`` has nothing to rebuild).
+
+    Returns:
+        The run directory.
+    """
+    from ..analysis.context import draw_context  # noqa: PLC0415
+    from ..data.stress import build_knob  # noqa: PLC0415
+
+    p = _validate_update_trajectory(cfg.params)
+    out = cfg.run_dir
+    if opts.replot:
+        print("[mechanism] update_trajectory has no figure to rebuild.", flush=True)
+        return out
+    set_seed(cfg.seed)
+    _write_config(cfg, p, out)
+    cells = _Cells(cfg, opts)
+    pick = [c for c in _channels(cfg) if (p["subject"] is None or c.subject == p["subject"])
+            and (p["emg"] is None or c.emg == p["emg"])]
+    if not pick:
+        raise ValueError(f"update_trajectory: no channel matches subject={p['subject']} emg={p['emg']}.")
+    ch = pick[0]
+    level, draw = float(p["stress"]["level"]), int(p["draw"])
+    knob = build_knob(p["stress"]["knob"], [level])
+    st = knob.apply(ch, level, rng_for(ch.label, "bayes_update", level, base_seed=cfg.seed))
+    Q, M = st.X_pool, st.n_sites
+    t_max = int(p["t_max"])
+    if t_max >= M:
+        raise ValueError(f"update_trajectory: t_max={t_max} must leave unobserved sites (grid has {M}).")
+    order = rng_for(grid_id(Q), "update_trajectory_sites", draw, base_seed=cfg.seed).permutation(M)[:t_max]  # [t_max]
+    full = draw_context(st, t_max, rng_for(st.label, "update_trajectory_trials", level, draw, base_seed=cfg.seed),
+                        sites=order)                                                # sites sorted, y aligned
+    y_of = dict(zip(full.sites.tolist(), full.y.tolist()))
+    hist_y = np.array([y_of[int(s)] for s in order])                                # [t_max], history order
+    if p["anchors"] is None:
+        anchors = spread_anchors(Q, np.setdiff1d(np.arange(M), order), int(p["n_anchors"]))
+    else:
+        anchors = np.asarray(p["anchors"], dtype=int)
+        if anchors.min() < 0 or anchors.max() >= M:
+            raise ValueError(f"update_trajectory.anchors must index the {M} sites, got {anchors.tolist()}.")
+    cs = [float(c) for c in p["y_prime"]["c"]]
+    ref = str(p["y_prime"]["reference"])
+    ts = list(range(int(p["t_min"]), t_max + 1, int(p["t_step"])))
+    engines = list(p["engines"])
+    params = {n: _engine_params(n, p, draw) for n in dict.fromkeys([*engines, ref])}
+
+    def compute(t: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        X, y = Q[order[:t]], hist_y[:t]
+        r = _make_engine(ref, p, cfg.device, draw)
+        r.fit(X, y)
+        rb = r.base(Q)
+        y_prime = np.array([[rb.mean[0, a] + c * rb.sd[0, a] for c in cs] for a in anchors])   # [A, C]
+        xs = np.repeat(Q[anchors], len(cs), axis=0)                                  # [A C, D]
+        res: dict[str, Any] = {"y_prime": y_prime.tolist()}
+        for n in engines:
+            eng = _make_engine(n, p, cfg.device, draw)
+            eng.fit(X, y)
+            base = eng.base(Q)
+            pr = eng.probe(xs, y_prime.reshape(-1), Q)                               # [A C, M]
+            res[n] = {"mean": base.mean[0].tolist(), "sd": base.sd[0].tolist(),
+                      "probe_mean": pr.mean.reshape(len(anchors), len(cs), M).tolist(),
+                      "probe_sd": pr.sd.reshape(len(anchors), len(cs), M).tolist()}
+        return res, {}
+
+    rows: dict[int, dict[str, Any]] = {}
+    t0 = time.time()
+    for t in ts:
+        ident = {**cells.channel(ch), "knob": knob.name, "level": level, "draw": draw, "t": int(t),
+                 "history": "update_trajectory_v1", "anchors": anchors.tolist(), "y_prime_reference": ref,
+                 "c": cs, "engine_params": params, "gp_params": p["gp_params"]}
+        hit = cells.run("trajectory_t", ident, f"trajectory {ch.label} t={t}", lambda t=t: compute(t))
+        if hit is not None:
+            rows[t] = hit[0]
+        if t % 10 == 0:
+            print(f"[mechanism] update_trajectory {ch.label} t={t} ({time.time() - t0:.0f}s)", flush=True)
+    cells.report()
+    done = [t for t in ts if t in rows]
+    if not done:
+        return out
+    E, A, C = len(engines), len(anchors), len(cs)
+    mean = np.array([[rows[t][n]["mean"] for n in engines] for t in done])                  # [T, E, M]
+    sd = np.array([[rows[t][n]["sd"] for n in engines] for t in done])                      # [T, E, M]
+    probe_mean = np.array([[rows[t][n]["probe_mean"] for n in engines] for t in done])      # [T, E, A, C, M]
+    probe_sd = np.array([[rows[t][n]["probe_sd"] for n in engines] for t in done])          # [T, E, A, C, M]
+    y_prime = np.array([rows[t]["y_prime"] for t in done])                                  # [T, A, C]
+    for name, arr in (("mean", mean), ("sd", sd), ("probe_mean", probe_mean), ("probe_sd", probe_sd)):
+        if not np.isfinite(arr).all():
+            raise RuntimeError(f"update_trajectory: non-finite {name} maps.")
+    observed = np.array([np.isin(np.arange(M), order[:t]) for t in done])                   # [T, M]
+    np.savez(os.path.join(out, "trajectory.npz"), context_ts=np.array(done), engines=np.array(engines),
+             anchors=anchors, c=np.array(cs), y_prime_reference=ref, channel=ch.label, ch2xy=np.asarray(st.ch2xy),
+             y_gt=np.asarray(st.y_gt), history_sites=order, history_y=hist_y, observed=observed,
+             mean=mean, sd=sd, probe_mean=probe_mean, probe_sd=probe_sd, dmu=probe_mean - mean[:, :, None, None, :],
+             y_prime=y_prime)
+    xy = np.asarray(st.ch2xy)
+    recs = []
+    for i, t in enumerate(done):
+        for e, n in enumerate(engines):
+            maps = [("base", -1, np.nan, np.nan, mean[i, e], sd[i, e])]
+            maps += [("after_update", int(anchors[a]), cs[c], float(y_prime[i, a, c]), probe_mean[i, e, a, c],
+                      probe_sd[i, e, a, c]) for a in range(A) for c in range(C)]
+            for kind, anchor, c, yp, mu, s in maps:
+                dmu = mu - mean[i, e] if kind != "base" else np.zeros(M)
+                recs.append(pd.DataFrame({
+                    "context_t": t, "engine": n, "map": kind, "anchor": anchor, "c": c, "y_prime": yp,
+                    "site": np.arange(M), "x": xy[:, 0], "y": xy[:, 1], "observed": observed[i],
+                    "y_gt": np.asarray(st.y_gt), "mean": mu, "sd": s, "dmu": dmu}))
+    pd.concat(recs, ignore_index=True).to_csv(os.path.join(out, "mean_maps.csv"), index=False)
+    with open(os.path.join(out, "trajectory_README.md"), "w", encoding="utf-8") as fh:
+        fh.write(_TRAJECTORY_README.format(channel=ch.label, T=len(done), E=E, A=A, C=C, M=M, engines=engines,
+                                           anchors=anchors.tolist(), c=cs, ref=ref, t_min=done[0], t_max=done[-1]))
+    print(f"[mechanism] wrote {os.path.join(out, 'trajectory.npz')} and mean_maps.csv", flush=True)
+    return out
+
+
+_TRAJECTORY_README = """# update_trajectory -- channel {channel}
+
+One growing history: `history_sites[:t]` with values `history_y[:t]` (in that order, the newest row last) is the
+context at step t, for t = {t_min} .. {t_max}. Units: the dataset's offline z-scored y. Engines: {engines}.
+
+`trajectory.npz` (T = {T} steps, E = {E} engines, A = {A} anchors, C = {C} multipliers, M = {M} sites):
+
+| key | shape | meaning |
+|---|---|---|
+| context_ts | [T] | t of each step |
+| mean, sd | [T, E, M] | predictive mean / SD map given the first t observations |
+| probe_mean, probe_sd | [T, E, A, C, M] | the same after one more observation y' at an anchor |
+| dmu | [T, E, A, C, M] | probe_mean - mean: the change of the mean map caused by that observation |
+| y_prime | [T, A, C] | y' = mu_ref(x') + c s_ref(x'), from {ref}'s base predictive (shared by every engine) |
+| anchors | [A] | anchor sites {anchors}; c = {c} |
+| observed | [T, M] | sites in the context at step t |
+| history_sites, history_y | [t_max] | the observation order and values |
+| ch2xy | [M, 2] | electrode-array coordinates of each site (`grid[x, y]`, as panel E plots it) |
+| y_gt | [M] | ground-truth response map |
+
+`mean_maps.csv` holds the same per (context_t, engine, map in base | after_update, anchor, c, site).
+"""
+
+
 #: Analysis runners by name.
 ANALYSES: dict[str, Callable[[MechanismConfig, RunOptions], str]] = {
     "bayes_update": run_bayes_update,
     "placement": run_placement,
     "cka": run_cka,
     "representation": run_representation,
+    "update_trajectory": run_update_trajectory,
 }
 
 

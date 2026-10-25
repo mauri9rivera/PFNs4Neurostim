@@ -1,0 +1,38 @@
+# update_trajectory (user 2026-10-24): how each engine's posterior predictive MEAN MAP changes at every step of one
+# growing history on a single NHP EMG channel, and how one more observation at a few anchors changes it. Data for the
+# NFM animation that replaces the four-panel C1 exemplar (output/NFM-presentation/E_update_exemplar.svg).
+#
+# Channel: subject 0, EMG 0 -- the exemplar channel of panel E / I (OMEGA's exemplar picks the first channel).
+# History: one random site order (draw 0) with one trial per site; the context at step t is its first t sites, so
+#   frames are nested (OMEGA's exemplar redraws the context at every t, which would make an animation jump).
+# Per t = 2 .. 80: base mean / SD maps of TabPFN-2.5 (deployed T 0.9, public-API refit), GP-MLL refit and GP-fixed;
+#   then, at 6 anchors (never observed up to t = 80, spread over the array), the maps after y' = mu + 1 sigma of
+#   GP-MLL refit -- panel E's observation, now at every t.
+# Output: output/mechanism/update_trajectory/nhp/nfm-trajectory/{trajectory.npz, mean_maps.csv, trajectory_README.md}.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_update_trajectory_nhp.yaml
+defaults:
+  dataset: nhp
+  context: nhp          # required by the loader; the trajectory uses its own t range below
+
+analysis: update_trajectory
+tag: nfm-trajectory
+device: cpu
+seed: 42
+output_root: output
+
+dataset:
+  subjects: [0]
+
+update_trajectory:
+  subject: 0
+  emg: 0
+  stress: {knob: k2_channel, level: 1.0}
+  draw: 0
+  t_min: 2
+  t_max: 80
+  t_step: 1
+  engines: [tabpfn_v2_5, gp_mll_refit, gp_fixed]
+  anchors: null
+  n_anchors: 6
+  y_prime: {reference: gp_mll_refit, c: [1.0]}

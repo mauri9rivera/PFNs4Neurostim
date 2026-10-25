@@ -1,0 +1,96 @@
+# shuffling-history (Hyp C, C2; user 2026-10-24): does the ORDER of TabPFN-2.5's context rows cause the asymmetry of
+# its implied posterior covariance? NHP. Exploratory follow-up of β1b (M16) and of OMEGA's cov_asymmetry, which is
+# beyond the empirical-Bayes band at every t (Ω12).
+#
+# WHY ORDER CAN MATTER. Every OMEGA / β1b refit sees the context sorted by site index, with the probed row (x', y')
+# appended LAST. TabPFN is not invariant to row order (probe 2026-10-24, subject 0 channel 0, t 50, n_estimators 1;
+# same-order refits are bit-identical): permuting D moves the predictive SD by up to 0.016 (CPU; 0.047 on CUDA) and
+# the mean by 6e-5 (CPU); at a REVISITED site, putting the new trial before its earlier one instead of after moves the
+# mean by up to 0.09 -- a third of the update itself (0.27) -- because duplicate rows are told apart by their order.
+# The implied covariance C(x', x) = Cov(y', mu_new(x)) compares "x' added last, read at x" with "x added last, read
+# at x'", so an order effect can show up as asymmetry.
+#
+# ============================ PRE-REGISTRATION (written 2026-10-24, before any shuffled cell ran) ============================
+# ARMS (posterior_cov.shuffle_arms; every arm refits the SAME context with the SAME quadrature levels, so arms are
+#   paired per cell; row orders come from their own seed stream, keyed by (channel, mode, S, level, t, draw)):
+#     sorted      mode none,    S 1   the stored order, x' last (= β1b as run; recomputed here so every arm shares one
+#                                     host and one code version, G5)
+#     history     mode history, S 1   D re-permuted at every refit, x' still last  -> isolates the sorted-history order
+#     shuffled    mode all,     S 1   D + {x'} re-permuted at every refit          -> x' at a random position
+#     avg4        mode all,     S 4   predictive = equal mixture over 4 such orders -> the order-averaged (exchangeable)
+#                                     predictive, 4x the cost
+# PRIMARY READOUT. cov_asymmetry_c = ||C - C'||_F / ||C||_F of the moment-matched implied covariance, per anchor pool:
+#   all (= β1b's `asymmetry`), observed (context sites: revisits), unobserved. 0 for any Bayesian model.
+# CONTRAST. Per cell (channel, t, pool), arm minus `sorted`; median over the 8 channels with the within-subject channel
+#   bootstrap (n_boot 2000, 95 %) -> posterior_cov_shuffle_contrast.csv. Within t only.
+# DECISION RULE. "Row order contributes to the asymmetry" at a (t, pool) iff an arm's contrast CI lies entirely below 0;
+#   the share it explains is reported as contrast / sorted median. Order is NOT the explanation where every CI includes
+#   0 or lies above it. `shuffled` (S 1) adds order noise to every refit, so a contrast above 0 for it alone, with avg4
+#   at or below sorted, reads as "order noise, not order bias". Secondary readouts (drift_abs_c, total_var_ratio_c,
+#   psd_neg_mass_c) are reported, never used to decide.
+# WORDING (G6, G7). "Order-averaging brings TabPFN's implied covariance closer to symmetric" or "row order does not
+#   explain the asymmetry"; never the bare words "Bayesian" / "non-Bayesian".
+# COST. One arm = one β1b cell (Narval work pool: median 44 min single-threaded, p90 55); avg4 = 4 arms. Coverage
+#   8 channels x 4 t x draw 0 = 32 cells x 7 arm-units ~ 165 single-threaded lane-h on Narval CPU. Local RTX 3060:
+#   ~0.39 s per refit (smoke 2026-10-24), i.e. ~40 min per arm at t 10 with RQMC 8 x 8 -- too slow for the grid.
+# ===================================================================================================================
+#
+# β2 / β1a cells use the pre-registered representation settings at level 1, draw 0, so they are served from the
+# `nhp` run's cache (0 computed); this run only adds the posterior_cov cells. Output:
+# output/mechanism/representation/nhp/shuffling-history/ (posterior_cov_shuffle.svg, posterior_cov_coherence*.csv,
+# posterior_cov_shuffle_contrast.csv, plus β1b's own posterior_cov.svg for the `sorted` arm).
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_shuffle_nhp.yaml
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_shuffle_nhp.yaml --compute-only --shard 0/4
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_shuffle_nhp.yaml --only-cached
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_shuffle_nhp.yaml --replot
+defaults:
+  dataset: nhp
+  context: nhp
+
+analysis: representation
+tag: shuffling-history
+device: cpu
+seed: 42
+output_root: output
+
+dataset:
+  subjects: [0, 1, 2, 3]
+
+representation:
+  stress: {knob: k2_channel, levels: [1.0]}
+  n_context_draws: 1
+  layers: null
+  readouts: [label, feature_mean, lens]
+  targets: [mean_own, sd_own, mean_mll, sd_mll, cov_mll, quant_own, quant_mll, K_X, K_GT]
+  belief_engines: [gp_mll_refit, gp_fixed]
+  layout_confound: gp_fixed
+  n_quantiles: 32
+  site_sets: [all]
+  tabpfn: {inference_seed: 0, softmax_temperature: 0.9, precision: fp32, max_batch_tokens: 400000}
+  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5,
+              lengthscale_floor: 0.05}
+  fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.05}
+  deconfound: {bandwidth_multipliers: [0.25, 0.5, 1.0, 2.0], min_residual_frac: 1.0e-10}
+  surrogate: {lengthscales: [0.10, 0.15, 0.30], n_fields: 192, n_replicates: 20, jitter: 1.0e-8, quantile: 0.95}
+  permutation: {n_perm: 200}
+  ceiling: {enabled: true, trial_draw_offset: 100}
+  target_relations: [[quant_mll, K_GT], [mean_mll, K_GT]]
+  site_match: {references: [gp_mll_refit, gp_fixed]}
+  headline: {statistic: deconfounded_vs_surrogate, readout: label}
+  inference: {n_boot: 2000, ci: 0.95}
+  posterior_cov:
+    enabled: true
+    engine: tabpfn_v2_5
+    references: [gp_mll_refit, gp_fixed]
+    coverage: {levels: [1.0], context_ts: null, draws: [0], channels_per_subject: 2}
+    quadrature: {method: rqmc, K: 8, u_min: 1.0e-12, central_mass: 1.0, n_scrambles: 8}
+    eps: 0.01
+    y_grid: {points: 512, u_tail: 1.0e-4}
+    moment_matched: true
+    shuffle_arms:
+      - {name: sorted, mode: none, n_permutations: 1}
+      - {name: history, mode: history, n_permutations: 1}
+      - {name: shuffled, mode: all, n_permutations: 1}
+      - {name: avg4, mode: all, n_permutations: 4}
+  figures: {level: null, exclude_ts: [10]}

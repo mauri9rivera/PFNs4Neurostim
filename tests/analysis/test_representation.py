@@ -344,3 +344,166 @@ def test_real_tabpfn_pass_lens_reproduces_the_final_predictive() -> None:
     assert len(states.layers) == 18 and states.label_token[0].shape == (ch.n_sites, 192)
     np.testing.assert_allclose(lens["means"][-1], beliefs["own"].mean, atol=1e-5)
     np.testing.assert_allclose(lens["quantiles"][-1], beliefs["own"].quantiles, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# shuffling-history (2026-10-24): β1b once per row-order arm
+# ---------------------------------------------------------------------------
+_SHUFFLE_ARMS = """
+    engine: tabpfn_v2_5
+    shuffle_arms:
+      - {name: sorted, mode: none}
+      - {name: shuffled, mode: all}
+      - {name: avg2, mode: all, n_permutations: 2}"""
+
+
+def test_shuffle_arms_run_once_each_and_are_contrasted_per_cell(tmp_path, tiny_channels, monkeypatch) -> None:
+    """Arms reach the engine with their own order settings; a GP stand-in is order-free, so every contrast is 0."""
+    seen: list[tuple[str, int, bool]] = []
+
+    class OrderFreePFN(B.GPFixedEngine):
+        def __init__(self, device, random_state, softmax_temperature, name, shuffle="none", n_permutations=1,
+                     rng=None):
+            super().__init__(lengthscale=0.3, outputscale=1.0, noise=0.05, name=name)
+            seen.append((shuffle, n_permutations, rng is not None))
+
+    monkeypatch.setattr(B, "PFNRefitEngine", OrderFreePFN)
+    path = _representation_config(tmp_path)
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read().replace("\n    engine: gp_fixed", _SHUFFLE_ARMS)
+    assert "shuffle_arms" in text
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    out = mechanism.run_mechanism(path)
+    # 2 covered channels x 3 arms, each with its own settings (and a generator iff it shuffles)
+    assert sorted(set(seen)) == [("all", 1, True), ("all", 2, True), ("none", 1, False)] and len(seen) == 6
+    pc = pd.read_csv(os.path.join(out, "posterior_cov.csv"))
+    assert set(pc["shuffle"]) == {"sorted", "shuffled", "avg2"} and len(pc) == 2 * 3 * 2
+    coh = pd.read_csv(os.path.join(out, "posterior_cov_coherence.csv"))
+    assert set(coh["pool"]) == {"observed", "unobserved", "all"}
+    order = ["subject", "emg", "shuffle"]
+    every = coh[coh["pool"] == "all"].sort_values(order)
+    pooled = pc[pc["reference"] == "gp_fixed"].sort_values(order)
+    np.testing.assert_allclose(every["cov_asymmetry_c"], pooled["asymmetry"], atol=1e-12)   # = β1b's asymmetry
+    contrast = pd.read_csv(os.path.join(out, "posterior_cov_shuffle_contrast.csv"))
+    assert set(contrast["shuffle"]) == {"shuffled", "avg2"} and set(contrast["reference"]) == {"sorted"}
+    np.testing.assert_allclose(contrast["median"], 0.0, atol=1e-12)
+    assert set(pd.read_csv(os.path.join(out, "posterior_cov_summary.csv"))["shuffle"]) == {"sorted", "shuffled",
+                                                                                           "avg2"}
+    for name in ("posterior_cov", "posterior_cov_shuffle"):
+        assert os.path.exists(os.path.join(out, f"{name}.svg")), name
+
+    # every arm is its own cached cell: --only-cached serves all three and computes nothing
+    def boom(*_a, **_k):
+        raise AssertionError("an --only-cached run must not compute")
+
+    monkeypatch.setattr(mechanism, "_posterior_cov_cell", boom)
+    mechanism.run_mechanism(path, only_cached=True)
+    pd.testing.assert_frame_equal(pc, pd.read_csv(os.path.join(out, "posterior_cov.csv")), check_like=True)
+
+
+def test_posterior_cov_alone_on_a_random_anchor_subset(tmp_path, tiny_channels, monkeypatch) -> None:
+    """beta2_enabled false runs β1b only; n_anchors takes every statistic on one shared anchor x anchor block."""
+    def boom(*_a, **_k):
+        raise AssertionError("β2 cells must not run")
+
+    monkeypatch.setattr(mechanism, "_representation_cell", boom)
+    path = _representation_config(tmp_path)
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read().replace("  n_context_draws: 2", "  n_context_draws: 2\n  beta2_enabled: false").replace(
+            "\n    engine: gp_fixed", "\n    engine: gp_fixed\n    n_anchors: 10")
+    assert "beta2_enabled" in text and "n_anchors" in text
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    out = mechanism.run_mechanism(path)
+    assert not os.path.exists(os.path.join(out, "representation.csv"))
+    pc = pd.read_csv(os.path.join(out, "posterior_cov.csv"))
+    assert (pc["n_anchors"] == 10).all() and (pc["asymmetry"] < 1e-8).all()      # GP-fixed: exact on any block
+    self_ref = pc[pc["reference"] == "gp_fixed"]
+    assert np.allclose(self_ref["nbs"], 1.0, atol=1e-6) and np.allclose(self_ref["trace_ratio"], 1.0, atol=1e-6)
+    coh = pd.read_csv(os.path.join(out, "posterior_cov_coherence.csv"))
+    assert (coh[coh["pool"] == "all"]["n_anchors"] == 10).all()
+    assert os.path.exists(os.path.join(out, "posterior_cov_summary.csv"))
+    X = tiny_channels[0].X_pool
+    a = mechanism.posterior_cov_anchors(X, 10, 10, 0, 0)
+    np.testing.assert_array_equal(a, mechanism.posterior_cov_anchors(X, 10, 10, 0, 0))   # shared, reproducible
+    assert a.size == 10 and np.unique(a).size == 10
+    np.testing.assert_array_equal(mechanism.posterior_cov_anchors(X, None, 10, 0, 0), np.arange(len(X)))
+    with pytest.raises(ValueError, match="exceeds"):
+        mechanism.posterior_cov_anchors(X, len(X) + 1, 10, 0, 0)
+    with pytest.raises(ValueError, match="computes nothing"):
+        mechanism._validate_representation({"beta2_enabled": False}, [10])
+    with pytest.raises(ValueError, match="n_anchors"):
+        mechanism._validate_representation({"posterior_cov": {"enabled": True, "n_anchors": 2}}, [10])
+
+
+def test_update_trajectory_nests_the_history_and_matches_the_engine(tmp_path, tiny_channels) -> None:
+    """Every step's context is a prefix of one history; stored maps equal a direct GP-fixed fit; cells are reused."""
+    path = tmp_path / "traj.yaml"
+    path.write_text(textwrap.dedent(f"""
+        defaults:
+          dataset: nhp
+        context: {{sizes: [10]}}
+        analysis: update_trajectory
+        tag: traj
+        device: cpu
+        seed: 0
+        output_root: {tmp_path.as_posix()}
+        update_trajectory:
+          t_min: 3
+          t_max: 8
+          engines: [gp_fixed, gp_mll_frozen]
+          y_prime: {{reference: gp_fixed, c: [-1.0, 1.0]}}
+          n_anchors: 3
+          gp_params: {{n_opt_steps: 5, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 1,
+                      lengthscale_floor: 0.05}}
+    """))
+    out = mechanism.run_mechanism(str(path))
+    z = np.load(os.path.join(out, "trajectory.npz"))
+    assert list(z["context_ts"]) == list(range(3, 9)) and z["mean"].shape == (6, 2, 49)
+    assert z["probe_mean"].shape == (6, 2, 3, 2, 49) and z["y_prime"].shape == (6, 3, 2)
+    obs = z["observed"]
+    assert (obs.sum(1) == np.arange(3, 9)).all() and (obs[1:] >= obs[:-1]).all()   # nested, one site per step
+    assert not obs[-1][z["anchors"]].any()                                           # anchors never observed
+    ch = tiny_channels[0]
+    i, t = 2, 5
+    eng = B.GPFixedEngine(**mechanism.UPDATE_TRAJECTORY_DEFAULTS["fixed_gp_params"])
+    eng.fit(ch.X_pool[z["history_sites"][:t]], z["history_y"][:t])
+    base = eng.base(ch.X_pool)
+    np.testing.assert_allclose(z["mean"][i, 0], base.mean[0], atol=1e-10)
+    a = int(z["anchors"][1])
+    np.testing.assert_allclose(z["y_prime"][i, 1], base.mean[0, a] + np.array([-1.0, 1.0]) * base.sd[0, a])
+    pr = eng.probe(ch.X_pool[[a]], z["y_prime"][i, 1, 1:], ch.X_pool)
+    np.testing.assert_allclose(z["dmu"][i, 0, 1, 1], pr.mean[0] - base.mean[0], atol=1e-10)
+    csv = pd.read_csv(os.path.join(out, "mean_maps.csv"))
+    assert len(csv) == 6 * 2 * (1 + 3 * 2) * 49 and set(csv["map"]) == {"base", "after_update"}
+    mechanism.run_mechanism(str(path), only_cached=True)                             # every step served from cache
+    with pytest.raises(ValueError, match="GP engine"):
+        mechanism._validate_update_trajectory({"y_prime": {"reference": "tabpfn_v2_5"}})
+    with pytest.raises(ValueError, match="t_min"):
+        mechanism._validate_update_trajectory({"t_min": 1})
+
+
+def test_shuffle_arm_validation() -> None:
+    v = mechanism._validate_shuffle_arms
+    assert v([{"name": "a", "mode": "history"}], "tabpfn_v2_5") == [
+        {"name": "a", "mode": "history", "n_permutations": 1}]
+    with pytest.raises(ValueError, match="GP engine"):
+        v([{"name": "a", "mode": "all"}], "gp_fixed")
+    with pytest.raises(ValueError, match="mode"):
+        v([{"name": "a", "mode": "reverse"}], "tabpfn_v2_5")
+    with pytest.raises(ValueError, match="n_permutations"):
+        v([{"name": "a", "mode": "none", "n_permutations": 4}], "tabpfn_v2_5")
+    with pytest.raises(ValueError, match="unique"):
+        v([{"name": "a", "mode": "all"}, {"name": "b", "mode": "all"}], "tabpfn_v2_5")
+    with pytest.raises(ValueError, match="needs name and mode"):
+        v([{"name": "a", "mode": "all", "seed": 1}], "tabpfn_v2_5")
+    with pytest.raises(ValueError, match="non-empty"):
+        v([], "tabpfn_v2_5")
+
+
+def test_the_shuffle_config_validates() -> None:
+    cfg = mechanism.load_mechanism_config("configs/experiment/mechanism_representation_shuffle_nhp.yaml")
+    p = mechanism._validate_representation(cfg.params, cfg.context_sizes)
+    assert cfg.run_dir.replace("\\", "/").endswith("mechanism/representation/nhp/shuffling-history")
+    assert [a["name"] for a in p["posterior_cov"]["shuffle_arms"]] == ["sorted", "history", "shuffled", "avg4"]
