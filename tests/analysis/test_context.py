@@ -172,3 +172,64 @@ class TestTrialDraw:
         ch = self._rich_channel()
         mixed = context_for(ch, 6, 1, base_seed=SEED, trial_draw=0)
         assert np.array_equal(mixed.sites, context_sites(ch.X_pool, 6, 1, base_seed=SEED))
+
+
+class TestRevisits:
+    """Contexts that sample some sites again (user 2026-10-26): a BO loop revisits electrodes."""
+
+    def test_no_revisits_and_sorted_order_is_the_historical_draw(self) -> None:
+        ch = _channel("0-0")
+        old = context_for(ch, 7, 1, base_seed=SEED, level=1.0)
+        new = context_for(ch, 7, 1, base_seed=SEED, level=1.0, n_revisits=0, row_order="sorted")
+        assert np.array_equal(old.sites, new.sites) and np.array_equal(old.y, new.y)
+        assert np.array_equal(old.trial_idx, new.trial_idx)
+
+    def test_revisited_sites_appear_twice_with_different_trials(self) -> None:
+        ch = _channel("0-0", n_reps=6)
+        ctx = context_for(ch, 9, 0, base_seed=SEED, level=1.0, n_revisits=3)
+        assert ctx.sites.size == ctx.X.shape[0] == ctx.y.size == 9
+        sites, counts = np.unique(ctx.sites, return_counts=True)
+        assert sites.size == 6 and (counts == 2).sum() == 3 and (counts == 1).sum() == 3
+        for s in sites[counts == 2]:
+            idx = ctx.trial_idx[ctx.sites == s]
+            assert np.unique(idx).size == 2                                   # a different trial each time
+        for site, tr, value in zip(ctx.sites, ctx.trial_idx, ctx.y):
+            assert value == ch.Y_trials[site, tr]
+
+    def test_distinct_sites_are_those_of_a_smaller_context_and_are_shared_across_channels(self) -> None:
+        a, b = _channel("0-0", n_reps=6), _channel("3-2", n_reps=6, offset=5.0)
+        ca = context_for(a, 9, 0, base_seed=SEED, n_revisits=3)
+        cb = context_for(b, 9, 0, base_seed=SEED, n_revisits=3)
+        assert np.array_equal(ca.sites, cb.sites)                             # revisited sites too (paired design)
+        assert np.array_equal(np.unique(ca.sites), context_sites(a.X_pool, 6, 0, base_seed=SEED))
+        assert not np.allclose(ca.y, cb.y)
+
+    def test_history_order_is_a_reproducible_permutation_of_the_sorted_rows(self) -> None:
+        ch = _channel("0-0", n_reps=6)
+        srt = context_for(ch, 9, 0, base_seed=SEED, n_revisits=3)
+        hist = context_for(ch, 9, 0, base_seed=SEED, n_revisits=3, row_order="history")
+        again = context_for(ch, 9, 0, base_seed=SEED, n_revisits=3, row_order="history")
+        assert np.array_equal(hist.sites, again.sites) and np.array_equal(hist.y, again.y)
+        assert not np.array_equal(hist.sites, srt.sites)
+        key = lambda c: sorted(zip(c.sites.tolist(), c.trial_idx.tolist()))   # noqa: E731
+        assert key(hist) == key(srt)
+
+    def test_history_order_without_revisits_only_reorders(self) -> None:
+        ch = _channel("0-0")
+        srt = context_for(ch, 7, 0, base_seed=SEED)
+        hist = context_for(ch, 7, 0, base_seed=SEED, row_order="history")
+        assert sorted(hist.sites.tolist()) == srt.sites.tolist() and np.isclose(np.sort(hist.y), np.sort(srt.y)).all()
+
+    @pytest.mark.parametrize("kw, match", [
+        ({"n_revisits": 7}, r"n_revisits=7 must be in"),
+        ({"n_revisits": 6}, r"exceeds the 2 distinct sites"),
+        ({"n_revisits": -1}, r"must be in"),
+        ({"row_order": "shuffled"}, "row_order must be one of"),
+    ])
+    def test_invalid_requests_fail_fast(self, kw: dict, match: str) -> None:
+        with pytest.raises(ValueError, match=match):
+            context_for(_channel("0-0", n_reps=6), 8, 0, base_seed=SEED, **kw)
+
+    def test_a_site_without_a_spare_trial_fails_fast(self) -> None:
+        with pytest.raises(ValueError, match="no valid trial left"):
+            context_for(_channel("0-0", n_reps=1), 6, 0, base_seed=SEED, n_revisits=2)

@@ -34,13 +34,20 @@ from ..data.channels import ChannelData
 from ..seeding import rng_for
 
 __all__ = [
-    "CONTEXT_SITE_STREAM", "CONTEXT_TRIAL_STREAM", "Context", "context_for", "context_sites", "draw_context",
-    "grid_id",
+    "CONTEXT_SITE_STREAM", "CONTEXT_TRIAL_STREAM", "CONTEXT_REVISIT_STREAM", "CONTEXT_ORDER_STREAM", "ROW_ORDERS",
+    "Context", "context_for", "context_sites", "draw_context", "grid_id",
 ]
 
 #: Seed-stream names. Distinct constants, so a future change to one cannot silently move the other.
 CONTEXT_SITE_STREAM: str = "mechanism_context_sites"
 CONTEXT_TRIAL_STREAM: str = "mechanism_context_trials"
+#: Streams of the revisit contexts (user 2026-10-26): which sites are sampled again (keyed by grid, like the sites) and the
+#: row order of a context listed in history order (keyed by channel).
+CONTEXT_REVISIT_STREAM: str = "mechanism_context_revisits"
+CONTEXT_ORDER_STREAM: str = "mechanism_context_order"
+#: Row orders of a context: ``sorted`` = by site, repeated trials of a site adjacent (the historical layout);
+#: ``history`` = one random permutation of the rows, as the observations arrive in a BO loop.
+ROW_ORDERS: tuple[str, ...] = ("sorted", "history")
 
 #: Characters of the coordinate hash kept as a grid identifier. 12 hex characters is 48 bits: collision-free
 #: for the handful of layouts a study holds, and short enough to read in a log line or a CSV column.
@@ -52,7 +59,8 @@ class Context:
     """A fixed context of noisy observations shared by every probed model.
 
     Attributes:
-        sites: Site indices of the observations, shape [t].
+        sites: Site indices of the observations, shape [t]. Distinct unless the context has revisits (``context_for``
+            with ``n_revisits > 0``), where a site can appear several times, each with a different trial.
         X: Their coordinates, shape [t, D].
         y: One valid noisy trial per observation, shape [t].
         trial_idx: Index of that trial in ``channel.Y_trials[site]``, shape [t]. Recorded so held-out trials can
@@ -166,12 +174,14 @@ def context_for(
     base_seed: int,
     level: float | None = None,
     trial_draw: int | None = None,
+    n_revisits: int = 0,
+    row_order: str = "sorted",
 ) -> Context:
     """The context one analysis cell is conditioned on: shared sites, this channel's own trials.
 
     Args:
         channel: Channel (already stressed, when a knob is applied).
-        t: Context size.
+        t: Context size (rows, revisits included).
         draw: Context-draw index.
         base_seed: Experiment-wide base seed.
         level: Stress level of the cell, part of the trial stream's key so that two levels of the same
@@ -182,13 +192,53 @@ def context_for(
             independent readings** -- the CKA noise ceiling of 2026-10-12, which asks how similar two
             GP posterior covariances are when they differ only by measurement noise -- cannot be
             built that way. This is the one knob that separates the two.
+        n_revisits: Rows that are a further trial at an already sampled site (user 2026-10-26: a BO loop revisits
+            electrodes, and a context of distinct sites never exercises that regime). The context then has
+            ``t - n_revisits`` distinct sites, drawn like a context of that size, and ``n_revisits`` of them (chosen per
+            grid, shared by every channel) appear a second time with a *different* valid trial. ``0`` reproduces the
+            historical context exactly.
+        row_order: One of :data:`ROW_ORDERS`; ``sorted`` is the historical order.
 
     Returns:
-        The context, with ``sites`` from :func:`context_sites` and one valid trial drawn per site.
+        The context, with ``sites`` from :func:`context_sites` and one valid trial drawn per site (plus the revisits).
+
+    Raises:
+        ValueError: On an unknown ``row_order``, ``n_revisits`` outside ``[0, t - 2]`` or above the number of
+            distinct sites, or a revisited site with no further valid trial.
     """
-    sites = context_sites(channel.X_pool, t, draw, base_seed=base_seed)      # [t]
+    if row_order not in ROW_ORDERS:
+        raise ValueError(f"context_for: row_order must be one of {ROW_ORDERS}, got {row_order!r}.")
+    n_rev = int(n_revisits)
+    if not 0 <= n_rev <= int(t) - 2:
+        raise ValueError(f"context_for: n_revisits={n_rev} must be in [0, t - 2] for t={t}.")
+    n_distinct = int(t) - n_rev
+    if n_rev > n_distinct:
+        raise ValueError(f"context_for: n_revisits={n_rev} exceeds the {n_distinct} distinct sites of a t={t} context.")
+    sites = context_sites(channel.X_pool, n_distinct, draw, base_seed=base_seed)     # [t - n_revisits]
     rng = rng_for(
         channel.label, CONTEXT_TRIAL_STREAM, level, int(t),
         int(draw if trial_draw is None else trial_draw), base_seed=base_seed,
     )
-    return draw_context(channel, int(t), rng, sites=sites)
+    ctx = draw_context(channel, n_distinct, rng, sites=sites)
+    if n_rev == 0 and row_order == "sorted":
+        return ctx
+    rows_site, rows_trial, rows_y = list(ctx.sites), list(ctx.trial_idx), list(ctx.y)
+    if n_rev:
+        rev_rng = rng_for(grid_id(channel.X_pool), CONTEXT_REVISIT_STREAM, int(t), int(draw), n_rev,
+                          base_seed=base_seed)
+        for s in np.sort(rev_rng.choice(sites, size=n_rev, replace=False)):
+            valid = np.flatnonzero(np.isfinite(channel.Y_trials[s]))
+            used = [tr for si, tr in zip(rows_site, rows_trial) if si == s]
+            free = np.setdiff1d(valid, used)
+            if free.size == 0:
+                raise ValueError(f"context_for: site {int(s)} of {channel.label} has no valid trial left to revisit.")
+            tr = int(rng.choice(free))
+            rows_site.append(int(s)), rows_trial.append(tr), rows_y.append(float(channel.Y_trials[s, tr]))
+    site_arr = np.asarray(rows_site, dtype=int)                                      # [t]
+    if row_order == "sorted":
+        order = np.argsort(site_arr, kind="stable")                                  # revisits follow their first trial
+    else:
+        order = rng_for(channel.label, CONTEXT_ORDER_STREAM, level, int(t), int(draw), n_rev,
+                        base_seed=base_seed).permutation(site_arr.size)
+    return Context(sites=site_arr[order], X=channel.X_pool[site_arr[order]].copy(),
+                   y=np.asarray(rows_y)[order], trial_idx=np.asarray(rows_trial, dtype=int)[order])

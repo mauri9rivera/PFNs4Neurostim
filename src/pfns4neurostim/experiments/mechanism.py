@@ -423,6 +423,11 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
     "stress": {"knob": "k2_channel", "levels": [1.0, 2.0, 4.0]},
     "n_context_draws": 2,
     "anchors": {"n_unobserved": 8, "n_observed": 4},
+    # Revisits (user 2026-10-26): ``fraction`` of the t rows of every grid context is a further trial at an already sampled
+    # site, as in a BO loop (0 = the historical context of distinct sites; its cells and identities are unchanged);
+    # ``row_order`` is sorted | history (analysis/context.ROW_ORDERS). Grid cells only: the gates, the frozen-refit
+    # discrepancy and the exemplar keep contexts of distinct sites.
+    "revisits": {"fraction": 0.0, "row_order": "sorted"},
     # method: gauss_hermite | truncated | rqmc (analysis/bayes_update.QUADRATURE_METHODS); central_mass for truncated;
     # n_scrambles for rqmc (K is then the points per scramble).
     "quadrature": {"method": "gauss_hermite", "K": 20, "u_min": 1e-12, "central_mass": 1.0, "n_scrambles": 1},
@@ -533,7 +538,7 @@ def _validate_bayes_update(p: dict[str, Any], ladder: Sequence[int]) -> dict[str
     """
     d = BAYES_UPDATE_DEFAULTS
     p = _check_keys(p, d, "bayes_update")
-    for sub in ("stress", "anchors", "quadrature", "y_grid", "shared", "tabpfn", "gp_bayes", "fixed_gp_params",
+    for sub in ("stress", "anchors", "revisits", "quadrature", "y_grid", "shared", "tabpfn", "gp_bayes", "fixed_gp_params",
                 "exemplar", "c1", "run", "discrepancy", "gates", "link"):
         p[sub] = _check_keys(p[sub], d[sub], f"bayes_update.{sub}")
     for g in d["gates"]:
@@ -543,6 +548,13 @@ def _validate_bayes_update(p: dict[str, Any], ladder: Sequence[int]) -> dict[str
     bad = [e for e in p["engines"] if e not in known]
     if bad:
         raise ValueError(f"bayes_update.engines: unknown {bad}; known {sorted(known)}.")
+    from ..analysis.context import ROW_ORDERS  # noqa: PLC0415
+
+    if not 0.0 <= float(p["revisits"]["fraction"]) < 1.0:
+        raise ValueError(f"bayes_update.revisits.fraction must be in [0, 1), got {p['revisits']['fraction']!r}.")
+    if p["revisits"]["row_order"] not in ROW_ORDERS:
+        raise ValueError(f"bayes_update.revisits.row_order must be one of {ROW_ORDERS}, got "
+                         f"{p['revisits']['row_order']!r}.")
     # The ladder reference (user, 2026-10-21): any non-TabPFN engine of the run -- GP-Bayes is optional.
     ref = p["shared"]["reference"]
     if ref not in p["engines"]:
@@ -729,6 +741,27 @@ def _first_per_subject(channels: Sequence[ChannelData], n: int) -> set[str]:
     return keep
 
 
+def _n_revisits(p: dict[str, Any], t: int) -> int:
+    """Rows of a ``t``-row grid context that are further trials at an already sampled site (``bayes_update.revisits``).
+
+    Args:
+        p: Resolved ``bayes_update`` block.
+        t: Context size.
+
+    Returns:
+        ``round(fraction * t)``.
+    """
+    return int(round(float(p["revisits"]["fraction"]) * int(t)))
+
+
+def _revisit_identity(p: dict[str, Any]) -> dict[str, Any]:
+    """The cell-identity entry of the context layout: empty for the historical layout, so its cached cells still serve."""
+    rv = p["revisits"]
+    if float(rv["fraction"]) == 0.0 and rv["row_order"] == "sorted":
+        return {}
+    return {"revisits": {"fraction": float(rv["fraction"]), "row_order": rv["row_order"]}}
+
+
 def _bayes_cell(
     stressed: ChannelData,
     label: str,
@@ -769,7 +802,8 @@ def _bayes_cell(
     from ..analysis import bayes_update as B  # noqa: PLC0415
 
     t0 = time.time()
-    ctx = context_for(stressed, int(t), int(draw), base_seed=cfg.seed, level=float(level))
+    ctx = context_for(stressed, int(t), int(draw), base_seed=cfg.seed, level=float(level),
+                      n_revisits=_n_revisits(p, int(t)), row_order=p["revisits"]["row_order"])
     rng = rng_for(label, "bayes_update", level, t, draw, base_seed=cfg.seed)
     anchors, pools, strata = B.select_anchors_uniform(stressed, int(p["anchors"]["n_unobserved"]),
                                                       int(p["anchors"]["n_observed"]), rng, ctx.sites)
@@ -1310,7 +1344,8 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                          "draw": draw, "engines_a": cov["A"], "engines_b": cov["B"],
                          "engine_params": {e: _engine_params(e, p, draw) for e in fitted},
                          **{k: p[k] for k in ("references", "anchors", "quadrature", "eps", "y_grid",
-                                              "shared", "far_pitch")}}
+                                              "shared", "far_pitch")},
+                         **_revisit_identity(p)}
                 hit = cells.run(
                     "cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
                     lambda st=st, ch=ch, level=level, t=t, draw=draw, cov=cov: (_bayes_cell(

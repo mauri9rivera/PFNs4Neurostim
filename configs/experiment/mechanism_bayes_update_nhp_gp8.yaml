@@ -1,0 +1,56 @@
+# 8-RESTART, 10-LAYOUT VARIANT (user, 2026-10-26): the empirical-Bayes yardstick for Figure H. Identical to
+# mechanism_bayes_update_nhp_gp10.yaml except gp_params.n_restarts = 8, n_context_draws = 10 and tag nhp-gp8.
+# EXPLORATORY, NOT PRE-REGISTERED (task plan row Omega12). Settled 2026-10-26 after the t = 40 diagnostic
+# (output/diagnostics/omega_t40/): the GP-MLL refit band moves with the optimiser budget more than with the layouts
+# (median drift 5 -> 10 restarts: t 40 0.158 -> 0.075; 52 % of the cells at t >= 40 change by > 0.05), so the draws
+# extension of the 5-restart run was dropped and the restarts were raised instead; 10 layouts per grid keep the layout
+# sampling of the nhp-l1-refine grid.
+#
+# SAME CELLS AS THE REFINEMENT GRID (tag nhp-l1-refine): level 1, t [30, 40, 50, 60, 80], 22 NHP channels, draws 0-9 =
+# 10 layouts. Layouts, anchors (8 unobserved + 4 observed), RQMC levels (8 scrambles x 8 points) come from the same seed
+# streams, so every anchor and every y' is the one TabPFN and GP-fixed saw in nhp-l1-refine: Figure H reads TabPFN-2.5
+# and GP-fixed from that run and GP-MLL refit from this one. 1,100 cells; GP-MLL refit only, Part A only (12 anchors x 64
+# RQMC values = 768 refits + 1 base fit per cell). No cell of output/cells/ is reused (n_restarts is in the key).
+#
+# Sizing (measured on the 10-restart arm, 2026-10-24: ~17-19 min per single-threaded cell; 12.0 GiB of 12G for 16 lanes was the
+# limit, 2 lanes killed per job): ~15 min per cell at 8 restarts -> ~275 core-h. Lines: output/logs/omega_gp8_pool_lines.sh.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp_gp8.yaml --only-cached
+defaults:
+  dataset: nhp
+  context: nhp
+
+analysis: bayes_update
+tag: nhp-gp8
+device: cpu
+seed: 42
+output_root: output
+
+dataset:
+  subjects: [0, 1, 2, 3]
+
+context:
+  sizes: [30, 40, 50, 60, 80]
+
+bayes_update:
+  engines: [gp_mll_refit]
+  references: []
+  # Part A everywhere, Part B nowhere (an empty level filter matches no cell).
+  coverage:
+    gp_mll_refit:
+      B: {levels: []}
+  stress: {knob: k2_channel, levels: [1.0]}
+  n_context_draws: 10
+  anchors: {n_unobserved: 8, n_observed: 4}
+  quadrature: {method: rqmc, K: 8, u_min: 1.0e-12, central_mass: 1.0, n_scrambles: 8}
+  eps: 0.01
+  y_grid: {points: 512, u_tail: 1.0e-4}
+  shared: {n_trials: 8, ladder: [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0], saturation_c: [1.0, 3.0],
+           reference: gp_mll_refit}
+  far_pitch: 4.0
+  # The only changes from mechanism_bayes_update_nhp.yaml: n_restarts 5 -> 8 (and 10 draws, set above).
+  gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 8,
+              lengthscale_floor: 0.05}
+  exemplar: {enabled: false, engines: [gp_mll_refit]}
+  panel_ts: [50, 80]
+  run: {gates: false, grid: true, discrepancy: false}
