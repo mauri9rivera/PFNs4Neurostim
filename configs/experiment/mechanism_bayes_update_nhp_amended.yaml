@@ -14,7 +14,7 @@
 # The pre-registered grid's cells are pre-amendment: cell identities moved with (3), so ``--only-cached`` no longer reads them
 # (``--replot`` of their run directory still works). Sensitivities to run later, not now: tail_measure halfnormal / uniform; K = 128.
 # GATE: G1 stays on the moment-matched readouts (exact for GP-fixed under any node set, ~1e-16). Measured 2026-10-28
-# (``scripts/gp_fixed_strata_exactness.py``, 16 GP-fixed cells, worst case): K = 64 raw covariance error 0.39 % of max |Sigma|,
+# (script removed in the 2026-10-28 cleanup, in git history at dac03e5; 16 GP-fixed cells, worst case): K = 64 raw covariance error 0.39 % of max |Sigma|,
 # raw total-variance deviation 0.17 %, raw drift and asymmetry 0, moment-matched everything 0; old RQMC 8 x 8: 26 %, 13.8 %, drift
 # 0.056, asymmetry 0.175. K = 128 halves the raw error (0.17 %). So the gate needs no relaxing and no K sensitivity (user: only if bad).
 # OBJECTIVE OMEGA (Sprint #4) -- Hypothesis C, re-founded 2026-10-19 (research_design.md §2 and §4):
