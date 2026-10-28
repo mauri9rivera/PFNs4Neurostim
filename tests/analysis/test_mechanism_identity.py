@@ -18,11 +18,15 @@ import pytest
 from pfns4neurostim.evaluation import cache
 from pfns4neurostim.experiments import mechanism
 
-#: ``(config, kind) -> (n cells, md5 of the sorted cell keys)`` at ``bb0bba5``.
+#: ``(config, kind) -> (n cells, md5 of the sorted cell keys)``. The three OMEGA kinds moved on 2026-10-28, deliberately: every GP-MLL
+#: engine now carries ``restart_rule: train_mode_nlml`` in its identity (``GPSurrogate`` ranked its restarts by an evaluation-mode
+#: loss, not the marginal likelihood, until then), so no cell fitted under the old rule is served. Their digests at ``bb0bba5``
+#: (the pulled Narval grid, now pre-amendment and readable by ``--replot`` only) were cell d3aa586c13ae267cddb5a81d2dca2d91,
+#: exemplar 372d58030c2074d08a56334c940c54d9, c1_exemplar f6935322936ea5a676133f0bbc35fb63. CKA (b) did not move.
 EXPECTED: dict[tuple[str, str], tuple[int, str]] = {
-    ("mechanism_bayes_update_nhp", "cell"): (528, "d3aa586c13ae267cddb5a81d2dca2d91"),
-    ("mechanism_bayes_update_nhp", "exemplar"): (4, "372d58030c2074d08a56334c940c54d9"),
-    ("mechanism_bayes_update_nhp", "c1_exemplar"): (4, "f6935322936ea5a676133f0bbc35fb63"),
+    ("mechanism_bayes_update_nhp", "cell"): (528, "b56a5328a7806b81b49d5930d70841a0"),
+    ("mechanism_bayes_update_nhp", "exemplar"): (4, "ffcc24f0427da1b412f3e3b9d7106db7"),
+    ("mechanism_bayes_update_nhp", "c1_exemplar"): (4, "ade0634f295a105a770a778d0920c131"),
     ("mechanism_cka_nhp", "b"): (40, "993820e1717e207380d0d6fe61556dd5"),
 }
 
@@ -49,7 +53,7 @@ def _requested(config: str, tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> d
 
 @pytest.mark.skipif(not os.path.isdir(_NHP_DATA), reason="NHP data not on disk")
 @pytest.mark.parametrize("config", sorted({c for c, _ in EXPECTED}))
-def test_cell_identities_are_unchanged_since_bb0bba5(config: str, tmp_path: Any,
+def test_cell_identities_are_unchanged_since_the_gp_restart_rule(config: str, tmp_path: Any,
                                                      monkeypatch: pytest.MonkeyPatch) -> None:
     keys = _requested(config, tmp_path, monkeypatch)
     for (cfg, kind), (n, digest) in EXPECTED.items():

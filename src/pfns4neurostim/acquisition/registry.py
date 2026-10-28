@@ -14,7 +14,10 @@ params object can report its *resolved* value at a given step, which is what the
 tidy CSV logs (``acq_param_<name>``).
 
 Closed forms follow Jones et al. (1998) for EI and Kushner (1964) for PI, using
-the surrogate's predictive marginals so GP and PFN get the identical rule.
+the surrogate's predictive marginals so GP and PFN get the identical rule. **Exception (2026-10-27, user):** a surrogate that exposes a
+bar-distribution predictive (``has_bar_predictive``: TabPFN-2.5 unless its ``acquisition_form`` model param is ``moments``) is scored with
+the closed forms over its own bars (``models.pfn.bar_acquisition``: ``FullSupportBarDistribution`` EI / PI and the ``Phi(kappa)`` quantile
+for UCB), the exact analogue of the Gaussian forms for a GP. The incumbent rules are unchanged.
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ from typing import Any, Callable
 import numpy as np
 from scipy import stats
 
+from ..models.pfn.bar_acquisition import bar_ei, bar_pi, bar_ucb  # tabpfn is imported lazily inside
 from ..models.protocol import marginals
 from .base import BOState
 from .schedules import Schedule, build_schedule
@@ -191,6 +195,9 @@ def _score_ei(
         incumbent = float(np.max(mean[observed]))
     else:
         incumbent = float(np.max(mean))
+    if getattr(surrogate, "has_bar_predictive", False):
+        criterion, logits = surrogate.predict_bars(X_pool)         # criterion, [N, bars]
+        return bar_ei(criterion, logits, incumbent + xi)           # [N]
     gap = mean - incumbent - xi                                    # [N]
     safe = np.maximum(std, 1e-12)                                  # [N]
     z = gap / safe                                                 # [N]
@@ -218,6 +225,9 @@ def _score_pi(
     xi = params.value("xi", state)
     observed = np.asarray(state.observed_indices, dtype=int)
     incumbent = float(np.max(mean[observed])) if observed.size else float(np.max(mean))
+    if getattr(surrogate, "has_bar_predictive", False):
+        criterion, logits = surrogate.predict_bars(X_pool)         # criterion, [N, bars]
+        return bar_pi(criterion, logits, incumbent + xi)           # [N]
     safe = np.maximum(std, 1e-12)                                  # [N]
     return stats.norm.cdf((mean - incumbent - xi) / safe)
 
@@ -237,8 +247,12 @@ def _score_ucb(
     Returns:
         UCB per candidate, shape [N].
     """
+    kappa = params.value("kappa", state)
+    if getattr(surrogate, "has_bar_predictive", False):
+        criterion, logits = surrogate.predict_bars(X_pool)         # criterion, [N, bars]
+        return bar_ucb(criterion, logits, kappa)                   # [N]
     mean, std = marginals(surrogate, X_pool)                       # [N], [N]
-    return mean + params.value("kappa", state) * std
+    return mean + kappa * std
 
 
 def _score_ts_marginal(

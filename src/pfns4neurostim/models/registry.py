@@ -45,6 +45,8 @@ class ModelSpec:
             (it exposes ``policy_scores``): it serves only the ``native`` acquisition
             and that acquisition serves only such models. The runners read this flag,
             never a model name.
+        bar_acquisition: True for a surrogate whose EI / PI / UCB are the closed forms over its bar distribution
+            (``models.pfn.bar_acquisition``); its ``acquisition_form`` model param selects ``bars`` (default) or ``moments``.
         notes: Short provenance note for tables and captions.
     """
 
@@ -55,16 +57,18 @@ class ModelSpec:
     supports: tuple[str, ...] = ("ei", "ucb", "ts_marginal")
     has_predictive_distribution: bool = True
     native_policy: bool = False
+    bar_acquisition: bool = False
     notes: str = ""
 
 
-def _build_tabpfn_v2_5(device: str = "cpu", n_estimators: int = 1, **kwargs: Any) -> Any:
+def _build_tabpfn_v2_5(device: str = "cpu", n_estimators: int = 1, acquisition_form: str = "bars", **kwargs: Any) -> Any:
     """Construct the vanilla TabPFN v2.5 surrogate.
 
     Args:
         device: ``'cpu'`` or ``'cuda'``.
         n_estimators: Ensemble members. 1 for BO loops (one transformer call
             per step, as every kept benchmark used).
+        acquisition_form: ``'bars'`` (EI / PI / UCB over the bar distribution) or ``'moments'`` (Gaussian forms).
         **kwargs: Forwarded to ``TabPFNRegressor``.
 
     Returns:
@@ -79,7 +83,7 @@ def _build_tabpfn_v2_5(device: str = "cpu", n_estimators: int = 1, **kwargs: Any
         ignore_pretraining_limits=True,
         **kwargs,
     )
-    return TabPFNSurrogate(regressor)
+    return TabPFNSurrogate(regressor, acquisition_form=acquisition_form)
 
 
 def _build_gp_mll(
@@ -206,11 +210,12 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         family="pfn",
         factory=_build_tabpfn_v2_5,
         supports=("ei", "ucb", "ts_marginal"),
+        bar_acquisition=True,
         notes="Pretrained, no finetuning; n_estimators=1; native bar distribution.",
     ),
     "gp_mll": ModelSpec(
         key="gp_mll",
-        version="gpytorch ExactGP (RBF), converged L-BFGS MLL, float64, 5 starts, noise floor 1e-3",
+        version="gpytorch ExactGP (RBF), converged L-BFGS MLL, float64, 5 starts ranked by train-mode NLML, noise floor 1e-3",
         family="gp",
         factory=_build_gp_mll,
         supports=("ei", "ucb", "ts_marginal", "ts_joint"),

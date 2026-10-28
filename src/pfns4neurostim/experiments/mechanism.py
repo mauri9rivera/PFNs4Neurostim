@@ -428,8 +428,10 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
     # ``row_order`` is sorted | history (analysis/context.ROW_ORDERS). Grid cells only: the gates, the frozen-refit
     # discrepancy and the exemplar keep contexts of distinct sites.
     "revisits": {"fraction": 0.0, "row_order": "sorted"},
-    # method: gauss_hermite | truncated | rqmc (analysis/bayes_update.QUADRATURE_METHODS); central_mass for truncated;
-    # n_scrambles for rqmc (K is then the points per scramble).
+    # method: gauss_hermite | truncated | rqmc (analysis/bayes_update.QUADRATURE_METHODS) | strata (deterministic equal-mass
+    # strata, nodes supplied by each predictive; K strata; user 2026-10-28, config ``mechanism_bayes_update_nhp_amended.yaml``);
+    # central_mass for truncated; n_scrambles for rqmc (K is then the points per scramble); u_min / central_mass /
+    # n_scrambles are unused by ``strata``.
     "quadrature": {"method": "gauss_hermite", "K": 20, "u_min": 1e-12, "central_mass": 1.0, "n_scrambles": 1},
     "eps": 0.01,
     "y_grid": {"points": 512, "u_tail": 1e-4},
@@ -442,7 +444,10 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
     # precision / max_batch_tokens apply to the frozen probe of ``discrepancy`` only (the refit uses the public API).
     # The inference seed of a grid cell is inference_seed + its context draw (user, 2026-10-16, replacing gate G5):
     # each draw is then also an independent TabPFN instance, so every between-draw interval carries seed variance.
-    "tabpfn": {"inference_seed": 0, "precision": "fp32", "max_batch_tokens": 400000, "softmax_temperature": 0.9},
+    # tail_measure: how the two outer buckets of TabPFN's bar distribution are treated, for Part A's moments and ``strata`` nodes
+    # (halfnormal = the library's own moments, every run before 2026-10-28; uniform; central = drop them, the amended measure).
+    "tabpfn": {"inference_seed": 0, "precision": "fp32", "max_batch_tokens": 400000, "softmax_temperature": 0.9,
+               "tail_measure": "halfnormal"},
     "gp_bayes": {"lengthscale": [0.05, 2.0, 12], "outputscale": [0.05, 5.0, 8], "noise": [1.0e-3, 1.0, 10],
                  "b2": 1.0, "prune_mass": 1.0e-10, "chunk": 2048, "exact_max_components": 64, "sd_bins": 32},
     "gp_params": {"n_opt_steps": 50, "lr": 1.0, "optimizer": "lbfgs", "dtype": "float64", "noise_floor": 1.0e-3,
@@ -513,7 +518,10 @@ TABPFN_QUANTILE_DTYPE: str = "float64"
 
 #: Quadrature schemes (mirrors ``analysis.bayes_update.QUADRATURE_METHODS``; kept here so validating a config does
 #: not import the analysis module).
-B_QUADRATURE_METHODS: tuple[str, ...] = ("gauss_hermite", "truncated", "rqmc")
+B_QUADRATURE_METHODS: tuple[str, ...] = ("gauss_hermite", "truncated", "rqmc", "strata")
+
+#: Tail conventions of TabPFN's bar-distribution predictive (mirrors ``analysis.bayes_update.TAIL_MEASURES``).
+B_TAIL_MEASURES: tuple[str, ...] = ("halfnormal", "uniform", "central")
 
 #: Pre-declared headline metrics (OMEGA §3.6): Part A per-anchor, Part A per-cell, Part B (TabPFN vs each reference).
 #: Part A's law-of-total-variance headline is total_var_ratio (user, 2026-10-16): the ratio of sums SumU / SumM is
@@ -582,6 +590,8 @@ def _validate_bayes_update(p: dict[str, Any], ladder: Sequence[int]) -> dict[str
     if p["quadrature"]["method"] not in B_QUADRATURE_METHODS:
         raise ValueError(f"bayes_update.quadrature.method must be one of {B_QUADRATURE_METHODS}, "
                          f"got {p['quadrature']['method']!r}.")
+    if p["tabpfn"]["tail_measure"] not in B_TAIL_MEASURES:
+        raise ValueError(f"bayes_update.tabpfn.tail_measure must be one of {B_TAIL_MEASURES}, got {p['tabpfn']['tail_measure']!r}.")
     for eng, parts in p["coverage"].items():
         if eng in B_ONLY_ENGINES and (parts or {}).get("A"):
             raise ValueError(f"bayes_update.coverage.{eng}.A: {eng} is a Part B reference only (Hypothesis C1).")
@@ -684,7 +694,8 @@ def _make_engine(name: str, p: dict[str, Any], device: str, draw: int = 0) -> An
     if name in TABPFN_ENGINES:
         tp = {**p["tabpfn"], **TABPFN_ENGINES[name]}
         return B.PFNRefitEngine(device=device, random_state=int(tp["inference_seed"]) + int(draw),
-                                softmax_temperature=float(tp["softmax_temperature"]), name=name)
+                                softmax_temperature=float(tp["softmax_temperature"]), name=name,
+                                tail_measure=str(tp.get("tail_measure", B.DEFAULT_TAIL_MEASURE)))
     if name == "gp_bayes":
         g = p["gp_bayes"]
         return B.GPBayesEngine(g["lengthscale"], g["outputscale"], g["noise"], b2=float(g["b2"]),
@@ -699,18 +710,26 @@ def _make_engine(name: str, p: dict[str, Any], device: str, draw: int = 0) -> An
     raise ValueError(f"Unknown bayes_update engine {name!r}.")
 
 
+#: How GP-MLL restarts are ranked, part of every GP-MLL engine's identity since 2026-10-27 (the train-mode marginal likelihood;
+#: before, the evaluation-mode loss, see ``GPSurrogate._fit_candidate``), so a cell fitted under the old rule is never served.
+GP_RESTART_RULE: str = "train_mode_nlml"
+
+
 def _engine_params(name: str, p: dict[str, Any], draw: int = 0) -> dict[str, Any]:
     """The settings of one engine that enter a cell identity (seed, temperature and quantile precision included)."""
     if name in TABPFN_ENGINES:
         tp = {**p["tabpfn"], **TABPFN_ENGINES[name]}
-        return {"inference_seed": int(tp["inference_seed"]) + int(draw), "softmax_temperature": float(tp["softmax_temperature"]),
-                "refit": True, "quantile_dtype": TABPFN_QUANTILE_DTYPE}
+        out = {"inference_seed": int(tp["inference_seed"]) + int(draw), "softmax_temperature": float(tp["softmax_temperature"]),
+               "refit": True, "quantile_dtype": TABPFN_QUANTILE_DTYPE}
+        if tp.get("tail_measure", "halfnormal") != "halfnormal":
+            out["tail_measure"] = tp["tail_measure"]          # added only when not the pre-2026-10-28 default: old cells keep hitting
+        return out
     if name == "gp_bayes":
         return {k: v for k, v in p["gp_bayes"].items() if k != "chunk"}
     if name == "gp_mll_refit":
-        return {"gp_params": p["gp_params"]}
+        return {"gp_params": p["gp_params"], "restart_rule": GP_RESTART_RULE}
     if name == "gp_mll_frozen":
-        return {"gp_params": p["gp_params"], "refit": False}
+        return {"gp_params": p["gp_params"], "refit": False, "restart_rule": GP_RESTART_RULE}
     return {"fixed_gp_params": p["fixed_gp_params"]}
 
 
@@ -838,28 +857,31 @@ def _bayes_cell(
         a = int(a)
         preds_b: dict[str, dict[str, Any]] = {}
         # One quadrature draw per anchor, shared by every engine (identical levels u; each maps them through its
-        # own quantile function).
-        u, w = B.quadrature_levels(str(qd["method"]), int(qd["K"]), u_min=float(qd["u_min"]),
-                                   central_mass=float(qd["central_mass"]), n_scrambles=int(qd["n_scrambles"]),
-                                   rng=rng_for(label, "bayes_update_quadrature", level, t, draw, a,
-                                               base_seed=cfg.seed))
+        # own quantile function). ``strata`` has no levels: every predictive supplies its own deterministic nodes.
+        levels = None
+        if str(qd["method"]) != B.STRATA_METHOD:
+            levels = B.quadrature_levels(str(qd["method"]), int(qd["K"]), u_min=float(qd["u_min"]),
+                                         central_mass=float(qd["central_mass"]), n_scrambles=int(qd["n_scrambles"]),
+                                         rng=rng_for(label, "bayes_update_quadrature", level, t, draw, a, base_seed=cfg.seed))
         for n in names:
             vals, parts = [], {}
             yqs = []
+            w = None
             if n in engines_a:
-                for sidx in range(len(u)):
-                    yq = B.quadrature_values(bases[n], a, u[sidx])
+                yqs, w = B.quadrature_nodes(str(qd["method"]), bases[n], a, int(qd["K"]), u_min=float(qd["u_min"]),
+                                            central_mass=float(qd["central_mass"]), n_scrambles=int(qd["n_scrambles"]),
+                                            levels=levels)
+                for sidx, yq in enumerate(yqs):
                     parts[f"quad{sidx}"] = np.arange(len(vals), len(vals) + len(yq))
                     vals += list(yq)
-                    yqs.append(yq)
             if n in engines_b:
                 for key in ("trial", "ladder"):
                     parts[key] = np.arange(len(vals), len(vals) + len(shared[key][i]))
                     vals += list(shared[key][i])
             pr = engines[n].probe(np.repeat(Q[a][None], len(vals), axis=0), np.asarray(vals), Q)
             if n in engines_a:
-                extra = [(yqs[sidx], pr.take(parts[f"quad{sidx}"])) for sidx in range(len(u))]
-                row, C, Cc = B.coherence_scheme(engines[n], bases[n], Q, a, u, w, float(p["eps"]),
+                extra = [(yqs[sidx], pr.take(parts[f"quad{sidx}"])) for sidx in range(len(yqs))]
+                row, C, Cc = B.coherence_scheme(engines[n], bases[n], Q, a, np.zeros((len(yqs), 1)), w, float(p["eps"]),
                                                 u_tail=float(yg["u_tail"]), grid_points=int(yg["points"]), extra=extra)
                 coh[n].append({**row, "pool": pools[i], "strata": strata[i], "trial_var": float(trial_var[i])})
                 Cs[n].append(C)
@@ -2089,7 +2111,9 @@ REPRESENTATION_DEFAULTS: dict[str, Any] = {
     "n_quantiles": 32,
     "site_sets": ["all"],                              # all | unobserved (demoted pitfall; never at t = 80)
     # The seed rule of every Hyp C analysis: the inference seed of a cell is inference_seed + its context draw.
-    "tabpfn": {"inference_seed": 0, "softmax_temperature": 0.9, "precision": "fp32", "max_batch_tokens": 400000},
+    # tail_measure: the outer-bucket convention of the refit engine of beta1b (analysis/bayes_update.TAIL_MEASURES); halfnormal = every run before 2026-10-28.
+    "tabpfn": {"inference_seed": 0, "softmax_temperature": 0.9, "precision": "fp32", "max_batch_tokens": 400000,
+               "tail_measure": "halfnormal"},
     "gp_params": {"n_opt_steps": 50, "lr": 1.0, "optimizer": "lbfgs", "dtype": "float64", "noise_floor": 1.0e-3,
                   "n_restarts": 5, "lengthscale_floor": 0.05},
     "fixed_gp_params": {"lengthscale": 0.6931471805599453, "outputscale": 1.0, "noise": 0.05},
@@ -2312,7 +2336,7 @@ def _representation_gp(name: str, p: dict[str, Any]) -> Any:
 def _representation_gp_params(name: str, p: dict[str, Any]) -> dict[str, Any]:
     """The settings of one GP belief engine that enter a cell identity."""
     if name == "gp_mll_refit":
-        return {"gp_params": p["gp_params"]}
+        return {"gp_params": p["gp_params"], "restart_rule": GP_RESTART_RULE}
     if name == "gp_fixed":
         return {"fixed_gp_params": p["fixed_gp_params"]}
     return {k: v for k, v in p["gp_bayes"].items() if k != "chunk"}

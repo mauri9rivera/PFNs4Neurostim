@@ -379,10 +379,21 @@ class GPSurrogate:
         likelihood.eval()
         with torch.no_grad():
             if self._n_opt_steps > 0:
-                # This is the feasibility test as well as the diagnostic: it is the evaluation-mode
-                # factorisation of the context posterior, the exact operation that killed five cells on
-                # 2026-09-30. A start that cannot do it is discarded instead of aborting the run.
-                final_loss = float(-mll(model(train_x), train_y).detach())
+                # The evaluation-mode factorisation of the context posterior is the feasibility test, the exact
+                # operation that killed five cells on 2026-09-30: a start that cannot do it is discarded instead of
+                # aborting the run. Its VALUE is not the marginal likelihood: in evaluation mode ``model(train_x)`` is
+                # the posterior at the training inputs, so ``-mll`` there is a training-set predictive likelihood that
+                # rewards interpolation (noise -> floor). Until 2026-10-27 that value ranked the restarts, which picked
+                # a noise-floor fit on 81 % of NHP contexts although it was > 0.01 nats worse in the real NLML on 67 %
+                # (research_design section 4, 2026-10-27). The restarts are ranked by the train-mode value below.
+                eval_loss = float(-mll(model(train_x), train_y).detach())
+                if not math.isfinite(eval_loss):
+                    raise NanError(f"non-finite marginal likelihood after the fit ({eval_loss}).")
+                model.train()
+                likelihood.train()
+                final_loss = float(-mll(model(train_x), train_y).detach())    # negative MARGINAL log likelihood per datum
+                model.eval()
+                likelihood.eval()
                 if not math.isfinite(final_loss):
                     raise NanError(f"non-finite marginal likelihood after the fit ({final_loss}).")
         diagnostics = self._read_hyperparameters(

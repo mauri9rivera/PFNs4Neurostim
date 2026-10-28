@@ -157,8 +157,13 @@ class TabPFNSurrogate:
     def __init__(
         self,
         model: TabPFNRegressor,
+        acquisition_form: str = "bars",
     ) -> None:
+        if acquisition_form not in ("bars", "moments"):
+            raise ValueError(f"acquisition_form must be 'bars' or 'moments', got {acquisition_form!r}.")
         self._model = model
+        #: ``'bars'``: EI / PI / UCB from the bar distribution itself (``bar_acquisition``); ``'moments'``: Gaussian forms.
+        self.acquisition_form = acquisition_form
         # Logit cache: populated by predict_ucb, invalidated by fit.
         # Allows predict(X) to skip a second forward pass when called with the
         # same X and context as the preceding predict_ucb(X) call.
@@ -229,6 +234,28 @@ class TabPFNSurrogate:
                 f"mean NaNs: {np.isnan(mean).sum()}, std NaNs: {np.isnan(std).sum()}."
             )
         return mean, std
+
+    def predict_bars(self, X: np.ndarray) -> tuple[Any, torch.Tensor]:
+        """Return the bar distribution at the candidates: the criterion and the logits.
+
+        Served from the logit cache when it is valid for this ``X``; otherwise one ``output_type='full'`` pass is run
+        and the cache refreshed. The criterion's borders are in the y space this surrogate was fitted on.
+
+        Args:
+            X: Query feature matrix, shape [M, D].  # [M, D]
+
+        Returns:
+            ``(criterion, logits)`` with logits of shape [M, num_bars].  # [M, num_bars]
+        """
+        if self._logit_cache is not None:
+            X_ref, cached_logits, cached_criterion = self._logit_cache
+            if X.shape == X_ref.shape and np.array_equal(X, X_ref):
+                return cached_criterion, cached_logits
+        full_output = self._model.predict(X, output_type="full")
+        logits = full_output["logits"]                                              # [M, num_bars]
+        criterion = full_output["criterion"]
+        self._logit_cache = (X.copy(), logits.detach(), criterion)
+        return criterion, logits.detach()
 
     def predict_ucb(
         self,

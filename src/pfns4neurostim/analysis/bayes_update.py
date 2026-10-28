@@ -59,6 +59,13 @@ __all__ = [
     "SHUFFLE_MODES",
     "context_order",
     "QUADRATURE_METHODS",
+    "STRATA_METHOD",
+    "TAIL_MEASURES",
+    "DEFAULT_TAIL_MEASURE",
+    "bar_moments",
+    "bar_strata_means",
+    "gauss_strata_nodes",
+    "quadrature_nodes",
     "gh_nodes",
     "quadrature_levels",
     "quadrature_values",
@@ -89,6 +96,18 @@ ANCHOR_STRATA: tuple[str, ...] = ("high", "low", "edge", "centre")
 ANCHOR_POOLS: tuple[str, ...] = ("unobserved", "observed")
 #: Pool label of the Part A summary over every anchor of a cell (written at assembly, user 2026-10-22).
 POOLED_ANCHORS: str = "all"
+
+#: Tail conventions of a bar-distribution predictive. TabPFN's regression head is 5000 buckets, uniform inside every interior
+#: bucket; the two outer buckets are ~60-260 predictive SDs wide and hold 1e-6 .. 2e-4 of the mass, so what happens inside them is a
+#: convention of the criterion, not a belief of the network, and it decides every readout that is a second moment (research_design
+#: section 4, 2026-10-28):
+#:   halfnormal  half-normal tails (``criterion.mean`` / ``variance``: the training density; the pre-2026-10-28 behaviour, the default)
+#:   uniform     outer buckets uniform on their finite width (``icdf`` / ``cdf`` / sampling)
+#:   central     outer buckets dropped, interior renormalised (user 2026-10-28; the amended OMEGA measure)
+TAIL_MEASURES: tuple[str, ...] = ("halfnormal", "uniform", "central")
+DEFAULT_TAIL_MEASURE: str = "halfnormal"
+#: Quadrature method of deterministic equal-mass strata (the predictive supplies its own nodes; see :func:`quadrature_nodes`).
+STRATA_METHOD: str = "strata"
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +267,21 @@ class Predictive:
         """
         raise NotImplementedError
 
+    def strata_nodes(self, anchor: int, K: int) -> tuple[np.ndarray, np.ndarray]:
+        """Deterministic quadrature nodes of the predictive at one site: conditional means of equal-mass strata.
+
+        Args:
+            anchor: Site index.
+            K: Number of strata.
+
+        Returns:
+            ``(y [n], w [n])``, weights summing to 1.
+
+        Raises:
+            NotImplementedError: For a predictive without a stratum rule (use a quantile-based method).
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no deterministic strata nodes.")
+
     def take(self, idx: Sequence[int] | np.ndarray) -> "Predictive":
         """The predictive restricted to some conditioning states.
 
@@ -308,6 +342,23 @@ class MixturePredictive(Predictive):
     def _site_components(self, m: int) -> tuple[np.ndarray, np.ndarray]:
         """Component means and variances at one site, shape [P, C] each."""
         return self.means[:, m], self.variances[:, m]
+
+    def strata_nodes(self, anchor: int, K: int) -> tuple[np.ndarray, np.ndarray]:
+        """Exact Gaussian strata of a one-component predictive (GP with point hyperparameters), see :func:`gauss_strata_nodes`.
+
+        Args:
+            anchor: Site index.
+            K: Number of strata.
+
+        Returns:
+            ``(y [K], w [K])``.
+
+        Raises:
+            NotImplementedError: For a mixture of several components or several probes.
+        """
+        if self.weights.shape != (1, 1):
+            raise NotImplementedError("MixturePredictive.strata_nodes needs a single Gaussian component and P = 1.")
+        return gauss_strata_nodes(float(self.mean[0, anchor]), float(np.sqrt(self.var[0, anchor])), K)
 
     def _mixture_cdf(self, y: np.ndarray, means: np.ndarray, sds: np.ndarray, weights: np.ndarray) -> np.ndarray:
         """``sum_c w_c Phi((y - mu_c) / s_c)`` with ``y`` [..., G] against components [..., C], chunked over C."""
@@ -588,13 +639,14 @@ class CriterionPredictive(Predictive):
         parts: Per conditioning state, ``(criterion, logits [M, bars])`` from ``predict(output_type='full')``.
     """
 
-    def __init__(self, parts: Sequence[tuple[Any, Any]]) -> None:
-        from ..models.pfn.tabpfn import _bar_distribution_moments  # noqa: PLC0415
-
+    def __init__(self, parts: Sequence[tuple[Any, Any]], tail_measure: str = DEFAULT_TAIL_MEASURE) -> None:
+        if tail_measure not in TAIL_MEASURES:
+            raise ValueError(f"CriterionPredictive: tail_measure must be one of {TAIL_MEASURES}, got {tail_measure!r}.")
         self.parts = list(parts)
-        moments = [_bar_distribution_moments(c, lg) for c, lg in self.parts]
+        self.tail_measure = tail_measure
+        moments = [bar_moments(c, lg, tail_measure) for c, lg in self.parts]
         self.mean = np.stack([m for m, _ in moments]).astype(np.float64)          # [P, M]
-        self.var = np.stack([sd for _, sd in moments]).astype(np.float64) ** 2     # [P, M]
+        self.var = np.stack([v for _, v in moments]).astype(np.float64)            # [P, M]
 
     def cdf(self, y_grid: np.ndarray) -> np.ndarray:
         """See :meth:`Predictive.cdf`."""
@@ -617,7 +669,141 @@ class CriterionPredictive(Predictive):
 
     def take(self, idx: Sequence[int] | np.ndarray) -> "CriterionPredictive":
         """See :meth:`Predictive.take`."""
-        return CriterionPredictive([self.parts[int(i)] for i in np.asarray(idx, dtype=int)])
+        return CriterionPredictive([self.parts[int(i)] for i in np.asarray(idx, dtype=int)], self.tail_measure)
+
+    def strata_nodes(self, anchor: int, K: int) -> tuple[np.ndarray, np.ndarray]:
+        """Deterministic nodes of the bar distribution at one site under this predictive's tail measure.
+
+        ``central``: ``K`` equal-mass strata of the interior buckets. ``uniform`` / ``halfnormal``: the same plus two nodes
+        per outer bucket (its mean +- its SD under the convention), weighted by the bucket's mass, so the node set carries
+        the measure's mean and variance up to the within-stratum part, which shrinks with ``K``.
+
+        Args:
+            anchor: Site index.
+            K: Interior strata.
+
+        Returns:
+            ``(y [n], w [n])``, weights summing to 1.
+
+        Raises:
+            NotImplementedError: For several probes.
+        """
+        if len(self.parts) != 1:
+            raise NotImplementedError("CriterionPredictive.strata_nodes is for a base predictive (P = 1).")
+        import torch  # noqa: PLC0415
+
+        crit, logits = self.parts[0]
+        probs = torch.softmax(logits[int(anchor)].double(), -1)                    # [bars]
+        p0, pL = float(probs[0]), float(probs[-1])
+        inner = bar_strata_means(crit, probs, p0, 1.0 - pL, int(K))                # [K]
+        if self.tail_measure == "central":
+            return inner, np.full(int(K), 1.0 / int(K))
+        b = crit.borders.double().cpu()
+        if self.tail_measure == "halfnormal":
+            left = crit.halfnormal_with_p_weight_before(crit.bucket_widths[0])
+            right = crit.halfnormal_with_p_weight_before(crit.bucket_widths[-1])
+            ml, sl = float(b[1] - left.mean.double()), float(left.variance.double().sqrt())
+            mr, sr = float(b[-2] + right.mean.double()), float(right.variance.double().sqrt())
+        else:                                                                       # uniform on the finite outer buckets
+            wl, wr = float(b[1] - b[0]), float(b[-1] - b[-2])
+            ml, sl = float(b[0] + wl / 2), wl / np.sqrt(12.0)
+            mr, sr = float(b[-2] + wr / 2), wr / np.sqrt(12.0)
+        y = np.concatenate([[ml - sl, ml + sl], inner, [mr - sr, mr + sr]])
+        w = np.concatenate([[p0 / 2, p0 / 2], np.full(int(K), (1.0 - p0 - pL) / int(K)), [pL / 2, pL / 2]])
+        return y, w
+
+
+def bar_moments(criterion: Any, logits: Any, tail_measure: str = DEFAULT_TAIL_MEASURE) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and variance of bar distributions under a tail convention (:data:`TAIL_MEASURES`).
+
+    ``halfnormal`` is the criterion's own ``mean`` / ``variance``. ``uniform`` takes every bucket, the outer two included,
+    uniform on its finite width; ``central`` drops the outer buckets and renormalises the interior.
+
+    Args:
+        criterion: ``FullSupportBarDistribution`` the logits belong to.
+        logits: Bar logits, shape [M, bars].
+        tail_measure: One of :data:`TAIL_MEASURES`.
+
+    Returns:
+        ``(mean [M], variance [M])`` as float64.
+
+    Raises:
+        ValueError: On an unknown measure.
+        RuntimeError: If a moment is not finite.
+    """
+    import torch  # noqa: PLC0415
+
+    if tail_measure not in TAIL_MEASURES:
+        raise ValueError(f"bar_moments: tail_measure must be one of {TAIL_MEASURES}, got {tail_measure!r}.")
+    if tail_measure == "halfnormal":
+        from ..models.pfn.tabpfn import _bar_distribution_moments  # noqa: PLC0415
+
+        mean, sd = _bar_distribution_moments(criterion, logits)
+        return mean.astype(np.float64), sd.astype(np.float64) ** 2
+    with torch.no_grad():
+        p = torch.softmax(logits.to(criterion.borders.device).double(), -1)        # [M, bars]
+        if tail_measure == "central":
+            p = p.clone()
+            p[:, 0] = 0.0
+            p[:, -1] = 0.0
+            p = p / p.sum(-1, keepdim=True)
+        b = criterion.borders.double().to(p.device)                                # [bars + 1]
+        lo, hi = b[:-1], b[1:]
+        m1 = (p * (lo + hi) / 2).sum(-1)                                           # [M]
+        m2 = (p * (lo ** 2 + lo * hi + hi ** 2) / 3).sum(-1)                       # [M]
+        var = (m2 - m1 ** 2).clamp_min(0.0)
+    mean_np, var_np = m1.cpu().numpy(), var.cpu().numpy()
+    if not (np.isfinite(mean_np).all() and np.isfinite(var_np).all()):
+        raise RuntimeError(f"bar_moments({tail_measure}): non-finite moments.")
+    return mean_np, var_np
+
+
+def bar_strata_means(criterion: Any, probs: Any, lo_u: float, hi_u: float, K: int) -> np.ndarray:
+    """Exact conditional means of ``K`` equal-mass strata of a bar distribution between two cumulative levels.
+
+    Uniform inside every bucket; zero-mass and zero-width buckets contribute nothing.
+
+    Args:
+        criterion: ``FullSupportBarDistribution`` (only its borders are read).
+        probs: Bucket probabilities at one site, shape [bars], float64 torch tensor.
+        lo_u: Lower cumulative level of the mass to stratify.
+        hi_u: Upper cumulative level.
+        K: Number of strata.
+
+    Returns:
+        Conditional means, shape [K].
+    """
+    import torch  # noqa: PLC0415
+
+    b = criterion.borders.double().to(probs.device)                                # [bars + 1]
+    c = torch.cumsum(probs, -1)                                                    # [bars]
+    c0 = c - probs                                                                 # [bars]
+    edges = lo_u + (hi_u - lo_u) * torch.arange(int(K) + 1, dtype=torch.float64, device=probs.device) / int(K)   # [K + 1]
+    a = torch.maximum(c0[:, None], edges[None, :-1])                               # [bars, K]
+    e = torch.minimum(c[:, None], edges[None, 1:])                                 # [bars, K]
+    m = (e - a).clamp_min(0.0)                                                     # [bars, K] mass of a bucket in a stratum
+    frac = torch.where(probs[:, None] > 0, ((a + e) / 2 - c0[:, None]) / probs[:, None].clamp_min(1e-300), torch.zeros_like(m))
+    y = b[:-1, None] + (b[1:] - b[:-1])[:, None] * frac.clamp(0.0, 1.0)            # [bars, K]
+    out = ((m * y).sum(0) / m.sum(0).clamp_min(1e-300)).cpu().numpy()              # [K]
+    if not np.isfinite(out).all():
+        raise RuntimeError("bar_strata_means: non-finite stratum means.")
+    return out
+
+
+def gauss_strata_nodes(mu: float, sd: float, K: int) -> tuple[np.ndarray, np.ndarray]:
+    """Exact conditional means of ``K`` equal-mass strata of ``N(mu, sd^2)``.
+
+    Args:
+        mu: Mean.
+        sd: Standard deviation.
+        K: Number of strata.
+
+    Returns:
+        ``(y [K], w [K])`` with equal weights ``1 / K``.
+    """
+    z = ndtri(np.arange(int(K) + 1) / int(K))                                      # [K + 1], +-inf at the ends
+    pdf = np.where(np.isfinite(z), np.exp(-0.5 * np.where(np.isfinite(z), z, 0.0) ** 2) / np.sqrt(2.0 * np.pi), 0.0)
+    return mu + sd * int(K) * (pdf[:-1] - pdf[1:]), np.full(int(K), 1.0 / int(K))
 
 
 class EqualMixturePredictive(Predictive):
@@ -820,16 +1006,22 @@ class PFNRefitEngine:
         n_permutations: Row orders per refit; above 1 the predictive is their equal-weight mixture
             (:class:`EqualMixturePredictive`), which needs a shuffling mode.
         rng: Generator of the row orders (required unless ``shuffle == 'none'``).
+        tail_measure: One of :data:`TAIL_MEASURES`: how the two outer buckets of every predictive are treated (moments and,
+            under the ``strata`` quadrature, nodes). The default reproduces every run before 2026-10-28.
 
     Raises:
-        ValueError: On an unknown mode, ``n_permutations < 1``, several orders with ``shuffle == 'none'``, or a
+        ValueError: On an unknown mode or tail measure, ``n_permutations < 1``, several orders with ``shuffle == 'none'``, or a
             shuffling mode without a generator.
     """
 
     def __init__(self, device: str = "cpu", random_state: int = 0, softmax_temperature: float = 0.9,
                  name: str = "tabpfn_v2_5", shuffle: str = "none", n_permutations: int = 1,
-                 rng: np.random.Generator | None = None) -> None:
+                 rng: np.random.Generator | None = None, tail_measure: str = DEFAULT_TAIL_MEASURE) -> None:
         from tabpfn import TabPFNRegressor  # noqa: PLC0415 - heavy import
+
+        if tail_measure not in TAIL_MEASURES:
+            raise ValueError(f"PFNRefitEngine: tail_measure must be one of {TAIL_MEASURES}, got {tail_measure!r}.")
+        self.tail_measure = tail_measure
 
         if shuffle not in SHUFFLE_MODES:
             raise ValueError(f"PFNRefitEngine: shuffle must be one of {SHUFFLE_MODES}, got {shuffle!r}.")
@@ -859,8 +1051,9 @@ class PFNRefitEngine:
     def _predictive(self, fits: Sequence[Sequence[tuple[Any, Any]]]) -> Predictive:
         """Predictive of ``P`` conditioning states from their ``S`` fits each, shape ``[P][S]``."""
         if self.n_permutations == 1:
-            return CriterionPredictive([f[0] for f in fits])
-        return EqualMixturePredictive([CriterionPredictive([f[s] for f in fits]) for s in range(self.n_permutations)])
+            return CriterionPredictive([f[0] for f in fits], self.tail_measure)
+        return EqualMixturePredictive([CriterionPredictive([f[s] for f in fits], self.tail_measure)
+                                       for s in range(self.n_permutations)])
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> None:
         """Keep the context; every prediction is a fresh fit."""
@@ -1354,6 +1547,45 @@ def quadrature_values(base: Predictive, anchor: int, u: np.ndarray) -> np.ndarra
     return base.ppf(np.asarray(u), np.array([anchor]))[0, 0]
 
 
+def quadrature_nodes(
+    method: str,
+    base: Predictive,
+    anchor: int,
+    K: int,
+    *,
+    u_min: float,
+    central_mass: float = 1.0,
+    n_scrambles: int = 1,
+    rng: np.random.Generator | None = None,
+    levels: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """The ``y'`` node sets and weights of one anchor for one predictive, under any quadrature method.
+
+    ``strata`` (user 2026-10-28) has the predictive supply deterministic nodes (:meth:`Predictive.strata_nodes`); every other
+    method maps levels through the predictive's quantile function (:func:`quadrature_levels`, :func:`quadrature_values`).
+
+    Args:
+        method: One of :data:`QUADRATURE_METHODS` or :data:`STRATA_METHOD`.
+        base: Predictive given D.
+        anchor: Anchor site.
+        K: Nodes (strata, Gauss-Hermite nodes, or RQMC points per scramble).
+        u_min: Level clip (levels methods).
+        central_mass: Kept mass of the truncated scheme.
+        n_scrambles: RQMC scrambles.
+        rng: Generator of the scrambles.
+        levels: Already drawn ``(u [S, K], w [K])`` shared across engines (levels methods); drawn here when ``None``.
+
+    Returns:
+        ``(list of node arrays, one per scramble; weights [n])``.
+    """
+    if method == STRATA_METHOD:
+        y, w = base.strata_nodes(int(anchor), int(K))
+        return [y], w
+    u, w = levels if levels is not None else quadrature_levels(method, K, u_min=u_min, central_mass=central_mass,
+                                                                n_scrambles=n_scrambles, rng=rng)
+    return [quadrature_values(base, int(anchor), us) for us in u], w
+
+
 def site_grid(
     predictives: Sequence[Predictive],
     u_tail: float,
@@ -1696,9 +1928,10 @@ def coherence(
     base = engine.base(Q)
     rows, Cs, Ccs = [], [], []
     for a in np.asarray(anchors, dtype=int):
-        u, w = quadrature_levels(method, K, u_min=u_min, central_mass=central_mass, n_scrambles=n_scrambles,
-                                 rng=rng)
-        row, C, Cc = coherence_scheme(engine, base, Q, int(a), u, w, eps, u_tail=u_tail, grid_points=grid_points)
+        ys, w = quadrature_nodes(method, base, int(a), K, u_min=u_min, central_mass=central_mass, n_scrambles=n_scrambles, rng=rng)
+        extra = [(y, engine.probe(np.repeat(Q[int(a)][None], len(y), axis=0), y, Q)) for y in ys]
+        row, C, Cc = coherence_scheme(engine, base, Q, int(a), np.zeros((len(ys), 1)), w, eps, u_tail=u_tail,
+                                      grid_points=grid_points, extra=extra)
         rows.append(row)
         Cs.append(C)
         Ccs.append(Cc)

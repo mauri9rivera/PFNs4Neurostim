@@ -77,7 +77,7 @@ representation:
   layout_confound: gp_fixed
   n_quantiles: 32
   site_sets: [all]
-  tabpfn: {inference_seed: 0, softmax_temperature: 0.9, precision: fp32, max_batch_tokens: 400000}
+  tabpfn: {inference_seed: 0, softmax_temperature: 0.9, precision: fp32, max_batch_tokens: 400000, tail_measure: central}   # amended 2026-10-28 (OMEGA amendment)
   gp_params: {n_opt_steps: 50, lr: 1.0, optimizer: lbfgs, dtype: float64, noise_floor: 1.0e-3, n_restarts: 5,
               lengthscale_floor: 0.05}
   fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.05}
@@ -94,7 +94,7 @@ representation:
     engine: tabpfn_v2_5
     references: [gp_mll_refit, gp_fixed]
     coverage: {levels: [1.0], context_ts: null, draws: [0], channels_per_subject: 2}
-    quadrature: {method: rqmc, K: 8, u_min: 1.0e-12, central_mass: 1.0, n_scrambles: 8}
+    quadrature: {method: strata, K: 64, u_min: 1.0e-12, central_mass: 1.0, n_scrambles: 1}   # amended 2026-10-28; was rqmc 8 x 8
     eps: 0.01
     y_grid: {points: 512, u_tail: 1.0e-4}
     moment_matched: true

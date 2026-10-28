@@ -141,6 +141,27 @@ class SurrogateAdapter:
         return mean, std
 
     @property
+    def has_bar_predictive(self) -> bool:
+        """True when EI / PI / UCB are to be scored over the wrapped model's bar distribution (``acquisition_form == 'bars'``)."""
+        return callable(getattr(self._model, "predict_bars", None)) and getattr(self._model, "acquisition_form", "moments") == "bars"
+
+    def predict_bars(self, X: np.ndarray) -> tuple[Any, Any]:
+        """Return the wrapped model's bar distribution at the candidates.
+
+        Args:
+            X: Candidate coordinates, shape [N, D].
+
+        Returns:
+            ``(criterion, logits)`` with logits of shape [N, bars].
+
+        Raises:
+            NotImplementedError: If the model has no bar predictive.
+        """
+        if not self.has_bar_predictive:
+            raise NotImplementedError(f"{self.key!r} has no bar-distribution predictive.")
+        return self._model.predict_bars(X)
+
+    @property
     def supports_joint(self) -> bool:
         """True for the GP family, whose posterior has a tractable joint draw."""
         return self.family == "gp" and hasattr(self._model, "predict_ts")

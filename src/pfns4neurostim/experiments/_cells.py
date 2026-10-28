@@ -9,7 +9,8 @@ from ..config import AcquisitionConfig, ExperimentConfig
 from ..data.channels import ChannelData
 from ..data.ground_truth import ground_truth_instances, split_half_reliability
 from ..evaluation.results import TidyRow
-from ..models.registry import model_version
+from ..models.pfn.bar_acquisition import BAR_ACQUISITIONS, DEFAULT_ACQUISITION_FORM
+from ..models.registry import MODEL_REGISTRY, model_version
 from ..seeding import rng_for
 
 __all__ = ["cell_identity", "row_from_payload", "count_channels", "gt_instances", "RETIRED_ROW_FIELDS"]
@@ -82,7 +83,7 @@ def cell_identity(
         "emg": channel.emg,
         "model": model,
         "model_version": model_version(model),
-        "model_params": cfg.model_params.get(model, {}),
+        "model_params": {k: v for k, v in cfg.model_params.get(model, {}).items() if k != "acquisition_form"},
         "device": cfg.device,
         "acq_type": acq.type,
         "acq_params_resolved": {
@@ -101,6 +102,14 @@ def cell_identity(
         "seed": seed,
         "cache_version": cfg.cache_version,
     }
+    # EI / PI / UCB of a bar-capable surrogate are scored over its bar distribution since 2026-10-27 (user): added ONLY then, so the
+    # TS cells, every GP cell and every ``acquisition_form: moments`` cell keep hitting. ``acquisition_form`` is excluded from
+    # ``model_params`` above for the same reason.
+    spec = MODEL_REGISTRY.get(model)
+    if spec is not None and spec.bar_acquisition and acq.type in BAR_ACQUISITIONS:
+        form = cfg.model_params.get(model, {}).get("acquisition_form", DEFAULT_ACQUISITION_FORM)
+        if form == "bars":
+            identity["acq_form"] = "bars"
     # Online y scaling changes what the surrogate is fitted on, so it must be part of the identity --
     # but added ONLY when active, so the thousands of cached 'none' cells stay valid (2026-09-27).
     if getattr(cfg, "online_y_scaler", "none") != "none":
