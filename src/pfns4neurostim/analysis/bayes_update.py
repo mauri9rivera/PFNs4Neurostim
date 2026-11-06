@@ -96,6 +96,10 @@ ANCHOR_STRATA: tuple[str, ...] = ("high", "low", "edge", "centre")
 ANCHOR_POOLS: tuple[str, ...] = ("unobserved", "observed")
 #: Pool label of the Part A summary over every anchor of a cell (written at assembly, user 2026-10-22).
 POOLED_ANCHORS: str = "all"
+#: Part A readouts of the predictive CDF (Kolmogorov distance, grid total variation of the martingale gap), the G8 headline.
+#: Added 2026-11-05, before the first amended grid cell; the grid-cell identity carries this tuple, so a cell cached
+#: without them is recomputed instead of assembling with empty columns.
+CDF_READOUTS: tuple[str, ...] = ("ks", "tv_grid")
 
 #: Tail conventions of a bar-distribution predictive. TabPFN's regression head is 5000 buckets, uniform inside every interior
 #: bucket; the two outer buckets are ~60-260 predictive SDs wide and hold 1e-6 .. 2e-4 of the mass, so what happens inside them is a
@@ -1766,7 +1770,10 @@ def coherence_anchor(
         eps: Influenced sites: ``M(x) >= eps s^2(x)``.
 
     Returns:
-        ``(row, C, C_c)``: per-anchor metrics and the raw / moment-matched implied covariance ``C(x', .)``, [M].
+        ``(row, C, C_c)``: per-anchor metrics and the raw / moment-matched implied covariance ``C(x', .)``, [M]. The row
+        includes the CDF readouts ``ks`` (``max_y |F_mix - F_base|``) and ``tv_grid`` (``0.5 sum |dD|`` on the grid, a
+        lower bound on the total variation), where ``F_mix`` is the node-weighted mixture of the refit CDFs; both are
+        medians over every site and are 0 for a coherent Bayesian update.
 
     Raises:
         RuntimeError: If a quantity is non-finite.
@@ -1781,13 +1788,20 @@ def coherence_anchor(
     C = w @ ((y_quad - ybar)[:, None] * (mus - mubar))                             # [M]
     delta = (mubar - mu) / np.sqrt(s2)                                             # [M]
     F_mix = np.einsum("k,kmg->mg", w, probes.cdf(y_grid))                          # [M, G]
-    drift_w1 = w1(F_mix, base.cdf(y_grid)[0], y_grid) / np.sqrt(s2)                # [M]
+    F_base = base.cdf(y_grid)[0]                                                   # [M, G]
+    drift_w1 = w1(F_mix, F_base, y_grid) / np.sqrt(s2)                             # [M]
+    # CDF readouts of the martingale identity (G8 headline, 2026-10-28): bounded, so the outer-bucket convention of
+    # TabPFN moves them by at most the outer-bucket mass (<= 2.4e-4), unlike the second-moment readouts.
+    D = F_mix - F_base                                                             # [M, G]
+    cdf_ks = np.abs(D).max(axis=-1)                                                # Kolmogorov distance  [M]
+    cdf_tv = 0.5 * np.abs(np.diff(D, axis=-1)).sum(axis=-1)                        # grid TV (lower bound)  [M]
     R = (w @ s2s + move) / s2                                                      # [M]
     rho = float(s2[anchor]) / v                                                    # stated / measured variance
     move_c, C_c = move * rho, C * rho                                              # [M]
     delta_c = (mubar - mu - (C / v) * (ybar - mu[anchor])) / np.sqrt(s2)           # [M]
     R_c = (w @ s2s + move_c) / s2                                                  # [M]
-    for name, arr in (("delta", delta), ("C", C), ("R", R), ("drift_w1", drift_w1), ("delta_c", delta_c)):
+    for name, arr in (("delta", delta), ("C", C), ("R", R), ("drift_w1", drift_w1), ("delta_c", delta_c),
+                      ("ks", cdf_ks), ("tv_grid", cdf_tv)):
         if not np.isfinite(arr).all():
             raise RuntimeError(f"coherence_anchor: {name} is non-finite.")
     infl = move >= eps * s2                                                        # [M]
@@ -1796,6 +1810,9 @@ def coherence_anchor(
         "anchor": int(anchor),
         "drift_abs": _median(np.abs(delta[infl])),
         "drift_w1": _median(drift_w1[infl]),
+        # median over EVERY site, not over I: a CDF readout is defined everywhere (as in the 2026-10-28 measure study)
+        "ks": float(np.median(cdf_ks)),
+        "tv_grid": float(np.median(cdf_tv)),
         # ratio of sums over I (user, 2026-10-15): a median of per-site ratios exploded at small-M sites
         "shrink_move_ratio": None if msum == 0 else float(shrink[infl].sum() / msum),
         "total_var_ratio": _median(R[infl]),
@@ -2074,7 +2091,8 @@ def coherence_cell(
         if idx.size == 0:
             continue
         cell: dict[str, Any] = {"pool": pool, "n_anchors": int(idx.size)}
-        for key in ("drift_abs", "drift_w1", "shrink_move_ratio", "total_var_ratio", "latent_frac", "implied_noise",
+        for key in ("ks", "tv_grid", "drift_abs", "drift_w1", "shrink_move_ratio", "total_var_ratio", "latent_frac",
+                    "implied_noise",
                     "drift_abs_c", "shrink_move_ratio_c", "total_var_ratio_c", "latent_frac_c", "implied_noise_c"):
             vals = np.array([rows[i][key] for i in idx if rows[i].get(key) is not None], dtype=np.float64)
             cell[key] = _median(vals)

@@ -1367,6 +1367,7 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                          "engine_params": {e: _engine_params(e, p, draw) for e in fitted},
                          **{k: p[k] for k in ("references", "anchors", "quadrature", "eps", "y_grid",
                                               "shared", "far_pitch")},
+                         "cdf_readouts": list(B.CDF_READOUTS),
                          **_revisit_identity(p)}
                 hit = cells.run(
                     "cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",

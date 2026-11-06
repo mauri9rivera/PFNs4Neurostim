@@ -23,8 +23,11 @@ from pfns4neurostim.experiments import mechanism
 #: loss, not the marginal likelihood, until then), so no cell fitted under the old rule is served. Their digests at ``bb0bba5``
 #: (the pulled Narval grid, now pre-amendment and readable by ``--replot`` only) were cell d3aa586c13ae267cddb5a81d2dca2d91,
 #: exemplar 372d58030c2074d08a56334c940c54d9, c1_exemplar f6935322936ea5a676133f0bbc35fb63. CKA (b) did not move.
+#: The grid cell moved again on 2026-11-05, deliberately and before any amended grid cell existed: its identity now carries
+#: ``cdf_readouts`` (the G8 Kolmogorov / grid-TV readouts of Part A), so a cell cached without them is recomputed. Its digest
+#: from 2026-10-28 to 2026-11-05 was b56a5328a7806b81b49d5930d70841a0; the exemplar kinds did not move.
 EXPECTED: dict[tuple[str, str], tuple[int, str]] = {
-    ("mechanism_bayes_update_nhp", "cell"): (528, "b56a5328a7806b81b49d5930d70841a0"),
+    ("mechanism_bayes_update_nhp", "cell"): (528, "295953a9a691d4813921ca40dfcc278c"),
     ("mechanism_bayes_update_nhp", "exemplar"): (4, "ffcc24f0427da1b412f3e3b9d7106db7"),
     ("mechanism_bayes_update_nhp", "c1_exemplar"): (4, "ade0634f295a105a770a778d0920c131"),
     ("mechanism_cka_nhp", "b"): (40, "993820e1717e207380d0d6fe61556dd5"),

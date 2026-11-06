@@ -4,6 +4,13 @@
 #       supplies its own exact conditional-mean nodes; same probe count as RQMC 8 x 8, no sampling noise).
 #   (2) TAIL MEASURE: tabpfn.tail_measure ``halfnormal`` (the library's moments: the training density, half-normal outer buckets)
 #       -> ``central`` (the two outer buckets dropped, the interior renormalised), for TabPFN's stated mean / variance and nodes.
+#   (4) ENGINES: the temperature-1.0 control ``tabpfn_v2_5_t1`` is dropped (user, 2026-10-28: only the deployed T 0.9 engine is considered;
+#       it was ~ T 0.9 in every pre-amendment readout and in no figure). Saves about a third of a cell's time. Re-add it to ``engines`` to restore it.
+#   (5) C1 REFERENCE (user, 2026-10-30; research log 2026-10-29 "Hypothesis C analysis set pruned for the AAAI paper"): ``gp_mll_frozen``
+#       leaves Hypothesis C -- removed from ``engines``, ``references`` and ``c1.engines``; ``c1.reference: gp_fixed`` (closed-form, exact
+#       update). GP-MLL refit stays in ``c1.engines`` and joins the C1 reading once its fit variability is handled. Part B still runs:
+#       C1's footprint / transfer readouts are Part B rows against ``c1.reference``; only Part B's C2 head-to-head is backlogged.
+#       Changed before any amended grid cell, so nothing is recomputed (cells are keyed by the engine list).
 #   (3) GP-MLL RESTART RULE (code, not config): restarts are ranked by the train-mode marginal likelihood (before: an evaluation-mode
 #       loss that rewarded interpolation). Part of every GP-MLL engine's cell identity (``restart_rule: train_mode_nlml``).
 # WHY: see the research log. In short: raw RQMC readouts were unstable even on GP-fixed (CKA of the implied covariance 0.34-0.99
@@ -19,7 +26,7 @@
 # 0.056, asymmetry 0.175. K = 128 halves the raw error (0.17 %). So the gate needs no relaxing and no K sensitivity (user: only if bad).
 # OBJECTIVE OMEGA (Sprint #4) -- Hypothesis C, re-founded 2026-10-19 (research_design.md §2 and §4):
 #   C2 (roadmap M15) "is TabPFN-2.5's in-context update Bayesian-like?" -- Part A coherence + Part B head-to-head;
-#   C1 (roadmap M10) "is it GP-like?" -- descriptive readouts against GP-MLL frozen, computed in the SAME cells.
+#   C1 (roadmap M10) "is it GP-like?" -- descriptive readouts against GP-fixed (GP-MLL frozen until 2026-10-30), computed in the SAME cells.
 # Plan of record: .research_assistant/omega_sprint4_bayesian_update.md. Replaces the old M10 (update rule) and Sprint #3 (F6).
 #
 # QUESTION. After ONE new observation (x', y') is added to the same context D, how does TabPFN's full posterior
@@ -40,7 +47,8 @@
 #                          The LADDER REFERENCE (shared.reference, 2026-10-21): fitted on every cell where Part B runs,
 #                          also at levels 2 / 4 where coverage keeps it out of Part B (fit + base only there).
 #   gp_fixed               l = ln 2, s^2 = 1, sigma^2 = 0.05, closed form (exact Bayes, other prior)
-#   gp_mll_frozen          type-II ML GP fitted on D, closed-form update with frozen hyperparameters. SCOPED EXCEPTION
+#   gp_mll_frozen          NOT AN ENGINE SINCE 2026-10-30 (header item 5); kept for the record:
+#                          type-II ML GP fitted on D, closed-form update with frozen hyperparameters. SCOPED EXCEPTION
 #                          (user, 2026-10-19) to "GP-MLL frozen is gone everywhere" (2026-10-14): a Part B reference
 #                          for Hypothesis C1 ONLY -- never a coherence engine, never read in C2 (the runner refuses it
 #                          in Part A).
@@ -68,7 +76,8 @@
 #   2026-10-16), cov_asymmetry (Bayes 0). Secondary: latent_frac, sigma_recovery_rho, shrink_move_ratio, drift_w1.
 #   Part B: NO single headline reference (2026-10-19) -- transfer_slope, footprint_r, gap_change, delta_crps and
 #   saturation in two C2 columns (gp_mll_refit, gp_fixed; gp_bayes dropped from the grid 2026-10-21).
-#   C1 (descriptive, no pass/fail): transfer_slope and footprint_r vs gp_mll_frozen (perfect GP = 1), gain and
+#   C1 (descriptive, no pass/fail; reference gp_fixed since 2026-10-30, header item 5 -- read gp_mll_frozen below as c1.reference):
+#   transfer_slope and footprint_r vs gp_mll_frozen (perfect GP = 1), gain and
 #   far_field_share (perfect GP = gp_mll_frozen's own), saturation (= 1); transfer_profile.csv (mean |T| per distance
 #   bin) and c1_exemplar.npz (change maps at the common anchor, y' = mu_ref + c1.exemplar_c s_ref). Figures: one
 #   readouts panel figure, update exemplar, update vs distance, surprise response; engines tabpfn_v2_5, gp_mll_frozen,
@@ -155,12 +164,14 @@ dataset:
 
 bayes_update:
   # gp_bayes: available, NOT in the grid (user, 2026-10-21); re-enable by adding it to engines / references.
-  engines: [tabpfn_v2_5, tabpfn_v2_5_t1, gp_mll_refit, gp_fixed, gp_mll_frozen]
-  references: [gp_mll_refit, gp_fixed, gp_mll_frozen]
+  # tabpfn_v2_5_t1 (T 1.0 control) dropped 2026-10-28 (user): only the deployed T 0.9 engine is considered;
+  # gp_mll_frozen dropped 2026-10-30 (user): it left Hypothesis C, GP-fixed is the C1 reference (header item 5).
+  engines: [tabpfn_v2_5, gp_mll_refit, gp_fixed]
+  references: [gp_mll_refit, gp_fixed]
   coverage:
     gp_mll_refit:
       B: {levels: [1.0]}
-  c1: {reference: gp_mll_frozen, engines: [tabpfn_v2_5, gp_mll_frozen, gp_mll_refit, gp_fixed],
+  c1: {reference: gp_fixed, engines: [tabpfn_v2_5, gp_fixed, gp_mll_refit],
        distance_bins: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 14.0], exemplar_c: 1.0}
   stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
   n_context_draws: 2

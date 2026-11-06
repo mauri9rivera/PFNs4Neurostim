@@ -125,9 +125,11 @@ class TestGPFixed:
             assert r["shrink_move_ratio"] == pytest.approx(1.0, abs=1e-8)
             assert r["latent_frac"] == pytest.approx(kC[a, a] / (kC[a, a] + FIXED["noise"]), abs=1e-8)
             assert r["drift_w1"] < 1e-3                                           # grid tolerance
+            assert r["ks"] < 1e-6 and r["tv_grid"] < 1e-6                         # the mixture of refits IS the base
         cells = B.coherence_cell(rows, C, anchors, ["unobserved"] * 3 + ["observed"] * 2, np.ones(5))
         for cell in cells:
             assert cell["cov_asymmetry"] < 1e-8 and cell["psd_neg_mass"] < 1e-8
+            assert cell["ks"] < 1e-6 and cell["tv_grid"] < 1e-6
 
     @pytest.mark.parametrize("method,kw", [("truncated", {"central_mass": 0.9999}),
                                            ("rqmc", {"n_scrambles": 3, "rng": np.random.default_rng(5)})])
@@ -253,6 +255,13 @@ class TestToyPower:
         toy.fit(ctx.X, ctx.y)
         rows, _, _ = B.coherence(toy, channel.X_pool, np.array([3, 30, 77]), K=20, eps=0.01)
         assert np.median([r["drift_abs"] for r in rows]) >= 0.05
+
+    def test_mean_bias_moves_the_predictive_cdf(self, channel, ctx) -> None:
+        """The G8 CDF readouts see the martingale violation (measured 0.09-0.14 here; GP-fixed scores ~1e-14)."""
+        toy = B.ToyUpdater(B.GPFixedEngine(**FIXED), bias_sd=0.25, name="toy_bias")
+        toy.fit(ctx.X, ctx.y)
+        rows, _, _ = B.coherence(toy, channel.X_pool, np.array([3, 30, 77]), K=20, eps=0.01)
+        assert all(0.02 <= r["ks"] <= 1.0 and 0.02 <= r["tv_grid"] <= 1.0 for r in rows)
 
 
 class TestRQMCFloor:
