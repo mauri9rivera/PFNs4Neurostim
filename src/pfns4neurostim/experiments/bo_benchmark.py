@@ -276,7 +276,7 @@ def run_bo_benchmark(
                         trajectories[_results.make_trajectory_key(row)] = cell[1]
         print(
             f"[bo_benchmark] cells: {store.hits} cached, {store.computed} computed, "
-            f"{len(store.failures)} failed",
+            f"{len(store.failures)} failed{store.not_cached_note()}",
             flush=True,
         )
         if compute_only:

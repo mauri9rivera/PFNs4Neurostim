@@ -200,8 +200,11 @@ bayes_update:
               lengthscale_floor: 0.05}
   # Keep in step with configs/model/gp_naive.yaml by hand.
   fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.05}
+  # exemplar.context_sizes [60] (user, 2026-11-07): the anchor must be unobserved at every exemplar t; over t 30-80 the
+  # only such site of nhp-s0-e0 sat on the array edge (site 17), at t = 60 alone it is central (site 43). The workshop
+  # figure shows t = 60. Exemplar cells only: no grid cell identity changes.
   exemplar: {enabled: true, subject: null, emg: null, level: 1.0, draw: 0,
-             engines: [tabpfn_v2_5, gp_mll_refit]}
+             engines: [tabpfn_v2_5, gp_mll_refit], context_sizes: [60]}
   # Figure-only key (not in any cell identity): context sizes drawn as panels of the surprise and distance figures.
   # t = 80 added after the grid (user, 2026-10-22); the grid computed every t, so nothing is recomputed.
   panel_ts: [10, 50, 80]

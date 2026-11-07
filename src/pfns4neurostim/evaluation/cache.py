@@ -298,6 +298,7 @@ class CellStore:
         hits: Cells served from the cache this run.
         computed: Cells computed this run.
         claimed_elsewhere: Misses skipped because another lane held the claim (work-pool mode).
+        not_cached: Misses skipped by ``only_cached``: a non-zero count means the assembly is partial.
         failures: Cells that raised.
     """
 
@@ -309,6 +310,7 @@ class CellStore:
     hits: int = 0
     computed: int = 0
     claimed_elsewhere: int = 0
+    not_cached: int = 0
     failures: list[CellFailure] = field(default_factory=list)
     host: dict[str, Any] = field(default_factory=dict)
 
@@ -349,8 +351,10 @@ class CellStore:
                 self._served()
                 return hit
         if self.only_cached:
+            self.not_cached += 1
+            print(f"[cache] not cached {label}", flush=True)
             return None
-        pooled = self.enabled and self.claim_ttl_s is not None
+        pooled =self.enabled and self.claim_ttl_s is not None
         path = cell_path(self.root, dataset, experiment, key)
         if pooled:
             if not claim_cell(path, float(self.claim_ttl_s)):
@@ -384,6 +388,14 @@ class CellStore:
             release_claim(path)
         self._served()
         return payload, trajectory
+
+    def not_cached_note(self) -> str:
+        """The tally fragment for ``--only-cached`` misses, empty when there were none.
+
+        Returns:
+            ``", N not cached (partial assembly)"`` or ``""``.
+        """
+        return f", {self.not_cached} not cached (partial assembly)" if self.not_cached else ""
 
     def _served(self) -> None:
         """Notify the progress callback that one cell was served."""

@@ -363,7 +363,8 @@ class _Cells:
         """Print the cache tally and raise if any cell failed (after the outputs are written)."""
         s = self.store
         pool = f", {s.claimed_elsewhere} claimed by other lanes" if s.claim_ttl_s is not None else ""
-        print(f"[mechanism] cells: {s.computed} computed, {s.hits} cached, {len(s.failures)} failed{pool}", flush=True)
+        print(f"[mechanism] cells: {s.computed} computed, {s.hits} cached, {len(s.failures)} failed{pool}"
+              f"{s.not_cached_note()}", flush=True)
         s.raise_if_failed()
 
 
@@ -454,8 +455,10 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
                   "n_restarts": 5, "lengthscale_floor": 0.05},
     "fixed_gp_params": {"lengthscale": 0.6931471805599453, "outputscale": 1.0, "noise": 0.05},
     # Omega-5: C(x', .) maps at ONE common anchor (the most central site unobserved in every exemplar context).
+    # context_sizes: the t at which the exemplar is computed (null = every context size of the run). The anchor must be
+    # unobserved in all of them, so a large t leaves only edge sites (t = 80 of 96 sites: one free site, on the edge).
     "exemplar": {"enabled": True, "subject": None, "emg": None, "level": 1.0, "draw": 0,
-                 "engines": ["tabpfn_v2_5", "gp_bayes", "gp_mll_refit"]},
+                 "engines": ["tabpfn_v2_5", "gp_bayes", "gp_mll_refit"], "context_sizes": None},
     "panel_ts": None,
     # Hypothesis C1, "is the update GP-like?" (user, 2026-10-19): descriptive readouts against GP-MLL frozen, inside the
     # same cells (a Part B reference only). distance_bins: edges (pitches) of the transfer-vs-distance profile;
@@ -601,6 +604,11 @@ def _validate_bayes_update(p: dict[str, Any], ladder: Sequence[int]) -> dict[str
     bad = [e for e in p["exemplar"]["engines"] if e not in p["engines"]]
     if p["exemplar"]["enabled"] and bad:
         raise ValueError(f"bayes_update.exemplar.engines: {bad} are not in bayes_update.engines {p['engines']}.")
+    ex_ts = p["exemplar"]["context_sizes"]
+    if p["exemplar"]["enabled"] and ex_ts is not None:
+        if not ex_ts:
+            raise ValueError("bayes_update.exemplar.context_sizes must be null (every context size) or non-empty.")
+        _subset_of_ladder(ex_ts, ladder, "bayes_update.exemplar.context_sizes")
     # C1 is active when its reference is an engine; its figures then show the listed engines that are present.
     c1 = p["c1"]
     if c1["reference"] in p["engines"]:
@@ -1286,6 +1294,111 @@ def _common_anchor(channel: ChannelData, contexts: Sequence[Any]) -> int:
     return int(cand[np.argmin(np.linalg.norm(X[cand] - centre, axis=1))])
 
 
+def _bayes_exemplar(cfg: MechanismConfig, p: dict[str, Any], cells: _Cells, channels: Sequence[ChannelData],
+                    knob: Any, out: str, write: bool) -> None:
+    """The exemplar cells of one channel at one anchor, per exemplar t: TabPFN's implied covariance and the C1 change maps.
+
+    Runs before the grid in every mode, so a work-pool lane (``--compute-only`` / ``--shard``) computes these cells too:
+    until 2026-11-07 the lanes returned after the grid and never reached them, so no cluster run produced the exemplar.
+    The lanes share the cells through claims like grid cells. A run that ends with some exemplar cell missing (an
+    ``--only-cached`` miss, a failure, a claim held by another lane) says which, instead of silently writing no map.
+
+    Args:
+        cfg: Resolved config.
+        p: Validated ``bayes_update`` parameters.
+        cells: Cell namespace.
+        channels: The run's channels; the exemplar is the first one matching ``exemplar.subject`` / ``exemplar.emg``.
+        knob: Stress knob of the grid.
+        out: Run directory.
+        write: Write ``exemplar.npz`` / ``c1_exemplar.npz`` (``False`` in a work-pool lane, which writes nothing).
+
+    Raises:
+        ValueError: If no channel matches the exemplar's subject / emg.
+    """
+    from ..analysis import bayes_update as B  # noqa: PLC0415
+
+    ex = p["exemplar"]
+    if not ex["enabled"] or not channels:
+        return
+    pick = [c for c in channels if (ex["subject"] is None or c.subject == ex["subject"])
+            and (ex["emg"] is None or c.emg == ex["emg"])]
+    if not pick:
+        raise ValueError(f"bayes_update.exemplar: no channel matches subject={ex['subject']} emg={ex['emg']}.")
+    ch = pick[0]
+    st = knob.apply(ch, ex["level"], rng_for(ch.label, "bayes_update", ex["level"], base_seed=cfg.seed))
+    ex_ts = cfg.context_sizes if ex["context_sizes"] is None else [int(t) for t in ex["context_sizes"]]
+    ts = [t for t in ex_ts if t < st.n_sites]
+    ctxs = {t: context_for(st, t, int(ex["draw"]), base_seed=cfg.seed, level=float(ex["level"])) for t in ts}
+    a = _common_anchor(st, list(ctxs.values()))
+    maps = {}
+    for t in ts:
+        def ex_cell(t: int = t) -> tuple[dict[str, Any], dict[str, Any]]:
+            res = {}
+            for n in ex["engines"]:
+                eng = _make_engine(n, p, cfg.device, int(ex["draw"]))
+                eng.fit(ctxs[t].X, ctxs[t].y)
+                qd = p["quadrature"]
+                _, C, _ = B.coherence(
+                    eng, st.X_pool, np.array([a]), int(qd["K"]), float(p["eps"]), method=str(qd["method"]),
+                    u_min=float(qd["u_min"]), central_mass=float(qd["central_mass"]),
+                    n_scrambles=int(qd["n_scrambles"]),
+                    rng=rng_for(ch.label, "bayes_update_exemplar", t, base_seed=cfg.seed),
+                    u_tail=float(p["y_grid"]["u_tail"]), grid_points=int(p["y_grid"]["points"]))
+                res[n] = C[0].tolist()
+            return {"C": res}, {}
+
+        hit = cells.run("exemplar", {**cells.channel(ch), "level": float(ex["level"]), "draw": int(ex["draw"]),
+                                     "t": int(t), "anchor": a, "quadrature": p["quadrature"], "eps": p["eps"],
+                                     "engine_params": {n: _engine_params(n, p, int(ex["draw"]))
+                                                       for n in ex["engines"]}},
+                        f"exemplar {ch.label} t={t}", ex_cell)
+        if hit is not None:
+            maps[t] = hit[0]["C"]
+    if maps and write:
+        np.savez(os.path.join(out, "exemplar.npz"), context_ts=np.array(sorted(maps)), anchor=a,
+                 engines=np.array(ex["engines"]), ch2xy=np.asarray(st.ch2xy), channel=ch.label,
+                 observed=np.array([np.isin(np.arange(st.n_sites), ctxs[t].sites) for t in sorted(maps)]),
+                 C=np.array([[maps[t][n] for n in ex["engines"]] for t in sorted(maps)]))
+    c1 = p["c1"]
+    ladder_ref = str(p["shared"]["reference"])
+    c1_ts = ts if c1["reference"] in p["engines"] else []
+    dmaps = {}
+    for t in c1_ts:
+        def c1_cell(t: int = t) -> tuple[dict[str, Any], dict[str, Any]]:
+            anchor_eng = _make_engine(ladder_ref, p, cfg.device, int(ex["draw"]))
+            anchor_eng.fit(ctxs[t].X, ctxs[t].y)
+            bb = anchor_eng.base(st.X_pool)
+            y = float(bb.mean[0, a] + float(c1["exemplar_c"]) * bb.sd[0, a])  # y' = mu_ref + c s_ref
+            res = {}
+            for n in c1["engines"]:
+                eng = _make_engine(n, p, cfg.device, int(ex["draw"]))
+                eng.fit(ctxs[t].X, ctxs[t].y)
+                base = eng.base(st.X_pool)
+                pr = eng.probe(st.X_pool[[a]], np.array([y]), st.X_pool)
+                res[n] = (pr.mean[0] - base.mean[0]).tolist()                 # [M]
+            return {"dmu": res, "y_prime": y}, {}
+
+        hit = cells.run("c1_exemplar", {**cells.channel(ch), "level": float(ex["level"]),
+                                        "draw": int(ex["draw"]), "t": int(t), "anchor": a,
+                                        "exemplar_c": float(c1["exemplar_c"]),
+                                        "ladder_reference": ladder_ref,
+                                        "engine_params": {n: _engine_params(n, p, int(ex["draw"]))
+                                                          for n in [*c1["engines"], ladder_ref]}},
+                        f"C1 exemplar {ch.label} t={t}", c1_cell)
+        if hit is not None:
+            dmaps[t] = hit[0]["dmu"]
+    if dmaps and write:
+        np.savez(os.path.join(out, "c1_exemplar.npz"), context_ts=np.array(sorted(dmaps)), anchor=a,
+                 engines=np.array(c1["engines"]), ch2xy=np.asarray(st.ch2xy), channel=ch.label,
+                 exemplar_c=float(c1["exemplar_c"]),
+                 observed=np.array([np.isin(np.arange(st.n_sites), ctxs[t].sites) for t in sorted(dmaps)]),
+                 dmu=np.array([[dmaps[t][n] for n in c1["engines"]] for t in sorted(dmaps)]))
+    lost =[f"exemplar t={t}" for t in ts if t not in maps] + [f"c1_exemplar t={t}" for t in c1_ts if t not in dmaps]
+    if lost and write:
+        print(f"[mechanism] exemplar incomplete for {ch.label}: {len(lost)} cell(s) missing ({', '.join(lost)}); "
+              f"the maps hold the other t only. Compute them with a run without --only-cached.", flush=True)
+
+
 def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
     """OMEGA: Parts A and B on the grid channel x level x t x draw, gates G1, G2, G4, the frozen-vs-refit discrepancy
     report, the exemplar, the figures.
@@ -1336,6 +1449,7 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                 summary.to_csv(os.path.join(out, "frozen_refit_discrepancy.csv"), index=False)
                 print(f"[mechanism] wrote {os.path.join(out, 'frozen_refit_discrepancy.csv')}", flush=True)
         if p["run"]["grid"]:
+            _bayes_exemplar(cfg, p, cells, channels, knob, out, write=not opts.compute_only)
             allowed = {n: _first_per_subject(channels, n) for n in {
                 int(spec["channels_per_subject"]) for parts in p["coverage"].values() for spec in (parts or {}).values()
                 if spec and "channels_per_subject" in spec}}
@@ -1398,79 +1512,6 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                                (h2h_rows, "headtohead.csv"), (sur_rows, "surprise.csv"),
                                (prof_rows, "transfer_profile.csv")):
                 _write_csv(rows, out, name)
-            ex = p["exemplar"]
-            if ex["enabled"] and channels:
-                pick = [c for c in channels if (ex["subject"] is None or c.subject == ex["subject"])
-                        and (ex["emg"] is None or c.emg == ex["emg"])]
-                if not pick:
-                    raise ValueError(f"bayes_update.exemplar: no channel matches subject={ex['subject']} emg={ex['emg']}.")
-                ch = pick[0]
-                st = knob.apply(ch, ex["level"], rng_for(ch.label, "bayes_update", ex["level"], base_seed=cfg.seed))
-                ts = [t for t in cfg.context_sizes if t < st.n_sites]
-                ctxs = {t: context_for(st, t, int(ex["draw"]), base_seed=cfg.seed, level=float(ex["level"])) for t in ts}
-                a = _common_anchor(st, list(ctxs.values()))
-                maps = {}
-                for t in ts:
-                    def ex_cell(t: int = t) -> tuple[dict[str, Any], dict[str, Any]]:
-                        res = {}
-                        for n in ex["engines"]:
-                            eng = _make_engine(n, p, cfg.device, int(ex["draw"]))
-                            eng.fit(ctxs[t].X, ctxs[t].y)
-                            qd = p["quadrature"]
-                            _, C, _ = B.coherence(
-                                eng, st.X_pool, np.array([a]), int(qd["K"]), float(p["eps"]), method=str(qd["method"]),
-                                u_min=float(qd["u_min"]), central_mass=float(qd["central_mass"]),
-                                n_scrambles=int(qd["n_scrambles"]),
-                                rng=rng_for(ch.label, "bayes_update_exemplar", t, base_seed=cfg.seed),
-                                u_tail=float(p["y_grid"]["u_tail"]), grid_points=int(p["y_grid"]["points"]))
-                            res[n] = C[0].tolist()
-                        return {"C": res}, {}
-
-                    hit = cells.run("exemplar", {**cells.channel(ch), "level": float(ex["level"]), "draw": int(ex["draw"]),
-                                                 "t": int(t), "anchor": a, "quadrature": p["quadrature"], "eps": p["eps"],
-                                                 "engine_params": {n: _engine_params(n, p, int(ex["draw"]))
-                                                                   for n in ex["engines"]}},
-                                    f"exemplar {ch.label} t={t}", ex_cell)
-                    if hit is not None:
-                        maps[t] = hit[0]["C"]
-                if maps:
-                    np.savez(os.path.join(out, "exemplar.npz"), context_ts=np.array(sorted(maps)), anchor=a,
-                             engines=np.array(ex["engines"]), ch2xy=np.asarray(st.ch2xy), channel=ch.label,
-                             observed=np.array([np.isin(np.arange(st.n_sites), ctxs[t].sites) for t in sorted(maps)]),
-                             C=np.array([[maps[t][n] for n in ex["engines"]] for t in sorted(maps)]))
-                c1 = p["c1"]
-                ladder_ref = str(p["shared"]["reference"])
-                dmaps = {}
-                for t in (ts if c1["reference"] in p["engines"] else []):
-                    def c1_cell(t: int = t) -> tuple[dict[str, Any], dict[str, Any]]:
-                        anchor_eng = _make_engine(ladder_ref, p, cfg.device, int(ex["draw"]))
-                        anchor_eng.fit(ctxs[t].X, ctxs[t].y)
-                        bb = anchor_eng.base(st.X_pool)
-                        y = float(bb.mean[0, a] + float(c1["exemplar_c"]) * bb.sd[0, a])  # y' = mu_ref + c s_ref
-                        res = {}
-                        for n in c1["engines"]:
-                            eng = _make_engine(n, p, cfg.device, int(ex["draw"]))
-                            eng.fit(ctxs[t].X, ctxs[t].y)
-                            base = eng.base(st.X_pool)
-                            pr = eng.probe(st.X_pool[[a]], np.array([y]), st.X_pool)
-                            res[n] = (pr.mean[0] - base.mean[0]).tolist()                 # [M]
-                        return {"dmu": res, "y_prime": y}, {}
-
-                    hit = cells.run("c1_exemplar", {**cells.channel(ch), "level": float(ex["level"]),
-                                                    "draw": int(ex["draw"]), "t": int(t), "anchor": a,
-                                                    "exemplar_c": float(c1["exemplar_c"]),
-                                                    "ladder_reference": ladder_ref,
-                                                    "engine_params": {n: _engine_params(n, p, int(ex["draw"]))
-                                                                      for n in [*c1["engines"], ladder_ref]}},
-                                    f"C1 exemplar {ch.label} t={t}", c1_cell)
-                    if hit is not None:
-                        dmaps[t] = hit[0]["dmu"]
-                if dmaps:
-                    np.savez(os.path.join(out, "c1_exemplar.npz"), context_ts=np.array(sorted(dmaps)), anchor=a,
-                             engines=np.array(c1["engines"]), ch2xy=np.asarray(st.ch2xy), channel=ch.label,
-                             exemplar_c=float(c1["exemplar_c"]),
-                             observed=np.array([np.isin(np.arange(st.n_sites), ctxs[t].sites) for t in sorted(dmaps)]),
-                             dmu=np.array([[dmaps[t][n] for n in c1["engines"]] for t in sorted(dmaps)]))
         cells.report()
     link = p["link"]
     if link["tidy_csv"] or link["stress_tidy_csv"]:

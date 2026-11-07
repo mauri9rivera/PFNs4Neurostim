@@ -268,7 +268,7 @@ def build_tidy_rows(
                     trajectories[_results.make_trajectory_key(row)] = cell[1]
     print(
         f"[stress_sweep] cells: {store.hits} cached, {store.computed} computed, "
-        f"{len(store.failures)} failed",
+        f"{len(store.failures)} failed{store.not_cached_note()}",
         flush=True,
     )
     if not rows and shard is not None and not store.failures and not skipped:

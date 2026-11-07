@@ -82,6 +82,17 @@ class TestCellStore:
         store = CellStore(str(tmp_path), only_cached=True)
         assert store.run("nhp", "x", IDENT, "c", lambda: pytest.fail("computed")) is None
 
+    def test_only_cached_miss_is_counted_and_announced(self, tmp_path: Any, capsys: pytest.CaptureFixture[str]) -> None:
+        """An --only-cached miss is never silent: it is logged by label and tallied as a partial assembly."""
+        CellStore(str(tmp_path)).run("nhp", "x", IDENT, "kept", lambda: ({"row": {}}, {}))
+        store = CellStore(str(tmp_path), only_cached=True)
+        assert store.not_cached_note() == ""
+        store.run("nhp", "x", IDENT, "kept", lambda: pytest.fail("computed"))
+        store.run("nhp", "x", {**IDENT, "seed": 9}, "lost", lambda: pytest.fail("computed"))
+        assert (store.hits, store.not_cached) == (1, 1)
+        assert store.not_cached_note() == ", 1 not cached (partial assembly)"
+        assert "[cache] not cached lost" in capsys.readouterr().out
+
     def test_failure_is_collected_not_raised(self, tmp_path: Any) -> None:
         store = CellStore(str(tmp_path))
 

@@ -155,7 +155,7 @@ def test_shared_ladder_is_required_and_validated(tmp_path, tiny) -> None:
         assert not os.path.exists(f"configs/experiment/{retired}.yaml")
 
 
-def _small_bayes_update(tmp_path, **extra: str) -> str:
+def _small_bayes_update(tmp_path, sizes: str = "[10]", **extra: str) -> str:
     body = """
         analysis: bayes_update
         bayes_update:
@@ -170,11 +170,12 @@ def _small_bayes_update(tmp_path, **extra: str) -> str:
           far_pitch: 3.0
           gp_bayes: {lengthscale: [0.1, 0.6, 3], outputscale: [0.5, 2.0, 2], noise: [0.05, 0.3, 2], b2: 1.0,
                      prune_mass: 1.0e-10, chunk: 64, exact_max_components: 64, sd_bins: 8}
-          exemplar: {enabled: true, subject: null, emg: null, level: 1.0, draw: 0, engines: [gp_bayes, gp_fixed]}
+          exemplar: {enabled: true, subject: null, emg: null, level: 1.0, draw: 0, engines: [gp_bayes, gp_fixed],
+                     context_sizes: null}
           panel_ts: [10]
           run: {gates: false, grid: true, discrepancy: false}
     """
-    return _config(tmp_path, body)
+    return _config(tmp_path, body, sizes=sizes)
 
 
 def test_bayes_update_runner_writes_every_table_and_figure_and_reassembles_from_cache(
@@ -210,6 +211,49 @@ def test_bayes_update_runner_writes_every_table_and_figure_and_reassembles_from_
     mechanism.run_mechanism(_small_bayes_update(tmp_path), only_cached=True)
     for n, before in tables.items():
         pd.testing.assert_frame_equal(before, pd.read_csv(os.path.join(out, f"{n}.csv")), check_like=True)
+
+
+def test_bayes_update_work_pool_lane_computes_the_exemplar(tmp_path, tiny) -> None:
+    """A work-pool lane (--compute-only) computes the exemplar cells too and writes nothing (fix of 2026-11-07: lanes
+    returned after the grid, so cluster runs never produced the exemplar)."""
+    out = mechanism.run_mechanism(_small_bayes_update(tmp_path), compute_only=True, claim_ttl_s=3600.0)
+    assert not os.path.exists(os.path.join(out, "exemplar.npz"))
+    assert not os.path.exists(os.path.join(out, "coherence.csv"))
+
+    def boom(*_a, **_k):
+        raise AssertionError("an --only-cached run must not compute")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(mechanism, "_make_engine", boom)
+        mechanism.run_mechanism(_small_bayes_update(tmp_path), only_cached=True)
+    with np.load(os.path.join(out, "exemplar.npz")) as ex:
+        assert list(ex["context_ts"]) == [10]
+
+
+def test_bayes_update_exemplar_context_sizes_pick_the_exemplar_t_and_must_be_run_sizes(tmp_path, tiny) -> None:
+    """exemplar.context_sizes restricts the exemplar to those t (its anchor is common to them only); a t outside
+    context.sizes is refused while the exemplar is enabled, and ignored when it is not."""
+    path = _small_bayes_update(tmp_path, sizes="[10, 20]")
+    out =mechanism.run_mechanism(path, ["bayes_update.exemplar.context_sizes=[20]"])
+    with np.load(os.path.join(out, "exemplar.npz")) as ex:
+        assert list(ex["context_ts"]) == [20]
+    with pytest.raises(ValueError, match="exemplar.context_sizes"):
+        mechanism.run_mechanism(path, ["bayes_update.exemplar.context_sizes=[30]"])
+    p = mechanism._validate_bayes_update({"exemplar": {"enabled": False, "context_sizes": [30]},
+                                          "stress": {"knob": "k2_channel", "levels": [1.0]}}, [10, 25, 50, 80])
+    assert p["exemplar"]["context_sizes"] == [30]
+
+
+def test_bayes_update_only_cached_assembly_reports_missing_exemplar_cells(tmp_path, tiny, capsys) -> None:
+    """An --only-cached assembly missing exemplar cells says which ones and tallies them, instead of a silent gap."""
+    mechanism.run_mechanism(_small_bayes_update(tmp_path))
+    capsys.readouterr()
+    # another exemplar draw: the grid cells still hit, every exemplar cell misses
+    mechanism.run_mechanism(_small_bayes_update(tmp_path), ["bayes_update.exemplar.draw=1"], only_cached=True)
+    log = capsys.readouterr().out
+    assert "[cache] not cached bayes_update:exemplar" in log
+    assert "exemplar incomplete" in log and "exemplar t=10" in log
+    assert "1 not cached (partial assembly)" in log
 
 
 def test_bayes_update_refuses_unknown_engines_and_ladders_without_saturation_points(tmp_path, tiny) -> None:
