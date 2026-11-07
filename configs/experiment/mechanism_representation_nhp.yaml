@@ -54,12 +54,34 @@
 #   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_nhp.yaml --set representation.posterior_cov.enabled=false
 #   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_nhp.yaml --only-cached
 #   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_representation_nhp.yaml --replot
+#
+# ============================== AMENDMENT 2026-11-07 (user; written before any amended BETA cell ran) ==============================
+# GRID. t = 30, 40, 50, 60, 80 (OMEGA Phase 1's refinement ladder: contexts are keyed by (grid, t, draw), so β1a / β1b
+#   read exactly the contexts of the coherence readouts), draws 0-9 for every cell kind (β1b included), K2 level 1 only
+#   (the dataset's own noise; levels 2 / 4 left with OMEGA Phase 2). Tag nhp-amended: the pre-amendment run dirs (stale
+#   GP-MLL beliefs, G2 / G6) stay as they are.
+# β1a READING RULE. The claim is convergence: TabPFN's per-site W2 to GP-MLL refit's predictive DECREASES as t grows.
+#   Per channel, the slope of log(median per-site W2) on log t (draws reduced first, observed and unobserved sites
+#   apart), then the median slope over channels with the channel bootstrap (D4). Primary: raw W2 (absolute
+#   convergence). Secondary: w2_over_sd (W2 in units of GP-MLL refit's own predictive SD), which falls only if TabPFN
+#   approaches GP-MLL faster than the posterior contracts. A decrease is a 95 % interval of the slope below 0.
+# β1b READING RULE. Headline: deconfounded debiased CKA of C_PFN against Sigma_MLL (geometry kernels and GP-fixed's
+#   covariance removed, as for every covariance target, D3d); a value near 0 reads "not distinguishable from geometry
+#   and layout" (WORDING above). Secondary: raw debiased CKA, NBS, Bures distance, trace ratio. Deconfounded, not raw:
+#   in the pre-amendment β1b runs geometry carried most of the raw score (raw 0.19-0.28 vs deconfounded 0.02-0.04
+#   against Sigma_MLL; 0.43-0.64 vs 0.15-0.24 against GP-fixed).
+# β2 HEADLINE (user, 2026-11-07). floor_subtracted_raw: raw debiased CKA minus the surrogate median, the deconfounded
+#   value secondary. For the belief-map targets geometry removal moves the label-token score by 0.03-0.06 only
+#   (pre-amendment runs, blocks 8 / 17: mean_own 0.88 vs 0.85, sd_own 0.84 vs 0.79), so the simpler statistic is kept;
+#   it is read against its own (higher) floor, since the raw surrogate quantile is ~0.47 against ~0.25 deconfounded.
 defaults:
   dataset: nhp
   context: nhp
 
+context: {sizes: [30, 40, 50, 60, 80]}   # amendment 2026-11-07
+
 analysis: representation
-tag: nhp
+tag: nhp-amended
 device: cpu
 seed: 42
 output_root: output
@@ -68,8 +90,8 @@ dataset:
   subjects: [0, 1, 2, 3]
 
 representation:
-  stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
-  n_context_draws: 2
+  stress: {knob: k2_channel, levels: [1.0]}   # amendment 2026-11-07: level 1 only (was [1.0, 2.0, 4.0])
+  n_context_draws: 10   # amendment 2026-11-07 (was 2)
   layers: null
   readouts: [label, feature_mean, lens]
   targets: [mean_own, sd_own, mean_mll, sd_mll, cov_mll, quant_own, quant_mll, K_X, K_GT]
@@ -87,16 +109,16 @@ representation:
   ceiling: {enabled: true, trial_draw_offset: 100}
   target_relations: [[quant_mll, K_GT], [mean_mll, K_GT]]
   site_match: {references: [gp_mll_refit, gp_fixed]}
-  headline: {statistic: deconfounded_vs_surrogate, readout: label}
+  headline: {statistic: floor_subtracted_raw, readout: label}   # amendment 2026-11-07 (was deconfounded_vs_surrogate)
   inference: {n_boot: 2000, ci: 0.95}
   posterior_cov:
     enabled: true
     engine: tabpfn_v2_5
     references: [gp_mll_refit, gp_fixed]
-    coverage: {levels: [1.0], context_ts: null, draws: [0], channels_per_subject: 2}
+    coverage: {levels: [1.0], context_ts: null, draws: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], channels_per_subject: 2}   # amendment 2026-11-07: draws 0-9 (was [0])
     quadrature: {method: strata, K: 64, u_min: 1.0e-12, central_mass: 1.0, n_scrambles: 1}   # amended 2026-10-28; was rqmc 8 x 8
     eps: 0.01
     y_grid: {points: 512, u_tail: 1.0e-4}
     moment_matched: true
   # Figure-only keys (no cell identity). exclude_ts: t = 10 left out of site_match / lens_distance (user, 2026-10-22).
-  figures: {level: null, exclude_ts: [10]}
+  figures: {level: null, exclude_ts: []}   # amendment 2026-11-07: no t = 10 on the ladder any more
