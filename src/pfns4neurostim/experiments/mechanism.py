@@ -2171,7 +2171,9 @@ REPRESENTATION_DEFAULTS: dict[str, Any] = {
     # Belief ceilings (D2 with D3e): pairs (target_a, target_b) scored per cell; never a pair of two models' beliefs
     # (BETA §4: models are compared site by site, not through their across-site Grams).
     "target_relations": [["quant_mll", "K_GT"], ["mean_mll", "K_GT"]],
-    "site_match": {"references": ["gp_mll_refit", "gp_fixed"]},
+    # pairs: β1a's yardstick, [model, reference] belief engines compared site by site like TabPFN (user, 2026-11-07:
+    # GP-fixed vs GP-MLL refit gives the convergence rate of prior mismatch alone). Empty keeps earlier identities.
+    "site_match": {"references": ["gp_mll_refit", "gp_fixed"], "pairs": []},
     # OPEN (research_design §4, 2026-10-19): the provisional headline and its alternative (b) are selectable here;
     # both are computable from representation.csv whatever is selected.
     "headline": {"statistic": "deconfounded_vs_surrogate", "readout": "label"},
@@ -2242,6 +2244,10 @@ def _validate_representation(p: dict[str, Any], ladder: Sequence[int]) -> dict[s
     bad = [r for r in p["site_match"]["references"] if r not in p["belief_engines"]]
     if bad:
         raise ValueError(f"representation.site_match.references {bad} are not in representation.belief_engines.")
+    for pair in p["site_match"]["pairs"]:
+        if len(pair) != 2 or pair[0] == pair[1] or any(e not in p["belief_engines"] for e in pair):
+            raise ValueError(f"representation.site_match.pairs: {pair} must name two different engines of "
+                             f"representation.belief_engines {p['belief_engines']}.")
     for pair in p["target_relations"]:
         if len(pair) != 2 or any(n not in p["targets"] for n in pair):
             raise ValueError(f"representation.target_relations: {pair} must name two of representation.targets.")
@@ -2536,7 +2542,9 @@ def _representation_cell(
         diagnostics["lens_final_max_abs_mean"] = float(np.abs(lens["means"][last] - beliefs["own"].mean).max())
     return {
         **out,
-        "site_match": R.site_match_rows(beliefs["own"].quantiles, beliefs, refs, observed),
+        "site_match": [*R.site_match_rows(beliefs["own"].quantiles, beliefs, refs, observed),
+                       *R.site_match_pair_rows(beliefs, [(codes[a], codes[b]) for a, b in p["site_match"]["pairs"]],
+                                               observed)],
         "lens": R.lens_rows(lens["quantiles"], lens["means"], states.layers, beliefs, refs, observed),
         "diagnostics": diagnostics,
         "host": socket.gethostname(),
@@ -2701,6 +2709,8 @@ def run_representation(cfg: MechanismConfig, opts: RunOptions) -> str:
         common = {k: p[k] for k in ("layers", "readouts", "targets", "belief_engines", "layout_confound", "n_quantiles",
                                     "site_sets", "deconfound", "surrogate", "permutation", "ceiling",
                                     "target_relations", "site_match")}
+        if not p["site_match"]["pairs"]:   # no yardstick pairs keeps every earlier cell's identity
+            common["site_match"] = {k: v for k, v in p["site_match"].items() if k != "pairs"}
         tables: dict[str, list[dict[str, Any]]] = {k: [] for k in (
             "alignment", "surrogate", "ceiling", "relations", "site_match", "lens", "posterior_cov",
             "posterior_cov_coherence")}
@@ -2864,10 +2874,10 @@ def _representation_summaries(out: str, p: dict[str, Any], seed: int) -> None:
         # every site as one pool too (the figure's default, user 2026-10-22); the split stays in the summary
         sm = pd.concat([sm, sm.assign(site_pool=R.SITE_POOL_ALL)], ignore_index=True)
         # matched per site first (site_match.csv), then the median over the sites of a pool, per cell
-        cell = (sm.groupby(["subject", "emg", "level", "context_t", "draw", "reference", "site_pool"])
+        cell = (sm.groupby(["subject", "emg", "level", "context_t", "draw", "model", "reference", "site_pool"])
                 [["w2", "w2_over_sd", "location", "spread", "shape"]].median().reset_index())
         R.channel_summary(cell, ["w2", "w2_over_sd", "location", "spread", "shape"],
-                          ["level", "context_t", "reference", "site_pool"], **kw).to_csv(
+                          ["level", "context_t", "model", "reference", "site_pool"], **kw).to_csv(
             os.path.join(out, "site_match_summary.csv"), index=False)
     path = os.path.join(out, "lens.csv")
     if os.path.exists(path):

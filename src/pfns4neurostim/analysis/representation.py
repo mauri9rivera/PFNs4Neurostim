@@ -50,6 +50,7 @@ __all__ = [
     "surrogate_rows",
     "surrogate_floors",
     "pair_rows",
+    "site_match_pair_rows",
     "site_match_rows",
     "lens_rows",
     "add_headline",
@@ -373,20 +374,69 @@ def site_match_rows(
         observed: Context-site mask, shape [M].
 
     Returns:
-        One row per (reference, site): ``w2``, ``location``, ``spread``, ``shape`` (squared terms summing to
-        ``w2 ** 2``), ``w2_over_sd`` (``w2`` over the reference's stated predictive SD at the site), and both models'
-        stated SDs.
+        One row per (reference, site): ``model`` (TabPFN-2.5), ``w2``, ``location``, ``spread``, ``shape`` (squared
+        terms summing to ``w2 ** 2``), ``w2_over_sd`` (``w2`` over the reference's stated predictive SD at the site), and
+        both models' stated SDs (``sd_own`` is the compared model's).
+    """
+    return _site_rows(E_own, beliefs["own"].sd, BELIEF_CODES["own"], beliefs, references, observed)
+
+
+def site_match_pair_rows(
+    beliefs: Mapping[str, Belief],
+    pairs: Sequence[tuple[str, str]],
+    observed: np.ndarray,
+) -> list[dict[str, Any]]:
+    """β1a yardstick: one reference model against another, site by site, exactly as TabPFN is compared.
+
+    The convergence of a belief to GP-MLL refit's as t grows is read against these rows: GP-fixed (a GP under another
+    prior) against GP-MLL refit gives the rate at which prior mismatch alone closes the gap (user, 2026-11-07).
+
+    Args:
+        beliefs: Belief per code.
+        pairs: ``(model, reference)`` belief codes, each compared like :func:`site_match_rows`.
+        observed: Context-site mask, shape [M].
+
+    Returns:
+        Rows of :func:`site_match_rows`, with ``model`` naming the compared reference model.
+    """
+    rows = []
+    for model, reference in pairs:
+        rows += _site_rows(beliefs[model].quantiles, beliefs[model].sd, BELIEF_CODES[model], beliefs, [reference],
+                           observed)
+    return rows
+
+
+def _site_rows(
+    E: np.ndarray,
+    sd: np.ndarray,
+    model: str,
+    beliefs: Mapping[str, Belief],
+    references: Sequence[str],
+    observed: np.ndarray,
+) -> list[dict[str, Any]]:
+    """Per-site W2 split of one model's belief embedding against each reference's (shared by β1a and its yardstick).
+
+    Args:
+        E: The compared model's belief embedding, shape [M, J].
+        sd: The compared model's stated predictive SD per site, shape [M].
+        model: Its name, written to every row.
+        beliefs: Belief per code (the references among them).
+        references: Belief codes to compare against.
+        observed: Context-site mask, shape [M].
+
+    Returns:
+        One row per (reference, site).
     """
     rows = []
     for code in references:
         ref = beliefs[code]
-        split = site_w2_split(E_own, ref.quantiles)
-        for s in range(E_own.shape[0]):
-            rows.append({"reference": BELIEF_CODES[code], "site": int(s), "observed": bool(observed[s]),
+        split = site_w2_split(E, ref.quantiles)
+        for s in range(E.shape[0]):
+            rows.append({"model": model, "reference": BELIEF_CODES[code], "site": int(s), "observed": bool(observed[s]),
                          "w2": float(split["w2"][s]), "location": float(split["location"][s]),
                          "spread": float(split["spread"][s]), "shape": float(split["shape"][s]),
                          "w2_over_sd": float(split["w2"][s] / ref.sd[s]), "sd_ref": float(ref.sd[s]),
-                         "sd_own": float(beliefs["own"].sd[s])})
+                         "sd_own": float(sd[s])})
     return rows
 
 

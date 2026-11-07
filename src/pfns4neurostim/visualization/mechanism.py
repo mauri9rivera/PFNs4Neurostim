@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from ..analysis.bayes_update import POOLED_ANCHORS
-from ..analysis.representation import SITE_POOL_ALL, channel_summary
+from ..analysis.representation import BELIEF_CODES, SITE_POOL_ALL, channel_summary
 from . import style
 
 __all__ = [
@@ -1040,8 +1040,8 @@ _REPRESENTATION_SECONDARY_COLUMNS: int = 3
 _SITE_MATCH_PANEL_ASPECT: float = 0.55
 
 #: Statistics of the β1a site-match figure (rows), with their axis-label keys.
-SITE_MATCH_STATS: dict[str, str] = {"w2_over_sd": "w2_over_sd", "location": "w2_location", "spread": "w2_spread",
-                                    "shape": "w2_shape"}
+SITE_MATCH_STATS: dict[str, str] = {"w2": "w2_site", "w2_over_sd": "w2_over_sd", "location": "w2_location",
+                                    "spread": "w2_spread", "shape": "w2_shape"}
 
 #: Statistics of the β1b posterior-covariance figure (columns), with the value of a perfect match.
 POSTERIOR_COV_STATS: dict[str, float] = {"nbs": 1.0, "cka": 1.0, "bures_rel": 0.0, "trace_ratio": 1.0}
@@ -1193,7 +1193,8 @@ def _site_match_figure(sm: pd.DataFrame, run_dir: str) -> list[str]:
     """β1a: per-site W2 to each reference and its location / spread / shape split vs t, every site pooled.
 
     One column: the references share each panel, told apart by colour and line style (user, 2026-10-22). The
-    observed / unobserved split stays in ``site_match_summary.csv``.
+    yardstick pairs (``model`` other than TabPFN-2.5, e.g. GP-fixed vs GP-MLL refit, user 2026-11-07) are drawn in
+    the neutral reference style beside them. The observed / unobserved split stays in ``site_match_summary.csv``.
 
     Args:
         sm: ``site_match_summary.csv`` rows at the figure level, excluded context sizes removed.
@@ -1203,7 +1204,9 @@ def _site_match_figure(sm: pd.DataFrame, run_dir: str) -> list[str]:
         Written paths.
     """
     sm = sm[sm["site_pool"] == SITE_POOL_ALL] if SITE_POOL_ALL in set(sm["site_pool"]) else sm
-    refs = list(dict.fromkeys(sm["reference"]))
+    own, yard = sm[sm["model"] == BELIEF_CODES["own"]], sm[sm["model"] != BELIEF_CODES["own"]]
+    refs = list(dict.fromkeys(own["reference"]))
+    pairs = list(dict.fromkeys(zip(yard["model"], yard["reference"])))
     stats = [s for s in SITE_MATCH_STATS if s in set(sm["value"])]
     if not refs or not stats:
         return []
@@ -1214,10 +1217,17 @@ def _site_match_figure(sm: pd.DataFrame, run_dir: str) -> list[str]:
         ax = axes[r][0]
         for ref in refs:
             st = arm_style(ref)
-            part = sm[(sm["reference"] == ref) & (sm["value"] == stat)].sort_values("context_t")
+            part = own[(own["reference"] == ref) & (own["value"] == stat)].sort_values("context_t")
             ax.plot(part["context_t"], part["median"], color=st.color, ls=st.linestyle, marker=st.marker,
                     label=f"vs {st.label}" if r == 0 else None)
             ax.fill_between(part["context_t"], part["ci_low"], part["ci_high"], color=st.color,
+                            alpha=style.BAND_ALPHA, lw=0)
+        for model, ref in pairs:
+            part = yard[(yard["model"] == model) & (yard["reference"] == ref) & (yard["value"] == stat)]
+            part = part.sort_values("context_t")
+            ax.plot(part["context_t"], part["median"], color=style.NEUTRAL_GREY, ls=":", marker="o",
+                    label=f"{arm_style(model).label} vs {arm_style(ref).label}" if r == 0 else None)
+            ax.fill_between(part["context_t"], part["ci_low"], part["ci_high"], color=style.NEUTRAL_GREY,
                             alpha=style.BAND_ALPHA, lw=0)
         ax.set_xticks(list(ts), [str(int(t)) for t in ts])
         ax.set_ylabel(style.axis_label(SITE_MATCH_STATS[stat]))

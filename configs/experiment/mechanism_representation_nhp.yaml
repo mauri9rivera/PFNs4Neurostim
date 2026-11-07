@@ -65,15 +65,19 @@
 #   apart), then the median slope over channels with the channel bootstrap (D4). Primary: raw W2 (absolute
 #   convergence). Secondary: w2_over_sd (W2 in units of GP-MLL refit's own predictive SD), which falls only if TabPFN
 #   approaches GP-MLL faster than the posterior contracts. A decrease is a 95 % interval of the slope below 0.
+#   Yardstick (user, 2026-11-07; site_match.pairs): the same slope for GP-fixed against GP-MLL refit, a GP under another
+#   prior, i.e. the convergence of prior mismatch alone. TabPFN's slope is read beside it, never alone: as steep or
+#   steeper = it approaches GP-MLL like a GP with another prior; shallower = it approaches it less than prior mismatch
+#   explains; no decrease where the yardstick decreases = a clear difference.
 # β1b READING RULE. Headline: deconfounded debiased CKA of C_PFN against Sigma_MLL (geometry kernels and GP-fixed's
 #   covariance removed, as for every covariance target, D3d); a value near 0 reads "not distinguishable from geometry
 #   and layout" (WORDING above). Secondary: raw debiased CKA, NBS, Bures distance, trace ratio. Deconfounded, not raw:
 #   in the pre-amendment β1b runs geometry carried most of the raw score (raw 0.19-0.28 vs deconfounded 0.02-0.04
 #   against Sigma_MLL; 0.43-0.64 vs 0.15-0.24 against GP-fixed).
-# β2 HEADLINE (user, 2026-11-07). floor_subtracted_raw: raw debiased CKA minus the surrogate median, the deconfounded
-#   value secondary. For the belief-map targets geometry removal moves the label-token score by 0.03-0.06 only
-#   (pre-amendment runs, blocks 8 / 17: mean_own 0.88 vs 0.85, sd_own 0.84 vs 0.79), so the simpler statistic is kept;
-#   it is read against its own (higher) floor, since the raw surrogate quantile is ~0.47 against ~0.25 deconfounded.
+# β2 HEADLINE (user, 2026-11-07). deconfounded_vs_surrogate, as β1b: electrode geometry is removed in every CKA reading,
+#   for consistency. For the belief-map targets the removal moves the label-token score by 0.03-0.06 only
+#   (pre-amendment runs, blocks 8 / 17: mean_own 0.88 vs 0.85, sd_own 0.84 vs 0.79); it mostly lowers the chance level
+#   (surrogate 95th percentile ~0.47 without, ~0.25 with). The raw score stays a secondary column.
 defaults:
   dataset: nhp
   context: nhp
@@ -108,8 +112,8 @@ representation:
   permutation: {n_perm: 200}
   ceiling: {enabled: true, trial_draw_offset: 100}
   target_relations: [[quant_mll, K_GT], [mean_mll, K_GT]]
-  site_match: {references: [gp_mll_refit, gp_fixed]}
-  headline: {statistic: floor_subtracted_raw, readout: label}   # amendment 2026-11-07 (was deconfounded_vs_surrogate)
+  site_match: {references: [gp_mll_refit, gp_fixed], pairs: [[gp_fixed, gp_mll_refit]]}   # pairs: β1a yardstick (2026-11-07)
+  headline: {statistic: deconfounded_vs_surrogate, readout: label}   # geometry removed in every CKA reading (user, 2026-11-07)
   inference: {n_boot: 2000, ci: 0.95}
   posterior_cov:
     enabled: true

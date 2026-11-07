@@ -59,6 +59,24 @@ def test_site_w2_split_is_an_identity_and_matches_gaussian_w2() -> None:
         B.site_w2_split(Ea, Eb[:, :10])
 
 
+def test_site_match_pair_rows_compare_one_reference_with_another_like_tabpfn() -> None:
+    """The β1a yardstick: a reference model's rows are exactly TabPFN's rows with that model's belief in its place."""
+    rng = np.random.default_rng(1)
+    u = B.belief_levels(16)
+    def belief(mu: float, s: float) -> R.Belief:
+        mean, sd = mu + rng.normal(size=6), s * np.ones(6)
+        return R.Belief(mean, sd, mean[:, None] + sd[:, None] * norm.ppf(u)[None], None)
+    beliefs = {"own": belief(0.0, 1.0), "mll": belief(0.5, 0.8), "fixed": belief(-0.3, 1.2)}
+    observed = np.array([True, False] * 3)
+    pair = R.site_match_pair_rows(beliefs, [("fixed", "mll")], observed)
+    as_own = R.site_match_rows(beliefs["fixed"].quantiles, {**beliefs, "own": beliefs["fixed"]}, ["mll"], observed)
+    assert [r["model"] for r in pair] == ["gp_fixed"] * 6 and {r["reference"] for r in pair} == {"gp_mll_refit"}
+    for a, b in zip(pair, as_own):
+        assert {k: v for k, v in a.items() if k != "model"} == {k: v for k, v in b.items() if k != "model"}
+    assert {r["model"] for r in R.site_match_rows(beliefs["own"].quantiles, beliefs, ["mll"], observed)} == {
+        "tabpfn_v2_5"}
+
+
 def test_implied_covariance_of_gp_fixed_is_its_posterior_covariance() -> None:
     """With every site an anchor, Part A's moment-matched rows reproduce GP-fixed's k_C exactly (β1b's floor)."""
     ch = gp_channel(5, 0.3, 0.2, 4, np.random.default_rng(1))
@@ -218,6 +236,7 @@ def _representation_config(tmp_path) -> str:
                       lengthscale_floor: 0.05}}
           surrogate: {{lengthscales: [0.15, 0.3], n_fields: 16, n_replicates: 3, jitter: 1.0e-8, quantile: 0.95}}
           permutation: {{n_perm: 20}}
+          site_match: {{references: [gp_mll_refit, gp_fixed], pairs: [[gp_fixed, gp_mll_refit]]}}
           inference: {{n_boot: 50, ci: 0.9}}
           posterior_cov:
             enabled: true
@@ -252,8 +271,12 @@ def test_representation_runner_end_to_end_cache_and_replot(tmp_path, tiny_channe
     assert (rep["headline_statistic"] == "deconfounded_vs_surrogate").all()
     assert {"headline_value", "headline_floor", "headline_margin", "surrogate_q_cka_deconf"} <= set(rep.columns)
     sm = tables["site_match"]
-    assert set(sm["reference"]) == {"gp_mll_refit", "gp_fixed"}
+    assert set(sm.loc[sm["model"] == "tabpfn_v2_5", "reference"]) == {"gp_mll_refit", "gp_fixed"}
+    assert set(sm.loc[sm["model"] == "gp_fixed", "reference"]) == {"gp_mll_refit"}            # the β1a yardstick
     np.testing.assert_allclose(sm["w2"] ** 2, sm["location"] + sm["spread"] + sm["shape"], rtol=1e-8, atol=1e-12)
+    sms = tables["site_match_summary"]
+    assert set(zip(sms["model"], sms["reference"])) == {("tabpfn_v2_5", "gp_mll_refit"), ("tabpfn_v2_5", "gp_fixed"),
+                                                        ("gp_fixed", "gp_mll_refit")}
     lens = tables["lens"]
     assert set(lens["comparison"]) == {"tabpfn_v2_5", "gp_mll_refit", "gp_fixed"}
     final = lens[(lens["comparison"] == "tabpfn_v2_5") & (lens["layer"] == _N_BLOCKS - 1)]
@@ -327,7 +350,10 @@ def test_the_pre_registered_config_validates() -> None:
     assert p["belief_engines"] == ["gp_mll_refit", "gp_fixed"] and "gp_bayes" not in p["belief_engines"]
     assert p["deconfound"]["bandwidth_multipliers"] == [0.25, 0.5, 1.0, 2.0]
     assert p["surrogate"]["lengthscales"] == [0.10, 0.15, 0.30]
-    assert p["posterior_cov"]["coverage"]["context_ts"] == [10, 25, 50, 80]
+    # amendment 2026-11-07: OMEGA Phase 1's refinement ladder, 10 draws for every cell kind, level 1, β1a yardstick
+    assert p["posterior_cov"]["coverage"]["context_ts"] == [30, 40, 50, 60, 80]
+    assert p["posterior_cov"]["coverage"]["draws"] == list(range(10)) and p["n_context_draws"] == 10
+    assert p["stress"]["levels"] == [1.0] and p["site_match"]["pairs"] == [["gp_fixed", "gp_mll_refit"]]
 
 
 @pytest.mark.slow
