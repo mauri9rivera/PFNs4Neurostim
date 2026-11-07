@@ -427,8 +427,10 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
     # Revisits (user 2026-10-26): ``fraction`` of the t rows of every grid context is a further trial at an already sampled
     # site, as in a BO loop (0 = the historical context of distinct sites; its cells and identities are unchanged);
     # ``row_order`` is sorted | history (analysis/context.ROW_ORDERS). Grid cells only: the gates, the frozen-refit
-    # discrepancy and the exemplar keep contexts of distinct sites.
-    "revisits": {"fraction": 0.0, "row_order": "sorted"},
+    # discrepancy and the exemplar keep contexts of distinct sites. ``max_distinct`` (null = off; user 2026-11-07) caps the
+    # distinct sites of a grid context instead: a t > max_distinct context is the max_distinct-site context plus
+    # t - max_distinct further trials, so t can exceed the grid's site count while the unobserved anchor pool survives.
+    "revisits": {"fraction": 0.0, "row_order": "sorted", "max_distinct": None},
     # method: gauss_hermite | truncated | rqmc (analysis/bayes_update.QUADRATURE_METHODS) | strata (deterministic equal-mass
     # strata, nodes supplied by each predictive; K strata; user 2026-10-28, config ``mechanism_bayes_update_nhp_amended.yaml``);
     # central_mass for truncated; n_scrambles for rqmc (K is then the points per scramble); u_min / central_mass /
@@ -566,6 +568,10 @@ def _validate_bayes_update(p: dict[str, Any], ladder: Sequence[int]) -> dict[str
     if p["revisits"]["row_order"] not in ROW_ORDERS:
         raise ValueError(f"bayes_update.revisits.row_order must be one of {ROW_ORDERS}, got "
                          f"{p['revisits']['row_order']!r}.")
+    md = p["revisits"]["max_distinct"]
+    if md is not None and (int(md) < 2 or float(p["revisits"]["fraction"]) != 0.0):
+        raise ValueError(f"bayes_update.revisits.max_distinct={md!r} must be >= 2 and needs revisits.fraction = 0 "
+                         f"(the two rules would both set the revisit count).")
     # The ladder reference (user, 2026-10-21): any non-TabPFN engine of the run -- GP-Bayes is optional.
     ref = p["shared"]["reference"]
     if ref not in p["engines"]:
@@ -776,17 +782,34 @@ def _n_revisits(p: dict[str, Any], t: int) -> int:
         t: Context size.
 
     Returns:
-        ``round(fraction * t)``.
+        ``t - max_distinct`` when ``revisits.max_distinct`` is set and below ``t``, else ``round(fraction * t)``.
     """
+    md = p["revisits"]["max_distinct"]
+    if md is not None and int(t) > int(md):
+        return int(t) - int(md)
     return int(round(float(p["revisits"]["fraction"]) * int(t)))
 
 
-def _revisit_identity(p: dict[str, Any]) -> dict[str, Any]:
-    """The cell-identity entry of the context layout: empty for the historical layout, so its cached cells still serve."""
+def _revisit_identity(p: dict[str, Any], t: int) -> dict[str, Any]:
+    """The cell-identity entry of a ``t``-row context's layout.
+
+    Empty for the historical layout, so its cached cells still serve; ``max_distinct`` joins only where it adds
+    revisits (``t > max_distinct``), so setting it leaves every smaller context's identity unchanged.
+
+    Args:
+        p: Resolved ``bayes_update`` block.
+        t: Context size.
+
+    Returns:
+        ``{}`` or ``{"revisits": {...}}``.
+    """
     rv = p["revisits"]
-    if float(rv["fraction"]) == 0.0 and rv["row_order"] == "sorted":
-        return {}
-    return {"revisits": {"fraction": float(rv["fraction"]), "row_order": rv["row_order"]}}
+    ident = {} if float(rv["fraction"]) == 0.0 and rv["row_order"] == "sorted" else {
+        "fraction": float(rv["fraction"]), "row_order": rv["row_order"]}
+    if rv["max_distinct"] is not None and int(t) > int(rv["max_distinct"]):
+        ident = {"fraction": float(rv["fraction"]), "row_order": rv["row_order"], **ident,
+                 "max_distinct": int(rv["max_distinct"])}
+    return {"revisits": ident} if ident else {}
 
 
 def _bayes_cell(
@@ -1462,7 +1485,9 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                 for level in knob.levels:
                     st = knob.apply(ch, level, rng_for(ch.label, "bayes_update", level, base_seed=cfg.seed))
                     snr = achieved_snr_db(st)
-                    tasks += [(ch, level, st, snr, t, draw) for t in cfg.context_sizes if t < st.n_sites
+                    # distinct sites, not rows, must stay below the grid's site count (revisits, max_distinct)
+                    tasks += [(ch, level, st, snr, t, draw) for t in cfg.context_sizes
+                              if t - _n_revisits(p, int(t)) < st.n_sites
                               for draw in range(int(p["n_context_draws"]))]
             if opts.compute_only:
                 tasks.sort(key=lambda task: (task[5], task[4], float(task[1]), task[0].subject, task[0].emg))
@@ -1482,7 +1507,7 @@ def run_bayes_update(cfg: MechanismConfig, opts: RunOptions) -> str:
                          **{k: p[k] for k in ("references", "anchors", "quadrature", "eps", "y_grid",
                                               "shared", "far_pitch")},
                          "cdf_readouts": list(B.CDF_READOUTS),
-                         **_revisit_identity(p)}
+                         **_revisit_identity(p, int(t))}
                 hit = cells.run(
                     "cell", ident, f"{ch.label} a={level:g} t={t} d={draw}",
                     lambda st=st, ch=ch, level=level, t=t, draw=draw, cov=cov: (_bayes_cell(

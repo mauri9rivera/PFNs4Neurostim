@@ -168,9 +168,19 @@ bayes_update:
   # gp_mll_frozen dropped 2026-10-30 (user): it left Hypothesis C, GP-fixed is the C1 reference (header item 5).
   engines: [tabpfn_v2_5, gp_mll_refit, gp_fixed]
   references: [gp_mll_refit, gp_fixed]
+  # Part B is restricted to the context sizes it ran at (none of these filters changes an existing cell's identity);
+  # the long-t extension (t 100-160, user 2026-11-07) is Part A only: it feeds the coherence panels alone.
   coverage:
+    tabpfn_v2_5:
+      B: {context_ts: [10, 25, 30, 40, 50, 60, 80]}
+    gp_fixed:
+      B: {context_ts: [10, 25, 30, 40, 50, 60, 80]}
     gp_mll_refit:
-      B: {levels: [1.0]}
+      B: {levels: [1.0], context_ts: [10, 25, 30, 40, 50, 60, 80]}
+  # max_distinct (user, 2026-11-07): a context of t > 80 rows is the t = 80 context's sites plus t - 80 further trials
+  # at them (each site revisited at most once: t <= 160), so t can pass the 96 NHP sites while 16 stay unobserved and
+  # the 8 + 4 anchor mix of every other t is kept. It enters only the identity of t > 80 cells.
+  revisits: {fraction: 0.0, row_order: sorted, max_distinct: 80}
   c1: {reference: gp_fixed, engines: [tabpfn_v2_5, gp_fixed, gp_mll_refit],
        distance_bins: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 14.0], exemplar_c: 1.0}
   stress: {knob: k2_channel, levels: [1.0, 2.0, 4.0]}
@@ -201,7 +211,7 @@ bayes_update:
   # Keep in step with configs/model/gp_naive.yaml by hand.
   fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.05}
   # exemplar.context_sizes [40] (user, 2026-11-07): the anchor must be unobserved at every exemplar t; over t 30-80 the
-  # only such site of nhp-s0-e0 sat on the array edge (site 17); at t = 40 alone it is central (site 52). The workshop
+  # only such site of nhp-s0-e0 sat on the array edge (site 17); at t = 40 alone it is central (site 42; four sites tie for most central). The workshop
   # figure shows t = 40 (at t = 60, site 43, GP-fixed's change was too small to read). Exemplar cells only: no grid
   # cell identity changes.
   exemplar: {enabled: true, subject: null, emg: null, level: 1.0, draw: 0,

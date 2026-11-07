@@ -173,6 +173,7 @@ def _small_bayes_update(tmp_path, sizes: str = "[10]", **extra: str) -> str:
           exemplar: {enabled: true, subject: null, emg: null, level: 1.0, draw: 0, engines: [gp_bayes, gp_fixed],
                      context_sizes: null}
           panel_ts: [10]
+          revisits: {fraction: 0.0, row_order: sorted, max_distinct: null}
           run: {gates: false, grid: true, discrepancy: false}
     """
     return _config(tmp_path, body, sizes=sizes)
@@ -242,6 +243,27 @@ def test_bayes_update_exemplar_context_sizes_pick_the_exemplar_t_and_must_be_run
     p = mechanism._validate_bayes_update({"exemplar": {"enabled": False, "context_sizes": [30]},
                                           "stress": {"knob": "k2_channel", "levels": [1.0]}}, [10, 25, 50, 80])
     assert p["exemplar"]["context_sizes"] == [30]
+
+
+def test_bayes_update_max_distinct_extends_t_past_the_grid_and_keeps_smaller_identities(tmp_path, tiny, capsys) -> None:
+    """revisits.max_distinct (2026-11-07): a context larger than the grid becomes the max_distinct-site context plus
+    revisits, and the key leaves the identity of every context at or below it untouched."""
+    path = _small_bayes_update(tmp_path, sizes="[10, 60]")                      # 60 rows > the 49 sites
+    out = mechanism.run_mechanism(path)
+    assert set(pd.read_csv(os.path.join(out, "coherence_cell.csv"))["context_t"]) == {10}   # t = 60 skipped
+    capsys.readouterr()
+    mechanism.run_mechanism(path, ["bayes_update.revisits.max_distinct=40"])
+    log = capsys.readouterr().out
+    assert "[cache] hit bayes_update:cell" in log and "t=10 d=0" in log.split("[cache] hit bayes_update:cell")[1]
+    cc = pd.read_csv(os.path.join(out, "coherence_cell.csv"))
+    assert set(cc["context_t"]) == {10, 60}
+    p = mechanism._validate_bayes_update({"revisits": {"max_distinct": 40}, "stress": {"knob": "k2_channel",
+                                          "levels": [1.0]}, "exemplar": {"enabled": False}}, [10, 25, 50, 80])
+    assert mechanism._n_revisits(p, 60) == 20 and mechanism._n_revisits(p, 40) == 0
+    assert mechanism._revisit_identity(p, 40) == {} and mechanism._revisit_identity(p, 60)["revisits"]["max_distinct"] == 40
+    with pytest.raises(ValueError, match="max_distinct"):
+        mechanism._validate_bayes_update({"revisits": {"max_distinct": 40, "fraction": 0.1}, "stress": {
+            "knob": "k2_channel", "levels": [1.0]}, "exemplar": {"enabled": False}}, [10, 25, 50, 80])
 
 
 def test_bayes_update_only_cached_assembly_reports_missing_exemplar_cells(tmp_path, tiny, capsys) -> None:
@@ -595,13 +617,13 @@ class TestStressSeriesAreLabelledInSnr:
 
 def test_bayes_update_revisits_are_validated_and_leave_the_default_identity_alone() -> None:
     base = {"stress": {"knob": "k2_channel", "levels": [1.0]}, "exemplar": {"enabled": False}}
-    assert mechanism.BAYES_UPDATE_DEFAULTS["revisits"] == {"fraction": 0.0, "row_order": "sorted"}
+    assert mechanism.BAYES_UPDATE_DEFAULTS["revisits"] == {"fraction": 0.0, "row_order": "sorted", "max_distinct": None}
     default = mechanism._validate_bayes_update({**base}, _LADDER)
-    assert mechanism._revisit_identity(default) == {}                          # historical cells keep serving
+    assert mechanism._revisit_identity(default, 40) == {}                      # historical cells keep serving
     assert mechanism._n_revisits(default, 40) == 0
     on = mechanism._validate_bayes_update({**base, "revisits": {"fraction": 0.25, "row_order": "history"}}, _LADDER)
     assert mechanism._n_revisits(on, 40) == 10
-    assert mechanism._revisit_identity(on) == {"revisits": {"fraction": 0.25, "row_order": "history"}}
+    assert mechanism._revisit_identity(on, 40) == {"revisits": {"fraction": 0.25, "row_order": "history"}}
     for bad in ({"fraction": 1.0}, {"fraction": -0.1}, {"row_order": "random"}):
         with pytest.raises(ValueError, match="revisits"):
             mechanism._validate_bayes_update({**base, "revisits": bad}, _LADDER)
@@ -610,9 +632,9 @@ def test_bayes_update_revisits_are_validated_and_leave_the_default_identity_alon
 def test_bayes_update_runs_on_contexts_with_revisits_and_gp_fixed_stays_exact(tmp_path, tiny) -> None:
     """Revisited sites (repeated x, different y) do not break the engines; an exact GP keeps its zero floor."""
     body = open(_small_bayes_update(tmp_path), encoding="utf-8").read()
-    body = body.replace("  anchors: {n_unobserved: 2, n_observed: 1}\n",
-                        "  anchors: {n_unobserved: 2, n_observed: 1}\n  revisits: {fraction: 0.4, row_order: history}\n")
-    assert "revisits:" in body
+    body = body.replace("  revisits: {fraction: 0.0, row_order: sorted, max_distinct: null}\n",
+                        "  revisits: {fraction: 0.4, row_order: history}\n")
+    assert "revisits: {fraction: 0.4" in body
     path = tmp_path / "revisit.yaml"
     path.write_text(body.replace("tag: tiny", "tag: tiny-revisit"))
     out = mechanism.run_mechanism(str(path))
@@ -620,4 +642,5 @@ def test_bayes_update_runs_on_contexts_with_revisits_and_gp_fixed_stays_exact(tm
     fixed = cc[cc["engine"] == "gp_fixed"]
     assert len(fixed) and (fixed["drift_abs"].abs() < 1e-8).all() and (fixed["cov_asymmetry"] < 1e-8).all()
     with open(os.path.join(out, "config.yaml"), encoding="utf-8") as fh:
-        assert yaml.safe_load(fh)["bayes_update"]["revisits"] == {"fraction": 0.4, "row_order": "history"}
+        assert yaml.safe_load(fh)["bayes_update"]["revisits"] == {"fraction": 0.4, "row_order": "history",
+                                                                  "max_distinct": None}
