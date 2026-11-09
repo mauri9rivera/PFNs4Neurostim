@@ -309,38 +309,6 @@ def _generator_validation(cfg: ExperimentConfig, shard: tuple[int, int] | None) 
     return pd.DataFrame.from_records(records)
 
 
-def _render_bridge(target: str, draws_dir: str, cfg: ExperimentConfig, df: pd.DataFrame) -> list[str]:
-    """Place the real channels of a draws run on this synthetic run's regime surface (S10).
-
-    Args:
-        target: This (synthetic) run directory.
-        draws_dir: Run directory of the matching draws sweep.
-        cfg: Resolved synthetic configuration.
-        df: This run's tidy frame.
-
-    Returns:
-        Paths written.
-
-    Raises:
-        FileNotFoundError: If either run lacks its tidy table or trajectories.
-    """
-    from ..visualization import stress as stress_figs  # noqa: PLC0415 - matplotlib import
-    from ..visualization import traces as T  # noqa: PLC0415
-
-    real_path = os.path.join(draws_dir, "tidy.csv")
-    frame = T.load_trace_frame(target)
-    if frame is None or not os.path.exists(real_path):
-        raise FileNotFoundError(f"--bridge needs {real_path} and this run's trajectories.pkl.")
-    real_df = pd.read_csv(real_path)
-    written = []
-    for model in [m for m in cfg.models if m != stress_figs.REFERENCE_MODEL]:
-        written += stress_figs.plot_bridge(
-            frame, df, real_df, os.path.join(target, "bridge", model),
-            knob=cfg.knob.type, margin=cfg.equivalence_margin, model=model,
-        )
-    return written
-
-
 def run_stress_sweep(
     config_path: str,
     overrides: list[str] | None = None,
@@ -352,7 +320,6 @@ def run_stress_sweep(
     on_cell: Callable[[], None] | None = None,
     shard: tuple[int, int] | None = None,
     compute_only: bool = False,
-    bridge: str | None = None,
 ) -> str:
     """Run (or re-plot) one stress sweep.
 
@@ -372,8 +339,6 @@ def run_stress_sweep(
         compute_only: Compute (and cache) cells but write no ``tidy.csv`` or figures: only a
             provenance record in ``{run_dir}/shards/``. Every job of an experiment shares one run
             directory; assemble the union with a final ``--only-cached`` run without ``--shard``.
-        bridge: Run directory of the draws sweep matching this synthetic sweep; draws the real
-            channels on this run's regime surface (roadmap S10).
 
     Returns:
         Path to the (single, merged) run directory holding the deliverables.
@@ -443,8 +408,6 @@ def run_stress_sweep(
             else _generator_validation(cfg, shard)
         )
         written += stress_figs.plot_generator_validation(features, target)
-    if bridge:
-        written += _render_bridge(target, bridge, cfg, df)
     for path in written:
         print(f"[stress_sweep] wrote {path}")
     return target
@@ -495,10 +458,6 @@ def main(argv: list[str] | None = None) -> int:
         "--compute-only", action="store_true",
         help="Compute and cache cells; write only a shard provenance record (implied by --shard).",
     )
-    parser.add_argument(
-        "--bridge", default=None, metavar="DRAWS_RUN_DIR",
-        help="synthetic runs only: overlay that draws run's real channels on the regime surface (S10).",
-    )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     cfg = load_experiment_config(args.config, args.overrides)
@@ -522,6 +481,6 @@ def main(argv: list[str] | None = None) -> int:
         run_stress_sweep(
             args.config, args.overrides, replot=args.replot, run_dir=args.run_dir,
             use_cache=not args.no_cache, only_cached=args.only_cached,
-            on_cell=diag.record_experiment, shard=args.shard, compute_only=args.compute_only, bridge=args.bridge,
+            on_cell=diag.record_experiment, shard=args.shard, compute_only=args.compute_only,
         )
     return 0

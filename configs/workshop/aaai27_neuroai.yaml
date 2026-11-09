@@ -1,0 +1,114 @@
+# AAAI-27 NeuroAI workshop short paper (4 pages, due 2026-11-20): inputs and layout of its four items.
+# Figure plan: research_design §0 (figures named by title, never by number). Task plan: Sprint #5, Step 6.
+#
+#   python scripts/workshop_figures.py --config configs/workshop/aaai27_neuroai.yaml
+#   python scripts/workshop_figures.py --config configs/workshop/aaai27_neuroai.yaml --only stress
+#
+# Geometry: width 'single' = 3.27 in (AAAI column 3.3 in), 'double' = 6.93 in (text width 7.0 in); confirm both
+# against AuthorKit27 before submission. The submission takes the PDFs; the SVGs are the working copies.
+#
+# G2 is enforced by code, not by this file: a model whose recorded model_version is not the registry's current one is
+# shown as "pending recompute" (today: every GP-MLL row, which predates the restart-rule fix). When the recomputes
+# land, add their run directories below; nothing else changes. Mechanism panels from fewer than expected_channels
+# channels, or at another t than requested, are stamped DRAFT automatically.
+out_dir: output/workshop-draft
+formats: [svg, pdf]
+
+# Multi-PFN benchmark table (Hyp 0 / A): 6 PFNs + GP-MLL / GP-fixed under ts_marginal (user, 2026-11-05).
+# PFNs4BO runs its native EI policy (G3 footnote). Rows shared by two runs of a dataset must agree cell for cell.
+benchmark:
+  datasets: [nhp, spinal, 5d_rat]
+  runs:
+    nhp: [output/benchmark/nhp/hyp0-pfn-bench-nhp, output/benchmark/nhp/hyp-a-nhp]
+    spinal: [output/benchmark/spinal/hyp0-pfn-bench-spinal, output/benchmark/spinal/hyp-a-spinal]
+    5d_rat: [output/benchmark/5d_rat/hyp0-pfn-bench-5d_rat, output/benchmark/5d_rat/hyp-a-5d_rat]
+  models: [tabpfn_v2_5, tabpfn_v3_5, tabicl, tabfm, causilo, pfns4bo, gp_mll, gp_naive]
+  metrics: [r2, exploration_score]
+  dataset_titles: {nhp: NHP cortical, spinal: Rat spinal, 5d_rat: Rat cortical}   # column-group titles (user, 2026-11-06)
+
+# NHP stress regimes (in vivo) (Hyp B): one row per metric, one column per knob (user, 2026-11-06).
+stress:
+  knobs:
+    k2_channel: output/stress/k2_channel/nhp/stress-k2-channel-draws-nhp
+    k5_outliers: output/stress/k5_outliers/nhp/stress-k5-nhp
+    k6_failure: output/stress/k6_failure/nhp/stress-k6-failure-nhp
+  knob_titles: {k2_channel: Noise amplification, k5_outliers: Outliers, k6_failure: Electrode failure}
+  models: [tabpfn_v2_5, gp_mll, gp_naive]
+  metrics: [exploration_score, r2]
+  min_snr_db: null          # the sweeps' own default (no clip)
+  show_channels: false      # per-channel traces are unreadable at this width
+  default_marker_knobs: [k2_channel]   # knobs whose panels mark the default regime (K5 / K6 levels start at it: no marker)
+  annotate_clip: false      # the R^2 axis is still clipped (style.R2_AXIS_FLOOR); the caption says so
+  width: double
+  panel_aspect: 0.8
+  # Breakdown metric OPEN (user, 2026-11-05): results are read first, then the claim is made per metric. To mark one:
+  # breakdown: {metric: recommended_regret, margin: 0.05, reference: gp_mll}
+  breakdown: null
+
+# Is the update GP-like? (Hyp C1). 2 x 2: (a) exemplar change maps at one anchor; (b) surprise response and (c) update
+# vs distance, all at t = 40. GP-MLL refit joins (b) and (c), not the maps of (a). The footprint-correlation panel was
+# dropped (user, 2026-11-07: no view the others do not give; backlogged in the roadmap), so the figure fits one column.
+# runs: the bayes_update run directories to pool. OMEGA Phase 1's refinement only (t 30-80 x 10 draws, K2 level 1,
+# 22 channels; it also holds the exemplar): the pre-registered headline. The grid run (t 10 / 25) is left out because
+# it has 2 draws per channel, so its points are not comparable with the refinement's (user, 2026-11-07).
+gp_like:
+  runs: [output/mechanism/bayes_update/nhp/phase1-refine]
+  engines: [tabpfn_v2_5, gp_fixed, gp_mll_refit]   # lines of (b) and (c)
+  map_engines: [tabpfn_v2_5, gp_fixed]             # maps of (a)
+  t: 40                     # every t-specific panel (user, 2026-11-07: at t = 60 GP-fixed's change is too small to see)
+  expected_channels: 22
+  width: single             # one AAAI column (user, 2026-11-07: compact 2 x 2)
+  height_ratio: 1.10        # figure height / width
+  legend_ncol: 3            # shared-legend entries per row
+  label_suffix: _compact    # style.AXIS_LABELS variant: the short labels a 3.27 in column needs at 9 pt (AAAI minimum);
+                            # the caption says the surprise and update are in ladder-reference SD at x'
+  map_letter_x: -0.12       # panel letter (a), axes fraction
+  readout_letter_xy: [-0.30, 1.20]   # panel letters (b), (c): above the y labels, axes fraction
+  middle_width_ratio: 0.40  # width of the colour-bar column between the maps, relative to one map
+  colorbar_box: [0.30, 0.06, 0.12, 0.88]   # the colour bar inside that column: [x0, y0, width, height], axes fraction
+  map_legend: {observed: Context sites, anchor: "Anchor $x'$"}
+  row_heights: [1.0, 1.25]  # maps row, readouts row (the two-line y labels need the height)
+
+# Is the update coherent? (Hyp C2 Part A). Part A readouts vs t, pooled anchors at the nominal level, one median band
+# per engine against the value every coherent Bayesian model scores. Two variants (user, 2026-11-06), one figure each:
+# - moments (no suffix): mean drift |delta| (martingale; Bayes 0), total-variance ratio (law of total variance; Bayes 1),
+#   implied-covariance asymmetry (Bayes 0). Second-moment readouts use the central tail measure (G8 convention C);
+#   state it in the caption.
+# - cdf: Kolmogorov distance and grid total variation between today's predictive CDF and the mixture of refit CDFs
+#   (martingale in distribution; Bayes 0). G8's headline readouts: identical under every tail convention. Log y axis,
+#   since GP-fixed (~1e-7) and GP-MLL refit (~1e-3) sit orders of magnitude below TabPFN (~1e-2).
+# Same runs as gp_like: the refinement only, t 30-80 (user, 2026-11-07).
+coherence:
+  # phase1-long-t: Part A at t 100-160 (the t = 80 sites + 20-80 revisits, revisits.max_distinct 80; user 2026-11-07)
+  runs: [output/mechanism/bayes_update/nhp/phase1-refine, output/mechanism/bayes_update/nhp/phase1-long-t]
+  engines: [tabpfn_v2_5, gp_fixed, gp_mll_refit]
+  expected_channels: 22
+  xticks: [40, 80, 120, 160]   # one tick per t collides at 30-60 once t reaches 160
+  variants:
+    - {suffix: "", metrics: [drift_abs, total_var_ratio, cov_asymmetry], yscale: linear, width: double,
+       panel_aspect: 0.8, letter_x: -0.22,
+       ylim: {drift_abs: [0.0, 0.5], total_var_ratio: [0.75, 1.25], cov_asymmetry: [0.0, 0.5]}}   # user, 2026-11-07
+    - {suffix: _cdf, metrics: [ks, tv_grid], yscale: log, width: onehalf, panel_aspect: 0.8, letter_x: -0.28}
+
+# Supplement: what the representation encodes (BETA; template, user 2026-11-09). One panel per BETA readout, each read
+# from the amended run's summary CSVs (nothing recomputed): (a) β2 label-token alignment with one belief target vs block
+# (headline statistic, geometry removed, against the smooth-field surrogate; G6 wording: decodability), (b) β1a per-site
+# W2 vs t on log-log axes (the user's reading: W2 should fall with t) with the GP-fixed vs GP-MLL refit yardstick,
+# (c) β1b deconfounded CKA of TabPFN's implied covariance with each reference covariance (the β1b headline, user
+# 2026-11-07), (d) zero-parameter vs tuned lens across blocks (a view, not analysed yet; user 2026-11-07).
+beta_supplement:
+  run: output/mechanism/representation/nhp/nhp-amended
+  width: double
+  panel_aspect: 0.62
+  letter_x: -0.16
+  beta2: {target: mean_mll, site_set: all, readout: label, value: headline_value, floor: headline_floor,
+          ylim: [-0.05, 0.95], legend_loc: upper center, legend_ncol: 3}
+  beta1a: {value: w2, site_pool: all, xscale: log, yscale: log, yticks: [0.3, 0.4, 0.5]}   # log-log: a power law is a line
+  beta1b: {engine: tabpfn_v2_5, value: cka_deconf, references: [gp_fixed, gp_mll_refit], ylabel: cka_deconfounded}
+  lens:
+    dir: output/diagnostics/tuned_lens_amended
+    metric: lens_kl
+    t: 40
+    yscale: log
+    variants: {fitted: tuned lens, zero: zero-parameter lens}   # legend labels, figure order
+    controls: [zero]                                            # drawn grey and dashed

@@ -22,6 +22,13 @@ from . import style
 
 __all__ = [
     "arm_style",
+    "surprise_panel",
+    "distance_panel",
+    "exemplar_map",
+    "c1_readout_panel",
+    "coherence_panel",
+    "channel_band",
+    "reference_summary_panel",
     "render_bayes_update",
     "render_predictive_link",
     "render_placement",
@@ -144,7 +151,7 @@ def _shown(df: pd.DataFrame, col: str = "engine") -> pd.DataFrame:
     return df[~df[col].isin(FIGURE_EXCLUDED_ENGINES)] if col in df else df
 
 
-def _channel_band(df: pd.DataFrame, col: str, x: str) -> pd.DataFrame:
+def channel_band(df: pd.DataFrame, col: str, x: str) -> pd.DataFrame:
     """Median over channels per ``x`` with its within-subject channel-bootstrap interval (BETA D4).
 
     Args:
@@ -168,7 +175,9 @@ def _channel_band(df: pd.DataFrame, col: str, x: str) -> pd.DataFrame:
 # bayes_update (OBJECTIVE OMEGA, 2026-10-15): Omega-1 ... Omega-5
 # ---------------------------------------------------------------------------
 #: Part A headline metrics of Omega-1, one column each, with the value every coherent Bayesian model scores.
-OMEGA_COHERENCE_METRICS: dict[str, float] = {"drift_abs": 0.0, "total_var_ratio": 1.0, "cov_asymmetry": 0.0,
+#: The CDF readouts ``ks`` / ``tv_grid`` lead: they are the G8 headline (2026-10-28), identical under every tail convention.
+OMEGA_COHERENCE_METRICS: dict[str, float] = {"ks": 0.0, "tv_grid": 0.0,
+                                            "drift_abs": 0.0, "total_var_ratio": 1.0, "cov_asymmetry": 0.0,
                                             "latent_frac": float("nan"), "update_share": float("nan"),
                                             "drift_abs_anchor": 0.0}
 #: Cell keys of the per-anchor rows, to reduce them to one row per cell, engine and pool.
@@ -222,7 +231,7 @@ def _median_band(ax: Any, df: pd.DataFrame, col: str, st: style.ModelStyle, x: s
         st: Engine style.
         x: Column on the x-axis.
     """
-    band = _channel_band(df, col, x)
+    band = channel_band(df, col, x)
     if band.empty:
         return
     ax.plot(band[x], band["median"], color=st.color, ls=st.linestyle, marker=st.marker, label=st.label,
@@ -280,6 +289,29 @@ def _omega_variance_index(pooled: pd.DataFrame, ts: Sequence[int], run_dir: str)
     return style.save_figure(fig, run_dir, "coherence_variance_index")
 
 
+def coherence_panel(ax: Any, cell: pd.DataFrame, metric: str, engines: Sequence[str] | None = None,
+                    ts: Sequence[int] | None = None, yscale: str = "linear") -> None:
+    """One Part A readout vs context size, one median band per engine, against the value of a coherent Bayesian model.
+
+    Args:
+        ax: Target axes.
+        cell: ``coherence_cell.csv`` rows of ONE pool at the nominal level.
+        metric: Key of :data:`OMEGA_COHERENCE_METRICS`.
+        engines: Engines drawn, in order (``None`` = every engine of the rows).
+        ts: Context-size ticks (``None`` = the sizes in the rows).
+        yscale: Matplotlib y scale. On ``"log"`` the Bayes value is drawn only if positive (the CDF distances are 0
+            for exact Bayes, so their reference is the axis floor, stated in the axis label).
+    """
+    order = list(engines) if engines is not None else list(cell["engine"].unique())
+    ax.set_yscale(yscale)
+    for engine in [e for e in order if e in set(cell["engine"])]:
+        _median_band(ax, cell[cell["engine"] == engine], metric, arm_style(engine))
+    if yscale != "log" or OMEGA_COHERENCE_METRICS[metric] > 0:
+        _bayes_value(ax, OMEGA_COHERENCE_METRICS[metric])
+    _context_axis(ax, sorted(cell["context_t"].unique()) if ts is None else ts)
+    ax.set_ylabel(style.axis_label(metric))
+
+
 def _omega_coherence(cell: pd.DataFrame, run_dir: str) -> list[str]:
     """Omega-1: Part A headlines vs context size, over every anchor (``coherence.svg``) and per pool (supplement).
 
@@ -304,11 +336,7 @@ def _omega_coherence(cell: pd.DataFrame, run_dir: str) -> list[str]:
         fig, axes = style.figure("double", nrows=-(-len(metrics) // ncols), ncols=ncols, squeeze=False,
                                  panel_aspect=_OMEGA_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
         for ax, metric in zip(axes.ravel(), metrics):
-            for engine in pooled["engine"].unique():
-                _median_band(ax, pooled[pooled["engine"] == engine], metric, arm_style(engine))
-            _bayes_value(ax, OMEGA_COHERENCE_METRICS[metric])
-            _context_axis(ax, ts)
-            ax.set_ylabel(style.axis_label(metric))
+            coherence_panel(ax, pooled, metric, ts=ts)
         for ax in axes.ravel()[len(metrics):]:
             ax.set_axis_off()
         axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
@@ -423,6 +451,37 @@ def _omega_headtohead(h2h: pd.DataFrame, run_dir: str) -> list[str]:
     return style.save_figure(fig, run_dir, "headtohead")
 
 
+def _surprise_rows(surprise: pd.DataFrame, engines: Sequence[str] | None) -> pd.DataFrame:
+    """Surprise rows the figures read: nominal level, unobserved anchors, shown engines (``None`` = every one)."""
+    sub = _shown(_nominal(surprise))
+    sub = sub[sub["pool"] == "unobserved"]
+    return sub if engines is None else sub[sub["engine"].isin(list(engines))]
+
+
+def surprise_panel(ax: Any, surprise: pd.DataFrame, t: int, engines: Sequence[str] | None = None) -> None:
+    """Update at the anchor vs injected surprise at one context size, one median band per engine.
+
+    Per anchor -> cell median -> median over channels with the channel-bootstrap band (:func:`_median_band`).
+
+    Args:
+        ax: Target axes.
+        surprise: ``surprise.csv`` rows.
+        t: Context size drawn.
+        engines: Engines drawn (``None`` = every engine of the table).
+    """
+    sub = _surprise_rows(surprise, engines)
+    at = sub[sub["context_t"] == t]
+    cell_keys = ["subject", "emg", "level", "context_t", "draw", "engine"]
+    per_cell = at.groupby([*cell_keys, "c"])["update_anchor_sd"].median().reset_index()     # anchors -> cell
+    order = list(engines) if engines is not None else list(per_cell["engine"].unique())
+    for engine in [e for e in order if e in set(per_cell["engine"])]:
+        _median_band(ax, per_cell[per_cell["engine"] == engine], "update_anchor_sd", arm_style(engine), x="c")
+    ax.axhline(0.0, color=style.NEUTRAL_GREY, lw=style.LINE_WIDTH / 2, ls=":", zorder=0)
+    ax.set_xlabel(style.axis_label("ladder_c"))
+    ax.set_ylabel(style.axis_label("update_anchor_sd"))
+    ax.set_title(f"$t$ = {int(t)}", fontsize=style.FONT_SIZES["legend"])
+
+
 def _omega_surprise(surprise: pd.DataFrame, panel_ts: Sequence[int], run_dir: str,
                     engines: Sequence[str] | None = None, name: str = "surprise_response",
                     reference: str | None = None) -> list[str]:
@@ -441,15 +500,11 @@ def _omega_surprise(surprise: pd.DataFrame, panel_ts: Sequence[int], run_dir: st
     Returns:
         Written paths.
     """
-    sub = _shown(_nominal(surprise))
-    sub = sub[sub["pool"] == "unobserved"]
-    if engines is not None:
-        sub = sub[sub["engine"].isin(list(engines))]
+    sub = _surprise_rows(surprise, engines)
     ts = [t for t in panel_ts if t in set(sub["context_t"])]
     if not ts:
         return []
     cell_keys = ["subject", "emg", "level", "context_t", "draw", "engine"]
-    per_cell = sub.groupby([*cell_keys, "c"])["update_anchor_sd"].median().reset_index()   # anchors -> cell
     # least-squares slope through the origin of the update on the surprise, per anchor, then per cell
     slope = (sub.assign(cu=sub["c"] * sub["update_anchor_sd"], cc=sub["c"] ** 2)
              .groupby([*cell_keys, "anchor"])[["cu", "cc"]].sum())
@@ -458,13 +513,7 @@ def _omega_surprise(surprise: pd.DataFrame, panel_ts: Sequence[int], run_dir: st
     fig, axes = style.figure("wide", ncols=len(ts) + 1, squeeze=False, panel_aspect=_OMEGA_PANEL_ASPECT,
                              layout=style.LAYOUT_ENGINE)
     for ax, t in zip(axes[0], ts):
-        at = per_cell[per_cell["context_t"] == t]
-        for engine in at["engine"].unique():
-            _median_band(ax, at[at["engine"] == engine], "update_anchor_sd", arm_style(engine), x="c")
-        ax.axhline(0.0, color=style.NEUTRAL_GREY, lw=style.LINE_WIDTH / 2, ls=":", zorder=0)
-        ax.set_xlabel(style.axis_label("ladder_c"))
-        ax.set_ylabel(style.axis_label("update_anchor_sd"))
-        ax.set_title(f"$t$ = {int(t)}", fontsize=style.FONT_SIZES["legend"])
+        surprise_panel(ax, surprise, t, engines)
     ax = axes[0][-1]
     for engine in slope["engine"].unique():
         _median_band(ax, slope[slope["engine"] == engine], "surprise_slope", arm_style(engine))
@@ -478,6 +527,34 @@ def _omega_surprise(surprise: pd.DataFrame, panel_ts: Sequence[int], run_dir: st
         fig.suptitle(style.SURPRISE_REFERENCE_TITLE.format(reference=arm_style(reference).label),
                      x=0.01, ha="left", fontsize=style.FONT_SIZES["title"])
     return style.save_figure(fig, run_dir, name)
+
+
+def exemplar_map(ax: Any, values: np.ndarray, xy: np.ndarray, observed: np.ndarray, anchor: int, vmax: float) -> Any:
+    """One map on the electrode grid: ``values`` on a diverging scale, context sites dotted, the anchor ringed.
+
+    Args:
+        ax: Target axes.
+        values: One value per site, shape [M].
+        xy: Integer grid position of every site, shape [M, 2].
+        observed: Context-site mask, shape [M].
+        anchor: Anchor site.
+        vmax: Symmetric colour limit.
+
+    Returns:
+        The image, for a colour bar.
+    """
+    shape = tuple(xy.max(axis=0) + 1)
+    grid = np.full(shape, np.nan)                                                  # [X, Y]
+    grid[xy[:, 0], xy[:, 1]] = values
+    im = ax.imshow(grid.T, origin="lower", cmap=style.DIVERGING_CMAP, vmin=-vmax, vmax=vmax)
+    obs = np.asarray(observed, dtype=bool)
+    ax.scatter(xy[obs, 0], xy[obs, 1], s=style.MARKER_SIZE, color=style.NEUTRAL_GREY, marker=".", lw=0)
+    ax.scatter([xy[anchor, 0]], [xy[anchor, 1]], s=style.MARKER_SIZE * 4, facecolors="none",
+               edgecolors=style.NEUTRAL_GREY, lw=style.LINE_WIDTH)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_frame_on(False)                                                         # a map has no axes to frame
+    return im
 
 
 def _omega_exemplar(run_dir: str, npz: str = "exemplar.npz", key: str = "C", label: str = "implied_cov",
@@ -502,23 +579,13 @@ def _omega_exemplar(run_dir: str, npz: str = "exemplar.npz", key: str = "C", lab
         return []
     ex = np.load(path)
     C, ts, engines, xy = ex[key], ex["context_ts"], [str(e) for e in ex["engines"]], ex["ch2xy"].astype(int)
-    shape = tuple(xy.max(axis=0) + 1)
     fig, axes = style.figure("full", nrows=len(engines), ncols=len(ts), squeeze=False, panel_aspect=_OMEGA_MAP_ASPECT,
                              layout=style.LAYOUT_ENGINE)
     for r, engine in enumerate(engines):
         vmax = float(np.abs(C[:, r]).max()) or 1.0
         for c, t in enumerate(ts):
             ax = axes[r][c]
-            grid = np.full(shape, np.nan)
-            grid[xy[:, 0], xy[:, 1]] = C[c, r]
-            im = ax.imshow(grid.T, origin="lower", cmap=style.DIVERGING_CMAP, vmin=-vmax, vmax=vmax)
-            obs = ex["observed"][c]
-            ax.scatter(xy[obs, 0], xy[obs, 1], s=style.MARKER_SIZE, color=style.NEUTRAL_GREY, marker=".", lw=0)
-            a = int(ex["anchor"])
-            ax.scatter([xy[a, 0]], [xy[a, 1]], s=style.MARKER_SIZE * 4, facecolors="none",
-                       edgecolors=style.NEUTRAL_GREY, lw=style.LINE_WIDTH)
-            ax.set_xticks([])
-            ax.set_yticks([])
+            im = exemplar_map(ax, C[c, r], xy, ex["observed"][c], int(ex["anchor"]), vmax)
             if r == 0:
                 ax.set_title(f"$t$ = {int(t)}", fontsize=style.FONT_SIZES["legend"])
             if c == 0:
@@ -563,8 +630,6 @@ def _c1_readouts(h2h: pd.DataFrame, reference: str, engines: Sequence[str], run_
     panels = [m for m in C1_READOUTS if m in sub]
     if not panels or reference not in set(sub["engine"]) | set(sub["reference"]):
         return []
-    ts = sorted(sub["context_t"].unique())
-    keys = ["subject", "emg", "level", "context_t", "draw", "engine"]
     # two rows, so axis labels never run into the neighbouring panel; the spare slot holds the legend, which
     # must list the reference too (panel (a) skips it: a contrast against itself is not drawn)
     ncols = _C1_READOUT_COLUMNS
@@ -573,18 +638,7 @@ def _c1_readouts(h2h: pd.DataFrame, reference: str, engines: Sequence[str], run_
                              layout=style.LAYOUT_ENGINE)
     flat = list(axes.ravel())
     for ax, metric in zip(flat, panels):
-        perfect, kind, source = C1_READOUTS[metric]
-        rows = sub[(sub["source"] == source)
-                   & ((sub["reference"] == reference) if kind == "contrast" else (sub["reference"] == "none"))]
-        per_cell = rows.groupby(keys)[metric].median().reset_index()
-        for engine in engines:
-            if kind == "contrast" and engine == reference:
-                continue
-            _median_band(ax, per_cell[per_cell["engine"] == engine], metric, arm_style(engine))
-        if perfect is not None:
-            _bayes_value(ax, perfect)
-        _context_axis(ax, ts)
-        ax.set_ylabel(style.axis_label(metric))
+        c1_readout_panel(ax, h2h, metric, reference, engines)
     handles: dict[str, Any] = {}
     for ax in flat[:len(panels)]:
         for h, lab in zip(*ax.get_legend_handles_labels()):
@@ -595,6 +649,60 @@ def _c1_readouts(h2h: pd.DataFrame, reference: str, engines: Sequence[str], run_
                              fontsize=style.FONT_SIZES["legend"])
     style.panel_letters(flat[:len(panels)])
     return style.save_figure(fig, run_dir, "c1_gp_like_readouts")
+
+
+def distance_panel(ax: Any, profile: pd.DataFrame, t: int, engines: Sequence[str]) -> None:
+    """C1: mean |transfer| vs distance from the anchor at one context size, one median band per engine.
+
+    Unobserved anchors and unobserved sites at the nominal level; per anchor -> cell median -> median over channels.
+
+    Args:
+        ax: Target axes.
+        profile: ``transfer_profile.csv`` rows.
+        t: Context size drawn.
+        engines: Engines drawn, in order.
+    """
+    engines = [e for e in engines if e not in FIGURE_EXCLUDED_ENGINES]
+    sub = _nominal(profile)
+    sub = sub[(sub["pool"] == "unobserved") & (sub["site_pool"] == "unobserved") & sub["engine"].isin(engines)
+              & (sub["context_t"] == t)]
+    sub = sub.assign(bin_mid=0.5 * (sub["bin_lo"] + sub["bin_hi"]))
+    keys = ["subject", "emg", "level", "context_t", "draw", "engine", "bin_mid"]
+    per_cell = sub.groupby(keys)["abs_transfer"].median().reset_index()
+    for engine in engines:
+        _median_band(ax, per_cell[per_cell["engine"] == engine], "abs_transfer", arm_style(engine), x="bin_mid")
+    ax.set_xlabel(style.axis_label("distance_pitch"))
+    ax.set_ylabel(style.axis_label("abs_transfer"))
+    ax.set_title(f"$t$ = {int(t)}", fontsize=style.FONT_SIZES["legend"])
+
+
+def c1_readout_panel(ax: Any, h2h: pd.DataFrame, metric: str, reference: str, engines: Sequence[str]) -> None:
+    """C1: one GP-likeness readout of :data:`C1_READOUTS` vs context size, against the perfect-GP value.
+
+    Unobserved anchors at the nominal level; per anchor -> cell median -> median over channels with the
+    channel-bootstrap band. A contrast readout skips the reference itself (a contrast against itself is not drawn).
+
+    Args:
+        ax: Target axes.
+        h2h: ``headtohead.csv`` rows.
+        metric: Key of :data:`C1_READOUTS`.
+        reference: The C1 reference engine.
+        engines: Engines drawn, in order.
+    """
+    perfect, kind, source = C1_READOUTS[metric]
+    sub = _nominal(h2h)
+    sub = sub[(sub["pool"] == "unobserved") & sub["engine"].isin(list(engines)) & (sub["source"] == source)
+              & ((sub["reference"] == reference) if kind == "contrast" else (sub["reference"] == "none"))]
+    keys = ["subject", "emg", "level", "context_t", "draw", "engine"]
+    per_cell = sub.groupby(keys)[metric].median().reset_index()
+    for engine in engines:
+        if engine in FIGURE_EXCLUDED_ENGINES or (kind == "contrast" and engine == reference):
+            continue
+        _median_band(ax, per_cell[per_cell["engine"] == engine], metric, arm_style(engine))
+    if perfect is not None:
+        _bayes_value(ax, perfect)
+    _context_axis(ax, sorted(sub["context_t"].unique()))
+    ax.set_ylabel(style.axis_label(metric))
 
 
 def _c1_distance(profile: pd.DataFrame, engines: Sequence[str], panel_ts: Sequence[int], run_dir: str) -> list[str]:
@@ -611,22 +719,13 @@ def _c1_distance(profile: pd.DataFrame, engines: Sequence[str], panel_ts: Sequen
     """
     engines = [e for e in engines if e not in FIGURE_EXCLUDED_ENGINES]
     sub = _nominal(profile)
-    sub = sub[(sub["pool"] == "unobserved") & (sub["site_pool"] == "unobserved") & sub["engine"].isin(list(engines))]
     ts = [t for t in panel_ts if t in set(sub["context_t"])]
     if not ts:
         return []
-    sub = sub.assign(bin_mid=0.5 * (sub["bin_lo"] + sub["bin_hi"]))
-    keys = ["subject", "emg", "level", "context_t", "draw", "engine", "bin_mid"]
-    per_cell = sub.groupby(keys)["abs_transfer"].median().reset_index()
     fig, axes = style.figure("wide" if len(ts) > 2 else "double", ncols=len(ts), squeeze=False,
                              panel_aspect=_OMEGA_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
     for ax, t in zip(axes[0], ts):
-        at = per_cell[per_cell["context_t"] == t]
-        for engine in engines:
-            _median_band(ax, at[at["engine"] == engine], "abs_transfer", arm_style(engine), x="bin_mid")
-        ax.set_xlabel(style.axis_label("distance_pitch"))
-        ax.set_ylabel(style.axis_label("abs_transfer"))
-        ax.set_title(f"$t$ = {int(t)}", fontsize=style.FONT_SIZES["legend"])
+        distance_panel(ax, profile, t, engines)
     axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"] - 1)
     style.panel_letters(axes.ravel())
     return style.save_figure(fig, run_dir, "c1_update_vs_distance")
@@ -1189,6 +1288,29 @@ def _representation_vs_layer(summary: pd.DataFrame, statistic: str, headline_rea
     return written
 
 
+def reference_summary_panel(ax: Any, summary: pd.DataFrame, value: str, references: Sequence[str], *,
+                            label_fmt: str | None = "{label}") -> None:
+    """A BETA summary statistic vs context size, one median line and channel-bootstrap band per reference.
+
+    Reads an already summarised table (``site_match_summary.csv`` / ``posterior_cov_summary.csv``: ``median``,
+    ``ci_low``, ``ci_high`` per ``context_t``); the references are told apart by colour and line style.
+
+    Args:
+        ax: Target axes.
+        summary: Summary rows at the figure level (one ``site_pool`` / engine already selected).
+        value: Statistic drawn (the ``value`` column).
+        references: References drawn, in order.
+        label_fmt: Legend label, formatted with the reference's ``label``; ``None`` = unlabelled.
+    """
+    for ref in references:
+        st = arm_style(ref)
+        part = summary[(summary["reference"] == ref) & (summary["value"] == value)].sort_values("context_t")
+        ax.plot(part["context_t"], part["median"], color=st.color, ls=st.linestyle, marker=st.marker,
+                label=None if label_fmt is None else label_fmt.format(label=st.label))
+        ax.fill_between(part["context_t"], part["ci_low"], part["ci_high"], color=st.color, alpha=style.BAND_ALPHA,
+                        lw=0)
+
+
 def _site_match_figure(sm: pd.DataFrame, run_dir: str) -> list[str]:
     """β1a: per-site W2 to each reference and its location / spread / shape split vs t, every site pooled.
 
@@ -1215,13 +1337,7 @@ def _site_match_figure(sm: pd.DataFrame, run_dir: str) -> list[str]:
     ts = sorted(sm["context_t"].unique())
     for r, stat in enumerate(stats):
         ax = axes[r][0]
-        for ref in refs:
-            st = arm_style(ref)
-            part = own[(own["reference"] == ref) & (own["value"] == stat)].sort_values("context_t")
-            ax.plot(part["context_t"], part["median"], color=st.color, ls=st.linestyle, marker=st.marker,
-                    label=f"vs {st.label}" if r == 0 else None)
-            ax.fill_between(part["context_t"], part["ci_low"], part["ci_high"], color=st.color,
-                            alpha=style.BAND_ALPHA, lw=0)
+        reference_summary_panel(ax, own, stat, refs, label_fmt="vs {label}" if r == 0 else None)
         for model, ref in pairs:
             part = yard[(yard["model"] == model) & (yard["reference"] == ref) & (yard["value"] == stat)]
             part = part.sort_values("context_t")
@@ -1237,12 +1353,58 @@ def _site_match_figure(sm: pd.DataFrame, run_dir: str) -> list[str]:
     return style.save_figure(fig, run_dir, "site_match")
 
 
+#: Blocks never shown in the lens figures (user, 2026-10-24): blocks 0-1 are degenerate (the lens map is constant or
+#: sign-flipped, research_design §4 OPEN QUESTION 2026-10-19), so no lens readout is read there.
+LENS_EXCLUDED_BLOCKS: tuple[int, ...] = (0, 1)
+#: The two lens-fidelity diagnostics, reported block by block (user, 2026-10-24) with the value of a faithful lens.
+LENS_FIDELITY_METRICS: dict[str, float] = {"lens_site_sd_ratio": 1.0, "lens_r_final": 1.0}
+
+
+def _lens_fidelity_figure(lens: pd.DataFrame, run_dir: str) -> list[str]:
+    """``lens_fidelity.svg``: site-SD ratio and correlation of each block's lens mean map with the final map, per t.
+
+    Args:
+        lens: ``lens_summary.csv`` rows (blocks in :data:`LENS_EXCLUDED_BLOCKS` already removed).
+        run_dir: Output directory.
+
+    Returns:
+        Written paths.
+    """
+    part = lens[(lens["comparison"] == "tabpfn_v2_5") & (lens["site_pool"] == "unobserved")
+                & lens["value"].isin(list(LENS_FIDELITY_METRICS))]
+    if part.empty:
+        return []
+    ts = sorted(part["context_t"].unique())
+    metrics = [m for m in LENS_FIDELITY_METRICS if m in set(part["value"])]
+    fig, axes = style.figure("double", ncols=len(metrics), squeeze=False,
+                             panel_aspect=_REPRESENTATION_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
+    for ax, metric in zip(axes[0], metrics):
+        for i, t in enumerate(ts):
+            sub = part[(part["value"] == metric) & (part["context_t"] == t)].sort_values("layer")
+            color = _t_color(i, len(ts))
+            ax.plot(sub["layer"], sub["median"], color=color, marker="o", label=f"$t$ = {int(t)}")
+            ax.fill_between(sub["layer"], sub["ci_low"], sub["ci_high"], color=color, alpha=style.BAND_ALPHA, lw=0)
+        _bayes_value(ax, LENS_FIDELITY_METRICS[metric])
+        ax.set_xlabel(style.axis_label("layer"))
+        ax.set_ylabel(style.axis_label(metric))
+        style.set_integer_xaxis(ax)
+    axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
+    style.panel_letters(list(axes[0]))
+    return style.save_figure(fig, run_dir, "lens_fidelity")
+
+
 def _lens_figure(lens: pd.DataFrame, run_dir: str) -> list[str]:
-    """Lens predictive of every block against TabPFN's final one and each reference (W2 / reference SD), per t."""
+    """Lens predictive of every block against TabPFN's final one and each reference (W2 / reference SD), per t.
+
+    Blocks 0-1 are left out (:data:`LENS_EXCLUDED_BLOCKS`), and the two fidelity diagnostics are drawn beside it
+    (:func:`_lens_fidelity_figure`).
+    """
+    lens = lens[~lens["layer"].isin(LENS_EXCLUDED_BLOCKS)]
+    written = _lens_fidelity_figure(lens, run_dir)
     part = lens[(lens["value"] == "w2_over_sd") & (lens["site_pool"] == "unobserved")]
     comps = list(dict.fromkeys(part["comparison"]))
     if not comps:
-        return []
+        return written
     ts = sorted(part["context_t"].unique())
     fig, axes = style.figure("wide", ncols=len(comps), squeeze=False, sharey=True,
                              panel_aspect=_REPRESENTATION_PANEL_ASPECT, layout=style.LAYOUT_ENGINE)
@@ -1260,7 +1422,7 @@ def _lens_figure(lens: pd.DataFrame, run_dir: str) -> list[str]:
     axes[0][0].set_ylabel(style.axis_label("lens_w2_over_sd"))
     axes[0][0].legend(loc="best", fontsize=style.FONT_SIZES["legend"])
     style.panel_letters(list(axes[0]))
-    return style.save_figure(fig, run_dir, "lens_distance")
+    return written + style.save_figure(fig, run_dir, "lens_distance")
 
 
 def _posterior_cov_figure(pc: pd.DataFrame, run_dir: str) -> list[str]:
@@ -1276,13 +1438,8 @@ def _posterior_cov_figure(pc: pd.DataFrame, run_dir: str) -> list[str]:
                              layout=style.LAYOUT_ENGINE)
     for c, stat in enumerate(stats):
         ax = axes[0][c]
-        for ref in dict.fromkeys(pc["reference"]):
-            st = arm_style(ref)
-            sub = pc[(pc["reference"] == ref) & (pc["value"] == stat)].sort_values("context_t")
-            ax.plot(sub["context_t"], sub["median"], color=st.color, ls=st.linestyle, marker=st.marker,
-                    label=st.label if c == 0 else None)
-            ax.fill_between(sub["context_t"], sub["ci_low"], sub["ci_high"], color=st.color, alpha=style.BAND_ALPHA,
-                            lw=0)
+        reference_summary_panel(ax, pc, stat, list(dict.fromkeys(pc["reference"])),
+                                label_fmt="{label}" if c == 0 else None)
         _bayes_value(ax, POSTERIOR_COV_STATS[stat])
         _context_axis(ax, ts)
         ax.set_ylabel(style.axis_label(stat if stat != "cka" else "cka_debiased"))

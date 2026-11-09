@@ -42,6 +42,7 @@ import os
 import warnings
 from typing import Any, Sequence
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -59,6 +60,8 @@ from . import traces as T
 
 __all__ = [
     "clip_low_snr",
+    "prepare_sweep_frame",
+    "degradation_panel",
     "plot_degradation_curves",
     "build_robustness_table",
     "budget_grid",
@@ -528,6 +531,97 @@ def _annotate_counts(ax, df: pd.DataFrame, x_col: str, counts: pd.DataFrame | No
                 va="bottom", fontsize=S.FONT_SIZES["annotation"], alpha=0.8)
 
 
+def degradation_panel(
+    ax: plt.Axes,
+    df: pd.DataFrame,
+    *,
+    knob: str,
+    metric: str,
+    models: Sequence[str] | None = None,
+    breakdowns: dict[str, float] | None = None,
+    show_channels: bool = True,
+    label_nominal: bool = True,
+    mark_default: bool = True,
+    annotate_clip: bool = True,
+    invert_x: bool = True,
+) -> None:
+    """One degradation panel: ``metric`` vs the knob's x-axis, one line and band per model.
+
+    Bounded metrics show the mean over channels with a 95% CI, heavy-tailed ones (R^2) the median with the
+    interquartile band (:func:`_model_band`); the R^2 axis is clipped for display only. Shared by
+    :func:`plot_degradation_curves` and the workshop figure *NHP stress regimes (in vivo)*.
+
+    Args:
+        ax: Target axes.
+        df: Tidy sweep frame (after :func:`_shared_ladder` and :func:`clip_low_snr`).
+        knob: Knob name (selects the x-axis and its label).
+        metric: Metric column.
+        models: Models drawn, in order (``None`` = every model of :data:`style.MODEL_ORDER` present).
+        breakdowns: Model -> breakdown point in x-axis units, drawn as dotted verticals (``None`` = none).
+        show_channels: Draw faint per-channel traces behind the model curves.
+        label_nominal: Give the default-regime marker a legend label.
+        mark_default: Draw the default-regime marker at all (``False`` leaves the panel without it and without
+            its legend entry).
+        annotate_clip: Write "axis clipped at ..." on an R^2 panel (the clipping itself always applies).
+        invert_x: Invert the axis when the x-axis decreases with stress (achieved SNR). Pass False when the
+            axes share x and the caller inverts once.
+    """
+    x_col = _knob_axis(df, knob)
+    nominal_x = _nominal_x(df, knob, x_col) if mark_default else None
+    if models is None:
+        models = [m for m in S.MODEL_ORDER if m in set(df["model"])]
+    for model in models:
+        sub = df[df["model"] == model]
+        if sub.empty or metric not in sub.columns:
+            continue
+        if show_channels:
+            for _, grp in sub.groupby(["subject", "emg"], dropna=False):
+                chan = grp.groupby("level", dropna=False).agg(
+                    x=(x_col, "mean"), y=(metric, "median" if _is_heavy_tailed(metric) else "mean")
+                ).sort_values("x")
+                ax.plot(chan["x"].to_numpy(), chan["y"].to_numpy(), color=S.model_color(model),
+                        alpha=S.FAINT_ALPHA, linewidth=0.5, marker="", zorder=1)
+        x, centre, lower, upper = _model_band(sub, x_col, metric)
+        ax.plot(x, centre, **S.plot_kwargs(model))
+        ax.fill_between(x, lower, upper, color=S.model_color(model), alpha=S.BAND_ALPHA, linewidth=0)
+        if breakdowns and model in breakdowns and np.isfinite(breakdowns[model]):
+            ax.axvline(breakdowns[model], color=S.model_color(model), linestyle=":", linewidth=0.8, alpha=0.9)
+    # The default regime of the dataset, on every panel; only one panel carries the legend entry.
+    if nominal_x is not None:
+        S.mark_nominal(ax, nominal_x,
+                       label=_nominal_label(df, knob, x_col, nominal_x) if label_nominal else None)
+    ax.set_ylabel(S.axis_label(f"{metric}_median" if _is_heavy_tailed(metric) else metric))
+    if metric == "r2":
+        ax.set_ylim(bottom=S.R2_AXIS_FLOOR, top=1.0)
+        if annotate_clip:
+            ax.text(0.98, 0.02, f"axis clipped at {S.R2_AXIS_FLOOR:g}", transform=ax.transAxes, ha="right",
+                    va="bottom", fontsize=S.FONT_SIZES["annotation"], alpha=0.7)
+    ax.set_xlabel(S.knob_x_label(knob, x_col))
+    if invert_x and x_col in X_DESCENDS_WITH_STRESS and not ax.xaxis_inverted():
+        ax.invert_xaxis()
+
+
+def prepare_sweep_frame(
+    df: pd.DataFrame,
+    min_snr_db: float | None = DEFAULT_MIN_SNR_DB,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The frame every stress deliverable is drawn from: shared ladder, current ``demo`` spelling, SNR clip.
+
+    Args:
+        df: Tidy sweep frame as read from ``tidy.csv``.
+        min_snr_db: SNR clip of :func:`clip_low_snr` (``None`` keeps every cell).
+
+    Returns:
+        ``(frame, counts)`` as returned by :func:`clip_low_snr`.
+    """
+    df = _shared_ladder(df)
+    if "demo" in df.columns:
+        # Legacy cells keep their recorded spelling on disk, readers see the current one
+        # (:func:`pfns4neurostim.evaluation.results.canonical_demo`).
+        df = df.assign(demo=canonical_demo_column(df["demo"]))
+    return clip_low_snr(df, min_snr_db)
+
+
 def plot_degradation_curves(
     df: pd.DataFrame,
     out_dir: str,
@@ -562,8 +656,6 @@ def plot_degradation_curves(
         Paths written.
     """
     x_col = _knob_axis(df, knob)
-    nominal_x = _nominal_x(df, knob, x_col)
-    nominal_label = _nominal_label(df, knob, x_col, nominal_x)
     # ``demo`` is resolved to its current spelling here, not in the cell: a run assembled from cells cached
     # before the 2026-09-27 rename carries ``demo2``/``demo1``, and titling such a figure by the raw value made
     # every pre-rename in-vivo run call itself "Synthetic" (fixed 2026-10-13).
@@ -580,66 +672,16 @@ def plot_degradation_curves(
 
     for idx, metric in enumerate(metrics):
         ax = axes[idx]
-        for model in models:
-            sub = df[df["model"] == model]
-            if sub.empty or metric not in sub.columns:
-                continue
-
-            if show_channels:
-                for (subj, emg), grp in sub.groupby(["subject", "emg"], dropna=False):
-                    chan = grp.groupby("level", dropna=False).agg(
-                        x=(x_col, "mean"), y=(metric, "median" if _is_heavy_tailed(metric) else "mean")
-                    )
-                    chan = chan.sort_values("x")
-                    ax.plot(
-                        chan["x"].to_numpy(),
-                        chan["y"].to_numpy(),
-                        color=S.model_color(model),
-                        alpha=S.FAINT_ALPHA,
-                        linewidth=0.5,
-                        marker="",
-                        zorder=1,
-                    )
-
-            x, centre, lower, upper = _model_band(sub, x_col, metric)
-            ax.plot(x, centre, **S.plot_kwargs(model))
-            ax.fill_between(
-                x,
-                lower,
-                upper,
-                color=S.model_color(model),
-                alpha=S.BAND_ALPHA,
-                linewidth=0,
-            )
-
-            if breakdowns and model in breakdowns and np.isfinite(breakdowns[model]):
-                if metric == metrics[0]:
-                    ax.axvline(
-                        breakdowns[model],
-                        color=S.model_color(model),
-                        linestyle=":",
-                        linewidth=0.8,
-                        alpha=0.9,
-                    )
-
-        # The default regime of the dataset, on every panel; only the first panel carries the legend entry.
-        if nominal_x is not None:
-            S.mark_nominal(ax, nominal_x, label=nominal_label if idx == 0 else None)
-
-        ax.set_ylabel(S.axis_label(f"{metric}_median" if _is_heavy_tailed(metric) else metric))
-        if metric == "r2":
-            ax.set_ylim(bottom=S.R2_AXIS_FLOOR, top=1.0)
-            ax.text(0.98, 0.02, f"axis clipped at {S.R2_AXIS_FLOOR:g}", transform=ax.transAxes, ha="right",
-                    va="bottom", fontsize=S.FONT_SIZES["annotation"], alpha=0.7)
+        degradation_panel(ax, df, knob=knob, metric=metric, models=models,
+                          breakdowns=breakdowns if metric == metrics[0] else None, show_channels=show_channels,
+                          label_nominal=idx == 0, invert_x=False)
         if idx == 0:
             _annotate_counts(ax, df, x_col, counts)
 
     # Achieved SNR decreases with stress: plot it decreasing left to right so the
-    # x-axis always reads "more stress to the right" (roadmap S2).
+    # x-axis always reads "more stress to the right" (roadmap S2). The axes share x, so inverting one inverts all.
     if x_col in X_DESCENDS_WITH_STRESS:
         axes[0].invert_xaxis()
-    for ax in axes:
-        ax.set_xlabel(S.knob_x_label(knob, x_col))
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="outside lower center", ncol=len(labels), frameon=False,
                fontsize=S.FONT_SIZES["legend"])
@@ -846,7 +888,7 @@ def build_robustness_table(
 #: Knobs that get the S5 knob x BO-budget regime heatmap.
 REGIME_KNOBS: frozenset[str] = frozenset({"k2_channel", "k2_global"})
 
-#: Number of BO-budget columns of a regime surface (S5/S10), spread evenly from the first acquisition to the full budget.
+#: Number of BO-budget columns of a regime surface (S5), spread evenly from the first acquisition to the full budget.
 #: E10's robustness-vs-budget readout uses the same grid, so its budgets are the heatmap's columns.
 REGIME_BUDGET_COLUMNS: int = 8
 
@@ -1099,76 +1141,6 @@ def plot_regime_heatmap(
         x=0.01, ha="left", fontsize=S.FONT_SIZES["title"],
     )
     return [csv_path, *S.save_figure(fig, out_dir, "regime_heatmap")]
-
-
-def plot_bridge(
-    synthetic_frame: pd.DataFrame,
-    synthetic_df: pd.DataFrame,
-    real_df: pd.DataFrame,
-    out_dir: str,
-    *,
-    knob: str,
-    margin: float,
-    model: str,
-    reference: str = REFERENCE_MODEL,
-) -> list[str]:
-    """Real channels placed on the synthetic regime surface (roadmap S10).
-
-    The background is the synthetic difference surface ``model - reference`` (non-inferior
-    cells outlined); each real channel is a point at its nominal achieved SNR and the
-    budget its draws run used, coloured by dataset. It answers where real
-    neurostimulation sits relative to the synthetic breakdown boundary.
-
-    Args:
-        synthetic_frame: Trace frame of the synthetic sweep.
-        synthetic_df: Tidy frame of the synthetic sweep (x-axis must be achieved SNR).
-        real_df: Tidy frame of the matching draws sweep; its nominal-level rows supply
-            each channel's achieved SNR and budget.
-        out_dir: Destination directory.
-        knob: Knob name of the synthetic sweep.
-        margin: Non-inferiority margin.
-        model: Model of the difference surface.
-        reference: Reference model.
-
-    Returns:
-        Paths written.
-    """
-    surf = regime_surface(synthetic_frame, synthetic_df, knob=knob, model=model, reference=reference, margin=margin)
-    from ..data.stress import KNOB_REGISTRY  # noqa: PLC0415
-
-    # ``nominal_in`` rather than the class attribute, so a knob without a constant nominal level resolves too.
-    nominal_level = KNOB_REGISTRY[knob].nominal_in(sorted(real_df["level"].astype(float).unique()))
-    if nominal_level is None:
-        raise ValueError(
-            f"plot_bridge: the draws sweep has no unstressed level for knob {knob!r}, so its channels have "
-            "no nominal achieved SNR to be placed at."
-        )
-    nominal = real_df[np.isclose(real_df["level"].astype(float), nominal_level)]
-    points = nominal.groupby(["dataset", "subject", "emg"], as_index=False).agg(
-        snr=("achieved_snr_db", "mean"), budget=("budget", "first")
-    )
-    # Map real coordinates onto the image grid (cells are indexed, not metric, on both axes).
-    xs = np.interp(points["budget"], surf["budgets"], np.arange(surf["budgets"].size))
-    order = np.argsort(surf["x"])
-    ys = np.interp(points["snr"], surf["x"][order], np.arange(surf["x"].size)[order])
-
-    fig, ax = S.figure("onehalf", layout=S.LAYOUT_ENGINE)
-    span = float(np.nanmax(np.abs(surf["value"]))) or 1.0
-    im = _draw_surface(ax, surf, cmap=S.DIVERGING_CMAP, vmin=-span, vmax=span)
-    for ds in points["dataset"].unique():
-        on = (points["dataset"] == ds).to_numpy()
-        ax.plot(xs[on], ys[on], linestyle="none", marker="o", markersize=S.MARKER_SIZE + 1, markerfacecolor="white",
-                color=S.NEUTRAL_GREY, label=S.DATASET_LABELS.get(str(ds), str(ds)))
-    ax.set_xlabel(S.axis_label("budget"))
-    ax.set_ylabel(S.axis_label("achieved_snr_db"))
-    fig.colorbar(im, ax=ax, label=S.axis_label("regret_difference"))
-    ax.legend(frameon=False, fontsize=S.FONT_SIZES["legend"])
-    fig.suptitle(f"Real channels on the synthetic surface: {S.model_label(model)} - {S.model_label(reference)}",
-                 x=0.01, ha="left", fontsize=S.FONT_SIZES["title"])
-    os.makedirs(out_dir, exist_ok=True)
-    csv_path = os.path.join(out_dir, "bridge_points.csv")
-    points.to_csv(csv_path, index=False)
-    return [csv_path, *S.save_figure(fig, out_dir, "real_on_synthetic_surface")]
 
 
 def plot_generator_validation(features: pd.DataFrame, out_dir: str) -> list[str]:
@@ -1705,12 +1677,7 @@ def render_all(
         ValueError: If the frame mixes ``online_y_scaler`` / ``normalization`` settings (E12 refuses to pool
             calibration across them); every other deliverable is written first.
     """
-    df = _shared_ladder(df)
-    if "demo" in df.columns:
-        # Once, for every deliverable below: legacy cells keep their recorded spelling on disk, readers see the
-        # current one (:func:`pfns4neurostim.evaluation.results.canonical_demo`).
-        df = df.assign(demo=canonical_demo_column(df["demo"]))
-    df, counts = clip_low_snr(df, min_snr_db)
+    df, counts = prepare_sweep_frame(df, min_snr_db)
     os.makedirs(out_dir, exist_ok=True)
     counts_path = os.path.join(out_dir, CHANNEL_COUNTS_FILE)
     counts.to_csv(counts_path, index=False)

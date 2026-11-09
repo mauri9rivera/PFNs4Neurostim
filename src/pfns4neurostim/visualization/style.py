@@ -70,6 +70,11 @@ __all__ = [
     "LINK_TITLE",
     "SURPRISE_REFERENCE_TITLE",
     "ENGINE_LABELS",
+    "ADAPTATION_NOTES",
+    "PENDING_RECOMPUTE_LABEL",
+    "TABLE_METRIC_LABELS",
+    "TABLE_METRIC_SUMMARIES",
+    "DRAFT_STAMP_COLOR",
     "IMPLIED_NOISE_LEGEND",
     "HYPC_LINE_ONLY_ENGINES",
     "HYPC_BAND_N_BOOT",
@@ -86,6 +91,7 @@ __all__ = [
     "KNOB_LABELS",
     "KNOB_X_AXIS",
     "KNOB_SYMBOLS",
+    "KNOB_SHORT_LABELS",
     "KNOB_PARAM_LABELS",
     "NOMINAL_MARKER_COLOR",
     "NOMINAL_MARKER_LABEL",
@@ -139,7 +145,7 @@ DECORATION_HEIGHT: float = 0.6
 R2_AXIS_FLOOR: float = -1.0
 #: Layout engine that keeps axis labels, titles and shared legends apart.
 LAYOUT_ENGINE: str = "constrained"
-#: Colormaps of the regime surfaces (S5/S10): sequential for a metric, diverging (centred on 0) for a
+#: Colormaps of the regime surfaces (S5): sequential for a metric, diverging (centred on 0) for a
 #: model difference. Both are perceptually uniform and colour-blind safe.
 SEQUENTIAL_CMAP: str = "viridis"
 DIVERGING_CMAP: str = "RdBu_r"
@@ -747,6 +753,8 @@ AXIS_LABELS: dict[str, str] = {
     # falls BETWEEN the two reference clouds. Bounded in [0, 1] by construction, so no clipping and no dropped
     # layers; the ratio's denominator (median gap 0.049 on NHP) is what put 51 % of its values outside [0, 1].
     "p_rank": "Rank placement (fraction of references exceeded)",
+    # M3 smooth-field audit (user, 2026-10-24): a channel's p_rank minus the smooth-field median at the same (t, layer).
+    "p_rank_excess": "Rank placement minus\nsmooth-field median",
     "rank_vs_floor": "Rank vs prior floor (fraction exceeded)",
     "rank_vs_ceiling": "Rank vs noise ceiling (fraction exceeded)",
     # BETA representation analysis (2026-10-21). CKA and Procrustes share their invariance group (translation,
@@ -769,12 +777,20 @@ AXIS_LABELS: dict[str, str] = {
     "w2_spread": "Spread term (z-units$^2$)",
     "w2_shape": "Shape term (z-units$^2$)",
     "lens_w2_over_sd": "Lens W2 / reference SD\n(median over sites)",
+    # Lens fidelity per block (user, 2026-10-24): 1 for a lens that reproduces the final map.
+    "lens_site_sd_ratio": "Lens site SD / final\n(amplitude, 1 = faithful)",
+    "lens_r_final": "Lens map vs final map\n(Pearson $r$, 1 = faithful)",
+    # Tuned-lens fidelity (2026-11-07): mean bucket KL(p_final || p_lens), analysis/tuned_lens.native_kl.
+    "lens_kl": "KL(final $\\|$ lens)\n(nats, 0 = faithful)",
     "layer": "Transformer layer",
     # OMEGA bayes_update (2026-10-15). Part A: every coherent Bayesian model scores 0 drift, a shrink / move
     # ratio of 1 and 0 asymmetry, whatever its prior. Part B: TabPFN's update against a GP reference, matched per
     # site before any aggregate. ``cov_asymmetry`` is the tower-property covariance -- never the retired
     # ``sym_err``, which divided by (1 - gain) and so assumed homoscedastic noise.
     # Hyp C labels sit in grids of four narrow panels, so the long ones break over two lines (user, 2026-10-22).
+    # G8 headline (2026-10-28, wired into Part A 2026-11-05): readouts of the predictive CDF, medians over every site.
+    "ks": "Kolmogorov distance\n(0 = Bayes)",
+    "tv_grid": "Grid total variation\n(0 = Bayes)",
     "drift_abs": "Mean drift $|\\delta|$\n(predictive SD)",
     "drift_w1": "Distributional drift W1 (predictive SD)",
     "shrink_move_ratio": "Expected shrink / mean movement (1 = Bayes)",
@@ -808,6 +824,13 @@ AXIS_LABELS: dict[str, str] = {
     "abs_transfer": "Mean $|T(x)|$\n(update per unit surprise)",
     "distance_pitch": r"Distance from $x'$ (electrode pitches)",
     "dmu_exemplar": r"Change of mean $\Delta\mu(x)$ (z-units)",
+    # Compact variants for a one-column (3.27 in) figure, where 9 pt text is the AAAI minimum (workshop GP-like figure,
+    # user 2026-11-07); the words they drop ("ladder-reference SD at x'") go to the caption.
+    "ladder_c_compact": "Surprise $c$ (SD)",
+    "update_anchor_sd_compact": "Update at $x'$ (SD)",
+    "abs_transfer_compact": "Mean $|T(x)|$",
+    "distance_pitch_compact": "Distance (pitches)",
+    "dmu_exemplar_compact": r"$\Delta\mu(x)$ (z-units)",
     # M8 predictive link (2026-10-21): the per-channel breakdown outcome is a count on the stress ladder (levels
     # passed before the first non-inferiority failure; the ladder length = never breaks down).
     "breakdown": "Breakdown point\n(stress levels passed)",
@@ -945,6 +968,14 @@ KNOB_SYMBOLS: dict[str, str] = {
     "k2_global": r"$\eta$",
     "k5_outliers": r"$\varepsilon$",
     "k6_failure": r"$\varphi$",
+}
+
+#: Short knob names for a row or panel title at column width, where :data:`KNOB_LABELS` does not fit (workshop, 2026-11-05).
+KNOB_SHORT_LABELS: dict[str, str] = {
+    "k2_channel": "K2 (channel noise)",
+    "k2_global": "K2 (global noise)",
+    "k5_outliers": "K5 (outliers)",
+    "k6_failure": "K6 (electrode failure)",
 }
 
 #: One-line meaning of each stress parameter, for a caption or a legend title.
@@ -1100,6 +1131,23 @@ GT_MODE_LABELS: dict[str, str] = {
     "full_mean": "Full-mean GT",
     "split_half": "Split-half GT",
 }
+
+#: Guardrail G3: how each adapted model differs from the others, stated wherever it appears in a table or caption.
+ADAPTATION_NOTES: dict[str, str] = {
+    "tabfm": r"$\sigma$ constructed (ensemble spread $\oplus$ out-of-fold residual RMSE); TabFM is a point regressor",
+    "causilo": r"$\sigma$ from integrating its quantile function",
+    "pfns4bo": "native EI policy, not ts_marginal",
+}
+#: Wording of a model whose recorded ``model_version`` differs from the registry's current one. Guardrail G2: its
+#: numbers are never shown, so the cell or curve says this instead.
+PENDING_RECOMPUTE_LABEL: str = "pending recompute"
+#: Column headers of the workshop benchmark table, and the summary each one reports (user, 2026-11-05).
+TABLE_METRIC_LABELS: dict[str, str] = {"r2": "$R^2$", "exploration_score": "Exploration"}
+TABLE_METRIC_SUMMARIES: dict[str, str] = {"r2": "median [IQR] over channels",
+                                          "exploration_score": "mean $\\pm$ 95% CI over channels"}
+#: Colour of the DRAFT stamp on a panel drawn from stand-in data (smoke run, pre-amendment run): the dark neutral
+#: of the calibration target, never a model or reference colour.
+DRAFT_STAMP_COLOR: str = CALIBRATION_TARGET_COLOR
 
 
 def axis_label(key: str) -> str:
