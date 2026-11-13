@@ -389,7 +389,7 @@ def test_shuffle_arms_run_once_each_and_are_contrasted_per_cell(tmp_path, tiny_c
 
     class OrderFreePFN(B.GPFixedEngine):
         def __init__(self, device, random_state, softmax_temperature, name, shuffle="none", n_permutations=1,
-                     rng=None):
+                     rng=None, n_estimators=1):
             super().__init__(lengthscale=0.3, outputscale=1.0, noise=0.05, name=name)
             seen.append((shuffle, n_permutations, rng is not None))
 

@@ -118,7 +118,7 @@ def _reference_bands(ax, orientation: str, *, label_it: bool, lines_only: bool =
 
 
 #: The engines of the update analysis that are tabpfn_v2_5 run differently, as shades of the TabPFN colour.
-_TABPFN_VARIANTS: tuple[str, ...] = ("tabpfn_v2_5", "tabpfn_v2_5_t1")
+_TABPFN_VARIANTS: tuple[str, ...] = ("tabpfn_v2_5", "tabpfn_v2_5_t1", "tabpfn_v2_5_e8")
 #: Update-analysis engine -> model key of the palette (one identity per reference GP).
 _ENGINE_MODEL: dict[str, str] = {"gp_bayes": "gp_bayes", "gp_mll_refit": "gp_mll", "gp_fixed": "gp_naive",
                                  "gp_mll_frozen": "gp_mll_frozen"}
@@ -133,11 +133,13 @@ def arm_style(engine: str) -> style.ModelStyle:
 
     Returns:
         The model style. TabPFN variants are shades of the TabPFN colour (the deployed ``tabpfn_v2_5`` is the
-        anchor); ``gp_mll_refit`` is GP-MLL and ``gp_fixed`` is GP-fixed.
+        anchor); ``gp_mll_refit`` is GP-MLL and ``gp_fixed`` is GP-fixed. An engine listed in
+        ``style.ENGINE_LABELS`` takes that label (TabPFN variants included).
     """
     if engine in _TABPFN_VARIANTS[1:]:
-        return style.series_style("tabpfn_v2_5", engine, list(_TABPFN_VARIANTS))
-    st = style.model_style(_ENGINE_MODEL.get(engine, engine))
+        st = style.series_style("tabpfn_v2_5", engine, list(_TABPFN_VARIANTS))
+    else:
+        st = style.model_style(_ENGINE_MODEL.get(engine, engine))
     return dataclasses.replace(st, label=style.ENGINE_LABELS[engine]) if engine in style.ENGINE_LABELS else st
 
 

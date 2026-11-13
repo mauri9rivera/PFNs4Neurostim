@@ -1,0 +1,65 @@
+# ENSEMBLE COMPARISON FOR THE COHERENCE FIGURE (user, 2026-11-13; research log 2026-11-13 "Ensembling (n_estimators = 8)
+# Reduces TabPFN's Implied-Covariance Asymmetry but Not Into the Empirical-Bayes Band").
+#
+# WHAT: Part A (coherence) of the amended OMEGA grid for ONE engine, ``tabpfn_v2_5_e8`` -- the deployed TabPFN-2.5 refit with
+# TabPFN's default ensemble of 8 preprocessing configurations instead of 1 -- on every context size of *Is the update
+# coherent?*: the phase1-refine ladder (t 30 / 40 / 50 / 60 / 80) and the phase1-long-t extension (t 100 / 120 / 140 / 160,
+# the t = 80 sites + t - 80 revisits, revisits.max_distinct 80), NHP 22 channels, K2 level 1, draws 0-9 = 1,980 cells.
+#
+# NOTHING ELSE IS COMPUTED. The deployed n = 1 engine, GP-MLL refit and GP-fixed are read from phase1-refine / phase1-long-t.
+#   - gp_fixed is listed only because the validator needs a model-neutral ladder reference (shared.reference); its coverage
+#     ``{draws: []}`` matches no cell, so it never runs. No engine runs Part B, so the ladder reference is never fitted.
+#   - C1 is off (c1.reference names an engine that is not in this run); the exemplar is off.
+#   - The e8 cells are new cells: ``n_estimators`` enters the cell identity only when it is not 1, so every cached n = 1 cell
+#     keeps its key and none is recomputed or shadowed.
+# Every other cell-identity setting (anchors, strata K = 64, central tail measure, T 0.9, inference seed 0 + draw, y grid,
+# eps, revisits) equals phase1-refine / phase1-long-t, so the e8 readouts are site- and anchor-matched to the n = 1 ones.
+#
+# COST (local single-thread probe 2026-11-13): an n = 8 refit costs 5.5-6.5x an n = 1 refit on CPU (1.45 / 1.76 / 2.34 s
+# against 0.27 / 0.29 / 0.36 s at t = 30 / 80 / 160). CPU only (user). Sizing in cluster-companion references/measured.md.
+#
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp_e8.yaml --compute-only
+#   python -m pfns4neurostim mechanism --config configs/experiment/mechanism_bayes_update_nhp_e8.yaml --only-cached
+
+defaults:
+  dataset: nhp
+  context: nhp
+
+analysis: bayes_update
+tag: nhp-e8
+device: cpu
+seed: 42
+output_root: output
+
+dataset:
+  subjects: [0, 1, 2, 3]
+
+context:
+  sizes: [30, 40, 50, 60, 80, 100, 120, 140, 160]
+
+bayes_update:
+  engines: [tabpfn_v2_5_e8, gp_fixed]
+  references: [gp_fixed]
+  coverage:
+    tabpfn_v2_5_e8:
+      B: {draws: []}          # Part A only
+    gp_fixed:
+      A: {draws: []}          # never runs (ladder-reference placeholder, see header)
+      B: {draws: []}
+  revisits: {fraction: 0.0, row_order: sorted, max_distinct: 80}
+  c1: {reference: gp_mll_refit, engines: [], distance_bins: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 14.0],
+       exemplar_c: 1.0}       # off: gp_mll_refit is not an engine of this run
+  stress: {knob: k2_channel, levels: [1.0]}
+  n_context_draws: 10
+  anchors: {n_unobserved: 8, n_observed: 4}
+  quadrature: {method: strata, K: 64, u_min: 1.0e-12, central_mass: 1.0, n_scrambles: 1}
+  eps: 0.01
+  y_grid: {points: 512, u_tail: 1.0e-4}
+  shared: {n_trials: 8, ladder: [-3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0], saturation_c: [1.0, 3.0],
+           reference: gp_fixed}
+  far_pitch: 4.0
+  tabpfn: {inference_seed: 0, precision: fp32, max_batch_tokens: 400000, softmax_temperature: 0.9, tail_measure: central}
+  fixed_gp_params: {lengthscale: 0.6931471805599453, outputscale: 1.0, noise: 0.05}
+  exemplar: {enabled: false, subject: null, emg: null, level: 1.0, draw: 0, engines: [tabpfn_v2_5_e8], context_sizes: [40]}
+  panel_ts: [40, 80, 160]
+  run: {gates: false, grid: true, discrepancy: false}

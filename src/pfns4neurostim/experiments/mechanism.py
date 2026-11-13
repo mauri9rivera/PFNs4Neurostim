@@ -507,10 +507,13 @@ BAYES_UPDATE_DEFAULTS: dict[str, Any] = {
 }
 
 #: TabPFN engines, all the deployed update -- a public-API refit on D + {(x', y')} per probe (user, 2026-10-15):
-#: the deployed temperature, and the network's raw PPD (temperature 1 by definition).
+#: the deployed temperature, and the network's raw PPD (temperature 1 by definition). ``tabpfn_v2_5_e8`` is the deployed
+#: engine with TabPFN's default ensemble of 8 preprocessing configurations instead of 1 (research log 2026-11-13: most of
+#: the n = 1 implied-covariance asymmetry is specific to one configuration).
 TABPFN_ENGINES: dict[str, dict[str, Any]] = {
     "tabpfn_v2_5": {},
     "tabpfn_v2_5_t1": {"softmax_temperature": 1.0},
+    "tabpfn_v2_5_e8": {"n_estimators": 8},
 }
 
 #: Engines that are Part B references only (never a coherence engine): GP-MLL frozen exists for Hypothesis C1 alone.
@@ -709,7 +712,8 @@ def _make_engine(name: str, p: dict[str, Any], device: str, draw: int = 0) -> An
         tp = {**p["tabpfn"], **TABPFN_ENGINES[name]}
         return B.PFNRefitEngine(device=device, random_state=int(tp["inference_seed"]) + int(draw),
                                 softmax_temperature=float(tp["softmax_temperature"]), name=name,
-                                tail_measure=str(tp.get("tail_measure", B.DEFAULT_TAIL_MEASURE)))
+                                tail_measure=str(tp.get("tail_measure", B.DEFAULT_TAIL_MEASURE)),
+                                n_estimators=int(tp.get("n_estimators", 1)))
     if name == "gp_bayes":
         g = p["gp_bayes"]
         return B.GPBayesEngine(g["lengthscale"], g["outputscale"], g["noise"], b2=float(g["b2"]),
@@ -737,6 +741,8 @@ def _engine_params(name: str, p: dict[str, Any], draw: int = 0) -> dict[str, Any
                "refit": True, "quantile_dtype": TABPFN_QUANTILE_DTYPE}
         if tp.get("tail_measure", "halfnormal") != "halfnormal":
             out["tail_measure"] = tp["tail_measure"]          # added only when not the pre-2026-10-28 default: old cells keep hitting
+        if int(tp.get("n_estimators", 1)) != 1:
+            out["n_estimators"] = int(tp["n_estimators"])     # likewise: every n = 1 cell keeps its identity
         return out
     if name == "gp_bayes":
         return {k: v for k, v in p["gp_bayes"].items() if k != "chunk"}
@@ -2630,7 +2636,8 @@ def _posterior_cov_cell(
                      arm["mode"] == "none" else rng_for(st.label, "representation_posterior_cov_shuffle", arm["mode"],
                                                         arm["n_permutations"], level, t, draw, base_seed=cfg.seed)}
         eng: Any = B.PFNRefitEngine(device=cfg.device, random_state=int(tp["inference_seed"]) + int(draw),
-                                    softmax_temperature=float(tp["softmax_temperature"]), name=name, **order)
+                                    softmax_temperature=float(tp["softmax_temperature"]), name=name,
+                                    n_estimators=int(tp.get("n_estimators", 1)), **order)
     else:
         eng = _representation_gp(name, p)
     eng.fit(ctx.X, ctx.y)

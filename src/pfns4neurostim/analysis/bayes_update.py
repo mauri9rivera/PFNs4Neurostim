@@ -1012,17 +1012,24 @@ class PFNRefitEngine:
         rng: Generator of the row orders (required unless ``shuffle == 'none'``).
         tail_measure: One of :data:`TAIL_MEASURES`: how the two outer buckets of every predictive are treated (moments and,
             under the ``strata`` quadrature, nodes). The default reproduces every run before 2026-10-28.
+        n_estimators: Ensemble members of every refit. 1 is the deployed engine (one preprocessing configuration, as in
+            every BO loop); above 1, TabPFN returns the equal mixture of the members' predictives on shared bar borders
+            (``average_before_softmax=False``), so every readout is unchanged in form. Added 2026-11-13 for the ensemble
+            comparison of the coherence figure (research log 2026-11-13).
 
     Raises:
-        ValueError: On an unknown mode or tail measure, ``n_permutations < 1``, several orders with ``shuffle == 'none'``, or a
-            shuffling mode without a generator.
+        ValueError: On an unknown mode or tail measure, ``n_permutations < 1``, several orders with ``shuffle == 'none'``, a
+            shuffling mode without a generator, or ``n_estimators < 1``.
     """
 
     def __init__(self, device: str = "cpu", random_state: int = 0, softmax_temperature: float = 0.9,
                  name: str = "tabpfn_v2_5", shuffle: str = "none", n_permutations: int = 1,
-                 rng: np.random.Generator | None = None, tail_measure: str = DEFAULT_TAIL_MEASURE) -> None:
+                 rng: np.random.Generator | None = None, tail_measure: str = DEFAULT_TAIL_MEASURE,
+                 n_estimators: int = 1) -> None:
         from tabpfn import TabPFNRegressor  # noqa: PLC0415 - heavy import
 
+        if int(n_estimators) < 1:
+            raise ValueError(f"PFNRefitEngine: n_estimators must be >= 1, got {n_estimators!r}.")
         if tail_measure not in TAIL_MEASURES:
             raise ValueError(f"PFNRefitEngine: tail_measure must be one of {TAIL_MEASURES}, got {tail_measure!r}.")
         self.tail_measure = tail_measure
@@ -1034,7 +1041,7 @@ class PFNRefitEngine:
                              f"shuffle is 'none' (every order would be the same).")
         if shuffle != "none" and rng is None:
             raise ValueError(f"PFNRefitEngine: shuffle={shuffle!r} needs a generator.")
-        self.reg = TabPFNRegressor(n_estimators=1, softmax_temperature=float(softmax_temperature),
+        self.reg = TabPFNRegressor(n_estimators=int(n_estimators), softmax_temperature=float(softmax_temperature),
                                    random_state=int(random_state), ignore_pretraining_limits=True, device=device)
         self.name = name
         self.shuffle = shuffle
