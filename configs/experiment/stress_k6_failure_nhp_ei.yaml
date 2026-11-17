@@ -1,0 +1,59 @@
+# EI variant (user, 2026-11-17): the same experiment with Expected Improvement (configs/acquisition/ei.yaml:
+# incumbent best_observed, xi 0; TabPFN-2.5 scores it over its bar distribution, acq_form 'bars') in place of
+# ts_marginal, for the _ei copies of the workshop table / stress figure. Its own tag, so its run directory never
+# overwrites the ts_marginal deliverable. Everything else is identical to stress_k6_failure_nhp.yaml.
+# Hypothesis B - K6 sparsity via electrode failure during the run.
+# Dataset: NHP (draws, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
+#
+# Knob:   a fraction epsilon of the electrodes fails, each at its own uniformly random moment
+#         of the run; afterwards it returns 0.0 (z-scored, = channel mean) and stays queryable,
+#         so the optimizer must notice. Regret, exploration, R^2 and calibration are scored on
+#         the SURVIVING electrodes (restructure 2026-09-23).
+# x-axis: epsilon.
+# Budget: total queries INCLUDING n_init (P0.3).
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k6_failure_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [tabpfn_v2_5, gp_mll, gp_naive]
+  acquisition: ei
+
+experiment: stress_sweep
+family: stress-k6-failure
+tag: nhp-ei
+
+knob:
+  type: k6_failure
+  levels: [0.0, 0.1, 0.25, 0.5, 0.75]
+  params:
+    dead_value: 0.0   # response of a failed electrode, z-scored units
+
+budget: 96
+n_init: 5
+n_reps: 20                 # raised 10 -> 20 on 2026-09-30: with the causal (online) y scaler the early
+                           # steps of a run are genuinely harder, so per-cell variance is higher and 10
+                           # repetitions no longer represent a surrogate's reconstruction performance.
+                           # n_reps is NOT part of cell identity (the rep index is), so raising it is
+                           # additive: reps 0-9 are served from cache and only 10-19 are computed.
+gt_mode: full_mean     # or split_half (task #7): rep i runs on cross-fitted instance i mod 2*gt_n_splits
+online_y_scaler: minmax   # CANONICAL 2026-09-30: causal y scaling, refit inside the BO loop from the
+                          # observations so far (none | minmax | zscore). This is the deployment-honest
+                          # setting; the offline `none` arm survives as the pre-09-30 NHP runs.
+gt_n_splits: 10
+device: cuda
+seed: 42
+output_root: output
+
+# Pre-registered TOST/non-inferiority margin, in range-normalized regret units.
+equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  # CPU pins (user, 2026-11-17: the EI wave runs on Narval / local CPUs). Per model, never a top-level `device`, which is in
+  # every cell's identity: flipping it would orphan the cached GP-fixed EI and PFNs4BO native cells. One rep of TabPFN-2.5
+  # on one CPU thread: 0.31 s per query, ~28 s per NHP rep (local probe 2026-11-17). TabFM stays on the GPU (top-level
+  # cuda): on CPU it needs ~340 s per prediction (wrappers.py).
+  tabpfn_v2_5: {device: cpu}
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

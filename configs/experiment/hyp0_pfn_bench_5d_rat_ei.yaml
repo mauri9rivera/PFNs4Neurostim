@@ -1,0 +1,62 @@
+# EI variant (user, 2026-11-17): the same experiment with Expected Improvement (configs/acquisition/ei.yaml:
+# incumbent best_observed, xi 0; TabPFN-2.5 scores it over its bar distribution, acq_form 'bars') in place of
+# ts_marginal, for the _ei copies of the workshop table / stress figure. Its own tag, so its run directory never
+# overwrites the ts_marginal deliverable. Everything else is identical to hyp0_pfn_bench_5d_rat.yaml.
+# Hypothesis 0 - PFN benchmark, 5d_rat: TabPFN-2.5 vs TabICL v2.2.0 vs TabFM vs PFNs4BO vs TabPFN-3.5 vs Causilo vs GP-MLL.
+#
+# Every model runs its own policy: `_supported` pairs PFNs4BO (an end-to-end BO model) with `native` only and
+# every other model with `ei` only (the ts_marginal original: `ts_marginal` only), so the acquisition list below adds no cross-product cells.
+#  - TabICL: native quantile predictive distribution (Thompson draws invert its quantile function).
+#  - TabFM: a POINT regressor upstream. Mean = upstream's own prediction (raw scale); sigma is CONSTRUCTED as
+#    sqrt(ensemble spread^2 + out-of-fold residual RMSE^2) (2026-09-25; before that the spread alone, which
+#    collapsed Thompson sampling to greedy). Guardrail G3: say "constructed sigma" in every table and caption.
+#  - PFNs4BO: HEBO+ prior, its own acquisition (`native`); runs in the MAIN env (py3.9, pins scikit-learn<1.2).
+#  - TabPFN-3.5: same bar-distribution predictive as TabPFN-2.5, newer checkpoint (tabpfn >= 9). Runs in the LATEST env:
+#    tabpfn >= 9 and the tabpfn 6.3.2 that provides TabPFN-2.5 own the same module name, so they cannot share one interpreter.
+#  - Causilo: native quantile predictive distribution (999 levels; Thompson draws invert it); needs torch >= 2.13, so the
+#    LATEST env too. Neither new model has run yet (2026-10-03): the first cell must confirm the wrapper against the real package.
+#  - TabFlex is dropped: upstream's weight host no longer resolves (microsoft/ticl issue #27).
+# Environments: TabICL and TabFM need the bench env (py3.11), PFNs4BO the main env, TabPFN-3.5 and Causilo the latest env. The portfolio submits each
+# model in its env against this ONE config, so every cell lands in this run and one assemble job (main env)
+# builds the tables and figures. Latency is descriptive only (guardrail G1).
+#
+#   CONDA_ENV=pfns4neurostim-bench LANES=4 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabpfn_v2_5,tabicl]"
+#   CONDA_ENV=pfns4neurostim LANES=2 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[pfns4bo]"
+#   CONDA_ENV=pfns4neurostim-latest LANES=2 sbatch scripts/run_bo_benchmark.sh configs/experiment/hyp0_pfn_bench_5d_rat.yaml "models=[tabpfn_v3_5,causilo]"
+defaults:
+  dataset: 5d_rat
+  model: [tabpfn_v2_5, tabicl, tabfm, pfns4bo, tabpfn_v3_5, causilo, gp_mll, gp_naive]
+  acquisition: [ei, native]
+
+experiment: bo_benchmark
+family: hyp0-pfn-bench
+tag: 5d_rat-ei
+
+budget: 100
+n_init: 5
+n_reps: 20                 # raised 10 -> 20 on 2026-09-30: with the causal (online) y scaler the early
+                           # steps of a run are genuinely harder, so per-cell variance is higher and 10
+                           # repetitions no longer represent a surrogate's reconstruction performance.
+                           # n_reps is NOT part of cell identity (the rep index is), so raising it is
+                           # additive: reps 0-9 are served from cache and only 10-19 are computed.
+gt_mode: full_mean
+online_y_scaler: minmax   # CANONICAL 2026-09-30: causal y scaling, refit inside the BO loop from the
+                          # observations so far (none | minmax | zscore). This is the deployment-honest
+                          # setting; the offline `none` arm survives as the pre-09-30 NHP runs.
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05
+
+# GP-MLL runs on CPU (measured 2.2x faster than CUDA for this Adam GP; P0.12).
+model_params:
+  # CPU pins (user, 2026-11-17: the EI wave runs on Narval / local CPUs). Per model, never a top-level `device`, which is in
+  # every cell's identity: flipping it would orphan the cached GP-fixed EI and PFNs4BO native cells. One rep of TabPFN-2.5
+  # on one CPU thread: 0.31 s per query, ~28 s per NHP rep (local probe 2026-11-17). TabFM stays on the GPU (top-level
+  # cuda): on CPU it needs ~340 s per prediction (wrappers.py).
+  tabpfn_v2_5: {device: cpu}
+  tabicl: {device: cpu}
+  tabpfn_v3_5: {device: cpu}
+  causilo: {device: cpu}
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

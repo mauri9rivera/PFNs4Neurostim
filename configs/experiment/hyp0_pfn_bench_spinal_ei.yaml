@@ -1,0 +1,46 @@
+# EI variant (user, 2026-11-17): the same experiment with Expected Improvement (configs/acquisition/ei.yaml:
+# incumbent best_observed, xi 0; TabPFN-2.5 scores it over its bar distribution, acq_form 'bars') in place of
+# ts_marginal, for the _ei copies of the workshop table / stress figure. Its own tag, so its run directory never
+# overwrites the ts_marginal deliverable. Everything else is identical to hyp0_pfn_bench_spinal.yaml.
+# Hyp 0 PFN benchmark, spinal: TabPFN-2.5, TabICL, TabFM, PFNs4BO, TabPFN-3.5, Causilo, GP-MLL.
+# Same design as hyp0_pfn_bench_nhp.yaml (see its header: envs, constructed TabFM sigma, G1/G3).
+#
+# Derived from the NHP config of the same name (2026-09-25); differences: dataset/tag spinal, budget 64
+# = the 8x8 grid (legacy spinal benchmark; NHP also uses budget = grid).
+defaults:
+  dataset: spinal
+  model: [tabpfn_v2_5, tabicl, tabfm, pfns4bo, tabpfn_v3_5, causilo, gp_mll, gp_naive]
+  acquisition: [ei, native]
+
+experiment: bo_benchmark
+family: hyp0-pfn-bench
+tag: spinal-ei
+
+budget: 64
+n_init: 5
+n_reps: 20                 # raised 10 -> 20 on 2026-09-30: with the causal (online) y scaler the early
+                           # steps of a run are genuinely harder, so per-cell variance is higher and 10
+                           # repetitions no longer represent a surrogate's reconstruction performance.
+                           # n_reps is NOT part of cell identity (the rep index is), so raising it is
+                           # additive: reps 0-9 are served from cache and only 10-19 are computed.
+gt_mode: full_mean
+online_y_scaler: minmax   # CANONICAL 2026-09-30: causal y scaling, refit inside the BO loop from the
+                          # observations so far (none | minmax | zscore). This is the deployment-honest
+                          # setting; the offline `none` arm survives as the pre-09-30 NHP runs.
+device: cuda
+seed: 42
+output_root: output
+equivalence_margin: 0.05
+
+# GP-MLL runs on CPU (measured 2.2x faster than CUDA for this Adam GP; P0.12).
+model_params:
+  # CPU pins (user, 2026-11-17: the EI wave runs on Narval / local CPUs). Per model, never a top-level `device`, which is in
+  # every cell's identity: flipping it would orphan the cached GP-fixed EI and PFNs4BO native cells. One rep of TabPFN-2.5
+  # on one CPU thread: 0.31 s per query, ~28 s per NHP rep (local probe 2026-11-17). TabFM stays on the GPU (top-level
+  # cuda): on CPU it needs ~340 s per prediction (wrappers.py).
+  tabpfn_v2_5: {device: cpu}
+  tabicl: {device: cpu}
+  tabpfn_v3_5: {device: cpu}
+  causilo: {device: cpu}
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}
