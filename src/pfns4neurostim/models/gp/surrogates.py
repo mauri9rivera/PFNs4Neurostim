@@ -110,6 +110,39 @@ GP_FIXED_NOISE: float = 0.05
 RESTART_AGREEMENT_NATS: float = 1e-3
 
 
+def _psd_factor(cov: "torch.Tensor", psd_tolerance: float) -> "torch.Tensor":
+    """Factor a symmetric, numerically indefinite covariance as ``L`` with ``L Lᵀ`` its nearest PSD matrix.
+
+    Negative eigenvalues are clipped to zero (the Frobenius-nearest PSD matrix). Only round-off is repaired: a most
+    negative eigenvalue beyond ``psd_tolerance`` × the largest one means the covariance itself is wrong, and raises.
+
+    Args:
+        cov: Symmetric covariance, shape [M, M].
+        psd_tolerance: Largest accepted ``-λ_min / λ_max``.
+
+    Returns:
+        Factor ``V diag(sqrt(λ⁺))``, shape [M, M], so that a draw is ``mean + factor @ eps``.
+
+    Raises:
+        RuntimeError: If the eigendecomposition is not finite, the largest eigenvalue is not positive, or the
+            covariance is indefinite beyond ``psd_tolerance``.
+    """
+    sym = 0.5 * (cov + cov.transpose(-1, -2))                    # [M, M]
+    evals, evecs = torch.linalg.eigh(sym)                          # [M], [M, M]
+    if not (torch.isfinite(evals).all() and torch.isfinite(evecs).all()):
+        raise RuntimeError(f"GPSurrogate.predict_ts: non-finite eigendecomposition of the covariance (M={cov.shape[0]}).")
+    lam_max = float(evals.max())
+    lam_min = float(evals.min())
+    if lam_max <= 0.0:
+        raise RuntimeError(f"GPSurrogate.predict_ts: covariance has no positive eigenvalue (max {lam_max:.3e}).")
+    if -lam_min > psd_tolerance * lam_max:
+        raise RuntimeError(
+            f"GPSurrogate.predict_ts: covariance indefinite beyond round-off (lambda_min {lam_min:.3e}, "
+            f"lambda_max {lam_max:.3e}, tolerance {psd_tolerance:g} x lambda_max; M={cov.shape[0]})."
+        )
+    return evecs * evals.clamp(min=0.0).sqrt().unsqueeze(0)       # [M, M]
+
+
 # ---------------------------------------------------------------------------
 # GPSurrogate — ExactGP wrapper conforming to SurrogateModel
 # ---------------------------------------------------------------------------
@@ -707,6 +740,7 @@ class GPSurrogate:
         temperature: float = 1.0,
         generator: "torch.Generator | None" = None,
         include_noise: bool = False,
+        psd_tolerance: float = 1e-3,
     ) -> np.ndarray:
         """Draw one joint Thompson sample from the GP posterior.
 
@@ -737,13 +771,18 @@ class GPSurrogate:
                 the global torch RNG.
             include_noise: Sample the noisy predictive posterior instead of the
                 latent one (diagnostic; see above).
+            psd_tolerance: Used only when Cholesky fails at every jitter level: the
+                posterior is then recomputed in float64 closed form and factored through
+                its eigendecomposition with negative eigenvalues clipped to zero, provided
+                the most negative one is no larger than ``psd_tolerance`` × the largest
+                (round-off, not a broken kernel).
 
         Returns:
             Thompson sample, shape [M].  # [M]
 
         Raises:
-            RuntimeError: If ``fit`` has not been called yet, or the sample is
-                not finite.
+            RuntimeError: If ``fit`` has not been called yet, the covariance is
+                indefinite beyond ``psd_tolerance``, or the sample is not finite.
             ValueError: If ``temperature`` is not strictly positive.
         """
         if self._model is None or self._likelihood is None:
@@ -773,10 +812,22 @@ class GPSurrogate:
                 except RuntimeError:
                     continue
             if chol is None:
-                raise RuntimeError(
-                    "GPSurrogate.predict_ts: latent covariance not positive definite "
-                    f"even with 1e-3 relative jitter (M={cov.shape[0]})."
-                )
+                # Cholesky failed at every jitter (2026-11-18): the float32 posterior covariance of a fitted
+                # GP-MLL with long lengthscales loses K** - K*x K^-1 Kx* to cancellation and comes out
+                # indefinite (NHP M = 96: lambda_min -3.9e-3 against lambda_max 1.6). Redo the posterior in
+                # float64 closed form (the same RBF hyperparameters, predict_frozen / posterior_covariance)
+                # and factor that; only its residual round-off is clipped (_psd_factor).
+                if hasattr(self._model, "feature_extractor"):
+                    raise RuntimeError(
+                        "GPSurrogate.predict_ts: latent covariance not positive definite even with 1e-3 "
+                        f"relative jitter (M={cov.shape[0]}), and a deep-kernel GP has no closed-form fallback."
+                    )
+                mean64, _ = self.predict_frozen(X)                                # [M]
+                cov64 = torch.as_tensor(self.posterior_covariance(X), dtype=torch.float64)  # [M, M]
+                if include_noise:
+                    cov64 = cov64 + float(self.hyperparameters()["noise"]) * torch.eye(cov64.shape[0], dtype=torch.float64)
+                mean = torch.as_tensor(mean64, dtype=torch.float64, device=cov.device)      # [M]
+                chol = _psd_factor(cov64, psd_tolerance).to(cov.device)                    # [M, M]
             eps = torch.randn(
                 cov.shape[0], dtype=cov.dtype, device=cov.device, generator=generator
             )                                                    # [M]

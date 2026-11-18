@@ -1,0 +1,49 @@
+# GP ts_joint variant (user, 2026-11-18): GP-MLL and GP-fixed with joint Thompson sampling (one draw from the joint latent
+# GP posterior, configs/acquisition/ts_joint.yaml; GP-only, since a PFN's query rows do not attend to each other). The PFN rows
+# of the same deliverable stay on ts_marginal (their own configs); the paper's supplement states the split: TS-marginal for
+# the tabular foundation models, TS-joint for the GPs. Its own tag, so its run directory never overwrites the ts_marginal
+# deliverable. Everything else is identical to hyp_a_nhp.yaml.
+# Hypothesis A - on-par-but-cheaper, NHP held-out subject.
+#
+# Headline acquisition: ts_marginal (independent per-site Thompson draws from each model's
+# predictive marginals; symmetric for GP and PFN), settled 2026-10-08 from the NHP acquisition core and
+# UCB kappa runs (research_design §4). The random-search baseline serves the
+# `random` acquisition only, hence the two-entry list. Regrets are range-normalized (P0.9);
+# latency is descriptive only (guardrail G1).
+#
+#   python -m pfns4neurostim bo_benchmark --config configs/experiment/hyp_a_nhp.yaml
+defaults:
+  dataset: nhp
+  # tabicl added 2026-10-22 (user): shown beside TabPFN-2.5 in the Hyp A figures and its own TOST family;
+  # TabPFN-2.5 stays the pre-registered model and the only PFN of Hyp B / C. Its cells are the PFN-bench ones
+  # (same settings and model group), so nothing is recomputed.
+  model: [gp_mll, gp_naive]
+  acquisition: ts_joint
+
+experiment: bo_benchmark
+family: hyp-a
+tag: nhp-tsj
+
+budget: 96
+n_init: 5
+n_reps: 20                 # raised 10 -> 20 on 2026-09-30: with the causal (online) y scaler the early
+                           # steps of a run are genuinely harder, so per-cell variance is higher and 10
+                           # repetitions no longer represent a surrogate's reconstruction performance.
+                           # n_reps is NOT part of cell identity (the rep index is), so raising it is
+                           # additive: reps 0-9 are served from cache and only 10-19 are computed.
+gt_mode: full_mean
+online_y_scaler: minmax   # CANONICAL 2026-09-30: causal y scaling, refit inside the BO loop from the
+                          # observations so far (none | minmax | zscore). This is the deployment-honest
+                          # setting; the offline `none` arm survives as the pre-09-30 NHP runs.
+device: cuda
+seed: 42
+cache_version: 2            # spelled out so a run can bump it (--set cache_version=3) to force a recompute
+                            # of cells whose *value* columns changed (e.g. new gp_* fit diagnostics)
+output_root: output
+equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}

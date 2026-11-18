@@ -1,0 +1,59 @@
+# GP ts_joint variant (user, 2026-11-18): GP-MLL and GP-fixed with joint Thompson sampling (one draw from the joint latent
+# GP posterior, configs/acquisition/ts_joint.yaml; GP-only, since a PFN's query rows do not attend to each other). The PFN rows
+# of the same deliverable stay on ts_marginal (their own configs); the paper's supplement states the split: TS-marginal for
+# the tabular foundation models, TS-joint for the GPs. Its own tag, so its run directory never overwrites the ts_marginal
+# deliverable. Everything else is identical to stress_k2_channel_draws_nhp.yaml.
+# Hypothesis B - K2-channel SNR: noise relative to each channel's own floor SNR.
+# Dataset: NHP (draws, in vivo). Models: TabPFN-2.5 vs GP-MLL vs GP-fixed.
+#
+# Knob:   y~[s,r] = y_gt[s] + alpha * (y[s,r] - y_gt[s]) on the trial bank only, so every
+#         channel receives the same *relative* damage (alpha < 1 = trial averaging).
+# x-axis: achieved SNR (dB); levels may and do reach SNR < 0 dB (restructure 2026-09-23).
+# Budget: total queries INCLUDING n_init (P0.3).
+#
+#   python -m pfns4neurostim stress_sweep --config configs/experiment/stress_k2_channel_draws_nhp.yaml
+defaults:
+  dataset: nhp
+  model: [gp_mll, gp_naive]
+  acquisition: ts_joint
+
+experiment: stress_sweep
+family: stress-k2-channel-draws
+tag: nhp-tsj
+
+knob:
+  type: k2_channel
+  # alpha shifts every channel's SNR by exactly -20*log10(alpha) dB relative to its own floor:
+  #   alpha  0.1  0.25  0.5   1   1.5    2     3     4     8
+  #   dB   +20  +12   +6    0  -3.5  -6.0  -9.5  -12.0 -18.1
+  # The first eight levels are the pre-restructure k2_snr ladder, so those cells carry over via
+  # scripts/relabel_knob_cells.py; alpha = 8 is new and pushes every channel below 0 dB.
+  # (knob.targets_db: [...] states the same ladder directly in dB instead.)
+  levels: [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0]
+
+budget: 96
+n_init: 5
+n_reps: 20                 # raised 10 -> 20 on 2026-09-30: with the causal (online) y scaler the early
+                           # steps of a run are genuinely harder, so per-cell variance is higher and 10
+                           # repetitions no longer represent a surrogate's reconstruction performance.
+                           # n_reps is NOT part of cell identity (the rep index is), so raising it is
+                           # additive: reps 0-9 are served from cache and only 10-19 are computed.
+gt_mode: full_mean     # or split_half (task #7): rep i runs on cross-fitted instance i mod 2*gt_n_splits
+online_y_scaler: minmax   # CANONICAL 2026-09-30: causal y scaling, refit inside the BO loop from the
+                          # observations so far (none | minmax | zscore). This is the deployment-honest
+                          # setting; the offline `none` arm survives as the pre-09-30 NHP runs.
+gt_n_splits: 10
+device: cuda
+seed: 42
+cache_version: 2            # spelled out so a run can bump it (--set cache_version=3) to force a recompute
+                            # of cells whose *value* columns changed (e.g. new gp_* fit diagnostics)
+output_root: output
+
+# Pre-registered TOST/non-inferiority margin, in range-normalized regret units.
+equivalence_margin: 0.05
+
+# GP models run on CPU: measured ~2.2x faster than CUDA for this Adam GP (P0.12); TabPFN stays
+# on `device`. Regret is unaffected; latency is descriptive only (guardrail G1).
+model_params:
+  gp_mll: {device: cpu}
+  gp_naive: {device: cpu}
